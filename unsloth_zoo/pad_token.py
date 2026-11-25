@@ -35,8 +35,7 @@ __all__ = [
     "fix_pad_token",
 ]
 
-# Candidate pad tokens, highest priority first; entries match by exact equality or prefix (<|reserved covers
-# <|reserved_special_token_0|>), and a closed candidate (ends with > |> ] )) wins over an open prefix.
+# Candidate pad tokens by priority; exact or prefix match; closed tokens beat open prefixes.
 POSSIBLE_RESERVED_TOKENS = (
     "<|finetune_right_pad_id|>",  # Llama-3.1
     "<|finetune_right_pad|>",     # Llama-4
@@ -339,8 +338,7 @@ def fix_pad_token(
         # A malformed vocab_size (e.g. a string) would crash the id >= vocab_size comparison, so treat it as unknown and skip range checks.
         vocab_size = None
     eos_token = getattr(inner, "eos_token", None)
-    # EOS ids that reject an aliasing pad come from the tokenizer and the config, not the generation_config stop list:
-    # it lists valid pads (Qwen's <|endoftext|>) and must not drive pad selection.
+    # EOS ids come from tokenizer and config, not generation_config, which lists valid pads.
     eos_token_ids = _eos_id_set(
         getattr(inner, "eos_token_id", None),
         getattr(cfg, "eos_token_id", None),

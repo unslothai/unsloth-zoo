@@ -33,8 +33,7 @@ def _expand_env_path(value: str) -> Path:
 
 
 def _is_writable(path: Path) -> bool:
-    # Any failure to create the dir or a throwaway file means not writable; symlinks are allowed (users symlink caches
-    # to large volumes); fallbacks are hardened in _is_safe_private_dir.
+    # Failed mkdir or temp file means unwritable; symlinked caches are allowed (large volumes).
     try:
         path.mkdir(parents = True, exist_ok = True)
         with tempfile.NamedTemporaryFile(dir = path):
@@ -109,8 +108,7 @@ def _resolve_hf_home() -> Path | None:
 
 
 def _active_caches() -> tuple[Path | None, Path | None, Path | None]:
-    # Resolve (hf_home, hub_cache, xet_cache) as Hub will; explicit env vars come first so they never depend on home
-    # resolution, and legacy HUGGINGFACE_HUB_CACHE is still honored by Hub.
+    # Resolve as Hub (env vars first, not home); legacy HUGGINGFACE_HUB_CACHE still honored.
     hf_home = _resolve_hf_home()
     hub_cache_env = os.environ.get("HF_HUB_CACHE")
     if hub_cache_env is None:

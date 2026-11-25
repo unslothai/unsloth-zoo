@@ -52,19 +52,16 @@ except Exception:
 # Every new length is one more static graph; torch's default allows 8 per code object.
 _RECOMPILE_FLOOR = 1024
 
-# Engagement counters, updated at trace time (comptime) or in eager code, never inside a graph.
-# specialized: enclosing-graph traces whose Q / K / V sequence sizes were made concrete.
-# left_dynamic: traces left symbolic because a sequence size derives from a mark_dynamic input.
-# failed: traces where the specialization could not be applied (torch internals moved, comptime missing).
-# static_calls: eager calls routed to the static compile of a call site's own entry point.
+# Engagement counters bumped at trace time (comptime) or eagerly, never in a graph: specialized
+# (Q/K/V sizes made concrete), left_dynamic (size derives from a mark_dynamic input), failed (torch
+# internals moved or comptime missing), static_calls (eager calls routed to the static compile).
 ROCM_FLEX_STATIC_STATS = {"specialized": 0, "left_dynamic": 0, "failed": 0, "static_calls": 0}
 _WARNED = set()
 _logger = logging.getLogger(__name__)
 
 
 def _warn_once(kind, message):
-    # Also called at trace time (comptime): a warning filter that turns RuntimeWarning into an error
-    # (-W error::RuntimeWarning) must not fail the enclosing Dynamo trace, so it is logged instead.
+    # Also at trace time (comptime): -W error::RuntimeWarning must not fail the trace; log it.
     if kind in _WARNED:
         return
     _WARNED.add(kind)
@@ -211,9 +208,8 @@ def compile_static_flex(entry, training = False):
     call site's own, so its Dynamo cache is not shared with another compile of flex_attention."""
     options = {}
     if _PER_CALL_RECOMPILE_LIMIT:
-        # This compile's own limit: the process-wide recompile_limit stays as its owner configured it. The
-        # accumulated limit is a per code object safety cap counted across compiles, so it still needs room.
-        # A process-wide limit set higher than the floor is kept for this compile too.
+        # This compile's recompile_limit is max(configured, floor); process-wide limit is untouched,
+        # and the accumulated per-code-object cap, counted across compiles, still needs room.
         options["recompile_limit"] = max(_configured_recompile_limit(), _RECOMPILE_FLOOR)
         _raise_recompile_budget(per_frame = False)
     else:

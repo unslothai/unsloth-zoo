@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 norm dtype: transformers keeps norm weights in float32 and returns weight * x.to(input_dtype), so a bf16
-model's next Linear gets float32; DeepSeek's reference returns (weight * x).to(dtype)."""
+"""DeepSeek-V4 norm dtype: transformers gives float32 for bf16 models; DeepSeek casts to dtype."""
 import inspect
 
 import torch

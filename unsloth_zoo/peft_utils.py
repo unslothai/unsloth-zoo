@@ -34,8 +34,7 @@ import re
 from .log import logger
 from .empty_model import _get_module_attribute
 
-# Leaf names of MoE routers, kept out of automatic LoRA targets; not gate, since D-FINE's gateway.gate is a plain
-# projection (_moe_router_gate_names decides by position).
+# MoE router leaf names, kept out of auto LoRA targets; `gate` decided by position, not name.
 MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
@@ -79,8 +78,7 @@ def _moe_router_gate_names(model):
     return names
 
 
-# PEFT's _check_lora_target_modules_mamba set, plus nemotron_h_puzzle (Nemotron 3.5 Bolt): its fused Mamba kernel reads
-# out_proj.weight directly, bypassing a LoRA adapter.
+# nemotron_h_puzzle joins PEFT's Mamba types; its fused kernel bypasses LoRA on out_proj.
 MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h", "nemotron_h_puzzle"))
 MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
 # Mamba, Mamba2, Nemotron-H name the mixer `mixer`; Falcon-H1, Bamba, Zamba2 `mamba`.
@@ -120,7 +118,6 @@ def _mamba_subtree_exclusion(leaves):
     )
 
 
-# Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
     "lm_head",
     "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
@@ -264,9 +261,8 @@ def get_peft_regex(
     regex_components  = "|".join(regex_components)
 
     match_linear_modules = r"(?:" + "|".join(re.escape(x) for x in only_linear_modules) + r")"
-    # No trailing .*? after the linear group: PEFT re.fullmatch would let attn.proj_drop (a Dropout) match; ending at
-    # the group keeps real Linears and drops same-prefix non-Linears; the dot before it anchors leaf names (bare proj
-    # matched Nemotron-H's Identity fc1_latent_proj, which PEFT rejects).
+    # No trailing .*?: fullmatch would let attn.proj_drop (Dropout) match; the dot anchors leaf
+    # names.
     if regex_model_parts == "":
         # With no vision/language model part selected (e.g. audio-only finetuning), the standard matcher would match
         # every attention/mlp leaf, so the base is made inert and only the dedicated audio branches below apply.
@@ -288,22 +284,9 @@ def get_peft_regex(
         pass
     pass
 
-    # Gemma 4 / Gemma 3N keep the visual/audio path in flat embedder Linears
-    # (embed_vision.embedding_projection, embed_audio.embedding_projection,
-    # vision_embedder.patch_dense, vision_tower.patch_embedder.input_proj) and a
-    # conformer audio_tower whose ffw_layer_* / lconv1d.linear_* / attention.post
-    # leaves carry no attn/mlp component token, so the standard matcher above can
-    # never select them. Add dedicated name-anchored branches, gated on the
-    # vision/audio flags, scoped to the attention/mlp flags, and -- when an explicit
-    # target_modules list is given -- intersected with it. Each branch is appended
-    # only if it re.fullmatch-es a Linear in THIS model (matching PEFT's own matcher).
-    # Some of these leaf names are NOT Gemma-exclusive: empty_model.py also lists
-    # embed_vision.embedding_projection / vision_tower.patch_embedder.input_proj as
-    # Mistral3 components, so a name-only match could change a non-Gemma target set.
-    # Gate the whole block on the Gemma 4 / Gemma 3N model families (via model_type /
-    # architectures) so every other architecture's regex stays byte-identical.
-    # Leading ".*?"; no trailing ".*?" (a real Linear leaf terminates the match);
-    # "(?:\.linear)?" also covers Gemma4ClippableLinear ".linear" children.
+    # Gemma 3N/4 audio/vision Linears lack attn/mlp tags: add name-anchored branches, appended only
+    # if fullmatch hits a Linear, gated on Gemma model_type so other archs stay byte-identical;
+    # scoped to attn/mlp and any explicit target_modules; Mistral3 shares some leaf names.
     def _scoped(leaves):
         if target_modules is not None:
             return [x for x in leaves if x in only_linear_modules]
@@ -320,9 +303,8 @@ def get_peft_regex(
     )
 
     def _linear_aware_branches(cores):
-        # Branch only on the real nn.Linear per core (bare module or .linear child of a Gemma4ClippableLinear wrapper);
-        # a blanket optional .linear would also match the wrapper and double-process the inner Linear; checking each
-        # core against linear_modules keeps Gemma 3N and Gemma 4 correct.
+        # Only real nn.Linear cores; a blanket optional .linear would double-process the inner
+        # Linear.
         out = []
         for core in cores:
             if any(re.fullmatch(r".*?" + core + r"\.linear", name, flags = re.DOTALL) for name in linear_modules):
@@ -377,8 +359,7 @@ def get_peft_regex(
         qwen4_cores += [r"\bhyper_connection_mixer\." + re.escape(x)
                         for x in _scoped(["input_mix_weight_down", "input_mix_weight_up"])]
         candidate_branches += _linear_aware_branches(qwen4_cores)
-    # DeepSeek-V4.1 (community port): the engram's wkv (layers.N.engram.wkv) has no attention / mlp ancestor; it is the
-    # memory branch's input projection, so it follows the language + mlp flags.
+    # DeepSeek-V4.1 engram wkv: no attn/mlp ancestor, so it follows the language/mlp flags.
     _dsv41_engram = [
         name + ".wkv" for name, module in model.named_modules()
         if type(module).__name__ == "DeepseekV41Engram"
@@ -454,8 +435,7 @@ def get_peft_regex(
                 f"{indexers[0]}; the integer top-k sends them no gradient, so these adapters will not train."
             )
             indexers = []
-    # DeepSeek-V4.1's CSA indexer only picks integer top-k entries: the LM loss never reaches it, so an adapter there
-    # never trains. Only an explicit target_modules list selects it.
+    # DeepSeek-V4.1 indexer: integer top-k, no LM-loss gradient; only explicit target_modules.
     indexer_prefixes = tuple(
         name + "." for name, module in model.named_modules()
         if type(module).__name__ == "DeepseekV41Indexer"
@@ -734,8 +714,7 @@ def requires_grad_for_gradient_checkpointing(model):
     pass
 
     def requires_grad_post_hook_eager(module, input, output):
-        # Skipped while compiling: the requires_grad flip is a needless graph break in Gemma 3N's compiled multimodal
-        # embedder (its LoRA projection follows); Dia's encoder runs eager.
+        # Skipped when compiling: requires_grad flip is a graph break in Gemma 3N's embedder.
         if torch.compiler.is_compiling(): return
         requires_grad_post_hook(module, input, output)
     pass
@@ -785,8 +764,7 @@ def requires_grad_for_gradient_checkpointing(model):
     def collect_hook_targets():
         hook_targets = OrderedDict()
         fallback_targets = OrderedDict()
-        # id(forward) -> (forward, source): every LoRA weight walks up to the same ancestors.
-        # Holding the function keeps its id from being reused within this call.
+        # Maps id(forward) to (forward, source); holding forward stops its id being reused.
         forward_sources = {}
 
         for name, param in model.named_parameters():
@@ -802,7 +780,6 @@ def requires_grad_for_gradient_checkpointing(model):
             fallback_name = None
             fallback_module = None
 
-            # Try getting previous parent module
             for j in range(len(name_components)-1, 0, -1):
                 name_curr = name_components[j]
                 name_pre  = "model." + ".".join(name_components[:j])

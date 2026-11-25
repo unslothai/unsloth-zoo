@@ -318,8 +318,7 @@ def fused_linear_grpo_loss(
                                           entropy_requires_grad = bool(entropy_coef) or entropy_weights is not None,
                                           rows_per_chunk = rows_per_chunk)
         lp, en = lp.reshape(B, T).float(), en.reshape(B, T).float()
-        # Masked tokens may hold any old / ref / ratio (padding): zero them before the ratio, as the op skips them,
-        # so an overflowed exp cannot turn the weighted sum (or its gradient) into NaN.
+        # Zero masked tokens first so an overflowed exp on padding cannot make the loss NaN.
         live = mask.to(device = device, dtype = torch.bool).reshape(B, T)
         z = lambda x: torch.where(live, x, torch.zeros_like(x)) if x is not None else None  # noqa: E731
         ell, _ = _token_terms(z(lp), adv, z(old), z(ref), z(isr), kind, *args)

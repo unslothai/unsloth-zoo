@@ -67,9 +67,8 @@ def _experts_per_chunk(param, dtype, budget = None):
     return max(1, min(param._original_shape[0], (_chunk_bytes() if budget is None else budget) // per_expert))
 
 
-# Per-GPU dequantize fallback state: [chunk bytes to try, calls left before the full budget is retried, smallest failed
-# chunk bytes]; in bytes, not experts, so smaller experts (a down_proj is half a gate_up) still probe below the failed
-# size.
+# Per-GPU fallback [chunk bytes, calls left before full-budget retry, smallest failed chunk bytes];
+# in bytes, not experts, so smaller experts (down_proj is half gate_up) still probe below it.
 _CHUNK_BUDGET = {}
 _CHUNK_RETRY_CALLS = 1024
 
@@ -85,8 +84,7 @@ def _dequantize_chunk(param, start, end, dtype, transpose, counts):
         from unsloth_zoo.packed_experts import PACKED_EXPERT_STATS
         if not torch.compiler.is_compiling():
             PACKED_EXPERT_STATS["chunks"] += 1
-        # Rows decode contiguous; the forward multiplies their transposed view, as the 16-bit path multiplies the
-        # module's (E, N, K) stack, so both take the same GEMM layout and agree bitwise.
+        # Contiguous rows used transposed: same GEMM layout as 16-bit path, agreeing bitwise.
         rows = param.dequantize_experts(start, end, dtype, False, counts[start:end])
         return rows.transpose(-2, -1) if transpose else rows
     scales = param.mxfp4_scales

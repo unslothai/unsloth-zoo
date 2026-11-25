@@ -287,8 +287,7 @@ def _unsloth_experts_dispatch(
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
         if fallback is not None:
-            # Without torch._grouped_mm or with packed MXFP4 stacks, take the eager forward (it
-            # dequantizes).
+            # No torch._grouped_mm, or packed MXFP4 stacks: eager forward, which dequantizes.
             if not _moe_utils_module()._check_torch_grouped_mm_supported() or any(
                 self._parameters.get(name) is not None
                 and self._parameters[name].dtype not in _DENSE_STACK_DTYPES

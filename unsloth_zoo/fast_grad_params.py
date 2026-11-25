@@ -51,8 +51,7 @@ def _registration_hook(module, name, value):
 
 
 def _flat_params(module):
-    """Cached tuple(module.parameters()), same walk, dedup and order as torch's _named_members; valid until the next
-    bump; marks the tree's modules for _registration_hook."""
+    """Cached module.parameters() in torch order; valid until bump(); marks the tree's modules."""
     d = module.__dict__
     hit = d.get(_CACHE)
     if hit is not None and hit[0] == _GEN[0]:

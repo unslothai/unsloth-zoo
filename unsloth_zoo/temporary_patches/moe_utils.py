@@ -100,8 +100,7 @@ def _replace_with_copy(current_file, destination):
         prefix = f".{os.path.basename(destination)}.", suffix = ".tmp", dir = directory,
     )
     try:
-        # Write through the descriptor, not by reopening the name, since this directory is writable by whoever could
-        # plant a copy and redirect the name; same as compiler._replace_compiled_cache_file.
+        # Write via the fd, not the name, since dir is writable by whoever could redirect it.
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             with open(current_file, "rb") as source:
@@ -148,15 +147,13 @@ def install_to_cache(source_path, destination_filename=None):
 
     current = _read_file_bytes(current_file)
     if current is not None and _read_file_bytes(destination) == current:
-        # Already installed: this runs on every import of unsloth_zoo on every rank and copies this whole module, so
-        # without the compare each import would overwrite it with an identical copy.
+        # Runs on every import and rank; skip rewriting when the installed copy matches.
         return True
 
     try:
         _replace_with_copy(current_file, destination)
     except Exception as replace_error:
-        # If a temp file cannot be made here, a plain copy is still tried to a destination we can write through; it
-        # loses atomicity, so the readback below guards against partial copies.
+        # If no temp file: non-atomic copy is tried; readback guards against partial copies.
         try:
             # Writing through a planted symlink would clobber whatever it targets.
             if os.path.islink(destination) or os.path.isdir(destination):
@@ -221,8 +218,7 @@ def _remove_cached_bytecode(source_file):
         bytecode_location = importlib.util.cache_from_source(source_file)
     except NotImplementedError:
         return True
-    # A symlinked __pycache__ would send this unlink outside the cache, so refuse and use our own definitions; skipped
-    # when sys.pycache_prefix is set, as that location is the user's own.
+    # Symlinked __pycache__ refused (unlinks escape); user's sys.pycache_prefix is trusted.
     if not getattr(sys, "pycache_prefix", None):
         try:
             if os.path.islink(os.path.dirname(bytecode_location)):
@@ -749,13 +745,11 @@ def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
     return inputs.new_empty((0, weight.shape[-1]))
 
 
-# Projection strides for the routing signature: a checksum, not an identity, since four projections leave a hidden - 4
-# null space; an identity would copy the [T, hidden] input (512MB transient); a swap must match every term (each
-# weighted by row index) and the norm.
+# Routing checksum strides, not identity (copying [T, hidden] costs 512MB); four projections leave a
+# hidden-4 null space; swaps must match every term (each weighted by row index) and the norm.
 _SIGNATURE_STRIDES = (12.9898, 78.233, 43.7585, 96.4271)
 
-# Row 2-norm carried beside the projections; it is not linear in the row, so the projections' null space does not reach
-# it, and swapped rows must match norms too.
+# Row 2-norm: nonlinear, so projections' null space misses it; swapped rows must match norms.
 _SIGNATURE_EXTRA = 1
 
 # Trailing checksum entries of a packed signature, not group boundaries; named because offsets are sliced off, and a bare [:-1] would read them as experts.
@@ -780,9 +774,8 @@ def _routing_signature(inputs, offsets):
             weights.unsqueeze(1) * strides).to(inputs.dtype)
         # Several projections, not one: a single dot maps rows orthogonal to it to zero like the zero row, letting such swaps across an expert boundary pass.
         rows = (inputs @ weights).float()
-        # Norm is not linear, so the projections' null space cannot reach it; vector_norm accumulates in fp32 from the
-        # input dtype, avoiding three concurrent 512MB temporaries of an x.float() product at 32K by 4096; dtype is
-        # promoted, not pinned, since vector_norm rejects narrowing.
+        # Norm is nonlinear, so the null space misses it; vector_norm accumulates in fp32, avoiding
+        # 3x 512MB temporaries at 32K x 4096; dtype promoted: vector_norm rejects narrowing.
         norm = torch.linalg.vector_norm(
             inputs, dim = -1, keepdim = True,
             dtype = torch.promote_types(inputs.dtype, torch.float32))
@@ -802,8 +795,7 @@ class _ManualGroupedMM(torch.autograd.Function):
     CheckpointError when routing changes saved shapes; it does not make routing deterministic."""
     @staticmethod
     def forward(ctx, inputs, weight, offsets):
-        # Stored as a plain list, not a tensor: non-reentrant checkpointing swaps saved tensors for the replay's, so
-        # only this copy keeps the forward's routing for backward to compare.
+        # Plain list: non-reentrant checkpoint swaps saved tensors, so only this keeps routing.
         ctx.forward_routing = routing = _routing_signature(inputs, offsets)
         ctx.save_for_backward(inputs, weight, offsets)
         with torch.no_grad():
@@ -1161,8 +1153,7 @@ class _ExpertBiasGather(torch.autograd.Function):
             if torch.compiler.is_compiling():
                 if _EXPERT_BIAS_GRAD_OP is not None and grad.dtype in (torch.float16, torch.bfloat16) \
                         and not _mm_fp32_out_ok(grad):
-                    # The fallback would upcast all of grad to fp32; running the eager row chunks as an opaque op keeps
-                    # that copy capped without specializing the row count.
+                    # Opaque op keeps the fp32 upcast capped, not specializing row count.
                     return _EXPERT_BIAS_GRAD_OP(expert_ids, grad, ctx.num_experts), None
                 # A loop over symbolic rows would specialize them: one uncapped GEMM instead.
                 return _one_hot_mm_fp32(expert_ids.unsqueeze(0) == experts, grad).to(grad.dtype), None
@@ -1996,8 +1987,7 @@ def _torch_version_tuple():
         return (0, 0)
 
 
-# CUDA not ROCm: torch 2.8 hard-raises unless dprops->major == 9 (Blas.cpp sm90_only); 2.9+ sends other archs to
-# _grouped_mm_fallback instead of raising (GroupedBlas.cpp, _grouped_mm_cuda).
+# CUDA only: torch 2.8 raises unless sm90; 2.9+ sends other archs to _grouped_mm_fallback.
 _TORCH_IS_CUDA_BUILD = getattr(torch.version, "hip", None) is None
 _TORCH_GROUPED_MM_SM90_ONLY = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() == (2, 8)
 _TORCH_GROUPED_MM_FALLS_BACK = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() >= (2, 9)
@@ -2846,14 +2836,12 @@ def _has_lora_adapters(param) -> bool:
     return active is None or len(active) > 0
 
 
-# Fused expert lora_B: expert-fastest, reshape(out, r, E), so column j is expert j % E (lora_A is expert-slowest,
-# reshape(E, r, in)); PEFT 0.18 to 0.21, vLLM (_stack_moe_lora_weights) and prime-rl all match, so the separated forward
-# must train this.
+# Fused lora_B is expert-fastest (column j = expert j % E; lora_A expert-slowest), as in vLLM
+# (_stack_moe_lora_weights), PEFT 0.18 to 0.21 and prime-rl; the separated forward must train this.
 LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
 
-# Legacy lora_B layout the separated forward read before the fix: expert-slowest, a rank-wide block of columns per
-# expert; self-consistent but understood by no other consumer, kept only to read such adapters back via
-# moe_lora_b_layout().
+# Legacy lora_B layout the separated forward read before the fix (expert-slowest, rank-wide blocks);
+# no other consumer understands it, kept to read such adapters via moe_lora_b_layout().
 LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
 
 _LORA_B_LAYOUTS = (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT)
@@ -3047,9 +3035,8 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    # Builds the second operand as (num_experts, rank, out) in one copy; going through unflatten_moe_lora_b and
-    # transposing copies it twice, and the extra saved tensor makes non-reentrant checkpointing recompute a different
-    # number of tensors than the forward saved.
+    # Builds (num_experts, rank, out) in one copy; unflatten_moe_lora_b plus transpose copies twice,
+    # an extra saved tensor makes non-reentrant checkpoint recompute a different tensor count.
     second_weight = _ExpertMajorGroupedOperand.apply(
         weight_B, num_experts, rank_per_expert, _resolve_moe_lora_b_layout(None),
     )
@@ -3605,8 +3592,7 @@ def _logical_expert_shape(param):
     materialized."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # Bounded walk, no id(): id() of a traced parameter guards on its identity, so a compiled decoder layer recompiled
-    # once per layer (each owns its expert parameters).
+    # Bounded walk, no id(): id() guards a traced param on identity, recompiling each layer.
     for _ in range(_LOGICAL_SHAPE_MAX_DEPTH):
         if param is None:
             break
@@ -3948,8 +3934,7 @@ def _legacy_lora_b_layout_requested() -> bool:
     about adapter provenance may redirect PEFT's get_delta_weight; unset keeps PEFT's reconstruction."""
     return os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") == LORA_B_LAYOUT_GROUPED_BY_EXPERT
 
-# The separated forward claims only gate_up_proj and down_proj; other experts-module parameters, such as NemotronH's
-# unfused experts.gate_proj / experts.up_proj, stay on PEFT's own forward and packing.
+# Only gate_up_proj/down_proj are claimed; NemotronH's experts.gate_proj/up_proj stay on PEFT.
 _SEPARATED_MOE_LORA_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
 
 
@@ -4022,9 +4007,8 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
             # A compiled-only run never reaches the eager probe.
             verdict = _wrapper_forward_applies_stash(wrapper, _MOE_LORA_COMPILED_VERDICT_ATTR)
         if verdict is False:
-            # Only a measured False overrides the structural test: an unpatched stacked-expert family (Olmoe, for one)
-            # is rank-major, and trusting the structural answer would mislabel it grouped_by_expert or, under the legacy
-            # override, merge it with the wrong pairing; None means not measured yet.
+            # Only a measured False overrides the structural test: unpatched stacked-expert families
+            # (Olmoe) are rank-major and would be mislabeled; None means unmeasured.
             return LORA_B_LAYOUT_RANK_MAJOR
         return _process_lora_b_layout()
     return LORA_B_LAYOUT_RANK_MAJOR
@@ -4171,8 +4155,7 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
 
 _STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
 
-# Scan depth bound: installed forwards delegate at most twice (dispatcher, backend, helper), and the bound keeps a
-# pathological import graph from making a cold start walk the module tree.
+# Forwards delegate at most twice (dispatcher, backend, helper); caps cold-start tree walks.
 _STASH_SCAN_MAX_DEPTH = 4
 
 
@@ -4373,18 +4356,16 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     # This Unsloth Zoo code section is licensed under AGPL3
 
     if torch.compiler.is_compiling():
-        # Never probe inside a captured graph: Dynamo traces the throwaway forward too (six expert einsums where two are
-        # correct, PyTorch 2.12 fullgraph); None means no evidence and caches nothing; an eager forward before or after
-        # compilation still sets the verdict.
+        # Never probe a captured graph: Dynamo traces the throwaway forward too (six einsums, two
+        # correct, PyTorch 2.12 fullgraph); None caches nothing; eager forwards set the verdict.
         return None
     lora_data = _extract_lora_from_wrapper(wrapper)
     lora_attr = moe_lora_stash_name(parameter_name)
     if lora_data is not None:
         setattr(experts_module, lora_attr, lora_data)
     _reset_moe_lora_stash_read(experts_module, parameter_name)
-    # The probe calls the inner wrapper under no_grad, the one state in which an unmarked inner wrapper takes the
-    # routed gpt-oss decode path (sm80+ CUDA): the experts forward would not run and the verdict would read
-    # "stash unread" for a forward that reads it.
+    # The probe runs under no_grad, where an unmarked inner wrapper takes the routed gpt-oss decode
+    # path (sm80+ CUDA) and skips the experts forward, falsely reading 'stash unread'.
     _mark_inner_expert_wrappers(wrapper)
     # A throwaway forward: it must not leave its routing for a gradient checkpoint replay.
     try:
@@ -4461,8 +4442,7 @@ def _fold_moe_lora_without_parametrization(
     if not isinstance(parameters, dict) or parameter_name not in parameters:
         return None
     if parameter_name in experts_module.__dict__:
-        # Refuse if something already shadows the registered parameter: swapping _parameters would not reach the
-        # forward, so folding would feed a value nothing reads.
+        # Refuse if shadowed: swapping _parameters never reaches forward; the fold is unread.
         return None
     original = parameters[parameter_name]
     folded = _moe_lora_folded_weight(self, original, active)
@@ -4741,8 +4721,7 @@ def _cast_delta_weight_like_param(delta_weight, param):
         from peft.tuners.lora.layer import ALLOWED_COMPUTE_DTYPES
         allowed = param.dtype in ALLOWED_COMPUTE_DTYPES
     except Exception:
-        # PEFT 0.18 has no ALLOWED_COMPUTE_DTYPES set and casts unconditionally, 0.19.0 onwards do; every dtype 0.18
-        # accepts for a 3D expert parameter is ordinary floating point.
+        # 0.18 lacks ALLOWED_COMPUTE_DTYPES, casts always; 0.19.0+ has it; 0.18 takes floats.
         allowed = param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
     if allowed:
         return delta_weight.to(param.device, param.dtype)
@@ -5492,8 +5471,7 @@ def patch_param_wrapper_for_moe():
 
         ParamWrapper.forward = _patched_param_wrapper_forward
 
-        # The forward is only half: the merge path reads lora_B through PEFT's ParamWrapper.get_delta_weight, which
-        # packs it the other way, so that is patched as well.
+        # The merge path (get_delta_weight) packs lora_B the other way, so it is patched too.
         if not getattr(ParamWrapper.get_delta_weight, "_unsloth_moe_layout_patched", False):
             if _original_param_wrapper_get_delta_weight is None:
                 _original_param_wrapper_get_delta_weight = ParamWrapper.get_delta_weight

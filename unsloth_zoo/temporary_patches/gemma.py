@@ -102,8 +102,7 @@ pass
 
 
 def _publish_boundary_helpers(modeling_module):
-    """Publish the boundary helpers into transformers' modeling_gemma3: compiled forwards are rebuilt from source and
-    import free names from there, else NameError on first run."""
+    """Publish helpers to modeling_gemma3: compiled forwards import free names, else NameError."""
     publish_to_modeling_module(
         modeling_module,
         _linear_boundary_dtype  = _linear_boundary_dtype,
@@ -123,8 +122,7 @@ def _other_family_load():
 pass
 
 
-# Forced float32 patches with no generic counterpart: stash the original once (a re-stash
-# would record our own forward) so a later flag "0" load can undo them.
+# Stash the original once (a re-stash records our forward) so a later flag "0" load can undo it.
 def _patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
     stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
     return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
@@ -229,8 +227,7 @@ def _fix_double_bos_and_pad(
     input_lens = [len(x) for x in text_inputs["input_ids"]]
     double_bos = [bos_token_id, bos_token_id]
     strip = [x[:2] == double_bos for x in text_inputs["input_ids"]]
-    # Only fields whose rows match input_ids row lengths are token aligned, keeping other outputs out of the per-row
-    # strip/pad; overflowing_tokens is excluded by name since a tail can match a row length.
+    # Only input_ids-length fields are per-token; overflowing_tokens is excluded by name.
     non_aligned = {"overflowing_tokens", "overflow_to_sample_mapping", "num_truncated_tokens", "length"}
     per_token_keys = [
         k for k, v in text_inputs.items()
@@ -271,14 +268,8 @@ pass
 
 
 def _resolve_Gemma3ProcessorKwargs():
-    """Gemma3ProcessorKwargs without touching transformers' deprecated alias.
-
-    transformers 5.23 turned `Gemma3ProcessorKwargs` into a module `__getattr__`
-    alias of `ProcessingKwargs` that emits a FutureWarning on every access, and
-    5.29 removes it. Use the real class when the module still defines it
-    (4.57.6 .. 5.22, it carries the Gemma 3 `_defaults`), else `ProcessingKwargs`,
-    which is exactly what the alias resolves to.
-    """
+    """Use real Gemma3ProcessorKwargs (has Gemma 3 _defaults) for 4.57.6-5.22; else
+    ProcessingKwargs, avoiding the 5.23+ alias that warns on every access; 5.29 removes it."""
     import transformers.models.gemma3.processing_gemma3 as processing_gemma3
     kwargs_class = vars(processing_gemma3).get("Gemma3ProcessorKwargs", None)
     if kwargs_class is not None:

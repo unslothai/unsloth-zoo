@@ -107,9 +107,8 @@ def _rocm_probe_dtype(device):
 
 
 def _select_rocm_sdpa(device):
-    # Backend selection only, never a launch: the SDPA kernels themselves are validated in isolated
-    # processes by Unsloth's rocm_sdpa_check. Read under the caller's live backend policy (sdpa_kernel,
-    # torch.backends.cuda flags), so nothing is cached.
+    # Backend selection only, never a launch: kernels are validated in isolated processes by
+    # rocm_sdpa_check; the live sdpa_kernel and torch.backends.cuda flags are read, not cached.
     with torch.cuda.device(device), torch.inference_mode(False), torch.enable_grad():
         q = torch.empty((1, 2, 16, 64), device = device, dtype = _rocm_probe_dtype(device), requires_grad = True)
         choice = int(_ROCM_SDPA_SELECT(q))
@@ -224,8 +223,7 @@ def _device_peak(device):
     try:
         return torch.cuda.memory_stats_as_nested_dict(device)["allocated_bytes"]["all"]["peak"]
     except Exception:
-        # No allocator statistics (a global CUDAPluggableAllocator raises from getDeviceStats):
-        # nothing is kept, the call recomputes as with saved attention off.
+        # No allocator stats (global CUDAPluggableAllocator): keep none, recompute as if off.
         return None
 
 
@@ -328,8 +326,7 @@ def _auto_keep(frame, entry):
 
 
 def _auto_release(frame, measured):
-    # Without a reading first, a later peak reading is charged with fewer kept bytes than it held,
-    # which only overstates the run's own peak: safe, but the replay reads first to stay exact.
+    # Reading first keeps the peak exact; without it, the peak is only overstated (safe).
     for device, kept in frame.kept:
         budget = _BUDGETS[device]
         if measured:
@@ -851,8 +848,7 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
             if leaf is x:
                 leaves[i] = None
             else:
-                # The kept graph holds the leaf (AccumulateGrad), which shares Q / K / V storage: swap in
-                # a stand-in so it keeps its autograd identity but not the storage.
+                # Leaf shares Q/K/V storage: a stand-in keeps autograd identity, not storage.
                 leaf.data = torch.empty((), dtype = leaf.dtype, device = leaf.device).expand(leaf.shape)
         kept.clear()
         entry.leaves = leaves
@@ -890,8 +886,7 @@ def _in_unsloth_compiled_block():
 
 
 def _strict_trace():
-    # Trace time only: is the frame being compiled one that may not graph break (fullgraph=True, or
-    # torch._dynamo.error_on_graph_break(True))? Unknown torch internals answer yes, the in-graph route.
+    # At trace time: strict (fullgraph=True, error_on_graph_break)? Unknown answers yes.
     try:
         from torch._dynamo.symbolic_convert import InstructionTranslator
         tx = InstructionTranslator.current_tx()
@@ -908,9 +903,8 @@ except Exception:
 
 
 def _strict_slot_impl(token, grad):
-    # Runs every time the strict in-graph route runs, compiled or not: it does to the frame what the
-    # helpers do for a call that keeps nothing (one empty entry in the first pass, one entry taken in the
-    # replay), so entries stay matched by call order whichever route each pass took.
+    # Runs on the strict in-graph route, compiled or not: adds one empty entry in the first pass and
+    # takes one in the replay, so entries stay matched by call order.
     frame = getattr(_TLS, "frame", None)
     if frame is None:
         return
@@ -923,8 +917,7 @@ def _strict_slot_impl(token, grad):
 
 _SLOT_TOKEN = torch.zeros(())
 try:
-    # An opaque op stays in a fullgraph compile; the declared mutation keeps it from being dropped as dead
-    # code and orders the slots of one graph. Grad mode is read at trace time, as the helpers read it.
+    # Opaque op kept by a declared mutation; orders one graph's slots; grad mode read at trace.
     @torch.library.custom_op("unsloth_zoo::saved_attention_strict_slot", mutates_args = ("token",))
     def _strict_slot(token: torch.Tensor, grad: bool) -> None:
         _strict_slot_impl(token, grad)

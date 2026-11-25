@@ -133,8 +133,7 @@ _OPAQUE_WRITER_GRACE = 1800.0
 # Watchdog measure interval; detection latency is up to one interval beyond the timeout, so it must stay well under DEFAULT_STALL_TIMEOUT.
 DEFAULT_POLL_INTERVAL = 5.0
 
-# Xet attempts before falling back to HTTP; a wedged transfer often clears on a fresh child, and only DATA-phase stalls
-# are retried, bounding the extra wait to one stall_timeout; 1 restores straight-to-HTTP.
+# Xet attempts before HTTP; only DATA-phase stalls retry; 1 restores straight-to-HTTP.
 DEFAULT_XET_ATTEMPTS = 2
 # Past this the ladder just burns time before the transport that would have worked.
 _MAX_XET_ATTEMPTS = 8
@@ -153,8 +152,7 @@ _HUB_CONSISTENCY_ERROR_RE = re.compile(
     r"consistency check failed: file should be of size", re.IGNORECASE
 )
 
-# Disk-full errnos read defensively via getattr: which errno names exist is platform-specific (CPython builds ifdef each
-# one), so a bare errno.EDQUOT would raise AttributeError.
+# getattr for errnos (platform-specific names): a bare errno.EDQUOT would raise AttributeError.
 _DISK_FULL_ERRNOS = frozenset(
     code for code in (getattr(errno, name, None) for name in ("ENOSPC", "EDQUOT"))
     if code is not None
@@ -177,8 +175,7 @@ _POLL_INTERVAL = 0.5
 
 
 def _env_seconds(name: str, default: float) -> float:
-    """Positive finite float from the env, junk ignored; nan and inf are rejected since they pass a <= 0 test but break
-    deadlines (nan never fires, inf raises OverflowError)."""
+    """Positive finite env float; nan and inf are rejected (they pass <= 0 but break deadlines)."""
     raw = os.environ.get(name)
     if not raw:
         return default
@@ -211,8 +208,7 @@ def xet_attempts() -> int:
 
 
 def http_attempts() -> int:
-    """HTTP attempts from UNSLOTH_HTTP_ATTEMPTS, with xet_attempts' junk and clamp rules; retried only on transient
-    transport failure or crash, never on a stall, which already waited out the patient threshold."""
+    """HTTP attempts from UNSLOTH_HTTP_ATTEMPTS; retry only transient failures, never a stall."""
     raw = os.environ.get("UNSLOTH_HTTP_ATTEMPTS")
     if not raw:
         return DEFAULT_HTTP_ATTEMPTS
@@ -307,8 +303,7 @@ def _xet_failure_reason(summary: str) -> str:
     try:
         from unsloth_zoo_downloads.hf_xet_tuning import scan_xet_log
 
-        # Scrubbed like other child errors: a reqwest failure displays the full URL, and CAS/S3 presigned URLs carry an
-        # X-Amz-Signature; this reason is persisted to health state and shown in the UI for 24h.
+        # Scrubbed: presigned URLs carry X-Amz-Signature; reason persisted and shown for 24h.
         messages = [
             _default_scrub_secrets(m)
             for m in scan_xet_log(_xet_log_dir(), max_messages = 2)
@@ -379,9 +374,8 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
             return f"{base}?***"
         return match.group(0)
 
-    # Query match stops at whitespace or a structural delimiter (quote, bracket, brace, paren, angle, pipe), since a URL
-    # in JSON or a dict repr would otherwise swallow the closing brace; signed values are percent-encoded so presigned
-    # URLs stay fully redacted.
+    # Query stops at whitespace or a structural delimiter, so a URL in JSON or a dict repr keeps its
+    # closing brace; signed values are percent-encoded so presigned URLs stay fully redacted.
     out = re.sub(
         r"(https?://[^\s?]+)\?([^\s\"'()<>{}|[\]]*)", _redact_signed_query, out
     )
@@ -479,8 +473,7 @@ def _link_partner_still_on_disk(link: Path, removed_partials: set) -> bool:
 
 
 def _link_partner_is_owned(link: Path, owned_incomplete_blobs: set) -> bool:
-    """Whether a dangling link's target blob is one of our partials, matched by the blob name it points at, since both
-    <etag>.incomplete and <etag>.<nonce>.incomplete occur."""
+    """Whether a dangling link targets one of our partials, matched by blob name (both spellings occur)."""
     try:
         target_name = Path(os.readlink(link)).name
     except OSError:
@@ -503,18 +496,16 @@ def _clear_partials(
     ownership_is_an_earlier_scan: bool = False,
     owned_names_may_be_reopened: bool = False,
 ) -> None:
-    """Purges the repo's active *.incomplete blobs and broken snapshot links, scoped to owned_incomplete_blobs; an
-    earlier-scan whitelist gets fresh age and live-writer checks at unlink; a reopened-name one skips the age check
-    and is spared by a live writer (issue 9094)."""
+    """Purges owned partials and broken links; an earlier-scan partial must be stale, and live
+    writers are spared (issue 9094)."""
     # Walks the process table once per call rather than per blob, since process_iter scans the whole host; taken at deletion time, not at the eligibility scan.
     rescanned_writers = None
     if ownership_is_an_earlier_scan or owned_names_may_be_reopened:
         _reset_live_writer_walk_record()
         rescanned_writers = _partial_paths_with_a_live_writer()
     if ownership_is_an_earlier_scan:
-        # Same gate as the eligibility scan: a walk that could not inspect every process is only a lower bound, so
-        # finding no writer is not proof; on a cache another UID can write, an unreadable process is a likely writer.
-        # Without the gate the rescan would overturn the scan's decision.
+        # Same gate as the scan: a walk that missed processes proves nothing, so the rescan is
+        # dropped.
         if rescanned_writers is not None and not _process_walk_sees_every_writer(cache_dir):
             rescanned_writers = None
         if rescanned_writers is not None and not _live_writer_walk_was_complete():
@@ -526,16 +517,8 @@ def _clear_partials(
                 # Mirrors the eligibility scan: an unreadable process of our own is not excused by privacy (declining
                 # would spare every blob on a systemd login), so the age bar is raised the same way.
                 active_grace = max(active_grace * 10.0, _OPAQUE_WRITER_GRACE)
-    # The same question for the reopened-name pass, asked the other way round. There the walk is
-    # not proof of ownership but proof that nobody ELSE holds a name we once owned, so a lower
-    # bound reads as "free to unlink". PRIVACY decides it first: where no other UID can write
-    # into the cache, no sibling can have reopened the name and an unreadable writer table costs
-    # nothing -- that is every single-user machine, #9094's included, and declining there would
-    # hand them all the repo-wide force this exists to avoid. Only on a cache somebody else can
-    # write into does the walk have to carry the claim, and there a walk that could not read
-    # every process is not proof of absence.
-    # Privacy cannot cover a process running as US that the walk could not read, so that case
-    # declines here too; the deterministic name is the one a same-uid sibling could hold.
+    # Privacy first: unreadable writers are harmless on a private cache (issue 9094); own-UID
+    # declines.
     reopened_scan_is_evidence = True
     if owned_names_may_be_reopened:
         reopened_scan_is_evidence = (
@@ -565,9 +548,8 @@ def _clear_partials(
                         if owned_incomplete_blobs is not None and blob.name not in owned_incomplete_blobs:
                             continue
                         try:
-                            # The mtime grace only guesses at sibling ownership and is wrong when ownership is known: it
-                            # spares the killed child's partial, so has_active_incomplete_blobs() forces a full
-                            # re-fetch.
+                            # Known ownership makes mtime grace wrong: it spares the killed child's
+                            # partial, forcing a re-fetch.
                             owned = (
                                 owned_incomplete_blobs is not None
                                 and blob.name in owned_incomplete_blobs
@@ -620,9 +602,8 @@ def _clear_partials(
                             # Spare a sibling's active link (target still has a fresh .incomplete).
                             if _broken_link_has_active_partner(link, active_grace = active_grace):
                                 continue
-                            # Also spare a link whose partial a check above kept: a writer reappearing after the scan
-                            # may not have written yet, so mtime reads it as stale; unlinking would strand a blob this
-                            # retry will not relink.
+                            # Spare links whose partial was kept: a reappearing writer may look
+                            # stale, and a retry won't relink.
                             if _link_partner_still_on_disk(link, removed_partials):
                                 continue
                             try:
@@ -688,8 +669,7 @@ def _active_incomplete_blob_sizes(
 
 
 def _cache_root_is_merely_absent(cache_dir: Optional[str] = None) -> bool:
-    """True only if the cache root does not exist (os.stat raises FileNotFoundError), not if it is unreadable;
-    hf_cache_root gives None for both, so a baseline needs this split."""
+    """True only if the root is absent (FileNotFoundError); hf_cache_root returns None for both."""
     if cache_dir is None:
         try:
             from huggingface_hub import constants as hf_constants
@@ -718,8 +698,7 @@ def _strict_repo_cache_dirs(
     *,
     absent_root_is_empty: bool = False,
 ) -> list:
-    """Same case rule as _case_safe_repo_cache_dirs, but read errors are raised rather than reported as no directories,
-    so 'cannot tell' stays distinct from 'nothing there'; callers map a raise to None."""
+    """Read errors raise, unlike _case_safe_repo_cache_dirs, so unknown is not confused with empty."""
     root = hf_cache_root(cache_dir = cache_dir)
     if root is None:
         # Only a baseline may treat a missing root as empty: before the first download it legitimately does not exist,
@@ -739,8 +718,7 @@ def _strict_repo_cache_dirs(
 
 
 def _blobs_dir_is_absent(blobs_dir) -> bool:
-    """True only for ENOENT or ENOTDIR on blobs; other OSErrors raise, since Path.is_dir() returns False on a permission
-    flap and that would release the partial guard."""
+    """True only for ENOENT or ENOTDIR; other OSErrors raise, since a flap would release the guard."""
     try:
         return not stat.S_ISDIR(os.stat(blobs_dir).st_mode)
     except (FileNotFoundError, NotADirectoryError):
@@ -785,8 +763,7 @@ def _baseline_incomplete_blob_names(
 def _incomplete_partial_names(
     repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
 ) -> Optional[set]:
-    """Names of the *.incomplete partials, or None if the cache is unreadable; reports absence only, since allocation
-    metadata cannot show holes and HTTP resume verifies size, not content."""
+    """Partial names, or None if unreadable; absence only, since HTTP resume checks size, not content."""
     names: set = set()
     try:
         # Selects from one root listing, not iter_active_repo_cache_dirs, which swallows OSError and would report a
@@ -809,8 +786,7 @@ _LIVE_WRITER_WALK = threading.local()
 
 
 def _live_writer_walk_was_complete() -> bool:
-    """Whether this thread's last live-writer walk read every process it listed; True by default, the answer for a
-    caller that never walked (e.g. a monkeypatched probe)."""
+    """Whether this thread's last live-writer walk read every process; True if no walk was recorded."""
     return bool(getattr(_LIVE_WRITER_WALK, "complete", True))
 
 
@@ -881,8 +857,7 @@ def _device_of(path) -> Optional[int]:
 
 
 def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
-    """False in a container when the cache is on a separate mount, as the PID walk cannot see sibling containers sharing
-    it; on the container's own root FS it is True; unreadable state is False too."""
+    """False in a container on a separate mount (sibling writers unseen) and when unreadable."""
     try:
         if os.name == "nt" or not os.path.isdir("/proc"):
             return True                      # no PID namespaces to hide a writer in
@@ -898,8 +873,7 @@ def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
         return False
 
 
-# Init names for PID 1 on a real host, not a container: a namespaced process walk is what is being detected, and an init
-# system as PID 1 is the strongest evidence, since a container's PID 1 is its entrypoint.
+# An init name as PID 1 is the strongest host evidence; a container's PID 1 is its entrypoint.
 _HOST_INIT_NAMES = frozenset({
     "systemd", "init", "launchd", "runit", "openrc-init", "s6-svscan", "upstart", "sysvinit",
 })
@@ -933,11 +907,8 @@ def _path_is_on_the_root_mount(path) -> bool:
 def _running_in_a_container() -> bool:
     """Whether this may be in its own PID namespace; uncertain answers yes, since a wrong yes only declines a purge;
     checks markers, a bare cgroup v2 '0::/', then PID 1's name (init on host, entrypoint in container)."""
-    # The markers systemd itself writes, which is what an init-based container looks like:
-    # nspawn and its relatives run systemd as PID 1 with a perfectly ordinary `/init.scope`
-    # cgroup and no runtime marker anywhere, so PID 1's NAME would answer "host" and the mount
-    # check below would never be consulted. `/run/systemd/container` names the technology;
-    # `/run/host` is the host mount nspawn exposes; `/proc/vz` without `/proc/bc` is OpenVZ.
+    # nspawn PID 1 is unmarked systemd; check /run/systemd/container, /run/host, /proc/vz (no
+    # /proc/bc).
     for marker in (
         "/.dockerenv", "/run/.containerenv", "/run/systemd/container", "/run/host",
     ):
@@ -988,14 +959,7 @@ def _group_is_private_to_this_user(gid: int) -> bool:
 
 
 def _posix_directory_is_private(path) -> bool:
-    """Whether only this UID can create or replace entries in *path*, on POSIX.
-
-    Ownership and the write bits, plus the absence of a POSIX ACL: an ACL can grant another
-    user write access with the mode bits reading 0755, and a directory that carries one is
-    treated as shared because this cannot evaluate who it names. Where extended attributes
-    cannot be listed at all the ACL question is unanswerable, and an unanswerable question is
-    not evidence of privacy.
-    """
+    """POSIX: owner, write bits and no ACL; an ACL, or unlistable xattrs, means not private."""
     info = os.stat(path)
     if info.st_uid != os.geteuid():
         return False
@@ -1024,8 +988,7 @@ def _cache_is_private_to_this_user(
     repo_type: Optional[str] = None,
     repo_id: Optional[str] = None,
 ) -> bool:
-    """True only if no other UID can write partials: on POSIX, owner, write bits and ACL of the root, the repo dir and
-    its blobs; on Windows, containment in the home dir; anything else is False."""
+    """True only if no other UID can write partials (POSIX owner, mode, ACL; Windows home dir)."""
     try:
         root = hf_cache_root(cache_dir = cache_dir)
         if root is None:
@@ -1066,8 +1029,7 @@ def _normalized_partial_key(path) -> str:
 def _live_writer_names_for_repo(
     live_paths: set, repo_type: str, repo_id: str, cache_dir: Optional[str],
 ) -> set:
-    """Basenames of live writer paths inside this repo's blobs dirs, so a partial held open in another repo cannot
-    count; if the cache cannot be enumerated, the whole set is used."""
+    """Live writer basenames in this repo's blobs dirs; if the cache is unlistable, all writers count."""
     roots = []
     try:
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
@@ -1084,8 +1046,7 @@ def _live_writer_names_for_repo(
 
 
 def _open_files_is_safe(psutil) -> bool:
-    """psutil < 8 on Windows holds the GIL through open_files() and TerminateThread()s stuck handle queries, which
-    can hang the calling process for good (giampaolo/psutil#1967, fixed by #2894)."""
+    """Windows psutil < 8 can hang in open_files() (giampaolo/psutil issue 1967, fixed by 2894)."""
     return sys.platform != "win32" or tuple(getattr(psutil, "version_info", ())) >= (8,)
 
 
@@ -1120,17 +1081,10 @@ def _partial_paths_with_a_live_writer() -> Optional[set]:
                     continue
                 # One unreadable process does not abandon the rest of the walk, but it means the result cannot be called proof of absence
                 _LIVE_WRITER_WALK.complete = False
-                # WHOSE process it was decides whether cache privacy can cover for it. Privacy
-                # only rules out other UIDs, so an unreadable process running as US is a writer
-                # nothing here excludes -- and macOS denies `open_files()` for same-uid
-                # processes under TCC and the hardened runtime, not only for other users'.
-                # Recorded per process, not per platform: `/proc` existing says nothing about
-                # THIS process, whose fd table the read above just failed on. A non-dumpable
-                # same-uid process refuses both, and that is not only sd-pam -- an Unsloth
-                # Studio backend on the same login refuses both too, and Studio downloads from
-                # the Hub. What this costs is bounded below rather than by declining, since on
-                # an ordinary Linux login there is always at least one such process and
-                # declining outright would turn the clearance off for everyone.
+                # Per process, not per platform (/proc existing says nothing about this process):
+                # privacy only excludes other UIDs, so an unreadable same-uid process (macOS TCC,
+                # non-dumpable) is a writer nothing excludes; declining would disable clearance for
+                # all.
                 try:
                     _LIVE_WRITER_WALK.missed_our_uid = (
                         _LIVE_WRITER_WALK.missed_our_uid
@@ -1151,8 +1105,7 @@ def _unowned_partials_safe_to_clear(
     active_grace: float,
     owned_incomplete_blobs: Optional[set],
 ) -> Optional[set]:
-    """Partials outside the ownership set that may be removed, or None to decline; both must hold: older than
-    active_grace and held open by no live process, which age alone cannot show."""
+    """Unowned partials to remove: older than active_grace and held by no live process; None declines."""
     _reset_live_writer_walk_record()
     live_writers = _partial_paths_with_a_live_writer()
     if live_writers is None:
@@ -1314,8 +1267,7 @@ def _child_rss(pid: int) -> Optional[int]:
 
 
 def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
-    """Basenames of the .incomplete blobs pid has open, i.e. this child's own partial even when resumed; None if
-    undeterminable, empty if the child is not yet writing (connect phase)."""
+    """Basenames of .incomplete blobs pid holds open, even when resumed; None if unknown, empty if idle."""
     try:
         import psutil  # type: ignore
     except ImportError:
@@ -1351,8 +1303,7 @@ def get_hf_download_state(
     repo_type: Optional[str] = "model",
     cache_dir: Optional[str] = None,
 ) -> Optional[tuple[int, bool]]:
-    """(total_on_disk_bytes, has_incomplete) for the HF cache, sparse-aware so a partial is not counted as full
-    progress; a missing cache gives (0, False), a probe exception gives None."""
+    """(bytes on disk, has_incomplete) of the HF cache, sparse-aware; probe errors give None."""
     try:
         if hf_cache_root(cache_dir = cache_dir) is None:
             return (0, False)
@@ -1678,8 +1629,7 @@ def _scrub_in_child(text: str, token: Optional[str]) -> str:
         return _default_scrub_secrets(text, hf_token = token)
 
 
-# Deterministic Hub errors recur identically over either transport, so HTTP retry is pointless; matched by class name so
-# the parent need not import HF's error classes
+# Deterministic Hub errors recur on any transport; matched by class name, no HF import needed
 _DETERMINISTIC_ERROR_NAMES = frozenset({
     "RepositoryNotFoundError",
     "RevisionNotFoundError",
@@ -1690,12 +1640,10 @@ _DETERMINISTIC_ERROR_NAMES = frozenset({
     "LocalTokenNotFoundError",  # a missing required token fails identically either way
     "BadRequestError",
     "HFValidationError",        # a malformed repo id / revision never reaches the network
-    # An OSError (via builtin ConnectionError) with no errno, so nothing below catches it and the rung
-    # default would spend an HTTP child plus the destructive purge on a repo the user switched offline.
+    # Offline-mode OSError has no errno, so nothing catches it; retrying would purge the repo
     "OfflineModeIsEnabled",
 })
-# Type rebuilt across the spawn but not retry-deterministic: HfHubHTTPError spans 4xx and 5xx/429, so retry stays
-# status-driven, and the real type is re-raised so except HfHubHTTPError keeps working
+# HfHubHTTPError spans 4xx and 5xx/429, so retry is status-driven; re-raised so except matches
 _TYPE_PRESERVE_ONLY_NAMES = frozenset({
     "HfHubHTTPError",
 })
@@ -1713,8 +1661,7 @@ def _resolve_exception_class(type_name: str) -> "Optional[type]":
     """Maps a child's error class name back to its class so the parent re-raises the original type, including builtin OSError subclasses; unknown names give None."""
     if type_name == "OSError":
         return OSError
-    # Preserve builtin OSError subclasses (PermissionError, FileNotFoundError, ...): deterministic FS failures the child
-    # cannot retry away, so caller except clauses still fire, not RuntimeError
+    # Builtin OSError subclasses are deterministic FS errors; keep them so except clauses fire
     builtin_cls = getattr(builtins, type_name, None)
     if isinstance(builtin_cls, type) and issubclass(builtin_cls, OSError):
         return builtin_cls
@@ -1762,8 +1709,7 @@ def _parse_errno(message: str) -> "Optional[int]":
 
 
 def _is_builtin_oserror(exc: BaseException) -> bool:
-    """True only for a builtin OSError (or subclass) with a real errno; requests and HF HTTP errors subclass OSError
-    without one, so bracketed [Errno N] text in their message is ignored."""
+    """True only for builtin OSError with a real errno; requests/HF [Errno N] text is ignored"""
     if not isinstance(exc, OSError):
         return False
     builtin = getattr(builtins, type(exc).__name__, None)
@@ -1781,9 +1727,8 @@ def _raise_child_error(message: str) -> None:
     if exc is None:
         raise RuntimeError(message)
     if _is_builtin_oserror(exc) and getattr(exc, "errno", None) is None:
-        # Carry errno (ENOSPC, EDQUOT, ...) across the spawn for builtin OSError subclasses only, since HF HTTP errors'
-        # [Errno N] is not real; set as an attribute, because LocalEntryNotFoundError's single-arg __init__ rejects a
-        # second arg and a two-arg form doubles the prefix
+        # Carry errno across spawn for builtin OSError subclasses only; HF's [Errno N] is not real;
+        # set as attribute, since LocalEntryNotFoundError rejects a second __init__ arg
         errno_val = _parse_errno(message)
         if errno_val is not None:
             try:
@@ -1794,16 +1739,14 @@ def _raise_child_error(message: str) -> None:
 
 
 def _is_retryable_download_error(exc: BaseException, *, on_xet: bool) -> bool:
-    """True for transient transport failures (CAS, reset, timeout, 5xx, 429) worth an HTTP retry, not deterministic Hub
-    errors (auth, not-found, gated, disk-full); on Xet an unrecognized error counts as transport, since one HTTP
-    attempt can disprove it; on HTTP it is surfaced."""
+    """True for transient transport errors (CAS, reset, timeout, 5xx, 429), not deterministic ones;
+    on Xet unknown errors count as transport (one HTTP try may disprove); on HTTP surfaced"""
     name = type(exc).__name__
     # Control flow, not transport: KeyboardInterrupt, SystemExit and GeneratorExit must not be retried, which would
     # spend an HTTP child and the purge; programming errors stay unlisted and get one HTTP attempt
     if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
         return False
-    # LocalEntryNotFoundError wraps both a deterministic offline miss and a transient HEAD connection error or timeout,
-    # so only the transient hint cases are retried
+    # LocalEntryNotFoundError mixes offline misses and HEAD errors; retry only transient hints
     if name == "LocalEntryNotFoundError" and any(
         hint in f"{name}: {exc}".lower() for hint in _TRANSIENT_ERROR_HINTS
     ):
@@ -1814,8 +1757,7 @@ def _is_retryable_download_error(exc: BaseException, *, on_xet: bool) -> bool:
     # would turn the report into a crashed verdict that spends the budget
     if isinstance(exc, OSError) and getattr(exc, "errno", None) in _DISK_FULL_ERRNOS:
         return False
-    # HTTP status (HfHubHTTPError carries a requests or httpx response): 5xx, 429 and 408 are transient; other 4xx such
-    # as 401, 403, 404 and 416 are deterministic
+    # 5xx, 408 and 429 are transient; other 4xx such as 401, 403, 404, 416 are deterministic
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if not isinstance(status, int):
         status = getattr(exc, "status_code", None)
@@ -1895,8 +1837,7 @@ def _download_child_entry(
         # Keep the HTTP writer sequential and resumable (hf_transfer's sparse partials cannot).
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     else:
-        # Defensive: the parent seeds these around the spawn, but a child launched by any other path must not inherit
-        # hf_xet's unbounded multi-GB buffer defaults
+        # Other launch paths must not inherit hf_xet's unbounded multi-GB buffer defaults
         try:
             from unsloth_zoo_downloads.hf_xet_tuning import resize_for_cache_dir
 
@@ -1921,8 +1862,7 @@ def _download_child_entry(
             repo_dir_name = f"{repo_type or 'model'}s--" + repo_id.replace("/", "--")
             blobs = os.path.join(cache_root, repo_dir_name, "blobs")
             os.makedirs(blobs, exist_ok = True)
-            # Hold the partial open for the whole stall, since the single-file watchdog counts only partials this PID
-            # holds open; bound to a local so it stays open across the sleep
+            # Single-file watchdog counts only this PID's open partials; hold across the sleep
             _stall_fh = open(os.path.join(blobs, "xet-force-stall.incomplete"), "wb")
             _stall_fh.write(b"\0" * 4096)
             _stall_fh.flush()
@@ -1965,11 +1905,9 @@ def _terminate_process_group(proc: "mp.process.BaseProcess", grace_period: float
 
     _signal_group(getattr(signal, "SIGTERM", signal.SIGINT))
     proc.join(timeout = grace_period)
-    # SIGKILL only while the child is alive: after join() reaps the leader, its pid could be recycled into an unrelated
-    # group that killpg would hit; hf_xet 1.5.x spawns no helpers, so nothing else needs cleanup
+    # SIGKILL only while alive (after join, pid may recycle); hf_xet 1.5.x spawns no helpers
     if proc.is_alive():
-        # The -9 sentinel takes the force-kill branch on Windows, where signal.SIGKILL is undefined; there proc.kill()
-        # equals proc.terminate(), so the call site stays consistent
+        # -9 sentinel: Windows lacks signal.SIGKILL; there proc.kill() equals proc.terminate()
         _signal_group(getattr(signal, "SIGKILL", -9))
         proc.join(timeout = 5.0)
 
@@ -1990,9 +1928,8 @@ def _run_download_attempt(
 ) -> tuple[str, Optional[str]]:
     """Runs one download in a spawn child under the watchdog and returns a tagged result: ok, stall, cancelled, crashed,
     retryable_error (transient) or error (deterministic); tests patch this seam."""
-    # Partials present before spawning are the baseline, so a new one is provably this child's; without that, Windows
-    # has no ownership evidence and the repo-wide force re-downloads every completed shard (issue 9094); sound because a
-    # fired stall means nothing in the whole repo grew
+    # Pre-spawn partials are the baseline; a new one is this child's, else Windows lacks ownership
+    # and force re-downloads completed shards (issue 9094); a stall means no repo growth
     baseline_partials: Optional[set] = _baseline_incomplete_blob_names(
         repo_type, repo_id, params.get("cache_dir")
     )
@@ -2009,8 +1946,7 @@ def _run_download_attempt(
         ),
         daemon = True,
     )
-    # Set the transport env in this process around the spawn: HF caches HF_HUB_DISABLE_XET at import and the child
-    # re-imports huggingface_hub, so a child-side set is too late
+    # Set in parent around spawn; HF caches HF_HUB_DISABLE_XET at import, child-side too late
     child_env = {
         "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         # Skip unsloth_zoo's heavy torch / transformers / device init in the child.
@@ -2022,8 +1958,7 @@ def _run_download_attempt(
     removed: list = []
     with _SPAWN_ENV_LOCK:
         if not disable_xet:
-            # hf_xet reads its buffer caps natively at import, so they must be in the environment before the child
-            # starts; setting them inside the child is too late
+            # hf_xet reads buffer caps at import, so they must be set before the child starts
             try:
                 from unsloth_zoo_downloads.hf_xet_tuning import resize_for_cache_dir
 
@@ -2060,8 +1995,7 @@ def _run_download_attempt(
                 os.environ.pop(k, None)
             proc.start()
         except BaseException:
-            # proc.start() can raise OSError under fd or thread exhaustion before the lifecycle finally runs, so the
-            # queue's pipe fds are closed here to avoid an fd leak
+            # proc.start() may raise OSError before finally; close queue pipes here (fd leak)
             try:
                 result_queue.cancel_join_thread()
                 result_queue.close()
@@ -2185,8 +2119,7 @@ def _run_download_attempt(
                         )
                         inferred -= writers - child_open
                     owned = inferred
-                # An empty ownership set would scope the purge to nothing and leave stale partials for the retry to
-                # re-trip on; use None (unscoped) so the mtime and partner guards still apply
+                # Empty set purges nothing; None (unscoped) keeps mtime and partner guards
                 params["_owned_incomplete_blobs"] = owned or None
                 if not needs_inference:
                     _terminate_process_group(proc, grace_period)
@@ -2197,8 +2130,7 @@ def _run_download_attempt(
             except queue.Empty:
                 continue
         else:
-            # Drain any enqueued result with a short get timeout, not get_nowait(): the child can exit before its feeder
-            # flushes the pipe, which would look falsely resultless
+            # Short get timeout, not get_nowait(): child may exit before its feeder flushes
             try:
                 result = result_queue.get(timeout = 1.0)
             except queue.Empty:
@@ -2236,8 +2168,7 @@ def _run_download_attempt(
 def _intact_subset(
     snapshot_dir: Path, *, repo_type: str, allow_patterns: Any, ignore_patterns: Any,
 ) -> bool:
-    """True when the selected files show no interrupted download: no dangling requested symlink and every exact-named
-    requested file present; a dangling excluded weight does not reject."""
+    """No requested symlink dangles, all exact-named files exist; excluded weights ignored"""
     return (
         not snapshot_has_requested_broken_symlinks(
             snapshot_dir, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
@@ -2283,8 +2214,7 @@ _CHECKPOINT_DIR_RE = re.compile(r"^checkpoint[-_]\d+$")
 
 
 def _diffusers_active_component_dirs(specs: dict) -> set:
-    """Components a pipeline loads: a [library, class] spec with both entries non-null; a [null, null] disabled
-    component such as safety_checker is skipped by the load, so not required."""
+    """Active: [library, class] specs with both entries non-null; [null, null] is disabled"""
     active: set = set()
     for name, spec in specs.items():
         if (
@@ -2313,9 +2243,8 @@ _WEIGHTLESS_COMPONENT_CLASS_RE = re.compile(
 
 
 def _component_requires_weight(spec: Any, names: list) -> bool:
-    """True if a component with no config.json or readable weight is incomplete, not weightless; the declared
-    model_index.json class decides (scheduler/tokenizer need no weight), so a lone sidecar cannot pass; name
-    heuristic only if the class is unknown"""
+    """True if no config.json or readable weight, unless the declared model_index.json class needs
+    none (scheduler/tokenizer); a lone sidecar fails; name heuristic only if class unknown"""
     cls = (
         spec[1]
         if isinstance(spec, (list, tuple)) and len(spec) >= 2 and isinstance(spec[1], str)
@@ -2411,10 +2340,9 @@ def _diffusers_component_weights_complete(
                 if not _has_read_weight(comp):
                     return False
             elif not _has_read_weight(comp) and _component_requires_weight(specs.get(comp), names):
-                # No config.json and no readable weight: an incomplete model-style component whose weight
-                # the load would fetch over un-killable Xet. A genuinely weightless component (scheduler /
-                # tokenizer / feature_extractor) is exempt -- decided by its DECLARED class when known, so
-                # a model component holding only a stray sidecar cannot pass as weightless.
+                # No config.json and no readable weight: an incomplete model component (weight would
+                # fetch over un-killable Xet); weightless scheduler/tokenizer/feature_extractor are
+                # exempt by DECLARED class when known, so a stray-sidecar model cannot pass.
                 return False
     # Floor: some component must hold a READ-format weight; rejects variant-only or config-only snapshots
     if variant:
@@ -2541,9 +2469,8 @@ _EITHER_FORMAT_WEIGHT_RE = re.compile(
 
 
 def _exact_weight_logical(base: str) -> Any:
-    """Group key: model.safetensors and pytorch_model.bin share ("root_model", None), or ("root_model", variant) for a
-    variant; adapter_model.* keys as ("adapter_model", ...); sharded or non-weight names map to themselves and are
-    each still required."""
+    """Group key: model/pytorch_model weights share ("root_model", None or variant); adapter_model.*
+    keys group as ("adapter_model", ...); sharded or other names each stay required."""
     m = _EITHER_FORMAT_WEIGHT_RE.match(base)
     if m is None:
         return base
@@ -2626,8 +2553,7 @@ def _has_selected_variant_weight(
 
 
 def _patterns_are_exact_names(patterns: Any) -> bool:
-    """True only for a non-empty allow list of EXACT filenames (no ``None`` / glob / trailing-slash dir).
-    Only such a request is locally provable complete; ``None`` / a glob needs the Hub manifest."""
+    """True only for a non-empty list of exact filenames; None or globs need the Hub manifest."""
     patterns = _as_pattern_list(patterns)
     if patterns is None:
         return False
@@ -2710,9 +2636,8 @@ def _has_readable_weight(
 def _readable_shard_set_incomplete(
     snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any, variant: Optional[str],
 ) -> bool:
-    """Invariant B: the in-scope shard set the load reads must be complete (a missing index shard, or a numbered shard
-    without its index, is retried); checks are scoped to the request selection; diffusers skips root shards and
-    checks component shards."""
+    """Invariant B: in-scope shard set must be complete (missing index shard or shard without its
+    index is retried); scoped to the selection; diffusers checks component shards only."""
     try:
         is_diffusers = (snapshot_dir / "model_index.json").is_file()
     except OSError:
@@ -2768,9 +2693,8 @@ def _readable_shard_set_incomplete(
 def _selected_readable_weight_complete(
     snapshot_dir: Path, *, allow_patterns: Any, ignore_patterns: Any, variant: Optional[str],
 ) -> bool:
-    """Model acceptance: the readable weight must be present (Invariant A) and its in-scope shard set complete
-    (Invariant B); both use the same filter and scope, so stray partials neither mask a hang nor cause a false
-    DownloadStallError."""
+    """Accepts only with a readable weight (Invariant A) and complete in-scope shards (Invariant B),
+    same filter; stray partials neither mask a hang nor cause a false DownloadStallError."""
     if not _has_readable_weight(
         snapshot_dir, allow_patterns = allow_patterns,
         ignore_patterns = ignore_patterns, variant = variant,
@@ -2934,16 +2858,10 @@ def _download_with_xet_fallback(
                     prepare_for_http_fn(repo_type, repo_id)
             except Exception as e:
                 logger.debug("prepare_for_http failed for %s: %s", repo_id, e)
-            # An unsafe partial that could not be cleared (locked / permission) would corrupt the blob
-            # on an HTTP resume, and the force that avoids that is REPO-WIDE, so spend one more
-            # BLOB-SCOPED attempt first: a spared partial cost every completed shard (#9094).
-            #
-            # The GATE is the tri-state, not `has_active_incomplete_blobs`, which walks
-            # `iter_active_repo_cache_dirs` and swallows OSError: a cache that has gone briefly
-            # unreadable answers False there, indistinguishable from a clean one, and False here
-            # skips the clearance AND the confirmation below, so an unforced HTTP child resumes
-            # whatever sparse partial is still on disk and finalizes it under its sha256 name.
-            # Only a POSITIVE confirmation that the cache is clean may skip this block.
+            # An uncleared unsafe partial corrupts an HTTP resume, so try a blob-scoped clear before
+            # the repo-wide force (a spared partial cost every completed shard, #9094); gate on the
+            # tri-state check since has_active_incomplete_blobs swallows OSError; only positive
+            # clean confirmation skips.
             if not _no_incomplete_blobs_confirmed(repo_type, repo_id, cache_dir):
                 survivors = _clear_unsafe_partials_for_http(
                     repo_type, repo_id, cache_dir = cache_dir,
@@ -3017,9 +2935,8 @@ def _download_with_xet_fallback(
             )
         )
 
-        # Cancellation wins over every FAILURE verdict, uniformly. Per-branch precedence let a cancel
-        # landing on a stall, a deterministic error or an incomplete snapshot report the download's
-        # own error, and on a Xet verdict run the destructive purge and spend another child. A
+        # Cancel wins over every FAILURE verdict uniformly; per-branch precedence let a cancel
+        # report the download's own error, or on Xet verdicts purge and spend another child. A
         # genuine success is exempt: the bytes are on disk, so returning them beats discarding them.
         if (
             (kind_result != "ok" or incomplete_snapshot)
@@ -3324,8 +3241,7 @@ def _warm_snapshot_without_child(
     cancel_event: Optional[threading.Event],
     cached_dir: str,
 ) -> Optional[str]:
-    """cached_dir when the Hub's file list proves the child would fetch and write nothing, else None (spawn).
-    Daemon thread, no executor: abandoned work cannot hold interpreter exit."""
+    """cached_dir if Hub lists nothing to fetch, else None; daemon thread can't hold exit."""
     try:
         from huggingface_hub import constants as hub_constants
         from huggingface_hub.utils import filter_repo_objects
@@ -3423,9 +3339,8 @@ def snapshot_download_with_xet_fallback(
     on_status: Optional[Callable[[str], None]] = None,
     prepare_for_http_fn: Optional[Callable[[str, str], None]] = None,
 ) -> str:
-    """Snapshot Xet-then-HTTP warm-up in a killable child before from_pretrained's in-process load; transient faults
-    raise DownloadTransportError, not a bare RuntimeError a caller could mistake for a skippable pre-download
-    failure; variant forces the child unless the Hub's file list proves nothing would be fetched."""
+    """Xet-then-HTTP warm-up in killable child; transient faults raise DownloadTransportError (bare
+    RuntimeError looks skippable); variant forces child unless Hub lists nothing to fetch."""
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Expand ~ as huggingface_hub does, so the probe and the child resolve to the same location.
     if isinstance(cache_dir, (str, os.PathLike)):

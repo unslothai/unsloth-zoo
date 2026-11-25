@@ -35,8 +35,7 @@ from .saved_attention import (
     save_attention_requested,
     patch_transformers_saved_attention,
 )
-# Re-exported under its old name: it lives in integrated_device.py so the import-time
-# allocator block can share the topic without importing torch.
+# Re-exported; lives in integrated_device.py so the import-time allocator block avoids torch.
 from .integrated_device import (
     KEEP_ON_DEVICE_ENV,
     _any_device_integrated,
@@ -83,12 +82,8 @@ DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable doub
 
 @functools.cache
 def _double_buffer_disabled():
-    # Cached: computed once on the first GC init (after device selection), never at
-    # import, so it does not probe the GPU before the caller picks its device. Double
-    # buffering overlaps the H2D offload copy with compute, but on unified-memory devices
-    # (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure overhead
-    # (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it; else
-    # disable when any visible device is integrated.
+    # Cached at first GC init, never at import (no early GPU probe); off on integrated devices (no
+    # H2D copy to hide, ~2x slower, no memory saved); UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it.
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
@@ -97,10 +92,9 @@ def _double_buffer_disabled():
 
 @functools.cache
 def _keep_on_device_indices():
-    # Devices whose checkpointed inputs stay where they are: on unified memory (AMD APUs gfx1150/1151, NVIDIA GB10) the
-    # "host" is the same DRAM, so offloading saves nothing and costs a D2H + H2D copy per layer plus pinned blocks.
-    # Cached like _double_buffer_disabled: first read at GC init, after device selection, never at import.
-    # UNSLOTH_GC_KEEP_ON_DEVICE=1 keeps them on every device, 0 offloads everywhere (the old behaviour).
+    # Unified-memory devices (AMD gfx1150/1151, NVIDIA GB10) keep inputs on device since offloading
+    # saves nothing; cached at first GC init after device selection, never at import;
+    # UNSLOTH_GC_KEEP_ON_DEVICE=1 keeps all, 0 offloads all.
     if DEVICE_TYPE not in ("cuda", "hip"): return frozenset()
     return unified_memory_device_indices()
 
@@ -111,9 +105,7 @@ _WARNED_KEEP_LOW_MEMORY = False
 # smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
 KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
 KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
-# _KEEP_BUDGET maps device_index to [free bytes at last read, torch allocated then, headroom, calls
-# since]; free is projected as last read minus later torch allocations, and mem_get_info (no sync)
-# is re-read near headroom or every _KEEP_BUDGET_REFRESH calls so outside allocations are seen.
+# _KEEP_BUDGET tracks free as last mem_get_info minus later allocs; re-reads see outside use.
 _KEEP_BUDGET = {}
 _KEEP_BUDGET_REFRESH = 256
 
@@ -163,11 +155,8 @@ def _keep_on_device_forced():
     return _env_tristate(KEEP_ON_DEVICE_ENV) is True
 
 
-# Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
-# exhausting it looks like a bare "CUDA error: out of memory" on an empty GPU. WSL2
-# caps it near 1-2GB and refuses single pinned allocations past a few MB, so fall
-# back to pageable memory (slower, no compute overlap) instead of dying. See
-# unslothai/unsloth 338, 1552, 1744, 1797 and https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications
+# WSL2 caps pinned memory near 1-2GB, falls back to pageable; unslothai/unsloth 338, 1552, 1744,
+# 1797.
 PINNED_MEMORY_AVAILABLE = True
 _WARNED_ABOUT_PINNED_MEMORY = False
 
@@ -198,12 +187,9 @@ def _warn_pinned_unavailable(detail):
     )
 
 
-# Tensor.is_pinned() is a cudaPointerGetAttributes driver query, not a cached flag,
-# and the two offload copies run once per checkpointed layer per micro batch. Cache
-# the answer on the buffer itself instead of in a list parallel to CPU_BUFFERS: a
-# parallel list can drift out of step with the slot it describes and claim a pageable
-# buffer is pinned, which would issue an async copy out of pageable memory. Readers
-# use getattr(..., False), so an unmarked buffer only costs a synchronous copy.
+# Cache the pinned flag on the buffer: is_pinned() is a driver query, and a parallel list can drift
+# and call a pageable buffer pinned, so an async copy runs from pageable memory; unmarked costs only
+# a sync copy.
 HOST_PINNED_ATTR = "_unsloth_is_pinned"
 
 
@@ -246,8 +232,7 @@ def _grow_host_buffer(buffer, new_size):
     new_bytes = max(old_bytes, new_size * buffer.element_size())
     pinned = getattr(buffer, HOST_PINNED_ATTR, False)
     if not pinned:
-        # Contents are rewritten before every read, so a pageable slot can take a fresh block:
-        # pinned again once RAM allows, instead of staying pageable after one low-RAM moment.
+        # Pageable slots take a fresh block when rewritten, so they re-pin once RAM allows.
         return _new_host_buffer(new_size, buffer.dtype)
     # resize_ takes a new pinned block and hands the old one back to the host cache.
     with _PINNED_LOCK:  # held through allocation: no double-spent headroom
@@ -275,16 +260,10 @@ def _grow_host_buffer(buffer, new_size):
             return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
-# Pinned pages cannot be swapped and every local rank pins its own pool (Arctic ALST), so
-# past block_swap's per-rank budget new offload buffers stay pageable.
-# torch's CachingHostAllocator rounds each pinned block up to a power of two and keeps
-# freed blocks page-locked in per-size free lists until empty_host_cache (aten/src/ATen/
-# core/CachingHostAllocator.h: PowerOf2Ceil in allocate, free_list_ in free, torch 2.6
-# through 2.15; 2.13+ settings turn both off above a size, see _host_alloc_policy). So
-# GC_PINNED_BYTES charges rounded blocks; a release moves one into _PINNED_CACHED, and it drops
-# only when torch.cuda.host_memory_stats() shows the allocator holding less.
-# A single local rank has no other ranks to leave RAM for, and a refused pin still stores the
-# same bytes pageable, so it only refuses a block that would not fit in the RAM available now.
+# Host allocator rounds pinned blocks to powers of two and keeps freed ones pinned until
+# empty_host_cache (torch 2.6-2.15; 2.13+ settings turn both off above a size), so GC_PINNED_BYTES
+# charges rounded blocks; a release moves one to _PINNED_CACHED until host_memory_stats shows less
+# held.
 GC_PINNED_BYTES = 0
 GC_PINNED_CAP = None        # None = not computed yet, -1 = uncapped, -2 = per block (one rank)
 _PIN_PER_BLOCK = -2
@@ -296,8 +275,7 @@ _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
 _PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
 
 
-# torch 2.13+ (c10/core/AllocatorConfig.h): above the round threshold / max cached size blocks are exact;
-# freed blocks above max cached size go back to the OS. torch 2.12 ignores the keys.
+# torch 2.13+: blocks above the round threshold are exact; torch 2.12 ignores these keys.
 _HOST_ALLOC_POLICY = (None, None, None)
 _TORCH_MINOR = Version(torch.__version__).release[:2]
 _HOST_ALLOC_KNOBS = _TORCH_MINOR >= (2, 13)
@@ -340,8 +318,7 @@ def _host_alloc_policy():
     settings = _host_allocator_settings()
     policy = _HOST_ALLOC_POLICY
     if settings != policy[0]:
-        # Fold each string into the policy in effect, starting from the environment torch parsed at
-        # startup: torch reports only the last, so omitted keys stay pinned.
+        # Fold into the policy in effect: torch reports only the last, so omitted keys persist.
         prior = policy[1:] if policy[0] is not None else _parse_host_alloc_policy(_env_allocator_settings())
         policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings, prior))
         if policy[1] != _INF: _warn_short_block_reuse()
@@ -362,10 +339,9 @@ def _warn_short_block_reuse():
     )
 
 
-# Offload slots are hidden * tokens * 2 bytes, often not a power of two (Qwen3-4B at 32k: 160MB pinned
-# as 256MB). On CUDA torch 2.14+ (2.13 can hand out a short block) set pinned_max_round_threshold_mb so
-# blocks above _GC_PINNED_EXACT_MB are pinned at their exact size, unless the user set either pinned
-# knob. Smaller pinned users (DataLoader batches) keep power-of-two reuse. UNSLOTH_GC_PINNED_EXACT=0 off.
+# Slot = hidden*tokens*2 bytes, often not a power of two (Qwen3-4B at 32k: 160MB pins as 256MB);
+# torch 2.14+ CUDA sets pinned_max_round_threshold_mb so blocks above _GC_PINNED_EXACT_MB pin exact
+# (2.13 can hand out short blocks), unless user set a pinned knob; UNSLOTH_GC_PINNED_EXACT=0 off.
 _GC_PINNED_EXACT_MB = 4
 _GC_PINNED_EXACT = False
 _PINNED_KNOBS = ("pinned_max_round_threshold_mb", "pinned_max_cached_size_mb")
@@ -516,14 +492,12 @@ def _empty_host_cache():
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     free = _host_allocator_free_bytes()
-    # host_memory_stats() does not process pending copy events, so a dead block whose last use was a
-    # non_blocking copy (every pinned offload slot) still reads as active there: our own released
-    # blocks are reason enough to flush, and _host_emptyCache processes those events first.
+    # host_memory_stats() misses pending non_blocking copies, so our released blocks justify a
+    # flush.
     released = _PINNED_RELEASED
     if not (ours or released or free): return False
     if ours or released:
-        # _host_emptyCache only frees blocks whose copy events completed: wait for our released
-        # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
+        # Sync released copies first: _host_emptyCache frees only blocks with completed copies.
         _synchronize_used_devices()
     try: torch._C._host_emptyCache()
     except Exception: return False
@@ -563,8 +537,7 @@ def _reserve_pinned_unlocked(nbytes):
     if _PINNED_CACHED.get(block, 0) > 0:
         _PINNED_CACHED[block] -= 1
         free = _host_allocator_free_bytes()
-        # Under a fixed cap a refusal here is sticky (pageable copies never drain the queue), so
-        # check the event queue; the per block mode re-checks host RAM below instead.
+        # Fixed cap: refusal is sticky, so check the event queue; per-block re-checks host RAM.
         if free is None or free >= block or (
             GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
         ):
@@ -710,8 +683,7 @@ def _release_pinned_unlocked(nbytes):
 
 
 
-# Releases may run on autograd worker threads. Held from the cap check through allocation, so two
-# callers cannot spend the same headroom (re-entrant for flushes).
+# Autograd threads also release; spanning cap check and allocation stops double-spent headroom.
 _PINNED_LOCK = threading.RLock()
 
 
@@ -731,12 +703,9 @@ def _view_bytes_as(buffer, nbytes, dtype, shape):
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
-# float32 activations offloaded while autocast is on for their device (FORCE_FLOAT32 residuals under fp16 /
-# bf16 autocast) are stored as bfloat16, the same bytes as before, and cast back to float32 for the
-# recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled float16 spiked grad norms 20x on a
-# T4 (outlier rows leave small entries subnormal). Without autocast the model trains in true float32, where
-# bf16 storage drifted LoRA grads ~0.1% (up to 4% on one full finetuning param), so those are stored exactly.
-# UNSLOTH_OFFLOAD_FP32=exact always keeps float32, =bf16 always stores bfloat16, unset / auto picks per tensor.
+# UNSLOTH_OFFLOAD_FP32=exact or bf16 forces a mode; auto stores autocast fp32 offloads as bf16 (fp16
+# overflows gemma3 residuals; per-row fp16 spiked grad norms 20x on T4; bf16 drifted LoRA grads
+# ~0.1%), else exact.
 def _fp32_offload_mode():
     mode = os.environ.get("UNSLOTH_OFFLOAD_FP32", "auto").strip().lower()
     if mode in ("exact", "fp32", "float32"): return "exact"
@@ -763,8 +732,7 @@ def _offload_store_dtype(tensor):
 
 @contextmanager
 def _no_inference_mode():
-    # Allocate GC buffers outside inference_mode (but in no_grad) so a later
-    # offload copy_ does not raise on an inference tensor (unsloth#3828).
+    # Create GC buffers outside inference_mode, or a later offload copy_ fails (unsloth#3828).
     try:
         leave_inference = torch.inference_mode(False)
     except (TypeError, AttributeError):
@@ -801,7 +769,6 @@ def _calculate_n_gradient_checkpoints(
     size = n_layers // n_checkpoints
     sizes = np.full(n_checkpoints, size, dtype = int)
     leftovers = n_layers % n_checkpoints
-    # Append leftovers from the right
     for k in range(leftovers):
         sizes[n_checkpoints-1-k] += 1
     boundaries = np.hstack((0, np.cumsum(sizes)))
@@ -871,13 +838,9 @@ pass
 # ---------------------------------------------------------------------------
 # Gradient-checkpoint recompute marker
 # ---------------------------------------------------------------------------
-# Thread-local flag, True only while a gradient-checkpoint backward is re-running
-# its wrapped forward to rebuild activations. Consumers (e.g. the MoE grouped-mm
-# recompute policy) read it via in_gradient_checkpoint_recompute() to decide whether
-# to pin a freshly dequantized tensor for the immediate backward (cheap under
-# checkpointing) or recompute it later. The context manager always restores the
-# previous value, so it is idempotent and safe under nesting and exceptions, and it
-# never alters checkpointing behaviour itself.
+# Thread-local, True only while checkpoint backward re-runs forward (MoE recompute policy reads it);
+# context manager always restores the prior value, is idempotent, safe under nesting and exceptions,
+# and never alters checkpointing.
 _GC_RECOMPUTE_TLS = threading.local()
 
 
@@ -1207,16 +1170,13 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
-        # that return the tensor itself (Qwen2-VL's vision block, and every
-        # transformers block since the tuple returns were retired) used to raise
-        # `ValueError: too many values to unpack` here, because forward() stored
-        # whatever the layer returned while backward() insisted on a 1-tuple.
+        # forward() stores whatever a layer returns, but backward() must unpack a 1-tuple;
+        # bare-tensor blocks (Qwen2-VL vision, later transformers) used to raise ValueError too many
+        # values to unpack.
         if isinstance(output, tuple):
             (output,) = output
         torch.autograd.backward(output, dY)
-        # Gradients for the extra inputs are returned to the engine instead of
-        # being left to accumulate as a side effect of the nested backward.
+        # Extra-input grads go back to the engine, not accumulate in the nested backward.
         return (None, hidden_states.grad,) + tuple(
             None if holder is None else holder.grad for holder in grad_holders
         )
@@ -1250,8 +1210,7 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # Outputs may be one tensor, a tuple or several; backprop only the outputs that received a
-        # grad.
+        # Outputs may be a tensor or tuple; backprop only the outputs that received a grad.
         outputs = output if isinstance(output, tuple) else (output,)
         pairs = [(o, g) for o, g in zip(outputs, dY)
                  if torch.is_tensor(o) and o.requires_grad and g is not None]
@@ -1259,32 +1218,18 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
             # As torch's reentrant checkpoint: nothing to backprop is an error, not a step with no gradients.
             raise RuntimeError("none of output has requires_grad=True, this checkpoint() is not necessary")
         torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
-        # Gradients for the extra inputs are returned to the engine instead of
-        # being left to accumulate as a side effect of the nested backward.
+        # Extra-input grads go back to the engine, not accumulate in the nested backward.
         return (None, hidden_states.grad,) + tuple(
             None if holder is None else holder.grad for holder in grad_holders
         )
 pass
 
 
-# @torch._disable_dynamo
-# def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
-#     return Unsloth_Offloaded_Gradient_Checkpointer.apply(function, *args)
-# pass
 
 
-# Keywords that belong to the checkpoint machinery itself rather than to the
-# wrapped function. The Unsloth reentrant checkpointers below never honoured
-# them, and that is deliberately left as-is so callers passing only these see
-# exactly today's behaviour. What must NOT happen is binding one of them onto
-# the wrapped block: the block has no such parameter and raises TypeError, so a
-# call that works against unpatched torch would start failing the moment Unsloth
-# swaps torch.utils.checkpoint.checkpoint out from under it.
-#
-# `early_stop` is the one that was missing: torch grew it as a per-call keyword
-# (present on 2.10 and 2.13 here) and documents it as ignored when
-# use_reentrant = True - which is exactly what these shims force - so dropping
-# it is the faithful behaviour.
+# Checkpoint-only keywords the reentrant shims deliberately ignore, to keep today's behaviour;
+# binding one onto the wrapped block raises TypeError; early_stop (torch 2.10 and 2.13) is
+# documented as ignored when use_reentrant=True, so dropping it is faithful.
 _TORCH_CHECKPOINT_KEYWORDS_LITERAL = frozenset({
     "preserve_rng_state",
     "context_fn",
@@ -1446,10 +1391,9 @@ _UNSLOTH_CKPT_SHIM_NAMES = frozenset({
 
 
 def _capture_pristine_checkpoint_once():
-    # Stash the genuine torch.utils.checkpoint.checkpoint the first time we patch, before any
-    # shim stacks. The per-patch _old_checkpoint is module-level, so a second patch overwrites
-    # it with the first shim and the pristine fn becomes unreachable. Consumers that must force
-    # use_reentrant=False (e.g. the Gemma-4 KV-sharing fix) read this set-once ref instead.
+    # Stash the genuine torch checkpoint on the first patch only: a second patch overwrites
+    # _old_checkpoint with the first shim, losing the pristine fn; the Gemma-4 KV-sharing fix reads
+    # this ref to force use_reentrant=False.
     ck = torch.utils.checkpoint
     if getattr(ck, "_unsloth_pristine_checkpoint", None) is not None:
         return
@@ -1483,9 +1427,8 @@ pass
 
 
 def _bind_transformers_checkpoint(shim):
-    # Remember the binding transformers had immediately before, which need not be torch's
-    # function (a caller's own wrapper) and may be another Unsloth shim when patches stack.
-    # One slot, like torch.utils.checkpoint._old_checkpoint, so the two stay in step on unpatch.
+    # Keep transformers' prior checkpoint binding (may be a caller's wrapper or another shim) in one
+    # slot, like torch's _old_checkpoint, so unpatch stays in step.
     import transformers.modeling_utils
     current = getattr(transformers.modeling_utils, "checkpoint", None)
     if current is not shim:
@@ -1534,7 +1477,6 @@ from torch.utils.checkpoint import (
     _get_autocast_kwargs,
     _get_device_module,
     get_device_states,
-    # set_device_states,
     detach_variable,
     contextlib,
     DefaultDeviceType,
@@ -1799,8 +1741,7 @@ CPU_INDEX = None
 GPU_BUFFERS = None
 GPU_BUFFER_DTYPE = None
 
-# CPU_BUFFERS slots are leased per checkpoint until its backward, so 1F1B schedules (two forwards
-# then two backwards) never reuse a pending slot. Lowest free slot first keeps 1F1B-free runs unchanged.
+# Slots are leased until their backward so 1F1B never reuses a pending one; lowest free first.
 _FREE_CPU_SLOTS = []    # min-heap of returned slot indices
 _CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
 _CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
@@ -1925,8 +1866,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
-            # Every visible device, as the HIP probe does: a device_map can put layers
-            # on a pre-Ampere card next to an Ampere device 0.
+            # Check visible GPUs: device_map can put pre-Ampere layers beside Ampere device 0.
             from .device_type import _visible_cuda_capabilities
             SUPPORTS_BFLOAT16 = all(major >= 8 for major, _ in _visible_cuda_capabilities())
         elif DEVICE_TYPE == "hip":
@@ -1948,8 +1888,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
-    # Re-probe: an earlier model in this process may have tripped the fallback. Clear
-    # the warning latch too, otherwise a second model falls back silently.
+    # Re-probe and clear the warning latch, or a second model falls back silently.
     global PINNED_MEMORY_AVAILABLE
     global _WARNED_ABOUT_PINNED_MEMORY
     PINNED_MEMORY_AVAILABLE = True
@@ -1977,8 +1916,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     else:
         GPU_BUFFERS_B = _PerDeviceSlots(n_gpus, _new_gpu_buffer)
         USE_DOUBLE_BUFFER = False # enabled after first pass if CUDA free memory > DOUBLE_BUFFER_HEADROOM
-        # Per-buffer events prevent double-buffering races; each tracks
-        # when compute on that buffer finishes. Bound to a device on first record.
+        # Per-buffer events prevent double-buffer races; bound to a device on first record.
         event_ctor = _double_buffer_event_ctor()
         BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
         BUFFER_EVENTS_B = tuple([event_ctor() for _ in range(n_gpus)])
@@ -3169,9 +3107,8 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     if not torch.is_grad_enabled():
         return _call_without_checkpoint(function, *args, *tensor_args)
-    # Not `not CPU_BUFFERS`: when every device keeps its inputs (unified memory, UNSLOTH_GC_KEEP_ON_DEVICE=1)
-    # the pool stays empty on purpose, and re-initializing on every call reset the streams, the GPU buffers
-    # and the free-memory budget each time. unpatch_unsloth_smart_gradient_checkpointing sets both to None.
+    # Test for None, not `not CPU_BUFFERS`: the pool stays empty by design when every device keeps
+    # inputs (unified memory, UNSLOTH_GC_KEEP_ON_DEVICE=1); re-init resets streams and buffers.
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)

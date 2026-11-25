@@ -71,12 +71,9 @@ __all__ = [
 
 
 class NgramProposer:
-    """Prompt lookup: continue the prompt from where the reply's last tokens occur in it.
-
-    Only the prompt is indexed. A reply repeating itself is a poor predictor of what it
-    says next, while a reply quoting the prompt (code under edit, a document being
-    summarised) keeps quoting it.
-    """
+    """Prompt lookup: continue the prompt from where the reply's last tokens occur in it; only the
+    prompt is indexed, since a reply repeating itself predicts poorly but one quoting the prompt
+    keeps quoting it."""
 
     def __init__(
         self,
@@ -130,14 +127,10 @@ class RowPlan:
 
 @dataclass(frozen = True)
 class RoundPlan:
-    """A plain window of ``length`` steps, or one verify round over ``rows``.
-
-    ``split`` asks the engine to evaluate drafts and catch-up before building the verify, so
-    the round's components can be timed apart. A nonzero ``controller_depth`` marks a round
-    drafted deeper than planned; acceptance learns only through that depth. ``trim`` asks
-    the controller to choose the verified prefix from the drafter's confidences. A nonzero
-    ``tree`` verifies that many rows of a best-first draft tree in the round's place.
-    """
+    """A plain window or a verify round; split times drafts apart from the verify; a nonzero
+    controller_depth marks a round drafted deeper than planned, teaching acceptance only at that
+    depth; trim picks the verified prefix from drafter confidences; tree verifies that many rows
+    of a draft tree instead."""
 
     kind: Literal["plain", "round"]
     length: int = 0
@@ -373,28 +366,10 @@ def _bucket(batch: int) -> int:
 
 
 class DraftController:
-    """Chooses each round by expected tokens per second, measured on this machine.
-
-    A round verifies ``[pending, draft...]`` for every row of the batch at one width; each
-    row's draft comes from the drafter, from a copy of its prompt, or from nothing. It
-    competes with a window of plain decoding. Acceptance is kept per reply (conditional per
-    drafted position, one rate for copies), seeded from the load's aggregate. Time is kept per
-    component, since the components move independently: verify by batch size and width,
-    drafting per row by depth, drafter catch-up per token, plain decoding per step by batch
-    size, and the drafting a fused round hides behind building its verify, by batch size. A candidate is worth its expected emitted tokens over its expected seconds, so a
-    drafter forward or a catch-up is paid for only where it earns more than a free copy.
-
-    Plain decoding is timed as the pipelined decode it is, so a drafter that loses to ordinary
-    decoding at some batch size converges to ordinary decoding there. Unmeasured entries are
-    extrapolated; close or stale rivals are re-measured on a token clock, each probe only once
-    the time it is expected to lose fits ``explore_fraction`` of the time recorded so far.
-    ``fixed_depth`` never trades drafting for plain decoding: each row drafts exactly ``max_depth`` (fewer at a reply's end) unless a copy is expected to emit more; only a step where no row can draft or copy decodes plainly.
-
-    With a drafter that reports each drafted position's probability (``trims``), a drafting round
-    drafts at full depth and ``trim`` then verifies the width that maximizes that round's own
-    expected tokens per second, from the calibrated probabilities; every ``full_every``-th such
-    round verifies them all, so deep positions keep calibrating.
-    """
+    """Picks each round by measured expected tokens/sec vs plain decoding; a drafter forward or
+    catch-up is paid only if it beats a free copy; fixed_depth never trades drafting for plain
+    decoding; with trims, the width is picked by calibrated tokens/sec and every full_every-th
+    round verifies all."""
 
     def __init__(
         self,
@@ -496,8 +471,7 @@ class DraftController:
         self._plan_epoch = 0
 
     _PRIOR_ACCEPTANCE = 0.7
-    # Priors until measured, relative to a plain step: a round pays a sync more than a plain
-    # step, a verified row a little, a drafted token a drafter forward, a catch-up token less.
+    # Plain-step priors: round sync, verified row, drafter forward per draft, cheaper catch-up.
     _ROUND_OVERHEAD = 1.2
     _VERIFY_SLOPE = 0.03
     _DRAFT_SLOPE = 0.25
@@ -891,8 +865,7 @@ class DraftController:
             self._credit -= charged * max(0.0, 1.0 - emitted / (charged * self._reference))
 
     def _source_probe(self, plan: RoundPlan, rows: Sequence[RowState], depth: int | None = None) -> tuple[RoundPlan, dict[int, str]]:
-        # A source that loses gets no samples to win back with, whatever beat it, so each row
-        # retries its unused sources, exponentially less often while they keep losing.
+        # Losing sources get no samples; each row retries unused ones, exponentially rarer.
         base = list(plan.rows) if plan.kind == "round" else [RowPlan()] * len(rows)
         probing = {}
         for i, state in enumerate(rows):
@@ -939,8 +912,7 @@ class DraftController:
         self._measured_at[(bucket, "plain")] = self.steps
 
     def deepening_pays(self, plan: RoundPlan, rows: Sequence[RowState], retry: bool = False) -> bool:
-        """Whether deeper rounds beat the plan rate (assumed so for the first few); with retry, a
-        losing verdict admits one deeper round after a doubling gap of tokens."""
+        """Deeper rounds are assumed to pay at first; a retry admits one after a doubling gap."""
         if self.deepened_cost.count < self._DEEPENED_TRIAL:
             return True
         reference = self.deepened_reference.value if self.deepened_profile is not None else self.round_seconds(plan, rows)
@@ -1002,13 +974,10 @@ class DraftController:
         confidences: Sequence[Sequence[float] | None] | None = None,
         cycle_seconds: float | None = None,
     ) -> None:
-        """Account a finished round; ``accepted[i]`` counts row ``i``'s accepted drafts.
-
-        ``seconds`` is the whole round. A split round times its parts apart; a fused round,
-        whose drafting overlaps building its verify, measures how much of the drafting it hid.
-        A ``first_use`` round, which also ran one-off first-use work, updates no cost and leaves its width unmeasured.
-        A ``trim`` round's ``confidences`` (each row's drafted-position probabilities) calibrate those that were verified.
-        """
+        """Account a finished round: accepted[i] counts row i's accepted drafts; split rounds time
+        their parts apart, fused rounds measure the drafting they hid, first_use rounds update no
+        cost and leave their width unmeasured, and trim rounds' confidences calibrate the
+        verified drafts."""
         self._plan_epoch += 1
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
@@ -1099,12 +1068,10 @@ class DraftController:
 
 
 class TreeBudget:
-    """How many rows of a best-first draft tree a round verifies, or a chain instead: the most tokens per second at this
-    Mac's cycle costs measured at load (``{rows: seconds}``, as `warm_speculative_rounds` times them) and the tokens rounds
-    actually emitted. A round of the widest tree holds the narrower trees and the chain of its lattice, so each tells what
-    they would have emitted on the same text: no calibration of the drafter's probabilities, and until enough such
-    rounds are in a round runs the widest tree. It keeps running unless its rate is under ``PROBE_SETTLED_RATE`` of the
-    best tree's, which then runs, the widest one round in ``PROBE_SETTLED_EVERY``: a nearer tie is within the estimate's noise."""
+    """Picks tree rows or a chain to verify by measured tokens/sec; the widest tree runs until
+    enough rounds score the rest; it runs unless its rate is under PROBE_SETTLED_RATE of the
+    best, when the best runs and the widest runs one round in PROBE_SETTLED_EVERY; a nearer tie
+    is within noise."""
 
     MIN_SAMPLES = 24
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SETTLED_RATE = 8, 64, 0.95
@@ -1154,9 +1121,8 @@ class TreeBudget:
 
 
 class TreeCalibration:
-    """How often a draft tree's node is accepted once its parent is, from the selector's q for it and its depth:
-    sigmoid(alpha + beta * logit q), which trees grow best first on. Each depth is refit from the verified children of
-    accepted rows by Newton steps on a ridge toward ``PRIOR``, within bounds: a free fit of a deep row's few records diverges."""
+    """Node acceptance given its parent, sigmoid(alpha + beta * logit q) per depth, refit from
+    verified children by bounded ridge Newton steps toward PRIOR; a free fit diverges."""
 
     RECORDS, MIN_RECORDS, REFIT_EVERY, STEPS, HALVINGS = 512, 32, 32, 4, 12
     ALPHA_BOUND, BETA_BOUNDS = 8.0, (0.1, 4.0)
@@ -1247,8 +1213,7 @@ class SizedTreeBudget:
         return max(self.load_costs)
 
     def yields_to_controller(self, state: RowState, trained: int) -> bool:
-        """Whether this round goes to the controller, which weighs plain windows and copies: its exploration costs about
-        2% on text trees serve well, so only drafts not paying for a round do."""
+        """Drafts not paying a round yield; exploring costs ~2% where trees serve text well."""
         return state.stats.expected(RowPlan("draft", trained)) < self.MIN_ROUND_TOKENS
 
     def _cost(self, rows: int) -> float:
@@ -1309,9 +1274,8 @@ def _position_seed(seed: int, position: int) -> int:
 
 
 class _RowSampler:
-    """Draws the token at absolute position ``p`` from a key of (seed, p), so a draw depends only on
-    its logits and position: rejected positions consume nothing, and rounds, plain windows and
-    batch membership leave the random stream unchanged."""
+    """Draws the token at absolute position ``p`` from key (seed, p): a draw depends only on logits
+    and p; rejected positions consume nothing, and rounds and batching leave it unchanged."""
 
     def __init__(self, params: SamplingParams):
         self.temperature = params.temperature
@@ -1471,8 +1435,7 @@ def _features(drafter, out) -> mx.array:
 
 
 def probe_drafter(target, drafter, length: int) -> list:
-    """The cache entries one row of ``drafter`` holds after ``length`` prompt tokens, from the features a row
-    starts from; the drafter evaluates nothing, and the target forward is as lazy as the target's own."""
+    """Drafter cache after ``length`` prompt tokens from row features; nothing is evaluated."""
     from mlx_vlm.models.cache import make_prompt_cache
 
     from .inference import native_lane_projections
@@ -1563,10 +1526,9 @@ def _committed_eval_state(cache):
 
 
 class SpeculativeEngine:
-    """Decodes B rows with the controller's choice each step: a verify round at one width, each
-    row verifying its own proposal and committing its own accepted count, or a window of
-    ordinary decode steps. Rows join and leave only between steps, when every row holds exactly
-    one pending token and the caches hold everything before it."""
+    """Each step decodes B rows as the controller chooses: a verify round at one width (each row
+    commits its accepted count), or a window of ordinary decode steps; rows join and leave only
+    between steps, when each holds one pending token and the caches hold all before it."""
 
     def __init__(self, model, controller: DraftController, drafter = None, logprobs: bool = False):
         from mlx_vlm.speculative.common import generation_stream, verify_forward
@@ -1766,8 +1728,7 @@ class SpeculativeEngine:
         return _features(self.drafter, out)
 
     def _step(self, inputs: mx.array, ahead: int = 0) -> tuple[mx.array, mx.array | None, mx.array | None]:
-        """Forward one token per row and sample the next; ``ahead`` counts tokens already sampled
-        for each row but not taken yet."""
+        """``ahead`` counts tokens already sampled for each row but not yet taken."""
         out = self.lm(inputs, cache = self.cache, **self._kwargs())
         drawn = [row.draw(row.logprobs(out.logits[i : i + 1, -1], inputs[i], ahead), row.emitted + ahead) for i, row in enumerate(self._rows)]
         scores = mx.concatenate([score for _, score in drawn]) if self.logprobs else None
@@ -2104,11 +2065,10 @@ def _shown_from(processor: Callable, start: int) -> Callable:
 
 
 class SpeculativeDraft:
-    """``draft_model`` for mlx-vlm's ``generate_step`` (with ``draft_kind = draft.draft_kind``): after
-    ``install_speculative_seam`` the reply decodes through the engine. Call ``prepare`` before each
-    generation; mlx-vlm does not pass on the prompt, sampling or logits processors, which must also
-    be given to ``generate_step`` for the first token. The controller persists. ``admit`` instead
-    prefills one row for an engine shared by many."""
+    """Draft model for mlx-vlm's ``generate_step`` (``draft_kind = draft.draft_kind``) after
+    ``install_speculative_seam``; call ``prepare`` before each generation and pass the prompt,
+    sampling and processors to ``generate_step``, as mlx-vlm does not; ``admit`` prefills one row
+    for a shared engine."""
 
     def __init__(self, controller: DraftController, drafter = None):
         self.controller = controller
@@ -2299,9 +2259,8 @@ _SHORTLIST_BITS, _SHORTLIST_KEEP, _SHORTLIST_GROUP, _SHORTLIST_CHUNK, _SHORTLIST
 
 
 class _ShortlistHead:
-    """Greedy tokens for drafting without a full pass over the target's output table: a 2-bit copy of its leading columns
-    picks a few candidates and the table's own rows choose among them. A draft is only a proposal, so a pick the
-    full head would not have made costs acceptance, never output."""
+    """Greedy drafting tokens without a full pass over the output table: a 2-bit copy of leading
+    columns shortlists, the table picks among them; a miss costs acceptance, never output."""
 
     def __init__(self, table: nn.Module, columns: int, nbytes: int):
         self.table, self.columns, self.nbytes, self._source, self._scan = table, columns, nbytes, None, None
@@ -2364,12 +2323,10 @@ class _ShortlistHead:
 
 
 class MTPDrafter:
-    """Drafts greedily with a Qwen-style MTP head, whose KV cache slot ``j`` holds the pair (token ``j + 1``,
-    target hidden ``j``). Plain windows and copy rounds only record pairs; a row replays them just before
-    it drafts, so an unused head costs nothing. The engine joins and splits head caches with the target's."""
+    """Greedy Qwen-style MTP drafter; cache slot ``j`` holds (token ``j + 1``, target hidden ``j``);
+    pairs replay just before a row drafts, so an unused head costs nothing."""
 
-    # Prompt positions a row starts from: more lifts acceptance on long prompts, but priming time and the
-    # hidden states the prefill keeps grow with it.
+    # A longer prompt tail lifts acceptance but grows priming time and prefill hidden states.
     prompt_tail = 4096
 
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
@@ -2514,8 +2471,7 @@ class AssistantRow:
 
 
 class AssistantDrafter:
-    """Drafts greedily with a Gemma 4 assistant, which keeps no cache of its own and attends to the
-    target's last full- and sliding-attention KV, read from the engine's caches at draft time."""
+    """Greedy Gemma 4 assistant: no cache, reads target's last full/sliding KV at draft time."""
 
     reads_target_kv = True
 
@@ -2894,9 +2850,8 @@ class ContextRow:
 
 
 class ContextDrafter:
-    """Drafts with a DFlash-family drafter (DFlash, DFlash2, DSpark): a block reads the target features of the
-    committed tokens as context and caches only that context, so a rejected draft leaves nothing to undo.
-    Each row drafts alone with its own caches, whose scalar offsets cannot be batched."""
+    """DFlash-family drafter (DFlash, DFlash2, DSpark): blocks cache only committed target features,
+    so a rejected draft needs no undo; rows draft alone (scalar offsets can't batch)."""
 
     kind = "dflash"
     context_rows = None
@@ -2924,8 +2879,7 @@ class ContextDrafter:
         attentions = [layer.self_attn for layer in model.layers] if self.predraft_rows else []
         if attentions and all(a.is_sliding for a in attentions):
             self.context_rows = max(a.sliding_window - 1 for a in attentions)
-        # DFlash2's selector reports each drafted position's probability, from which the controller trims a round.
-        # Fast Verify's dense rounds verify whole tiles or trees instead.
+        # Trims rounds by DFlash2 selector probability; dense Fast Verify verifies tiles/trees.
         enabled = not self.fast_verify or any(hasattr(module, "switch_mlp") for _, module in target.named_modules())
         self._selector = getattr(model, "candidate_selector", None) if enabled else None
         if self._selector is not None:
@@ -3057,9 +3011,8 @@ class ContextDrafter:
                 mx.async_eval(row.prefetched)
 
     def predraft(self, row: ContextRow, hidden: mx.array, accepted: mx.array, anchor: mx.array) -> bool:
-        """Prepare ``row``'s next block before its round's acceptance reaches the host: ``hidden`` holds
-        the round's verified rows, of which the round takes the first ``accepted + 1`` (a device scalar), and ``anchor``
-        is the token after them. The next ``push`` appends those rows' context; ``discard`` drops the block instead."""
+        """Prepares the next block before acceptance reaches the host, from the first ``accepted +
+        1`` (device scalar) rows; ``push`` appends their context, ``discard`` drops it."""
         if row.features or row.prefetched is not None or row.prefetched_tree is not None or not 0 < hidden.shape[0] <= self.predraft_rows:
             return False
         from .inference import PredraftCache
@@ -3359,10 +3312,9 @@ def _omlx_nextn_key(key: str, text_config: dict) -> str | None:
 
 
 def _native_mtp_head(path: Path) -> tuple | None:
-    """``(splitter, source_config, text_config, rename, [(file, keys)])`` for a checkpoint's own MTP head, or None. The head
-    is the splitter's own layout, at the top level or under one ``model.``/``language_model.`` wrapper, where MLX
-    conversions of vision-language checkpoints keep it (``language_model.mtp.*``), or the layout omlx converts nextn layers
-    to (``_omlx_nextn_key``), already sanitized; ``rename`` maps a stored key to the splitter's layout."""
+    """Returns (splitter, source_config, text_config, rename, [(file, keys)]) or None; head sits at
+    top level or under a model. or language_model. wrapper (VLM MLX keeps language_model.mtp.*),
+    or in omlx nextn layout (_omlx_nextn_key, already sanitized); rename maps stored keys."""
     from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 
     try:

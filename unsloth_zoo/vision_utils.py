@@ -120,9 +120,8 @@ def resolve_file_uri_to_path(path):
     return url2pathname(path_part) or path
 
 
-# Dataset rows carry arbitrary http(s) URLs fetched server-side, so without a destination check they can reach
-# 127.0.0.1, the LAN or the metadata endpoint; public URLs and local files are unaffected; serving media from a private
-# host needs UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1
+# Dataset http(s) URLs are fetched server-side, so block private destinations (127.0.0.1, LAN,
+# metadata); public and local files pass; UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1 allows private hosts.
 UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
 UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
 _MAX_MEDIA_REDIRECTS = 5
@@ -136,8 +135,7 @@ _BLOCKED_CIDRS = (
     "::/128", "::1/128", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 )
 
-# Metadata services answer on a fixed name too, which is what a configured HTTP
-# proxy resolves instead of us.
+# Metadata services answer on fixed names too; a configured proxy resolves them instead of us.
 _BLOCKED_HOSTNAMES = frozenset((
     "metadata.google.internal", "metadata.goog", "metadata",
     "instance-data", "instance-data.ec2.internal",
@@ -359,8 +357,7 @@ def _check_fetchable_url(url: str):
     return (_host_forms(host), tuple(str(ip) for ip in addresses or ()))
 
 
-# Resolving twice (check, then HTTP client) lets an attacker answer the two lookups differently (public, then private);
-# connect to the checked address but keep the hostname for Host, SNI and certificate checks.
+# Resolving twice allows rebinding; dial the checked IP, keep hostname for Host, SNI, certs.
 _PINNED_ADDRESSES = contextvars.ContextVar("unsloth_pinned_addresses", default = None)
 # The address is not ours to choose here: the guard is off, or a proxy picks it.
 _UNPINNED = "unsloth_unpinned"
@@ -629,8 +626,7 @@ def smart_resize(
 
 
 def _refuse_network_share_image(path):
-    # Same rule as fetch_video: on Windows even os.path.isfile on a UNC path opens an SMB connection.
-    # PIL also opens bytes / PathLike paths (a dict row's binary "path" column), so check their decoded form too.
+    # Windows os.path.isfile on UNC opens SMB; PIL opens bytes/PathLike, so check decoded form.
     try:
         name = os.fsdecode(path) if isinstance(path, (bytes, os.PathLike)) else path
     except Exception:
@@ -772,9 +768,8 @@ def _read_video_pyav(
         rate = stream.average_rate or stream.guessed_rate
         video_fps = float(rate) if rate else 0.0
         if start and stream.time_base:
-            # Jump to the keyframe at or before `start`, as torchvision does, rather than
-            # decoding and discarding everything ahead of a late segment. The filter below
-            # still drops the frames between that keyframe and `start`.
+            # Seek to the keyframe at or before `start` (as torchvision does) instead of decoding
+            # and discarding earlier frames; the filter below still drops frames up to `start`.
             try:
                 container.seek(int(start / stream.time_base), stream=stream, backward=True)
             except av.error.FFmpegError:
@@ -978,7 +973,6 @@ def _read_video_torchcodec(
     video = decoder.get_frames_at(indices=idx).data
     # Ensure channel-first layout (T, C, H, W). torchcodec returns NHWC.
     if hasattr(video, "ndim") and video.ndim == 4:
-        # If second dim looks like height and last dim like channels, permute to TCHW
         if video.shape[-1] in (1, 3, 4) and video.shape[1] not in (1, 3, 4):
             video = video.permute(0, 3, 1, 2).contiguous()
     if UNSLOTH_ENABLE_LOGGING:
@@ -1160,9 +1154,8 @@ def _is_network_share(path: str) -> bool:
     return p.startswith("//") and p[2:].split("/", 1)[0].lower() not in _LOCAL_SHARE_HOSTS
 
 
-# A real video container never starts like this (nor with whitespace or a BOM, which a padded
-# text document would); a playlist would make ffmpeg open its entries itself (file:// segments
-# included), outside every check here.
+# Real video containers never start like these heads (nor padded text with whitespace or a BOM); a
+# playlist would make ffmpeg open its entries, file:// segments included, outside our checks.
 _PLAYLIST_HEADS = (b"#EXTM3U", b"<", b"ffconcat", b"\xef\xbb\xbf", b" ", b"\t", b"\r", b"\n")
 
 
@@ -2243,9 +2236,8 @@ class UnslothVisionDataCollator:
             audio = self._extract_audio_for_example(example, messages)
             audios.extend(audio)
 
-        # With audio, omit max_length/truncation from the top-level processor call: _merge_kwargs broadcasts them into
-        # audio_kwargs, which truncates the waveform to max_length samples instead of leaving it intact; truncate
-        # input_ids manually after the call.
+        # With audio, omit max_length/truncation from the top-level call: _merge_kwargs broadcasts
+        # them into audio_kwargs, truncating the waveform; truncate input_ids manually.
         proc_kwargs = dict(
             text=texts,
             padding=True,
@@ -2945,7 +2937,6 @@ class UnslothVisionDataCollator:
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask, token_type_ids)
             )
 
-            # Truncate with side awareness
             if self.max_seq_length is not None:
                 input_ids, attention_mask, completion_mask, token_type_ids = self._truncate_by_side(
                     input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length, token_type_ids=token_type_ids
@@ -2961,7 +2952,6 @@ class UnslothVisionDataCollator:
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask,)
             )
 
-            # Truncate with side awareness
             if self.max_seq_length is not None:
                 input_ids, attention_mask, completion_mask = self._truncate_by_side(
                     input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length

@@ -213,9 +213,8 @@ def _flex_eligible(q, kv_len = None):
     return kv_len is None or q.shape[0] * q.shape[1] * kv_len <= _FLEX_MAX_TABLE
 
 
-# The sink is applied through flex's log-sum-exp (out * sigmoid(lse - sink)); its gradients need flex to propagate
-# LSE gradients. Numerically verified on torch 2.14 (B200 oracle, Colab T4 / L4 / G4); CPU flex has no backward,
-# so older releases could not be checked here and keep the reference for differentiable calls with a sink.
+# Sink goes via flex's LSE (needs LSE grads); verified on torch 2.14 (B200, T4/L4/G4) only; CPU flex
+# has no backward, so older releases keep the reference for differentiable sink calls.
 _FLEX_SINK_VERIFIED_TORCH = (2, 14)
 
 
@@ -264,8 +263,7 @@ def window_topk_idxs(seq_len, window_size, batch, device):
 
 
 def _connected_zeros(q, *others):
-    """Zero output that stays in every input's autograd graph (zero gradients, not None): empty-slice sums connect
-    without reading values (a disabled -inf sink would make `x * 0` NaN)."""
+    """Zeros connected to all inputs (zero grads, not None); no values read: -inf * 0 is NaN."""
     out = q.new_zeros(q.shape)
     for t in (q,) + others:
         if t is not None and t.is_floating_point():
@@ -303,8 +301,7 @@ def _reference_chunk_rows(q, k):
     return max(1, min(s, _TORCH_CHUNK_ELEMS // max(1, k * d * b)))
 
 
-# Compiled code runs the chunked reference as one opaque op; unrolled, the first step never
-# finished.
+# Compiled code runs the chunked reference as one opaque op (unrolled, step 1 never finished).
 _REF_V = "v1"
 
 
@@ -326,8 +323,7 @@ def _(q, kv, sink, topk_idxs, softmax_scale):
 
 
 def _reference_block_backward(grad_out, q_chunk, kv_pad, sink, safe_chunk, valid_chunk, softmax_scale, dkv_pad):
-    """Gradients of _reference_block (recomputed forward): returns dq_chunk and dsink [h] (accumulation dtype),
-    adds the kv gradient into dkv_pad [b, n + 1, d] (accumulation dtype)."""
+    """Returns dq_chunk, dsink [h] (accum dtype); adds kv grad into dkv_pad [b, n + 1, d]."""
     b, c, h, _ = q_chunk.shape
     acc = sink.dtype
     batch_index = torch.arange(b, device = q_chunk.device).view(b, 1, 1).expand_as(safe_chunk)
@@ -497,8 +493,7 @@ def _flex_kernel_options(q):
         return _FLEX_KERNEL_OPTIONS_D512
     if d > 128 and torch.cuda.get_device_capability(q.device)[0] < 9:
         return _FLEX_KERNEL_OPTIONS_SMALL_TILES
-    # Training / prefill only: below 128 queries Inductor otherwise picks flex_decoding, which rejects this
-    # block mask's tiles ("Q and KV block sizes must be divisible") and is forward only.
+    # Training/prefill only: flex_decoding (<128 queries, fwd only) rejects this mask's tiles.
     return {"FORCE_USE_FLEX_ATTENTION": True}
 
 
@@ -798,9 +793,8 @@ def _contiguous_rows(visible):
 
 
 def _qsa_geometry(attention_mask, ratio):
-    """(lo, hi, block starts per batch row) for an interval-shaped mask, else None. The scan and the start lists
-    need host syncs, so the result is cached on the mask tensor (every QSA layer of a forward, and its gradient
-    checkpoint recompute, gets the same mask object), keyed by its version; inference tensors are rescanned."""
+    """Returns (lo, hi, block starts) per row or None for non-interval masks; host-sync scan cached
+    per mask _version, shared by QSA layers and recompute; rescanned for inference tensors."""
     # One shared selection per batch row: per-head masks ([b, h > 1, s, n]) cannot be represented.
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
         return None

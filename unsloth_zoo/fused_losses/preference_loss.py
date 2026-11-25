@@ -116,9 +116,7 @@ _HALF_DTYPES = (torch.float16, torch.bfloat16)
 
 @torch.no_grad()
 def _sliced_backward(ctx, hidden, weight, bias, labels, lse, logps, grad_logps):
-    # Trainable half head: float32 vocab x hidden accumulator plus per-chunk GEMM/cast copies cost ~10 x vocab x hidden
-    # bytes, and head-dtype chunk sums lose bits; loop over vocab slices, each summed over row chunks in a float32
-    # accumulator of about one chunk size, costing the same as autograd.
+    # Loop over vocab slices to avoid ~10 x vocab x hidden bytes of float32 head copies per chunk.
     need_hidden, need_weight, need_bias = ctx.needs_input_grad[:3]
     scale_multiply, scale_divide, softcapping = ctx.transforms
     scale = 1.0
@@ -196,9 +194,8 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
         # A trainable half precision head runs the vocab sliced backward, which needs each row's lse.
         sliced = ctx.needs_input_grad[1] and weight.dtype in _HALF_DTYPES
         if sliced and ctx.needs_input_grad[0]:
-            # Sliced backward holds a float32 rows x hidden gradient plus its cast (6 N H bytes for half hidden) and a
-            # head-dtype grad (2 V H); the per-chunk loop holds float32 head-sized copies (10 V H) and a hidden-dtype
-            # grad, favoured for long contexts.
+            # Sliced backward only when its memory estimate beats the per-chunk loop's float32
+            # copies (10 V H).
             vocab_size = weight.shape[0]
             hidden_bytes = hidden.element_size()
             cast_bytes = hidden_bytes if hidden.dtype != torch.float32 else 0
@@ -356,8 +353,7 @@ def _compact_forward(hidden, weight, bias, labels, mask, chunk_size, transforms,
     if sliced:
         saved_lse = expand(saved_lse)
     elif sliced_ok:
-        # The selected count switched to the per-chunk backward, which never reads lse; the fake kernel only sees
-        # sliced_ok, so the metadata keeps its n_all length.
+        # Fake kernel sees only sliced_ok, so lse keeps its n_all length even when unused.
         saved_lse = torch.zeros(n_all, dtype = dtype, device = device)
     return (
         expand(logps),
@@ -394,8 +390,7 @@ def _compact_backward(grad_logps, hidden, weight, bias, labels, mask, logps, sav
     return grad_hidden, grad_weight, grad_bias
 
 
-# Versioned name: a saved compile cache keys custom ops by name, so a schema change under the old name replays the old
-# calling convention (the backward gained `logps`); bump on every schema change.
+# Bump this versioned op name on every schema change; a compile cache keys custom ops by name.
 _OP_NAMESPACE = "unsloth_zoo_fused_preference_v2"
 _HAS_CUSTOM_OP = hasattr(torch, "library") and hasattr(torch.library, "custom_op") \
     and hasattr(torch.library, "register_fake")

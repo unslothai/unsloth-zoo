@@ -253,8 +253,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     else:
         # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
         avail = free - others + on_host
-    # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
-    # only once the layer is in: give in-flight peers a moment before refusing.
+    # Mid-copy peers took bytes out of free but lower reservations late; retry before refusing.
     retries = _PEER_RETRIES if others else 0
     while need > avail and retries > 0:
         retries -= 1
@@ -399,8 +398,7 @@ def _creditable_host_storages(swapped, layers, owner):
     for li, layer in enumerate(swapped):
         for _, p in _swappable(layer):
             if p.device.type == "cpu":
-                # Pinned by torch's caching host allocator: freeing it parks the block in that cache, still pinned,
-                # and nothing returns it to the OS while packing. Never credited.
+                # Torch's caching host allocator keeps freed pinned blocks; never credited.
                 try:
                     if p.data.is_pinned():
                         continue
@@ -663,8 +661,7 @@ class _Block:
                 if c is None:
                     dec = (self.decoders or {}).get(d)
                     if dec is not None:
-                        # The slot may still be written by a compressed block's decode that was stolen before
-                        # compute waited for it (an interrupted step): order this copy after it.
+                        # Interrupted decode may still write the slot: the copy waits for it.
                         stream.wait_stream(dec.stream)
                     bufs[d].copy_(self.host_buf[d], non_blocking = True)
                     event.record(stream)
@@ -776,8 +773,7 @@ class BlockSwap:
         self._ckpt_wrapped = weakref.WeakSet()
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
-            # Still a host session (with nothing pending): other local ranks then read this rank as done with it,
-            # and every rank's session count stays in step.
+            # A host session with nothing pending keeps every rank's session count in step.
             _begin_host_session()
             _end_host_session()
             return
@@ -811,17 +807,10 @@ class BlockSwap:
         self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
                                   and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
         _begin_host_session()
-        # Weights already in host RAM are released as their block is packed. On Linux the registered arena is
-        # pageable and fills block by block, so only a couple of blocks are ever held twice (Flash-Next: 79.5 GiB
-        # of host layers packed with 34.5 GiB still free); Windows commits that arena up front, so no credit there.
-        # The chunked fallback allocates one chunk at a time and releases each block's original right after
-        # packing it, so on top of the originals it holds at most one chunk and the block being packed.
-        # Per storage: a CPU tensor shared by several selected layers is released (and credited) once.
-        # A storage is freed only once every tensor on it is gone: credit only one that lives in a single swapped
-        # layer's swappable weights (a 10 GiB storage viewed by ten layers stays resident until the last is packed,
-        # and one also viewed from outside the swapped weights is never freed by packing).
-        # The whole model when it is known, passed or inferred from find_decoder_layers: an alias outside the
-        # decoder list (a tied head, a model-level buffer) keeps the storage alive just the same.
+        # Host copies freed as each block packs (Linux pageable arena fills block by block; Windows
+        # commits up front, no credit); chunked fallback holds at most one chunk plus the block;
+        # storage credited only if its tensors all lie in one swapped layer (outside aliases keep it
+        # alive).
         owner = model
         if owner is None:
             try:
@@ -837,8 +826,7 @@ class BlockSwap:
         for ptr, n in host_storages.items():
             if not _in_ranges(ptr, file_backed):
                 self._host_credit[next(iter(users[ptr]))] += n
-        # Peak is the largest committed through block k minus released before k, not total less
-        # credits.
+        # Peak = max(committed through k - released before k), not total minus credits.
         if not _can_register():
             # The chunked fallback commits whole chunks, rounded up to powers of two (padding included).
             commits = _chunked_commits([b.sizes for b in self.blocks])
@@ -930,9 +918,8 @@ class BlockSwap:
 
             self._arm(forward = True)
             if self._auto:
-                # A fresh allocator peak window from here on: the load's own peak would hide every training peak
-                # below it, and temporaries inside a layer (dequantized expert stacks) never reach a hook sample.
-                # Before training starts, so a caller measuring the training peak from here reads the same number.
+                # Fresh allocator peak window before training: the load's peak would hide training
+                # peaks; in-layer temporaries never reach a hook sample.
                 try:
                     for dv in self._peak_devs:
                         torch.cuda.reset_peak_memory_stats(dv)
@@ -1051,9 +1038,8 @@ class BlockSwap:
             self._publish_packed(k)
 
     def _publish_packed(self, k):
-        # Other local ranks hold back only the rise still to come, chunk padding already committed
-        # included; not capped at the first estimate, since freeing a storage larger than its block
-        # raises free RAM the next blocks need.
+        # Other local ranks hold back only the rise still to come (padding included); not capped at
+        # the first estimate, since freeing a storage larger than its block raises free RAM.
         credit = getattr(self, "_host_credit", None)
         if credit is not None and k < len(credit) and credit[k] > 0:
             # The credit assumes the originals' pages are gone now: heap-served ones need an explicit trim.
@@ -1076,8 +1062,7 @@ class BlockSwap:
         used, ends = 0, []
         for k, b in enumerate(self.blocks):
             if self._compress and b.compressible():
-                # Encoded regions are never larger than raw ones, so they fit the arena; on Linux its unused tail
-                # is never written and so never committed (and never pinned).
+                # Encoded <= raw, so it fits; unused Linux tail is never committed or pinned.
                 used = b.pack_compressed(arena, used, self.device)
             else:
                 regions = {}
@@ -1201,9 +1186,8 @@ class BlockSwap:
             self._note_block_peak(b)
         self._fetch(b, steal = True)
         marks = getattr(b, "marks", None)
-        # A sample still in flight is kept for _harvest: re-recording its events would lose it.
-        # mark_open: 1 = waiting sample open, 2 = full sample recorded, 3 = wait-only sample closed (the forward
-        # hook never ran: a recompute that stopped early) but its events may still be in flight.
+        # Samples in flight are kept for _harvest (re-recording loses them); mark_open 1 = waiting,
+        # 2 = full, 3 = wait-only closed (forward hook never ran, events may be in flight).
         in_flight = marks is not None and (
             (b.mark_open == 2 and not marks[2].query()) or (b.mark_open in (1, 3) and not marks[1].query()))
         if marks is not None and not in_flight:
@@ -1592,9 +1576,8 @@ class BlockSwap:
             self._note_peak(dv)
         out = _output_logits(output)
         node = getattr(out, "grad_fn", None) if isinstance(out, torch.Tensor) else None
-        # When the output's grad lands, the op that consumed the output (the loss) has just held the output,
-        # its grad and a temporary of the same size; only the grad is still allocated. A node hook, not a
-        # tensor hook: callers keep only the loss, and a tensor hook dies with the dropped output.
+        # At grad landing only the grad is allocated (loss held output, grad and a same-size temp);
+        # node hook, as callers keep only the loss and a tensor hook dies with the output.
         hooks = [(node, out.device, out.nbytes)] if node is not None else []
         # The loss too: fused cross entropy (Unsloth's) computes it from the hidden states, so returned logits
         # (UNSLOTH_RETURN_LOGITS=1) need not be its ancestors and backward from the loss never reaches them.
@@ -2096,8 +2079,7 @@ def _counted_named(module):
     return [(n, p) for n, p in module.named_parameters() if id(p) in ids]
 
 
-# Loaded bytes per declared (meta) byte of a quantized weight before any layer of that kind has loaded:
-# bitsandbytes declares the unquantized shape in the compute dtype (16-bit) and stores 4 or 8 bits per value.
+# Prior loaded/declared ratio until a kind loads: bitsandbytes declares 16-bit, stores 4/8 bits.
 _QUANT_PRIOR = {"4bit": 0.25, "8bit": 0.5}
 
 
@@ -2130,8 +2112,7 @@ class _HostLoad:
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
         self.owned_names = {}
-        # Ratios are per kind and layer: an unquantized skip layer loads full size, the rest at 4
-        # bits.
+        # Ratios per kind and layer: unquantized skip layers load full size, others at 4 bits.
         self.decl, self.kind_ratios = {}, {}
         self.cpu_to_come = 0
 

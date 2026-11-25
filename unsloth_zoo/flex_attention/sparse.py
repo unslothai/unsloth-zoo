@@ -77,9 +77,8 @@ def reset_sparse_attn_stats():
 
 
 def additive_bias_present(mask, visible, kind = None):
-    """Eager is a host sync; under CUDA graph capture reuse the warm-up answer per kind and shape: a
-    bias in any warm-up call keeps the bias; with none, a device assert raises on any finite
-    bias; unseen shapes keep the bias."""
+    """Eager is a host sync: under graph capture reuse the warm-up answer per kind and shape (any
+    bias keeps it; with none, a device assert raises on finite bias); unseen shapes keep it."""
     key = (kind, mask.device, mask.dtype, tuple(mask.shape))
     if mask.is_cuda and torch.cuda.is_current_stream_capturing():
         if _BIAS_SEEN.get(key) is False:

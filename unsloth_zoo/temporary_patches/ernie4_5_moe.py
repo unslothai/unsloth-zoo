@@ -32,8 +32,7 @@ from .moe_utils import (
 
 
 def _make_ernie4_5_moe_lora_extractor():
-    """LoRA extractor for fused ERNIE 4.5 MoE experts; same 3D layout as Qwen3MoeExperts: gate_up_proj (E, 2*I, H),
-    down_proj (E, H, I), io-dims read from hidden_dim / intermediate_dim."""
+    """Same layout as Qwen3MoeExperts: gate_up_proj (E, 2*I, H), down_proj (E, H, I)."""
     def _get_ernie4_5_moe_lora_dims(wrapper):
         if wrapper is None or not hasattr(wrapper, "get_base_layer"):
             return None, None

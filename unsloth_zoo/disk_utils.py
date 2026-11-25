@@ -57,8 +57,7 @@ DISK_SLACK_BYTES = 2 * 1024**3
 
 
 def is_kaggle_environment():
-    """True only in a running Kaggle kernel: needs both KAGGLE_KERNEL_RUN_TYPE and /kaggle/working; not any KAGGLE_*
-    var, since Kaggle CLI credentials match it; not /kaggle alone, which Colab VMs have."""
+    """KAGGLE_KERNEL_RUN_TYPE and /kaggle/working; not KAGGLE_* (CLI) or bare /kaggle (Colab)."""
     override = os.environ.get("UNSLOTH_IS_KAGGLE", None)
     if override is not None:
         return str(override).strip().lower() in _TRUE
@@ -79,8 +78,7 @@ def is_colab_environment():
 
 
 def free_bytes(path):
-    """Free bytes on the filesystem holding `path`, or None if unmeasurable; None not 0, since 0 reads as a full disk
-    and blocks every caller; walks up to the nearest existing ancestor."""
+    """Bytes free on path's filesystem (nearest existing ancestor), or None (0 blocks callers)."""
     try:
         probe = os.path.abspath(os.path.expanduser(str(path)))
     except Exception:
@@ -102,8 +100,7 @@ def _is_uint8(param):
 
 
 def logical_numel(param, name = ""):
-    """Logical parameter count, not numel() on quantized weights: bitsandbytes packs two 4-bit params per uint8 (real
-    shape in quant_state); MXFP4 _blocks count 2x and _scales count 0."""
+    """Not numel(): bnb packs 2 4-bit params/uint8; MXFP4 _blocks count 2x, _scales count 0."""
     if name and _is_uint8(param):
         if name.endswith("_scales"):
             return 0

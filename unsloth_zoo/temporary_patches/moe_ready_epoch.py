@@ -13,9 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Process-wide expert-state stamp so grouped MoE readiness and NF4 table checks skip per-expert scans; moves on module
-hooks, _apply, PEFT tuner state, and each optimizer step; accelerate-hooked or FSDP2-gathered subtrees are never
-cached; UNSLOTH_MOE_FAST_READY=0 runs full checks every call."""
+"""Expert-state stamp bumped by hooks, _apply, PEFT, optimizer steps lets MoE/NF4 checks skip scans;
+accelerate-hooked/FSDP2-gathered subtrees never cached; UNSLOTH_MOE_FAST_READY=0 disables."""
 import functools
 import os
 import weakref
@@ -81,8 +80,7 @@ def _wrap_bumping(owner, name):
 
 
 def wrap_peft():
-    """Wrap PEFT BaseTunerLayer state methods and every subclass defined so far (lora.bnb and others import lazily, so
-    full checks re-call); returns False without PEFT."""
+    """Wraps PEFT state methods and subclasses so far, lazy ones on re-call; False w/o PEFT."""
     try:
         from peft.tuners.tuners_utils import BaseTunerLayer
     except Exception:
@@ -198,8 +196,7 @@ def _qs_key(qs):
 
 
 def _qs_ptrs(qs):
-    """Storage addresses the NF4 pointer tables embed: absmax, code, and when nested, state2 (absmax / code) and the
-    offset; a hook-less swap of any must re-key the tables."""
+    """NF4 tables embed absmax, code, nested state2, offset addresses; hook-less swaps re-key."""
     key = (_ptr(qs.absmax), _ptr(qs.code))
     if getattr(qs, "nested", False):
         s2, off = qs.state2, qs.offset
@@ -208,8 +205,7 @@ def _qs_ptrs(qs):
 
 
 class Lean:
-    """Lean view of base projections (compute dtypes, weight and bias identity and address, requires_grad, quant state)
-    that catches hook-less .data swaps; re-read once per block per step."""
+    """Lean base-projection view, re-read per block per step, catching hook-less .data swaps."""
     __slots__ = ("dicts", "params", "cds", "ws", "wptrs", "rgs", "qss", "aptrs", "bs", "brgs")
 
     def __init__(self, dicts):

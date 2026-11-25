@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native MTP heads trained outside the target: Qwen3.5/3.6 use Qwen35MTPHead, other mtp_families use nextn.NextNHead;
-position p takes post-output_norm hidden of p-1 and token p, predicts p+1; recursive steps feed back the normed
-output as h (llama.cpp graph_mtp)."""
+"""MTP heads: Qwen3.5/3.6 use Qwen35MTPHead, others nextn.NextNHead; position p takes normed hidden
+of p-1 and token p, predicts p+1; recursion feeds normed output as h (llama.cpp graph_mtp)."""
 
 __all__ = [
     "MTP_PREFIX_RE",

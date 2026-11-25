@@ -101,8 +101,7 @@ def _unpinned_default_start_method(module) -> Optional[str]:
 
     try:
         name = module.context._default_context._default_context._name
-        # Only if the platform offers it: a Windows runner answered 'fork' while get_all_start_methods() was ['spawn'],
-        # reading Windows as forkable and looping on spawn re-import (issues 3211, 3397).
+        # Only listed methods: Windows reported 'fork' and looped on spawn (issues 3211, 3397).
         if isinstance(name, str) and name and (not methods or name in methods):
             return name
     except Exception:
@@ -144,8 +143,7 @@ def _workers_unusable_reason() -> Optional[str]:
 
 
 def _cgroup_cpu_quota() -> Optional[float]:
-    """cgroup CPU ceiling in cores, or None outside one; reuses hf_xet_tuning's reader (v1 and v2, /proc/self/cgroup
-    walk, unlimited sentinels), imported lazily so the module loads alone."""
+    """cgroup CPU limit in cores or None; reuses hf_xet_tuning's v1/v2 reader, imported lazily."""
     try:
         from unsloth_zoo.hf_xet_tuning import cgroup_cpu_limit
         return cgroup_cpu_limit()
@@ -206,8 +204,7 @@ def _proc_self_cgroup() -> list:
 
 
 def _cgroup_free_bytes_unaided() -> Optional[int]:
-    """Fallback for an older unsloth_zoo without the private cgroup helpers, mirroring _cgroup_free_bytes; a bare public
-    cgroup_memory_limit is last resort, as a limit is still a ceiling."""
+    """Fallback for old unsloth_zoo without private helpers; a public limit is last resort."""
     lines = _proc_self_cgroup()
     free = []
 
@@ -253,9 +250,8 @@ def _cgroup_free_bytes_unaided() -> Optional[int]:
 
 
 def _cgroup_free_bytes() -> Optional[int]:
-    """Bytes free under the binding cgroup memory limit, or None; each limit pairs with the usage of the directory that
-    set it, since an ancestor's usage counts unseen siblings; root memory.current is the whole machine, so never
-    subtract it from a unit's MemoryMax."""
+    """Bytes free under the binding cgroup memory limit, or None; each limit pairs with its setter's
+    usage, since ancestor usage counts unseen siblings; never subtract root memory.current."""
     try:
         from unsloth_zoo.hf_xet_tuning import (
             _cgroup_v1_dirs,
@@ -264,8 +260,7 @@ def _cgroup_free_bytes() -> Optional[int]:
             _read_first_line,
         )
     except Exception:
-        # An older unsloth_zoo lacks these helpers, so pair the limit with current usage: an 8GB cgroup with 6GB
-        # resident would otherwise report 8GB free, and memory pressure is what this ceiling guards.
+        # Without them, pair the limit with usage: 8GB limit, 6GB resident: 2GB free, not 8GB.
         return _cgroup_free_bytes_unaided()
 
     def _used(path):
@@ -308,8 +303,7 @@ def _available_memory_gb() -> Optional[float]:
 
 
 def _usable_cpus() -> Optional[int]:
-    """CPUs this process may run on, or None: cpu_count() reports the host's, so under taskset, Slurm pinning or a
-    Kubernetes CPU quota a one-core job would auto-size workers that contend for that core."""
+    """Usable CPUs or None: cpu_count() is the host's, not taskset, Slurm or K8s quota limits."""
     try:
         import psutil
         cpus = psutil.cpu_count()
@@ -436,39 +430,22 @@ def _from_environment() -> "tuple[bool, Optional[int]]":
 
 
 def environment_override() -> "tuple[bool, Optional[int]]":
-    """Returns (was_set_and_valid, value), value None meaning in-process; NUM_PROC_ENV_VAR is the uncapped hatch, so
-    callers need this rather than reading it directly; an unparseable or negative value is not the hatch and is
-    ignored with a warning."""
+    """Returns (was_set_and_valid, value); None value means in-process; NUM_PROC_ENV_VAR is
+    uncapped, so callers use this; unparseable or negative values are ignored with a warning."""
     return _from_environment()
 
 
 def get_dataset_num_proc(
     desired: Optional[int] = None, *, serial_as_none: bool = True
 ) -> Optional[int]:
-    """Return a safe ``num_proc`` for ``Dataset.map()`` / ``Dataset.filter()``.
-
-    ``None`` means "run in-process" -- the only value that builds no worker pool
-    on every supported ``datasets`` release, since 4.x pools for any
-    ``num_proc >= 1``. Everything returned is bounded by free memory, explicit
-    counts included; only ``NUM_PROC_ENV_VAR`` is exempt.
-
-    Args:
-        desired: The worker count the caller asked for, or None to auto-size.
-        serial_as_none: How to encode "run in-process". True at a ``map()`` call
-            site, yielding ``None``. **False when writing back to a config**,
-            yielding ``1``, because downstream readers
-            (``dataset_utils.sft_prepare_dataset``) treat a config ``None`` as
-            "auto-size me" and would inflate a user's ``1``.
-
-    Returns:
-        A worker count >= 2, or this layer's in-process sentinel (``None`` at a
-        call site, ``1`` at the config layer).
-    """
+    """Safe num_proc for map/filter: None is in-process (only value with no pool on every supported
+    datasets release; 4.x pools for num_proc >= 1); counts memory-bounded except
+    NUM_PROC_ENV_VAR; returns >= 2 or sentinel; serial_as_none=False gives 1 for configs (None
+    means auto-size)."""
     # 1. The environment override wins over everything, uncapped and unvetoed, so a user who knows their workload is fork-safe is never downgraded.
     env_set, env_value = _from_environment()
     if env_set:
-        # In-process must still be encoded for this layer, or UNSLOTH_DATASET_NUM_PROC=0 (the hatch the dead-worker
-        # message recommends) would inflate a config instead of removing workers.
+        # Encode in-process here too, or UNSLOTH_DATASET_NUM_PROC=0 would inflate configs.
         return _serial(serial_as_none) if env_value is None else env_value
 
     # 2. Workers are unusable whatever was requested; see _workers_unusable_reason for the two refusals.
@@ -498,8 +475,7 @@ def get_dataset_num_proc(
     return num_proc
 
 
-# datasets raises this message when a pool worker dies, never reads its exit status, so an OOM kill, a segfault and a
-# real exception look identical (issue 2693).
+# Raised when a worker dies, exit status unread: OOM kill looks like an exception (issue 2693).
 _WORKER_DIED = "subprocesses has abruptly died"
 
 
@@ -559,9 +535,8 @@ def _largest_split_rows(trainer) -> Optional[int]:
 
 
 def _zoo_auto_sizer_forks() -> bool:
-    """Whether train_on_responses_only auto-sizes workers for a bare None; it asks stdlib multiprocessing, not
-    multiprocess, so where the two disagree None means size-it-for-me and datasets builds that pool on the non-fork
-    multiprocess context."""
+    """Whether train_on_responses_only auto-sizes a bare None, judged by stdlib multiprocessing, not
+    multiprocess; where they disagree, datasets builds its pool on the non-fork context."""
     try:
         return _module_start_method("multiprocessing") == "fork"
     except Exception:
@@ -584,9 +559,8 @@ def _serial_for_the_zoo(value: Optional[int]) -> Optional[int]:
 
 
 def resolve_responses_only_num_proc(trainer, num_proc):
-    """Caps the auto worker count (uncapped in older releases, issue 2693); serial is 1 on fork but None on spawn, since
-    a Pool(1) child re-imports __main__ (issues 3211, 3397); an explicit count skips its small-split guard, so it is
-    worth it only for splits big enough to parallelize."""
+    """Caps the auto worker count (issue 2693); serial is 1 on fork, None on spawn: a Pool(1) child
+    re-imports __main__ (issues 3211, 3397); explicit counts skip the small-split guard."""
     # Mirrors that helper's own test so explicit means the same on both sides; it treats bools as auto, since type(True) is not int.
     was_auto = num_proc is None or type(num_proc) is not int
     rows = _largest_split_rows(trainer)

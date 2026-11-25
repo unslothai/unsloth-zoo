@@ -77,8 +77,7 @@ class _BlockExpand(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         grad_src = grad.new_zeros(ctx.src_shape)
-        # Half-precision copies are summed in fp32 and rounded once: a running fp16 sum overflows on partial
-        # sums (40000 + 40000 - 40000 - 40000 gave inf) that the unwrapped tower accumulates without.
+        # Half copies sum in fp32: partial fp16 sums overflow (40000+40000-40000-40000 is inf)
         wide = torch.float32 if grad.dtype in (torch.float16, torch.bfloat16) else grad.dtype
         for s0, length, copies in ctx.blocks:
             acc = grad[copies[0] : copies[0] + length]

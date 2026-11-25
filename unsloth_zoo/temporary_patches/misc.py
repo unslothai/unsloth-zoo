@@ -826,8 +826,7 @@ _EFFICIENT_SDPA_ACCEPTS_CACHE = {}
 
 
 def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, requires_grad):
-    # Equal head counts need no enable_gqa, so mem-efficient SDPA also runs a maskless causal call; transformers < 5
-    # still passes enable_gqa = True, so both forms must be accepted.
+    # Accept both: transformers < 5 passes enable_gqa = True; equal head counts omit it.
     key = (str(device), dtype, num_heads, head_dim, dropout, requires_grad)
     accepts = _EFFICIENT_SDPA_ACCEPTS_CACHE.get(key, None)
     if accepts is not None:
@@ -847,8 +846,7 @@ def _efficient_sdpa_accepts_mha(device, dtype, num_heads, head_dim, dropout, req
 
 
 def _flash_sdpa_takes_causal(config, embeds):
-    """Without a mask transformers asks SDPA for enable_gqa, which only the flash kernel takes; other kernels fall to
-    math with [bsz, heads, q, q] scores (fp32 Qwen3-0.6B, 8192 x 2: 2.8 -> 33 GB)."""
+    """No mask: SDPA gets enable_gqa, only flash takes it; others fall to math (q x q scores)."""
     if embeds.dtype not in (torch.float16, torch.bfloat16) or not embeds.is_cuda:
         return False
     if torch.version.hip is not None or not torch.backends.cuda.flash_sdp_enabled():
@@ -915,9 +913,8 @@ def _module_spans_devices(module):
 
 
 def _calling_model_spans_devices(max_depth = 8):
-    """True when the module whose forward builds this mask spans several devices: a device_map split can put later
-    layers on a GPU or shape flash cannot take, where maskless SDPA falls to math; cached per module, False if no
-    caller is found."""
+    """True when the calling module spans several devices: later layers may land where flash cannot
+    run, so maskless SDPA falls to math; cached per module, False if no caller."""
     frame = sys._getframe(1)
     for _ in range(max_depth):
         frame = frame.f_back
@@ -3517,9 +3514,8 @@ _SFT_SHIELDED_INPUT_TYPES = {}
 
 
 def _sft_shielded_inputs(inputs, contents):
-    """Copy of contents without the liger-only forward kwargs, built as the caller's own mapping type (a BatchEncoding
-    stays one) and cached per type; compute_loss injects on the mapping the caller passed in, the only interception
-    point."""
+    """Copy without liger-only kwargs, in the caller's mapping type (BatchEncoding stays one),
+    cached per type; compute_loss injects on the caller's mapping, its only interception point."""
     if not isinstance(inputs, Mapping):
         return contents
     cls = type(inputs)

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Trains speculative-decoding drafters against a frozen target: native MTP heads (mtp.Qwen35MTPHead and DeepSeek-V3
-style NextN families in mtp_families), DSpark for Qwen3 and EAGLE-3 for targets without MTP; transformers is imported
-lazily so `import unsloth_zoo` is unchanged."""
+"""Trains speculative-decoding drafters on a frozen target: MTP heads, DSpark for Qwen3, EAGLE-3 for
+targets without MTP; transformers is imported lazily so `import unsloth_zoo` is unchanged."""
 
 __all__ = [
     "resolve_text_parts",

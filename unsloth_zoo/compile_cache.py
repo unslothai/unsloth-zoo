@@ -80,16 +80,14 @@ def _cache_root():
         if home == "~" or not os.path.isdir(home):
             return None
         root = os.path.join(home, ".cache", "unsloth", "mega_cache")
-    # Canonicalize with realpath so the validated path is the one later reads and writes use; abspath collapses .. only
-    # lexically, so a symlink followed by .. validates one directory while the kernel opens another.
+    # realpath, not abspath: a symlink followed by .. would validate one dir and open another.
     return os.path.realpath(root)
 pass
 
 
 def _is_trusted_directory(path, *, allow_missing = True):
-    """Whether an existing cache dir is safe to load: on POSIX reject symlinks, foreign-owned and group/other-writable
-    dirs (a checksum only detects corruption); missing dirs are allowed, to be created by _ensure_private_directory
-    on save; non-POSIX relies on the opt-in."""
+    """Safe to load: on POSIX, no symlinks, foreign-owned or group/other-writable dirs (checksums
+    only catch corruption); missing dirs are allowed; non-POSIX relies on opt-in."""
     if path is None:
         return True
     try:
@@ -100,8 +98,7 @@ def _is_trusted_directory(path, *, allow_missing = True):
                 return allow_missing
             return stat.S_ISDIR(directory_stat.st_mode)
 
-        # Validate every ancestor, not just the leaf: a 0700 cache under a non-sticky group/world-writable parent can be
-        # renamed and swapped before open(), defeating the leaf permission check.
+        # A non-sticky group/world-writable ancestor lets a 0700 leaf be swapped before open().
         target = os.path.abspath(os.fspath(path))
         current = target
         target_exists = False
@@ -137,9 +134,8 @@ pass
 
 
 def _ensure_private_directory(path):
-    """Create missing components with an explicit 0700 that survives any umask (unlike makedirs, whose mode reaches only
-    the leaf); existing components are never re-permissioned, and a configured root is used only if
-    _is_trusted_directory accepts it; no process-wide umask change."""
+    """Missing dirs get explicit 0700 (umask-proof, unlike makedirs which sets only the leaf);
+    existing dirs untouched; a root must pass _is_trusted_directory; no umask change."""
     try:
         target = os.path.abspath(os.fspath(path))
         if os.name != "posix":
@@ -336,8 +332,7 @@ def _read_disk_bundle(directory, manifest_path):
 pass
 
 
-# Kinds torch stores as one file per key are merged by key so this run's copy wins; Inductor / AOTAutograd keep guarded
-# variants per key, so they stay by content.
+# Single-file kinds merge by key (this run wins); Inductor/AOTAutograd keep entries by content.
 _SINGLE_ENTRY_KINDS = frozenset((
     "AutotuneCacheArtifact", "PGOCacheArtifact", "PrecompileCacheArtifact",
     "AUTOTUNE", "PGO",  # torch 2.7: one CacheArtifact class with a type enum
@@ -503,9 +498,8 @@ pass
 
 @contextlib.contextmanager
 def _key_lock(directory):
-    """Serialize savers of one key across processes, else one writer collects a bundle another's manifest names and
-    concurrent unions drop artifacts; yields whether to save (unlocked only where locking is unsupported; a timeout
-    or untrusted lock file skips)."""
+    """Serialize cross-process savers of one key (else concurrent unions drop artifacts); may_save
+    is False on timeout or untrusted lock file, True unlocked where locking unsupported."""
     lock = None
     may_save = True
     try:
@@ -593,12 +587,10 @@ pass
 
 
 def megacache_save():
-    """Persist artifacts at exit (atexit) or on demand; the on-disk bundle is merged in first so the saved bundle is the
-    union; an unchanged run is skipped; never raises."""
+    """Save at exit/on demand: union with the on-disk bundle, skip if unchanged; never raises."""
     if not (_STATE["armed"] and megacache_is_enabled() and _mega_cache_supported()):
         return False
-    # Only LOCAL_RANK (else RANK) 0 saves: one writer per node since roots default to node-local disks; shared roots
-    # rely on the pid-unique temp file and atomic replace.
+    # Only LOCAL_RANK (else RANK) 0 saves: one per node; shared roots rely on atomic replace.
     if os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")) != "0":
         return False
     key = _STATE["loaded_key"]
@@ -676,8 +668,7 @@ def _save_locked(torch, key, directory, manifest_path):
         os.chmod(temporary_manifest, 0o600)
     os.replace(temporary_manifest, manifest_path)
     _log(f"saved bundle for key {key} ({len(data)} bytes)")
-    # Best-effort GC of superseded bundles (incl. legacy fixed-name one); a reader keeps its open handle and a later
-    # reader re-reads the manifest; per file, as Windows refuses to unlink a held bundle.
+    # Best-effort GC of old bundles; readers keep open handles; Windows won't unlink held ones.
     try:
         names = os.listdir(directory)
     except Exception:

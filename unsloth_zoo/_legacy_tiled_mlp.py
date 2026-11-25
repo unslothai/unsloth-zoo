@@ -72,10 +72,8 @@ class TiledMLP(torch.autograd.Function):
     @staticmethod
     @torch_amp_custom_fwd
     def forward(ctx, mlp_forward, mlp_module, x, preserve_rng_state, num_shards, max_flat_qlen):
-        # num_shards is probably the wrong name and it should be n_splits
-        # num_shards is also not guaranteed. It could end up having num_shards + 1
-        # the main thing is the shard seq length is all the same unless it's not
-        # evenly divisible with sequence length. Then the last shard will have the remainder.
+        # num_shards is probably the wrong name (should be n_splits); the shard count may be
+        # num_shards + 1, and the last shard takes any remainder.
         ctx.shard_dim = -2
         B, S, H = x.shape
         ctx.num_shards = num_shards

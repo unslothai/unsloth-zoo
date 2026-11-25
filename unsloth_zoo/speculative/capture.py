@@ -81,9 +81,8 @@ def _check_no_head_bias(lm_head, base_layer):
 
 
 def effective_lm_head_weight(lm_head):
-    """The [V, H] matrix lm_head(x) multiplies by: lm_head.weight for plain, merged or disabled heads, else base plus
-    scaled LoRA deltas, cached until the weight, adapters or merge state changes; DoRA, lora_bias, a nonzero bias or
-    quantized base raise."""
+    """[V, H] weight: lm_head.weight if plain/merged/disabled, else base + scaled LoRA deltas,
+    cached until weight/adapter/merge changes; DoRA/lora_bias/nonzero bias/quantized base raise."""
     lora_A = getattr(lm_head, "lora_A", None)
     get_base_layer = getattr(lm_head, "get_base_layer", None)
     if not isinstance(lora_A, torch.nn.ModuleDict) or not callable(get_base_layer):
@@ -252,8 +251,7 @@ def capture_hidden_states(model, layer_ids = (), final = True, embed = False):
         norm_fired[0] = False
 
     def backbone_hook(module, args, output):
-        # Fast forwards (e.g. Unsloth's LlamaModel) call the norm functionally and bypass its hook, so the backbone's
-        # last_hidden_state is post-norm in both paths.
+        # Fast forwards (LlamaModel) skip norm hook; last_hidden_state post-norm in both paths.
         if not norm_fired[0]:
             tensor = _first_tensor(output)
             if tensor is not None:

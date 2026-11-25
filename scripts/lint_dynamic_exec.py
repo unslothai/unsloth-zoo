@@ -171,8 +171,7 @@ def scan_file(path: Path) -> list[dict]:
     try:
         visitor.visit(tree)
     except RecursionError:
-        # A deeply nested literal can raise RecursionError during the walk after a good parse; report nothing so the
-        # gate survives, compileall still sees the file.
+        # RecursionError on a deep literal: report nothing, compileall still sees the file.
         return []
     return visitor.findings
 

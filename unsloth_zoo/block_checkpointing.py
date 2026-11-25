@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Block gradient checkpointing for diffusers, transformers or plain nn.Module models; every_n_blocks follows
-transformers' every_n_layers (blocks 0, N, 2N); imports only torch."""
+"""Block checkpointing for diffusers, transformers or nn.Module; blocks 0, N, 2N; torch only."""
 
 import contextlib
 import functools

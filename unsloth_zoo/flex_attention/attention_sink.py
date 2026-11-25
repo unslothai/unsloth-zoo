@@ -78,8 +78,7 @@ pass
 def generate_sliding_window_with_sink(window_size: int):
     def sliding_window(batch, head, q_idx, kv_idx):
         causal_mask = (q_idx + 1) >= kv_idx
-        # Official PyTorch attends 1 extra token (windowed_mask q_idx - kv_idx <= window_size); HuggingFace and official
-        # GPT OSS attend only 128 tokens, not 128+1.
+        # Official PyTorch attends 1 extra token; HF and GPT OSS attend only 128, not 128+1.
         windowed_mask = (q_idx + 1) - kv_idx < window_size
         sink_first_column = kv_idx == 0
         return (causal_mask & windowed_mask) | sink_first_column
@@ -110,8 +109,7 @@ def old_flex_attention_with_sink(
     sliding_window = None,
     compile = True,
 ):
-    """One sink token for full/sliding window attention (cf. Efficient Streaming Language Models with Attention Sinks),
-    primarily GPT-OSS; training only, since inference breaks KV cache absolute positioning."""
+    """One sink token; training only, since inference breaks KV cache absolute positioning."""
     if not self_attn.training:
         raise NotImplementedError("Unsloth: This version of flex attention only works for training")
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"

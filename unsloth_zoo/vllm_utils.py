@@ -366,9 +366,8 @@ def _setup_vllm_external_launcher(engine_args, launch_info):
     rank, local_rank, world_size = launch_info
     local_index = _init_torchrun_process_group(launch_info)
     engine_args["distributed_executor_backend"] = "external_launcher"
-    # vLLM needs a seed with external_launcher; offset it per rank as TRL colocate does (seed = process_index // tp),
-    # since GRPO puts copies of one prompt on several ranks and equal engine seeds would sample identical completions
-    # for them.
+    # vLLM needs a seed with external_launcher; offset per rank as TRL colocate does (seed =
+    # process_index // tp), else GRPO prompt copies on several ranks sample identical completions.
     engine_args["seed"] = int(engine_args.get("seed") or 0) + dist.get_rank()
     if local_index is not None and local_index == local_rank:
         local_index = None
@@ -976,9 +975,8 @@ def patch_vllm_enable_sleep_mode():
             discardable = (),
             *args, **kwargs) -> None:
         """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
-        # vLLM >= 0.34 calls sleep(offload_tags, discardable). `discardable` names weight tensors vLLM may drop
-        # instead of backing up; Unsloth never offloads or frees "weights" (they are shared with training), so it
-        # is accepted and has nothing to act on. *args/**kwargs keep later additions from breaking the call.
+        # vLLM >= 0.34 calls sleep() with discardable (weights vLLM may drop); Unsloth never
+        # offloads weights (shared with training), so it's ignored; *args/**kwargs absorb new args.
         if offload_tags is None:
             # by default, allocated tensors are offloaded on sleep
             offload_tags = (MemAllocator.default_tag, )
@@ -1457,8 +1455,7 @@ def vllm_dynamic_quant_supported(
 ) -> bool:
     # All Unsloth Zoo code licensed under LGPLv3
 
-    # Dynamic quants are unsupported when only some modules within a layer are
-    # quantized (not the whole layer).
+    # Dynamic quants are unsupported when only some modules within a layer are quantized.
     if not model_name.lower().endswith("unsloth-bnb-4bit"): return True
     if "quantization_config" not in config: return True
 
@@ -1478,7 +1475,6 @@ def vllm_dynamic_quant_supported(
     find_regex = re.compile(find_regex)
 
     for module in llm_int8_skip_modules:
-        # Could not find parent
         if find_regex.search(module) is None: return False
     return True
 pass
@@ -2984,9 +2980,8 @@ def approximate_vllm_memory_usage(
     full_kv_elements, sliding_kv_elements = _kv_cache_elements_per_token(config)
     memory_left_for_kv_cache = free_memory - bytes_for_model
 
-    # CUDA graph overhead: each graph stores activations for one batch size, so it scales with hidden_size and
-    # num_layers (0.15-0.5 GiB for 1B-8B); ~172 graphs with FULL_AND_PIECEWISE and LoRA (51 sizes x 2 lora + 35 x 2
-    # decode).
+    # CUDA graph overhead: each graph's activations scale with hidden_size and num_layers (0.15-0.5
+    # GiB for 1B-8B); ~172 graphs with FULL_AND_PIECEWISE = 51 sizes x 2 lora + 35 x 2 decode.
     if cuda_graph_overhead:
         num_cuda_graphs = 172
         per_graph_estimate = hd * n_layers * 4  # bytes, rough per-graph activation estimate
@@ -3432,8 +3427,7 @@ def _install_vllm_decompose_size_nodes_fix():
                             f"got {type(dim_val)} for dim {i} of '{node.name}'"
                         )
 
-            # Worklist rewires size-tuple consumers (x.size()[:-1] becomes a derived tuple); getitem leaves are erased
-            # at once, tuple nodes last in reverse push order so children go first.
+            # Worklist: erase getitem leaves now, tuple nodes last so children go first.
             worklist = [(node, dims)]
             to_erase = []
             while worklist:
@@ -3649,9 +3643,8 @@ def _can_link_libcuda() -> bool:
     return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
 
 def _clear_flashinfer_env_on_hip():
-    # AMD ROCm: FlashInfer needs the CUDA nvcc compiler and never applies; forced FlashInfer env vars are removed even
-    # if the package is absent, so vLLM falls back to the default backend; returns True on HIP or NPU so the caller
-    # skips CUDA FlashInfer setup.
+    # ROCm/NPU: FlashInfer needs CUDA nvcc and never applies; forced FlashInfer env vars are removed
+    # even if the package is absent; returns True so the caller skips CUDA FlashInfer setup.
     if not is_hip() and DEVICE_TYPE != "npu":
         return False
     _fi_forced = False
@@ -3671,12 +3664,10 @@ _UNSLOTH_FLASHINFER_ABSENT = object()
 # What `_block_flashinfer_import` evicted from sys.modules, keyed by module name.
 _UNSLOTH_BLOCKED_FLASHINFER_MODULES = {}
 
-# Set by the pre-flight, read when engine args are built: the sys.modules block misses the EngineCore child, which vLLM
-# forces to spawn once CUDA is initialised (Unsloth always has that, so the child starts empty); VLLM_ATTENTION_BACKEND
-# was removed in 0.13.0, leaving the pickled engine arg.
+# Set by the pre-flight, read at engine-arg build: sys.modules block misses the EngineCore child
+# (spawned after CUDA init); VLLM_ATTENTION_BACKEND, removed in 0.13.0, stays in the pickled arg.
 _UNSLOTH_FLASHINFER_UNUSABLE = False
-# Count of built engines still needing the process-wide FlashInfer block; a failed load or dry run must not lift it
-# while a live engine still lazily imports FlashInfer at run time.
+# Engines still importing FlashInfer lazily; a failed load or dry run must not lift the block.
 _UNSLOTH_FLASHINFER_BLOCK_OWNERS = 0
 
 
@@ -3795,15 +3786,9 @@ _ALLOC_CONF_ENV_VARS = (
     "PYTORCH_ALLOC_CONF",
 )
 
-# CuMemAllocator (standby / sleep mode) refuses to start when the caching
-# allocator runs with expandable segments. Both our patched __init__ and the
-# upstream vLLM one raise a deterministic AssertionError; match either wording.
-# This is a configuration failure, never an out of memory condition.
-#
-# The phrases are full ones on purpose. Torch's genuine OOM message *also*
-# mentions expandable segments ("... try setting
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation"), so
-# a bare "expandable_segments" test would mislabel real OOMs the other way.
+# CuMemAllocator (standby / sleep mode) refuses to start with expandable segments: both patched and
+# upstream raise a deterministic AssertionError, a configuration failure, never OOM; match the full
+# phrases, since real OOM text also mentions expandable_segments.
 _EXPANDABLE_SEGMENTS_MARKERS = (
     # unsloth_zoo.vllm_utils.patch_vllm_enable_sleep_mode
     "not supported with expandable segments",
@@ -3950,8 +3935,7 @@ def _patch_vllm_replayssm_gdn():
 
 
 def _normalize_speculative_keys(config):
-    # vLLM's create_speculative_config does the same ("num-speculative-tokens" -> "num_speculative_tokens"; a later
-    # spelling of one key wins, as in vLLM's dict comprehension).
+    # Same as vLLM create_speculative_config: dashes become underscores; a later spelling wins.
     return {str(key).replace("-", "_"): value for key, value in config.items()}
 
 
@@ -4023,8 +4007,7 @@ _SPECULATIVE_CONFIG_ENV = "UNSLOTH_VLLM_SPECULATIVE_CONFIG"
 # target distribution. Others (medusa, mlp_speculator, dflash, dspark, ngram_gpu, custom_class, plugin speculators)
 # are refused rather than passed on unverified.
 _SUPPORTED_SPECULATIVE_METHODS = frozenset(("eagle", "eagle3", "mtp", "ngram", "draft_model", "suffix"))
-# 'synthetic' and 'fly' accept draft tokens the target would reject, so a GRPO rollout would be sampled from another
-# distribution than the target logprobs it reports.
+# synthetic' and 'fly' accept tokens the target rejects, so GRPO logprobs mismatch samples.
 _LOSSLESS_REJECTION_SAMPLE_METHODS = frozenset(("standard", "block"))
 
 
@@ -4120,8 +4103,7 @@ def _speculative_config_has_secret(value, key = None):
 
 
 def _patch_vllm_log_non_default_args():
-    # LLM() logs its non-default engine args verbatim, and vLLM only redacts top-level api_key / hf_token, so a
-    # credential nested in speculative_config (draft loader extra config) would reach the log.
+    # vLLM redacts only top-level api_key/hf_token; nested speculative_config secrets leak.
     try:
         import vllm.entrypoints.llm as llm_module
     except Exception:
@@ -4180,9 +4162,8 @@ _NOT_FOR_INFERENCE_WEIGHTS = frozenset(("training_args.bin", "optimizer.bin", "o
 
 
 def _select_draft_weight_files(files, load_format = "auto", index = None):
-    # The files vLLM's DefaultModelLoader loads, from root-level (name, size) pairs: mistral consolidated*.safetensors
-    # under 'auto' when present, else the first of *.safetensors / *.bin / *.pt that matches, a safetensors index
-    # filtering duplicates. Returns GiB, or None when the format is not the default loader's or a size is unknown.
+    # Returns GiB of DefaultModelLoader's root-level files: consolidated*.safetensors under 'auto'
+    # if present, else first *.safetensors/*.bin/*.pt; None if unsized or non-default format.
     import fnmatch
     files = [(n, b) for n, b in files if "/" not in n and "\\" not in n]
     if load_format in (None, "auto"):
@@ -4230,8 +4211,7 @@ def _same_checkpoint(draft, target):
 
 
 def _speculative_draft_gb(speculative_config, target_model_name, target_revision = None):
-    # GiB of draft weights vLLM loads beside the target: 0 for ngram / suffix and for MTP layers inside the target's
-    # own checkpoint; None when it cannot be sized.
+    # Draft GiB beside the target: 0 for ngram/suffix and in-target MTP; None if unsized.
     method = speculative_config.get("method", None)
     draft = speculative_config.get("model", None)
     if method not in _SPECULATIVE_DRAFT_METHODS: return 0.0
@@ -4443,8 +4423,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         return True
 
     if speculative:
-        # SamplingParams._validate_spec_decode rejects any logit_bias under speculative decoding (vLLM 0.29), so biasing
-        # would fail every request; older V1 only warns and drops it.
+        # vLLM 0.29 rejects logit_bias under spec decoding; older V1 only warns and drops it.
         if _mask_in_model():
             return _record()
         raise RuntimeError(
@@ -4482,8 +4461,7 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         params.logit_bias = merged
         request.sampling_params = params
 
-    # Every request reaches the engine core via client add_request / add_request_async (incl. LLM.generate, n > 1
-    # children, streaming chunks), so biasing there covers all once per request.
+    # Every request reaches add_request / add_request_async, so biasing there covers all once.
     client = getattr(engine, "engine_core", None)
     v1 = client is not None and any(
         getattr(client, name, None) is not None for name in ("add_request", "add_request_async")
@@ -4639,8 +4617,7 @@ def _vllm_fp32_lm_head_overrides(training):
 
 
 def _warn_fp32_lm_head_set_late():
-    # Trainer logprob projectors read UNSLOTH_VLLM_FP32_LM_HEAD as a def-time default (a Dynamo constant); a flag set
-    # after import unsloth reaches vLLM only, so old and new logps disagree.
+    # Trainer reads UNSLOTH_VLLM_FP32_LM_HEAD at def time; setting it late makes logps differ.
     rl = sys.modules.get("unsloth_zoo.rl_replacements")
     if rl is None:
         return False
@@ -4880,8 +4857,7 @@ def _routing_replay_model_runner(engine_args, config = None):
 
 
 def _is_vllm_replayssm_refusal(error_text):
-    # vLLM config validation refuses the combination (e.g. forced Model Runner V2); with speculative decoding, vLLM 0.29
-    # turns ReplaySSM into RecoverSSM, which only Kimi KDA supports.
+    # vLLM 0.29 with speculation turns ReplaySSM into RecoverSSM; only Kimi KDA supports it.
     error_text = str(error_text).lower()
     return "replayssm" in error_text or "recoverssm" in error_text
 
@@ -4895,17 +4871,15 @@ def _is_memory_profiling_race_error(error_text):
 def _is_out_of_memory_error(error_text):
     # A real out of memory condition, as opposed to any text that merely contains alloc or the word memory.
     error_text = str(error_text).lower()
-    # The more specific phrase decides: race text wins over OOM text, and OOM wins over the expandable segments clash
-    # since torch's OOM text only suggests expandable segments; 'Error in memory profiling' can only mean the race,
-    # whatever arithmetic it quotes.
+    # Race text wins over OOM text, and OOM wins over the expandable segments clash (torch's OOM
+    # text only suggests it); 'Error in memory profiling' can only mean the race.
     if _is_memory_profiling_race_error(error_text):
         return False
     return any(marker in error_text for marker in _OUT_OF_MEMORY_MARKERS)
 
 
 def _is_expandable_segments_error(error_text):
-    # Standby mode with expandable_segments:True is a config clash, not an OOM; a real OOM wins because torch's OOM text
-    # suggests expandable segments, so it must not be routed to the config message.
+    # Standby with expandable_segments:True is a config clash; OOM text names it, so OOM wins.
     error_text = str(error_text).lower()
     if _is_out_of_memory_error(error_text):
         return False
@@ -4920,9 +4894,8 @@ def _expandable_segments_env_vars():
 
 
 def _expandable_segments_standby_message(error):
-    # torch reads the allocator config once (at import on 2.10+, else first allocation), so clearing the env var would
-    # not turn expandable segments off; existing segments stay expandable, silencing the guard trades an assertion for a
-    # crash (pytorch/pytorch issue 147851); set it before import unsloth.
+    # torch reads the allocator config at import (2.10+) or first allocation, so set the env var
+    # before import unsloth; silencing the guard risks a crash (pytorch/pytorch issue 147851).
     offenders = _expandable_segments_env_vars()
     if len(offenders) == 0:
         # Not visible in this process (child process env, or already cleared), so all three are named rather than guessed.
@@ -4947,8 +4920,7 @@ def _expandable_segments_standby_message(error):
 
 
 def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = False):
-    # Deliberately no OOM advice: free VRAM went up, so there was no shortage; a smaller model, 4bit weights or lower
-    # gpu_memory_utilization change nothing about an assert comparing two free-memory snapshots.
+    # Free VRAM rose: no shortage or OOM advice; an assert compares two free-memory snapshots.
     attempts = ""
     if trials > 1:
         attempts = f"Unsloth already tried loading {trials} times.\n"
@@ -6731,8 +6703,7 @@ def _vllm_lora_target_names(vllm_model, manager = None, lora_config = None):
         if isinstance(embedding_modules, dict):
             embedding_names.update(embedding_modules.keys())
 
-    # Prefer the manager's own dict: those are the names activate_adapter looks up, so a
-    # module vLLM declined to wrap is correctly absent from it.
+    # Prefer manager's dict (names activate_adapter looks up): unwrapped modules are absent.
     raw_names = list(getattr(manager, "modules", {}) or {})
     if len(raw_names) == 0:
         raw_names = [name for name, module in named_modules
@@ -6740,8 +6711,7 @@ def _vllm_lora_target_names(vllm_model, manager = None, lora_config = None):
 
     names = set()
     for name in raw_names:
-        # Once LoRA is enabled the modules are wrapped, so named_modules reports the
-        # LinearBase at `<module>.base_layer` while adapters name `<module>`.
+        # Once wrapped, named_modules reports `<module>.base_layer`; adapters name `<module>`.
         if name.endswith(".base_layer"): name = name[:-len(".base_layer")]
         names.add(name)
         # q_proj/k_proj/v_proj are one qkv_proj module in vLLM, so the adapter's own name
@@ -7378,8 +7348,7 @@ def _lora_is_sharded(model):
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
-    # Any adapter decides: one left out of FSDP2 (ignored_params) stays plain; slots are cached
-    # once.
+    # Any adapter decides; one left out of FSDP2 ignored_params stays plain; slots cached once.
     if not isinstance(model, torch.nn.Module):
         return any(isinstance(p, DTensor) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n)
     slots = model.__dict__.get("_unsloth_lora_slots")
@@ -7831,8 +7800,7 @@ def _merged_rollout_restore(state):
                 try:
                     exact_unfold(targets, stream = state.stream)
                 except torch.cuda.OutOfMemoryError:
-                    # Raised before the first in-place write (no target restoring): no weight changed, so run it once
-                    # more. A restoring target cannot be retried.
+                    # OOM before any in-place write (no target restoring): safe to retry once.
                     if any(t.restoring for t in targets): raise
                     retry = True
                 if retry:
@@ -8130,8 +8098,7 @@ def _merged_rollout_dispatch(request, llm, call, cache_was_reset):
         return _merged_rollout_call(request, llm, call, cache_was_reset)
     if all(isinstance(x, _MergedLoRARequest) for x in request) and len({id(x.state) for x in request}) == 1:
         return _merged_rollout_call(request[0], llm, call, cache_was_reset)
-    # Mixed per-prompt requests take vLLM LoRA for the adapter prompts and the base for the rest: neither may run on
-    # the fold a scope holds (the adapter delta would apply twice).
+    # No LoRA or base call may run on a scope's held fold; the adapter delta would apply twice.
     _rollout_scope_release_idle(llm)
     real = {}
     for x in request:
@@ -8195,16 +8162,6 @@ pass
 
 @torch.inference_mode
 def load_lora(model, save_directory, load_tensors = False, lora_request_id = None):
-    # vllm_lora_already_loaded(model)
-    # Check internally if model has hot loaded LoRAs
-    # if load_tensors and hasattr(model, "saved_vllm_lora_request"):# vllm_lora_already_loaded(model):
-    #     if not hasattr(model, "model_loras_A"):
-    #         # Prepare vLLM for LoRA direct loading!
-    #         prepare_vllm_lora_loading(model)
-    #     pass
-    #     load_lora_directly(model)
-    #     return model.saved_vllm_lora_request
-    # pass
 
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
@@ -8270,7 +8227,6 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
         state_dict = _pad_lone_moe_expert_lora(model, state_dict)
 
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
-        # Commented-out LoRA warm-up: a generate call on the prompt Hi! with the lora_request.
     else:
         _check_lora_rank_fits(model, save_directory)
         # Same checks on the path branch, read off the checkpoint header.
@@ -8299,7 +8255,6 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     pass
 
     LORA_REQUEST_ID += 1
-    # Commented-out: would set model.vllm_engine.vllm_lora_request to the current LoRA request.
     return lora_request
 pass
 
@@ -8319,8 +8274,7 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
             elif total_memory_gb <= 16: n_batches = llm.approx_max_num_seqs // 5
             elif total_memory_gb <= 24: n_batches = llm.approx_max_num_seqs // 2
             else: n_batches = llm.approx_max_num_seqs
-            # Small engines round to 0. Keep the width on this engine, not the environment,
-            # so another engine in the same process sizes its own.
+            # Small engines round to 0; keep the width on the engine, not the environment.
             n_batches = max(n_batches, 1)
             try: llm._unsloth_batches = n_batches
             except Exception: pass
@@ -8357,7 +8311,6 @@ def delete_vllm(llm = None):
         destroy_model_parallel,
         destroy_distributed_environment,
     )
-    # Delete the llm object and free the memory
     destroy_model_parallel()
     destroy_distributed_environment()
     if llm is not None:

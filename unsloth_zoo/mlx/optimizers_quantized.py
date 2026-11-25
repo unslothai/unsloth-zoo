@@ -173,8 +173,7 @@ def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE
 def announce_quantized_optimizer(
     optimizer_name, group_size = DEFAULT_GROUP_SIZE, enabled = True,
 ):
-    """Prints the routing line once per process, returning whether it printed; _build_optimizer runs per run and rank,
-    so an unguarded print repeats per rank and notebook re-run."""
+    """Prints once per process, returns whether it did; _build_optimizer runs per run and rank."""
     if not enabled or optimizer_name in _ANNOUNCED:
         return False
     _ANNOUNCED.add(optimizer_name)
@@ -183,9 +182,8 @@ def announce_quantized_optimizer(
 
 
 def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFAULT_BITS):
-    """Dequantizes packed first moments so a quantized checkpoint loads into plain optim.Adam/AdamW (else b1 * m on a
-    list raises TypeError); applies the v == 0 mask as apply_single does, since carried residue would move inactive
-    coordinates."""
+    """Dequantizes packed first moments so a quantized checkpoint loads into plain optim.Adam/AdamW
+    (b1 * m fails on a list); applies v == 0 mask, since residue moves inactive coordinates."""
     if isinstance(state, dict):
         out = {}
         for key, value in state.items():

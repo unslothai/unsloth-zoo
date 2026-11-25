@@ -412,8 +412,7 @@ def _compile_layers(model):
 
 
 def _is_control_flow(error):
-    """Exceptions torch raises on purpose through a layer call: non-reentrant checkpointing stops a recomputation
-    early with _StopRecomputationError once it has every saved tensor."""
+    """Deliberate torch exception: _StopRecomputationError ends non-reentrant recompute early."""
     import torch.utils.checkpoint as checkpoint
     stop = getattr(checkpoint, "_StopRecomputationError", None)
     return stop is not None and isinstance(error, stop)
@@ -1011,8 +1010,7 @@ class FastCPUModel:
     @staticmethod
     def _prepare(model, use_gradient_checkpointing):
         if use_gradient_checkpointing in (True, "unsloth") and not _non_reentrant_checkpointing_on(model):
-            # "unsloth" offloads activations to host RAM on GPUs; on CPU they already live there,
-            # so it is plain recomputation.
+            # unsloth" offloads activations to RAM on GPU; on CPU it is plain recomputation.
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
@@ -1389,8 +1387,7 @@ _SAFETENSORS_DTYPES = {
 
 
 def _safetensors_dtype_rank():
-    """safetensors' save_file lays tensors out by dtype (its own order, widest first) then name: read that order from
-    the installed safetensors so the streamed file is byte-identical to save_file's."""
+    """Reads save_file's dtype-then-name order live, so streamed output is byte-identical."""
     import json
     import struct
     try:
@@ -1405,9 +1402,8 @@ def _safetensors_dtype_rank():
 
 
 def _write_safetensors(path, entries, rank = None):
-    """A safetensors file written one tensor at a time: the header comes from shapes / dtypes, then each tensor is
-    made, written and dropped, so at most one merged tensor is alive (safetensors' save_file holds the whole file as
-    bytes). Same layout as save_file (metadata first, dtype then name order). Returns the payload size in bytes."""
+    """Streams safetensors one tensor at a time, header from shapes/dtypes, unlike save_file's
+    whole-file buffer; same layout (dtype, then name); returns payload bytes."""
     import json
     import struct
     rank = rank or _safetensors_dtype_rank()

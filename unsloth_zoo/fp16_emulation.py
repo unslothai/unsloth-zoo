@@ -44,8 +44,7 @@ _HAS_OUT_DTYPE = None
 
 
 def _has_out_dtype() -> bool:
-    """torch.mm out_dtype needs torch 2.8+; probed on CUDA only, since aten::mm.dtype is CUDA-only and a CPU
-    NotImplementedError, a RuntimeError, would be cached as False forever."""
+    """Needs torch 2.8+; CUDA-only probe (aten::mm.dtype) since a CPU error would cache False."""
     global _HAS_OUT_DTYPE
     if _HAS_OUT_DTYPE is None:
         if not torch.cuda.is_available():
@@ -131,9 +130,8 @@ _SPLIT_RANGE_LIMIT = 2.0 ** 28
 
 
 def _split_can_represent(x: torch.Tensor) -> bool:
-    """Whether one per-tensor scale can carry this operand: False for non-finite entries (residual inf - inf gives NaN)
-    or a within-tensor range wider than the split window; always True under torch.compile, where host reads break the
-    graph."""
+    """Per-tensor scale can carry the operand: False for non-finite entries (inf - inf = NaN) or a
+    range wider than the split window; True under torch.compile (host reads break graph)."""
     if torch.compiler.is_compiling():
         return True
     absx = x.abs()
@@ -154,9 +152,8 @@ def fp16_split_mm(
     products: int = 3,
     scale: bool = True,
 ) -> torch.Tensor:
-    """Split-term float32 matmul returning float32; products keeps the most significant cross terms (2-term split: 3
-    products drop lo*lo); on float16, scale must stay True for tensors with magnitudes below 0.125 (nearly all LLM
-    weights)."""
+    """Split-term matmul returning float32; products keeps top cross terms (2-term split: 3 products
+    drop lo*lo); on float16 scale must stay True for magnitudes below 0.125 (~all LLM weights)."""
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError(f"fp16_split_mm expects 2D operands, got {A.shape} and {B.shape}")
     if terms < 1 or products < 1:
@@ -190,8 +187,7 @@ def fp16_split_mm(
 
 
 class _FP16SplitMatmul(torch.autograd.Function):
-    """Autograd wrapper so the emulation stands in for a float32 matmul in training; both input gradients are emulated
-    the same way, keeping backward at forward accuracy."""
+    """Autograd wrapper; both input grads are emulated, so backward keeps forward accuracy."""
     @staticmethod
     def forward(ctx, A, B, dtype, terms, products, scale):
         ctx.save_for_backward(A, B)

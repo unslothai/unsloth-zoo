@@ -143,8 +143,7 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
 
 
 def token_average_scale(trainer, num_items_in_batch):
-    """Scale Trainer.compute_loss applies to a loss when num_items_in_batch counts tokens across ranks (DDP's gradient
-    mean cancels it); compute_loss overrides must match."""
+    """Scale if ranks count tokens (DDP's mean cancels it); compute_loss overrides must match."""
     args = trainer.args
     if num_items_in_batch is None or not getattr(args, "average_tokens_across_devices", False):
         return 1

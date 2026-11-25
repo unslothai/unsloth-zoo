@@ -220,8 +220,7 @@ def copy_attributes(original_model, new_model):
                 original_val = getattr(original_module, attr)
 
                 if attr in buffer_names and attr != "layer_scalar":
-                    # gemma3 etc. keep embed_scale and position_ids as buffers, so copy such buffers from the original,
-                    # moved to the new model's device, to avoid inconsistencies.
+                    # gemma3 buffers (embed_scale, position_ids) are copied to the new device.
                     setattr(module, attr, original_val.to(new_model.device))
                 elif is_comparable(original_val):
                     setattr(module, attr, original_val)
@@ -286,9 +285,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype}
     original_meta_model = None
     error = None
-    # include_buffers=False is required: buffers (e.g. Gemma 3's embed_scale,
-    # position_ids) need real values, not empty meta tensors, or attribute
-    # access fails during inference.
+    # include_buffers=False is required: buffers (e.g. Gemma 3's embed_scale, position_ids) need
+    # real values, not empty meta tensors, or attribute access fails during inference.
     with init_empty_weights(include_buffers = False):
         if model_name is not None and not using_text_subconfig:
             try:
@@ -328,14 +326,12 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         "linear_conv_kernel_dim": 1,
     })
 
-    # Set attention module head_dim
     head_dim = _global_config_value(
         causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads,
     )
     new_config.update({"head_dim" : head_dim})
 
-    # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
-    # for the 43+ architectures that set it False (GptOss, Mamba, Bloom, GPT-J...).
+    # eager, not sdpa: from_config raises ValueError for 43+ archs with _supports_sdpa False.
     new_model = AutoModelForCausalLM.from_config(
         new_config,
         attn_implementation = "eager",
@@ -781,8 +777,7 @@ def _is_known_architecture(architecture):
 pass
 
 
-# Matches `blocks[0]` or `blocks[0][1]`: a name without brackets (not limited to ASCII identifiers, since PyTorch allows
-# Unicode submodule names) plus digit-only subscripts; the name goes to getattr.
+# Matches blocks[0] or blocks[0][1]: a bracket-free name (any Unicode) plus digit subscripts.
 _INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
 _INDEX = re.compile(r"\[(\d+)\]")
 

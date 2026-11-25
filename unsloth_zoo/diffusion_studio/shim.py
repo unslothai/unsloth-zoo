@@ -102,8 +102,7 @@ async def _bind_to_local_caller(request, call_next):
     (which is what breaks rebinding), and an Origin or Referer, when the caller
     sends one at all, must be local. An ordinary OpenAI client sends neither.
     """
-    # The Host check applies only when the server binds loopback; a deliberate --host 0.0.0.0 publishes the listener, so
-    # any Host name it is reached by is accepted.
+    # Host check only when binding loopback; a deliberate --host 0.0.0.0 accepts any Host name.
     if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and \
         not _is_local_name(_hostname_of("//" + (request.headers.get("host") or ""))):
         return JSONResponse({"error": "forbidden host"}, status_code = 403)

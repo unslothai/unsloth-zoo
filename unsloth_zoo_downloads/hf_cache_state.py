@@ -109,8 +109,7 @@ def blob_bytes_present(path: Path) -> int:
     st = path.stat()
     blocks = getattr(st, "st_blocks", None)
     if blocks is not None:
-        # Trust st_blocks even at 0: a truncated sparse .incomplete reports full st_size with 0 blocks and must read as
-        # 0 bytes; a > 0 guard would fall through to st_size.
+        # Trust st_blocks at 0: sparse .incomplete is 0 bytes, not st_size; a > 0 guard fails.
         return min(blocks * 512, st.st_size)
     if sys.platform == "win32":
         allocated = _windows_allocated_size(path)
@@ -224,8 +223,7 @@ def _is_canonical_weight_shard_index(name: str) -> bool:
     return name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
 
 
-# Exact canonical or single-variant component shard index (one variant token); rejects stale sidecars like
-# diffusion_pytorch_model.safetensors.index.fp16.extra.json; keeps the base for the probe.
+# Only canonical or single-variant shard indexes; stale extra-variant sidecars are rejected.
 _COMPONENT_SHARD_INDEX_RE = re.compile(
     r"^(?P<base>diffusion_pytorch_model|model|pytorch_model)\.(?P<ext>safetensors|bin)"
     r"\.index(?:\.(?P<variant>[^.]+))?\.json$"
@@ -372,8 +370,7 @@ def snapshot_has_requested_broken_symlinks(
     ignore_patterns: "Optional[object]" = None,
     repo_type: "Optional[str]" = "model",
 ) -> bool:
-    """True iff a dangling symlink is for a file the request selects, so a dangling root model.safetensors does not fail
-    a weightless allow=['config.json'] request; repo_type is kept for compatibility."""
+    """True iff a dangling symlink is for a selected file; repo_type kept for compatibility."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     broken = _broken_symlink_rel_paths(snapshot_dir)
@@ -399,8 +396,7 @@ def _ignore_strips_all_weights(ignore_patterns: "list") -> bool:
     return True
 
 
-# Representative weight names a glob allow pattern is probed against; a glob matching none (tokenizer*, *.json) is
-# weightless; covers variant, sharded, adapter, diffusers and .bin forms.
+# A glob allow pattern matching no representative weight name (e.g. tokenizer*) is weightless.
 _WEIGHT_PATTERN_PROBES = (
     "model.safetensors",
     "model.fp16.safetensors",
@@ -434,9 +430,7 @@ _NON_WEIGHT_DIRS = frozenset({
 
 
 def _pattern_can_select_weight(pattern: "object") -> bool:
-    """Whether one allow pattern can select a weight: weight suffixes and non-metadata dirs count, globs only if they
-    match a _WEIGHT_PATTERN_PROBES name, concrete non-weight names do not; a false weight-bearing only spawns the
-    child."""
+    """Whether one allow pattern can select a weight; erring toward True only spawns the child process."""
     if not isinstance(pattern, str):
         return True
     if pattern.endswith("/"):
@@ -458,8 +452,7 @@ def _pattern_can_select_weight(pattern: "object") -> bool:
 def request_can_include_weights(
     allow_patterns: "Optional[object]" = None, ignore_patterns: "Optional[object]" = None
 ) -> bool:
-    """Whether an allow/ignore-restricted request can still include a weight; conservative, so False only for a clearly
-    weightless request (tokenizer/config allow, or ignore stripping all weights)."""
+    """Conservative: False only when clearly weightless (e.g. tokenizer/config allow)."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     if allow_patterns is None and ignore_patterns is None:
@@ -490,9 +483,8 @@ def _canonical_root_weights_complete(
     snapshot_dir: Path, entries: list, ignore_patterns: "Optional[list]" = None,
     *, prefer_safetensors: bool = False,
 ) -> bool:
-    """True iff the root holds a complete canonical weight set (single file or full index) in formats not ignored;
-    strict prefer_safetensors rejects bin-only unless safetensors is ignored (else the load fetches over Xet); the
-    lenient POST path accepts a finished bin-only repo."""
+    """True iff the root has a complete canonical weight set; strict prefer_safetensors rejects
+    bin-only unless safetensors is ignored."""
     root_files: set = set()
     root_indices: list = []
     for entry in entries:
@@ -634,8 +626,7 @@ def _has_incomplete_canonical_root_shards(
         names = [entry.name for entry in snapshot_dir.iterdir()]
     except OSError:
         return False
-    # Shard evidence is a numbered shard file or canonical shard index; an index-only partial (no shards yet) is still
-    # incomplete, caught before any shard exists.
+    # Index-only partial (no shards yet) is incomplete, caught before any shard exists.
     has_shard_evidence = (
         any(_CANONICAL_ROOT_SHARD_RE.match(name) for name in names)
         or any(_is_canonical_weight_shard_index(name) for name in names)
@@ -648,9 +639,8 @@ def _has_incomplete_canonical_root_shards(
 def _has_incomplete_variant_root_shards(
     snapshot_dir: Path, variant: str, *, ignore_patterns: "Optional[object]" = None
 ) -> bool:
-    """True when the root variant weight the load reads is an incomplete shard set (partial index, or shards with no
-    index); safetensors is checked before bin; only root model variants count, so a stale adapter_model set cannot
-    force-fail it."""
+    """True when the root variant weight the load reads is an incomplete shard set (partial index,
+    or shards with no index); safetensors checked before bin; stale adapter_model set ignored."""
     dot_infix = f".{variant}."     # variant index or single file
     dash_infix = f".{variant}-"    # a sharded variant weight (model.<variant>-00001-of-00002.safetensors)
     ignore_patterns = _as_pattern_list(ignore_patterns)
@@ -665,8 +655,7 @@ def _has_incomplete_variant_root_shards(
     has_single_st = has_single_bin = False
     for entry in entries:
         name = entry.name
-        # Only the ROOT model index counts: a non-model variant index (e.g. adapter_model) the default load does not
-        # read is skipped so it cannot fail the model variant.
+        # Only the ROOT model index counts; an unread non-model variant index cannot fail it.
         if dot_infix in name and _ROOT_MODEL_SHARD_INDEX_RE.match(name):
             probe = _index_weight_probe(name, variant)
             if not _read_format_kept(probe, ignore_patterns):
@@ -712,8 +701,7 @@ _ROOT_MODEL_SHARD_INDEX_RE = re.compile(
     r"^(?:model\.safetensors|pytorch_model\.bin)\.index(?:\.[^.]+)?\.json$"
 )
 
-# Root model variant weight, single or sharded (model.fp16.safetensors, pytorch_model.fp16-00001-of-00002.bin); excludes
-# PEFT adapters the variant load does not read.
+# Root model variant weight, single or sharded; PEFT adapters are excluded.
 _ROOT_MODEL_VARIANT_WEIGHT_RE = re.compile(
     r"^(?:model|pytorch_model)\.[^.]+(?:-\d{5}-of-\d{5})?\.(?:safetensors|bin)$"
 )
@@ -728,8 +716,7 @@ def _index_variant_token(name: str) -> "Optional[str]":
 
 
 def _index_shard_rel_paths(index_path: Path, dir_rel: str) -> "Optional[list]":
-    """Snapshot-relative paths of the shards an index lists, joined under dir_rel so the request filter sees repo paths;
-    None if unreadable or malformed (fail closed)."""
+    """Shard paths an index lists, joined under dir_rel; None if malformed (fail closed)."""
     import json
 
     try:
@@ -782,24 +769,13 @@ def _selected_shard_index_incomplete(
     snapshot_dir: Path, *, allow_patterns: "Optional[object]", ignore_patterns: "Optional[object]",
     variant: "Optional[str]",
 ) -> bool:
-    """True when a weight-shard INDEX the load READS -- a sharded ADAPTER or a component SUBFOLDER set not
-    covered by the canonical / variant ROOT-model checks -- lists an absent shard (or is malformed).
-    Scoped to the request so a complete download is never false-rejected:
-
-    - variant: a variant load reads only variant indices; a plain load only canonical ones.
-    - allow / ignore: an index is read only when its listed shards survive the request filter.
-    - precedence: safetensors read before bin, so when both are selected only the safetensors set's
-      completeness is required.
-
-    Also rejects a SELECTED numbered shard FILE whose directory has NO index of the read format: the load
-    enumerates a sharded weight through its index, so a shard set without one is incomplete and would
-    fetch the index + remaining shards over Xet. The ROOT canonical / variant MODEL shard set is skipped
-    (the root-shard checks own it)."""
+    """True when a READ non-root index (sharded adapter or component subfolder) lists an absent or
+    malformed shard, or a selected numbered shard has no index; root model shards skipped;
+    variant, allow/ignore and safetensors-before-bin scoping apply."""
     allow_patterns = _as_pattern_list(allow_patterns)
     ignore_patterns = _as_pattern_list(ignore_patterns)
     want_variant = variant or None
-    # Canonical single-weight bases whose file beats a stale same-dir shard index; includes adapter_model so a PEFT
-    # adapter file is not rejected by a stale adapter index.
+    # Canonical single-weight bases (incl. adapter_model) beat a stale same-dir shard index.
     _canon = r"(?:diffusion_pytorch_model|model|pytorch_model|adapter_model)"
     if want_variant is None:
         shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
@@ -852,8 +828,7 @@ def _selected_shard_index_incomplete(
                 continue
             ckpt_dirs = [p for p in rel.split("/")[:-1] if _CHECKPOINT_DIR_RE.match(p)]
             if ckpt_dirs and not _request_scopes_into_dir(allow_patterns, ckpt_dirs[0]):
-                # Skips a leftover checkpoint subtree the request does not target; an explicit load
-                # (allow=['checkpoint-N/*']) does read it, so that set is checked.
+                # Skips leftover checkpoint subtrees unless the request allow scopes into one.
                 continue
             if not _filter_paths([rel], allow_patterns, ignore_patterns):
                 continue  # the load does not read this shard (out of scope / ignored format)
@@ -916,15 +891,13 @@ def _diffusers_declared_component_specs(snapshot_dir: Path) -> "Optional[dict]":
 
 
 def _diffusers_declared_components(snapshot_dir: Path) -> "Optional[set]":
-    """Component subfolders declared in model_index.json, so stale undeclared subtrees cannot force-fail a download;
-    None (check all subfolders) when absent or malformed."""
+    """Declared subfolders only (stale undeclared ones cannot fail); None means check all."""
     specs = _diffusers_declared_component_specs(snapshot_dir)
     return set(specs) if specs else None
 
 
 def _diffusers_active_components(snapshot_dir: Path) -> "Optional[set]":
-    """Active components: declared [library, class] pairs with both non-null, so disabled [null, null] components like
-    safety_checker are skipped; None (fail open) if absent or malformed."""
+    """Active components (non-null [library, class]); None (fail open) if absent or malformed."""
     specs = _diffusers_declared_component_specs(snapshot_dir)
     if not specs:
         return None
@@ -943,8 +916,7 @@ def _diffusers_component_shards_incomplete(
     shard, or a numbered shard with no index; root and checkpoint dirs skipped."""
     want_variant = variant or None
     ignore_patterns = _as_pattern_list(ignore_patterns)
-    # Only ACTIVE components count: a disabled [null, null] component (safety_checker) is not loaded, so its stale
-    # incomplete index must not raise DownloadStallError.
+    # Active components count: disabled ones' stale index cannot raise DownloadStallError.
     declared = _diffusers_active_components(snapshot_dir)
     if want_variant is None:
         shard_file_re = re.compile(r"^[^.]+-\d{5}-of-\d{5}\.(?:safetensors|bin)$")
@@ -988,8 +960,7 @@ def _diffusers_component_shards_incomplete(
             index_fmts.setdefault(dir_rel, set()).add(fmt)
             shard_rels = _index_shard_rel_paths(entry, dir_rel)
             if shard_rels is None:
-                # A malformed index defers only if its format is read (a shard survives the ignore filter); an ignored
-                # format's stale index must not force a retry.
+                # Malformed index defers only if its format is read (not ignored).
                 probe = _index_shard_probe(name, dir_rel)
                 if probe is None or _filter_paths([probe], None, ignore_patterns):
                     return True
@@ -1001,8 +972,7 @@ def _diffusers_component_shards_incomplete(
             fmt = "safetensors" if name.endswith(".safetensors") else "bin"
             shard_fmts.setdefault(dir_rel, set()).add(fmt)
         elif single_file_re.match(name) and _filter_paths([rel], None, ignore_patterns):
-            # A single canonical component weight is read before a same-format shard index in the same dir, so a stale
-            # co-resident index must not reject the component.
+            # A single canonical component weight beats a same-format shard index in its dir.
             fmt = "safetensors" if name.endswith(".safetensors") else "bin"
             single_fmts.setdefault(dir_rel, set()).add(fmt)
     for dir_rel, by_fmt in per_dir.items():
@@ -1085,8 +1055,7 @@ def _repo_dir_has_broken_snapshot_symlinks(repo_dir: Path) -> bool:
 
 
 def _case_safe_repo_cache_dirs(root: Path, repo_type: Optional[str], repo_id: str) -> list:
-    """Hub case-folds cache dir names: prefer exact case, accept a folded match only on a case-insensitive fs, and
-    attribute nothing on a collision so no other repo is purged."""
+    """Exact case first; fold-match only on case-insensitive fs; a collision purges nothing."""
     target = repo_cache_dir_name(repo_type, repo_id)
     folded_target = target.lower()
     try:

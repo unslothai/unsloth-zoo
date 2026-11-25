@@ -86,9 +86,8 @@ REPLAY_STATS = {"runs": 0, "compressor_lora": 0}
 
 
 def prepare_compiled_checkpoint():
-    """Set specialize_float so checkpoint recompute saves the same tensors as forward (unspecialized
-    floats reorder LoRA saves); set once at load before anything compiles, since Dynamo guards
-    config and per-call toggling recompiles"""
+    """Sets specialize_float so checkpoint recompute saves forward's tensors (unspecialized floats
+    reorder LoRA saves); set once at load before compiling, as Dynamo guards config."""
     dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
     if dynamo_config is None or not hasattr(dynamo_config, "specialize_float"):
         return False
@@ -276,9 +275,8 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_fake_quant_ste)
 
 
-# Grouped LoRA for o_a_proj (when unsloth grouped LoRA is not registered): A [r,in_g], B
-# [G*out_g,r], delta=B@A keeps base shape; group g rows of B act on group g input; plain PEFT
-# B(A(x)) is [..,G,G*out_g], cannot add
+# Grouped LoRA for o_a_proj (if unsloth's is absent): A [r,in_g], B [G*out_g,r], delta=B@A keeps
+# base shape; group g rows of B act on group g input; PEFT B(A(x)) is [..,G,G*out_g], cannot add.
 _GROUPED_LORA_CLS = None
 
 
@@ -427,8 +425,7 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_moe)
 
 
-# 4. `num_experts`: the text config names its routed experts `n_routed_experts` (aliased only as `num_local_experts`),
-#    while TRL's MoE load-balancing path (and other MoE helpers) read `config.num_experts`.
+# Config has n_routed_experts (alias num_local_experts) but TRL's MoE helpers read num_experts.
 def patch_deepseek_v41_config_aliases():
     modeling = _modeling()
     if modeling is None:
@@ -449,9 +446,8 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_config_aliases)
 
 
-# Pooled (ratio > 1) compressor reads .weight, so LoRA on kv_proj/gate_proj is skipped; the decoder
-# layer swaps in merged W + scaling*B@A views (fp32, no LoRA dropout), since the compiled cache
-# replaces the compressor and attention classes
+# Pooled (ratio > 1) compressor reads .weight, skipping LoRA on kv_proj/gate_proj; decoder layer
+# swaps in merged W+scaling*B@A views (fp32, no LoRA dropout) as compiled cache replaces classes.
 class _MergedLoraWeight:
     __slots__ = ("module",)
 
@@ -611,8 +607,7 @@ def _frozen_engram(modeling, key, emb):
 
 
 def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_size = 32, dtype = None):
-    """Parameter-free engram table for the native DeepSeek-V4.1, so sharding, meta init, optimizers and DCP never see
-    it. The frozen table load hook binds it to the checkpoint after ``from_pretrained``."""
+    """Parameter-free, so sharding, meta init, optimizers and DCP never see it; bound at load."""
     import types
     from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
     if not install_frozen_table_load_hook():

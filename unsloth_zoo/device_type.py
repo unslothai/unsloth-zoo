@@ -454,9 +454,8 @@ def get_amd_flash_attn_func(device = None):
         import aiter as _aiter
         if hasattr(_aiter, "flash_attn_func"):
             return _aiter.flash_attn_func
-        # FlashAttnFunc.apply() needs 13+ positional args (ROCm/aiter:aiter/ops/mha.py), so it cannot be wrapped safely
-        # without the defaults for the installed aiter; return None to fall back to SDPA; aiter >= 0.7 should expose
-        # flash_attn_func.
+        # FlashAttnFunc.apply() needs 13+ positional args, so wrapping is unsafe without aiter's
+        # defaults; return None to fall back to SDPA; aiter >= 0.7 should expose flash_attn_func.
     except Exception:
         pass
     return None
@@ -546,8 +545,7 @@ def get_device_type():
     if _IS_MLX:
         return "mlx"
     if _GPU_INIT_SKIPPED:
-        # Checked before the hardware probes: __init__.py publishes cpu unconditionally, so checking only in the
-        # no-accelerator fallback left a CUDA host with both.
+        # Check before probes: __init__.py always publishes cpu, so a CUDA host reports both.
         return "cpu"
     if cpu_backend_forced():
         return "cpu"
@@ -581,8 +579,7 @@ def get_device_type():
     other = None
     if hasattr(torch, "accelerator") and torch.accelerator.is_available():
         other = str(torch.accelerator.current_accelerator())
-    # An active accelerator Unsloth does not drive (hpu, mtia, ...) keeps its error instead of training on CPU; a Mac
-    # without MLX (mps) is the exception, where CPU is supported.
+    # Other accelerators (hpu, mtia, ...) keep their error, not CPU; mps without MLX is exempt.
     if fallback == "cpu" and other not in (None, "mps"):
         fallback = None
     if fallback is not None:

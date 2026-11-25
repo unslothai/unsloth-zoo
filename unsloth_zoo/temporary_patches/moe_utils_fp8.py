@@ -410,8 +410,7 @@ def _fp4_dequant_whole_stack(packed_u8, scale_f, values, target_dtype):
     return (pairs * scale_f.unsqueeze(-1)).to(target_dtype).view(E, M, 2 * K_packed)
 
 
-# dynamic=False: automatic-dynamic ran slower than eager; past dynamo's recompile limit the unchunked body would run
-# eagerly (GBs of indices), so shapes are capped and each device keeps its own copy.
+# dynamic=False (automatic-dynamic was slower); shapes capped per device to bound recompiles.
 _FP4_COMPILED = {}
 _FP4_COMPILED_SHAPES = {}
 _FP4_COMPILED_MAX_SHAPES = 6
@@ -819,9 +818,8 @@ def _slice_fp8_linear_quant_state(experts_module, param_name: str, expert_idx: i
 
 
 def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights):
-    # Last-resort FP8 path (no scaled_grouped_mm, dequant returned None) ignores the LoRA stash from
-    # patch_param_wrapper_for_moe, so it refuses rather than train silently without the adapter;
-    # _patched_param_wrapper_forward must not reroute quantized params to PEFT.
+    # Last-resort FP8 path (dequant returned None) ignores the LoRA stash, so it refuses rather than
+    # train silently; _patched_param_wrapper_forward must not reroute quantized params to PEFT
     from .moe_utils import take_moe_lora_stash
     if (
         take_moe_lora_stash(self, "gate_up_proj") is not None
@@ -1214,15 +1212,13 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 
 
 # ============================================================================
-# Save-side hooks dequant base FP8 weights before LoRA merge and requant after; saving_utils.py consults
-# _MOE_QUANT_HANDLERS per expert weight key, keeping FP8 plumbing local to this file.
+# Save hooks dequant FP8 bases before LoRA merge and requant after; see _MOE_QUANT_HANDLERS.
 # ============================================================================
 
 # FP8 e4m3 max representable magnitude; matches transformers' Fp8Quantize.convert (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
 _FP8_E4M3_MAX = 448.0
 
-# Sentinel a handler returns when it identifies its quant kind but cannot safely apply a LoRA merge (e.g. missing
-# companion scale); saving_utils.py then skips the expert and records a fallback.
+# Sentinel for a known quant kind with unsafe LoRA merge: expert skipped, fallback recorded.
 _MOE_QUANT_UNSAFE = object()
 
 
@@ -1318,8 +1314,7 @@ def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
     """
     dtype_str = header_metadata.get(weight_key, {}).get("dtype")
     _e5m2 = getattr(torch, "float8_e5m2", None)
-    # e5m2 is FP8 but this requant path only encodes e4m3, so it refuses (UNSAFE) and the merge is skipped and logged
-    # rather than writing raw FP8 back with a stale scale.
+    # e5m2 is FP8, but requant encodes only e4m3: skip merge rather than write stale raw FP8.
     if dtype_str == "F8_E5M2":
         return _MOE_QUANT_UNSAFE, None
     # Cheap probe: skip non-FP8 keys without paying for a tensor read.
@@ -1391,8 +1386,7 @@ def apply_moe_quant_load(file, header_metadata, key, block_size = None):
 # ============================================================================
 # Hook FP8 experts dispatch + relax HF Trainer FP8 guard
 # ============================================================================
-# transformers swaps in FP8Experts for FP8 checkpoints, so per-arch patches of Qwen3MoeExperts never reach it; override
-# the FP8 experts registry so every forward uses forward_moe_backend_fp8.
+# Per-arch patches miss FP8Experts; override registry so forwards use forward_moe_backend_fp8.
 
 from .common import (
     TEMPORARY_PATCHES,

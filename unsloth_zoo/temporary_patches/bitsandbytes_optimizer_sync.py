@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skips bitsandbytes' per-parameter sync in non-paged steps (the legacy default stream already orders them; the sync
-only blocks the host); paged, non-CUDA and side-stream params keep it; unknown step shapes are left alone;
-UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores the original step."""
+"""Skips bitsandbytes per-param sync when the legacy default stream orders steps; paged, non-CUDA,
+side-stream and unknown-shape cases keep it; UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores it."""
 
 import ast
 import inspect

@@ -54,13 +54,11 @@ def _longest_common_sublist(lists):
         """Return (exists, sublist) for a common sublist of `length`."""
         common = set()
         first = lists[0]
-        # All sublists of `length` from the first list
         for i in range(len(first) - length + 1):
             sub = tuple(first[i:i + length])
             common.add(sub)
         pass
 
-        # Keep only sublists also present in every remaining list
         for lst in lists[1:]:
             current = set()
             for i in range(len(lst) - length + 1):
@@ -144,17 +142,15 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
-    # substring == [0] may just be the original single token.
-    # Fixes https://github.com/unslothai/unsloth/issues/1290
-    # Mistral [INST] [/INST] singular tokens break since we output [0] but need [3] [4].
+    # substring == [0] may be the original single token (Mistral [INST] [/INST] outputs [0] but
+    # needs [3] [4]); fixes https://github.com/unslothai/unsloth/issues/1290.
     if substring == [0] and len(all_input_ids[0]) == 1:
         single_token = all_input_ids[0][0]
         if all(single_token in x for x in all_input_ids):
             substring = [single_token]
     pass
 
-    # If substring is original input_ids + [0], keep the original. Happens when
-    # the chat template uses no newlines/spaces (e.g. Phi-4).
+    # Keep original when substring is input_ids + [0]: no newlines/spaces in template (Phi-4).
     if (len(set(str(x) for x in all_input_ids)) == 1) and \
         (len(all_input_ids[0]) + 1 == len(substring)) and \
         (all_input_ids[0] == substring[:-1]):
@@ -162,10 +158,9 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         substring = all_input_ids[0]
     pass
 
-    # Recover optional left/right tokens around the matched core. `substring` carries
-    # an appended [0] sentinel, so it need not be a sublist of `original`; track the
-    # match index explicitly rather than letting the loop fall through (which sliced
-    # at the last index, or left `j` unbound on an empty tokenization).
+    # Recover optional left/right tokens around the matched core; substring carries an appended [0]
+    # sentinel, so may not be a sublist of original: track the match index explicitly, not by loop
+    # fall-through (which sliced the last index or left j unbound on empty tokenization).
     original = _without_dummy_prefix(tokenizer(component, add_special_tokens = False).input_ids, component, tokenizer)
     where = -1
     for j in range(len(original)):
@@ -173,15 +168,10 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
             where = j
             break
     if where == -1:
-        # The core was never located in the component's own tokenization, so it was
-        # never verified against real tokenizer output. It can be the bare [0]
-        # sentinel, or a real token with that sentinel glued on (Phi-3 gives
-        # [32010, 0] for a marker that tokenizes to [32010]). Returning it either
-        # makes A_first == 0 and matches every <unk>/<pad>/"!" in the corpus, or
-        # matches nothing and masks the whole dataset. Report no core instead, which
-        # both empty-core guards downstream already handle. Only force_match = False
-        # gets here: with force_match = True the core is the component's own
-        # tokenization, so it is always located at index 0.
+        # Core not located in the component's own tokenization is unverified: the bare [0] sentinel,
+        # or a token with it glued (Phi-3 [32010, 0]); returning it sets A_first == 0 and matches
+        # every <unk>/<pad>, or masks all data, so report no core (both empty-core guards handle
+        # it).
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
@@ -540,8 +530,7 @@ def _labels_are_token_level(dataset, sample):
     # No usable features: an in-memory dict-of-lists, or an IterableDataset.
     value = sample.get("labels") if isinstance(sample, dict) else None
     if value is None:
-        # Scan for the first non-null row, capped so a streaming or huge split
-        # is not walked end to end for a column verdict.
+        # Scan for a non-null row, capped so a streaming or huge split is not walked whole.
         try:
             for i, row in enumerate(dataset):
                 if i >= 100: break
@@ -550,8 +539,7 @@ def _labels_are_token_level(dataset, sample):
                 if value is not None: break
         except Exception: value = None
     if value is None: return None
-    # A string/bytes `labels` is a class NAME, not tokens; it can never be
-    # supervision, so it goes with the other raw columns.
+    # A string/bytes labels value is a class name, never supervision; treat it as a raw column.
     if isinstance(value, (str, bytes)): return False
     try:
         len(value)
@@ -646,9 +634,8 @@ def _keep_media_columns(trainer, keys):
         pass
 
 
-# Every suffix a missing entry costs is a VLM row silently trained as text,
-# so cover the modern web formats too (`.avif` is what most image CDNs serve
-# now) and the older spellings of the ones already here.
+# Every missing suffix is a VLM row silently trained as text; cover modern web formats (.avif) and
+# older spellings of the listed ones.
 _MEDIA_SUFFIXES = (
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
     ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
@@ -677,9 +664,8 @@ def _looks_like_media_value(value, _depth = 0):
     return text.endswith(_MEDIA_SUFFIXES)
 
 
-# The prose that goes WITH the media. Tokenizer outputs live in `_TEXT_COLUMNS`;
-# these are the raw columns a vision collator still has to read, and a keep-list
-# that held the image but not its prompt left that collator nothing to tokenize.
+# Prose that goes with the media: raw columns the vision collator reads (tokenizer outputs live in
+# _TEXT_COLUMNS); a keep-list holding the image but not its prompt leaves nothing to tokenize.
 _RAW_TEXT_COMPANION_COLUMNS = frozenset((
     "text", "texts", "prompt", "prompts", "question", "questions",
     "caption", "captions", "instruction", "instructions", "input", "inputs",
@@ -715,24 +701,18 @@ class _MediaAwareCollator:
                  companion_keys = ()):
         self.text = text
         self.media = media
-        # Kept so the media collator can read the prompt beside its image, and
-        # stripped again on the text path, which cannot tensorize a raw string.
-        # Lowercased: `_keep` below tests `key.lower()`, and unlike the other two
-        # sets this one carries the caller's own `dataset_text_field`. A
-        # mixed-case one (`Body`) never matched, so the raw string it names
-        # survived into a text batch and `DataCollatorForSeq2Seq` died on it.
+        # Kept for the media collator, stripped on the text path; lowercased because _keep tests
+        # key.lower(), and a mixed-case dataset_text_field (Body) never matched, so
+        # DataCollatorForSeq2Seq died on its raw string.
         self.companion_keys = frozenset(
             k.lower() if isinstance(k, str) else k for k in companion_keys)
-        # Split, not merged: an ambiguous name is decided by its value below,
-        # and folding the two would match `url` on the name alone.
+        # Split: ambiguous keys are judged by value, since folding matches url by name alone.
         self.ambiguous_keys = frozenset(ambiguous_keys)
         self.media_keys = frozenset(media_keys) - self.ambiguous_keys
 
-    # Raw conversational columns. Their images sit INSIDE the value, as
-    # `{"type": "image", ...}` parts, so no top-level key names them and a batch
-    # of them went to the text collator that cannot read the conversation at all,
-    # let alone its images. Routed to the media collator on the column's
-    # presence: that collator handles this TRL format, and the text one cannot.
+    # Raw conversational columns hold images inside typed content parts, so no top-level key names
+    # them; route on the column's presence to the media collator, since the text one cannot read
+    # conversations.
     _CONVERSATION_KEYS = frozenset((
         "messages", "conversations", "conversation", "chat",
     ))
@@ -743,10 +723,9 @@ class _MediaAwareCollator:
             for k in keys:
                 if not isinstance(k, str): continue
                 lowered = k.lower()
-                # An ambiguous name is weighed by its VALUE, the same trade the
-                # initial-split guard makes: `path`/`url` is a media reference
-                # or ordinary provenance, and matching the name alone would send
-                # every row carrying a plain URL to the vision collator.
+                # An ambiguous name (path/url) is weighed by its VALUE, like the initial-split
+                # guard: it may be a media reference or plain provenance, and name alone would send
+                # every plain URL to vision.
                 if lowered in self.ambiguous_keys:
                     if _looks_like_media_value(feature.get(k)): return True
                     continue
@@ -758,21 +737,10 @@ class _MediaAwareCollator:
     def __call__(self, features):
         if self._has_media(features):
             return self.media(features)
-        # Strip what only the MEDIA path wanted kept. The signature whitelist is
-        # global, so a benign `url`/`path`/`prompt`/`content` column now survives
-        # unused-column removal for every split -- and the text collator
-        # tensorizes every key it is handed, so a retained string kills the
-        # batch. Removed here, not from the keep-list: the media path still
-        # needs those columns, and this is the only point that knows which path
-        # a batch took. Copies, so the caller's rows are left alone.
-        # By VALUE for the ambiguous and companion names, not by name alone. Both
-        # sets are ordinary English words, so under `remove_unused_columns=False`
-        # a caller's tensorizable auxiliary input called `output` or `content`
-        # was dropped from every text batch and its custom `compute_loss` never
-        # saw it. What the text collator cannot stack is a raw STRING; a number
-        # or a tensor under the same name is a model input and stays.
-        # The media names go on sight: they are never model inputs, and a text
-        # batch is one `_has_media` already declined to call multimodal.
+        # Drops media-only columns from text batches (global whitelist keeps them):
+        # ambiguous/companion names by value (raw strings only), media names on sight; copies rows;
+        # removed here, not keep-list, as media path needs them; with remove_unused_columns=False a
+        # tensor/number named output stays.
         maybe = self.ambiguous_keys | self.companion_keys
         def _keep(key, value):
             if not isinstance(key, str): return True
@@ -787,8 +755,7 @@ class _MediaAwareCollator:
         return self.text(stripped)
 
     def __getattr__(self, attribute):
-        # Only for names this class does not define; `text` is set in __init__,
-        # so this cannot recurse through it.
+        # Only for undefined names; text is set in __init__, so this cannot recurse.
         if attribute.startswith("__"): raise AttributeError(attribute)
         return getattr(self.__dict__["text"], attribute)
 pass
@@ -2790,8 +2757,7 @@ def standardize_data_formats(
     import collections
     import itertools
 
-    # VLMs need list-valued content ([{"type": "text", "text": ...}]); text
-    # models use a plain string.
+    # VLMs need list-valued content parts; text models use a plain string.
     is_vlm = False
     if tokenizer is not None:
         if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
@@ -2819,15 +2785,13 @@ def standardize_data_formats(
         for alias in (aliases_for_system + aliases_for_user + aliases_for_assistant)
     )
 
-    # The cardinality heuristic below ties on small datasets, picks the content column, and
-    # the alias check then rejects the user's own text.
+    # Cardinality ties on small datasets pick content; the alias check then rejects user text.
     alias_keys = [
         key for key in keys
         if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
     ]
 
-    # Both columns alias-only is real: {"role": "user", "content": "assistant"} comes out
-    # swapped with no error anywhere. The key NAMES are the only tiebreak left.
+    # Alias-only in both columns swaps roles silently; key names are the only tiebreak left.
     named_role_keys = [key for key in keys if str(key).strip().lower() in _ROLE_KEY_NAMES]
 
     if len(alias_keys) == 1:
@@ -2857,8 +2821,7 @@ def standardize_data_formats(
         )
     pass
 
-    # Normalization can collapse two aliases the caller meant to keep apart ("Human" for
-    # user, "human" for assistant), silently relabelling every such message. Refuse instead.
+    # Normalizing can merge aliases kept apart (Human, human); refuse, don't silently relabel.
     aliases_mapping = {}
     for group, role in (
         (aliases_for_system, "system"),
@@ -2877,8 +2840,7 @@ def standardize_data_formats(
                 )
             aliases_mapping[key] = role
 
-    # Normalise only on a miss and memoise the spelling this dataset uses, capped so a
-    # pathological dataset cannot grow the dict without limit.
+    # Normalise only on a miss; memo capped at _ALIAS_MEMO_LIMIT so a dataset cannot grow it.
     _ALIAS_MEMO_LIMIT = 64
 
     def _standardize_dataset(examples):
@@ -2912,10 +2874,9 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        # One policy, one place. The copy that used to live here read stdlib
-        # multiprocessing's start method while datasets uses multiprocess, and it
-        # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
-        # on datasets >= 4.1, the pool this exists to avoid.
+        # One num_proc policy, in dataset_num_proc: datasets uses multiprocess, and falling back to
+        # num_proc=1 under memory pressure is a Pool(1) on datasets >= 4.1, which this exists to
+        # avoid.
         from .dataset_num_proc import environment_override, get_dataset_num_proc
         # Per-row work is tiny, so a pool mostly pickles shards: in-memory defaults stay in process (as Studio's copy does).
         if (
@@ -3050,8 +3011,7 @@ def _row_tools(example):
 
 # Faster SFTTrainer prepare_dataset
 _MAP_TO_DISK_DIR = None
-# Windows cannot delete a file that is still memory-mapped, and the tokenized dataset is usually still
-# alive when the atexit cleanup runs, so each run would leave its dir behind; the next run removes them.
+# Windows cannot delete memory-mapped files still alive at atexit; the next run sweeps them.
 _SWEEP_STALE_MAP_DIRS = __import__("os").name == "nt"
 
 

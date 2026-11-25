@@ -273,24 +273,20 @@ def check_signal_escape_patterns(code: str):
             func = node.func
             func_name = None
 
-            # Get the function name for pattern matching
             if isinstance(func, ast.Attribute):
                 # signal.signal(...), signal.setitimer(...), etc.
                 if isinstance(func.value, ast.Name):
                     if func.value.id in self.signal_aliases:
                         func_name = f"signal.{func.attr}"
                 elif isinstance(func.value, ast.Attribute):
-                    # Handle chained attributes
                     pass
             elif isinstance(func, ast.Name):
                 # Direct call like setitimer(...) after from signal import setitimer
                 if func.id in ("signal", "setitimer", "alarm", "pthread_sigmask"):
                     func_name = func.id
 
-            # Check for signal tampering patterns
             if func_name:
                 if func_name in ("signal.signal", "signal"):
-                    # Check if setting SIGALRM handler
                     if len(node.args) >= 1:
                         arg0 = node.args[0]
                         if _ast_name_matches(arg0, ("SIGALRM", "signal.SIGALRM")):
@@ -301,7 +297,6 @@ def check_signal_escape_patterns(code: str):
                             })
 
                 elif func_name in ("signal.setitimer", "setitimer"):
-                    # Check if disabling ITIMER_REAL
                     if len(node.args) >= 1:
                         arg0 = node.args[0]
                         if _ast_name_matches(arg0, ("ITIMER_REAL", "signal.ITIMER_REAL")):
@@ -333,7 +328,6 @@ def check_signal_escape_patterns(code: str):
                 self.generic_visit(node)
                 return
 
-            # Check for bare except or catching TimeoutError/BaseException inside a loop
             if node.type is None:
                 exception_catching.append({
                     "type": "bare_except_in_loop",
@@ -348,7 +342,6 @@ def check_signal_escape_patterns(code: str):
                         "description": f"Catches {node.type.id} in loop - may suppress timeout and continue",
                     })
             elif isinstance(node.type, ast.Tuple):
-                # except (TimeoutError, ValueError):
                 for elt in node.type.elts:
                     if isinstance(elt, ast.Name):
                         if elt.id in ("TimeoutError", "BaseException", "Exception"):
@@ -488,9 +481,8 @@ def validate_single_function_source(
 pass
 
 
-# Modules generated code may import; excludes filesystem, network and process modules (os, subprocess, socket, ctypes);
-# string (Formatter.get_field reaches real builtins, str.format is checked in _reject_dunder_access); dataclasses
-# (sys.modules lookup fails for synthetic globals).
+# Excludes os/subprocess/socket/ctypes; string's Formatter.get_field reaches builtins; str.format
+# checked in _reject_dunder_access; dataclasses sys.modules lookup fails for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
@@ -524,9 +516,8 @@ _SELF_MATCHING_TYPES = frozenset({
     "set", "str", "tuple",
 })
 
-# Interpreter object-graph walks invisible to the private-attribute and import rules: gi_frame.f_back.f_back.f_builtins
-# reaches the real builtins of the trusted caller; indexing __import__ out restores everything; frames, generators,
-# coroutines and tracebacks all expose them.
+# Interpreter walks (frames, generators, coroutines, tracebacks) reach the trusted caller's real
+# builtins, invisible to attribute/import checks; indexing __import__ out restores everything.
 _DENIED_ATTR_NAMES = frozenset({
     "ag_await", "ag_code", "ag_frame",
     "cr_await", "cr_code", "cr_frame", "cr_origin",
@@ -541,9 +532,8 @@ _DENIED_ATTR_NAMES = frozenset({
 if sys.version_info >= (3, 14):
     _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
-# Dunders generated helper classes may define; a def name is invisible to the Name and Attribute walk, so without this
-# list generated code could define __setattr__ or __getattr__ and hook copy helpers' attribute machinery; __init__ and
-# comparison/arithmetic dunders stay.
+# Allowed dunder defs include __init__ and comparison/arithmetic; def names escape the
+# Name/Attribute walk, so __setattr__/__getattr__ would hook copy helpers' attribute machinery.
 _ALLOWED_DUNDER_DEFS = frozenset({
     "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
     "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
@@ -633,8 +623,7 @@ def _allowlist_builtins():
         "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
         "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
         "str", "sum", "tuple", "type", "zip",
-        # Class machinery for generated helper classes; hasattr only answers yes or no, and object/super expose nothing
-        # new, since going further needs a dunder the AST check rejects.
+        # hasattr is yes/no only; object/super expose nothing new without a rejected dunder.
         "bytearray", "classmethod", "hasattr", "object", "property",
         "staticmethod", "super",
         # Generated code routinely uses try/except.
@@ -645,8 +634,7 @@ def _allowlist_builtins():
         "ZeroDivisionError",
     )
     exposed = {name: getattr(_py_builtins, name) for name in names}
-    # Comparison and arithmetic dunders return NotImplemented for operands they do not handle, so the singleton must be
-    # reachable; it is a value, not a capability.
+    # Comparison/arithmetic dunders return NotImplemented: a reachable value, not a capability.
     exposed["NotImplemented"] = _py_builtins.NotImplemented
     # Required for `class` statements.
     exposed["__build_class__"] = _py_builtins.__build_class__
@@ -665,8 +653,7 @@ _ATTR_TARGET_GUARD = "__unsloth_attr_target__"
 
 
 def _is_host_class(cls):
-    # A host class is one its module publishes under its qualname. Classes the strategy makes itself (class blocks,
-    # type(...), namedtuple) resolve to nothing, so they stay assignable.
+    # Host classes: published under their qualname; generated classes stay assignable.
     if getattr(cls, "__module__", None) == "__user_code__":
         return False
     target = sys.modules.get(getattr(cls, "__module__", None) or "")
@@ -689,8 +676,7 @@ pass
 
 
 class _GuardAttributeTargets(ast.NodeTransformer):
-    # `X.a = v` becomes `guard(X).a = v`: X is still evaluated once, in the same order, in every target position
-    # (assign, augmented, for, with, unpacking, del).
+    # `X.a = v` becomes `guard(X).a = v`; X is evaluated once, in order, in every target form.
     def visit_Attribute(self, node):
         self.generic_visit(node)
         if isinstance(node.ctx, (ast.Store, ast.Del)):

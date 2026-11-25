@@ -124,8 +124,7 @@ try:
     _ONE_BLOCK_MISCOMPILE = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 13)
 
     def _compile_block_mask(bsz, head, M, N):
-        # torch 2.10's dynamic create_block_mask miscompiles one-block lengths: block counts come out 2 instead of 1 and
-        # read past the buffer (illegal memory access).
+        # torch 2.10 dynamic create_block_mask miscompiles 1-block lengths (reads past buffer).
         blk = FLEX_ATTENTION_BLOCK_SIZE
         if not _ONE_BLOCK_MISCOMPILE or (M > blk and N > blk):
             return True
@@ -152,9 +151,8 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _build_block_mask(mask_mod, bsz, head, M, N, device)
 
-    # Block masks for stateless mask_mods (causal / sliding window) only depend on the
-    # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.
-    # Never pass mask_mods closing over per batch tensors (padding, document ids).
+    # Block masks for stateless mask_mods depend only on mask_mod and shapes, so layers and replays
+    # share them; never close over per-batch tensors (padding, document ids).
     _BLOCK_MASK_CACHE = {}
     _BLOCK_MASK_CACHE_SIZE = 32
 
@@ -173,8 +171,7 @@ try:
         key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
         block_mask = _BLOCK_MASK_CACHE.get(key)
         if block_mask is None:
-            # Masks grow ~quadratically with length, so only the current shape's masks are kept (one per mask_mod and
-            # inference mode, shared by one forward's layers); other shapes are freed first.
+            # Masks grow ~quadratically; only current-shape masks are kept, others are freed.
             for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
                 del _BLOCK_MASK_CACHE[k]
             if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
@@ -332,13 +329,11 @@ try:
                 https://pytorch.org/blog/flexattention-for-inference/
                 https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L91
                 """
-                # Get next multiple of FLEX_ATTENTION_KV_INCREMENT
                 div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 2 # Minus two since we need the block mask to use the saved offset_tensor
                 # Minus 2, not -1, since offset is pre-incremented (see self.offset += 1), not post-incremented.
                 if self.offset <= -2:
-                    # Minimum is -1
                     self.offset = -1
                     # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = None
@@ -383,7 +378,6 @@ try:
                 n = sliding_window
                 self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
                 if self.offset <= -2:
-                    # Minimum is -1
                     self.offset = -1
                     # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = sliding_window - 1 # Minus 1 since token 128 means index 127
@@ -402,8 +396,7 @@ try:
                 self.offset += 1
                 self.offset_tensor.add_(1)
             elif (self.sliding_window is not None):
-                # Quick return: the sliding window block mask is always the same; reached only once offset >=
-                # sliding_window (max sliding window already reached).
+                # Block mask is fixed once offset >= sliding_window (max window reached).
                 return self.block_mask_slice
             if self.offset >= self.max_length:
                 # Must be >= since offset=127 with max_length=128 means size 128, because indexing is zero based.

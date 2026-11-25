@@ -148,8 +148,7 @@ def _mhc_projection_rsqrt(hidden_streams, fn, eps):
 
 
 def unsloth_mhc_projection_rsqrt(hidden_streams, fn, eps):
-    """MHC_NATIVE_PROJECTION_SOURCE with the same memory saving as unsloth_mhc_projection: backward reruns the FP32
-    upcast instead of keeping it. Bitwise identical."""
+    """Same saving as unsloth_mhc_projection: backward reruns the FP32 upcast; bit-identical."""
     if (
         torch.compiler.is_compiling()
         or not torch.is_grad_enabled()
@@ -169,8 +168,7 @@ def _mhc_projection(hidden_streams, input_norm, fn):
 
 
 def unsloth_mhc_projection(hidden_streams, input_norm, fn):
-    """Runs F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float()) and saves hidden_streams (alive anyway),
-    not its FP32 upcast, for backward, which reruns the math."""
+    """Saves hidden_streams (alive anyway), not its FP32 upcast; backward reruns the math."""
     if (
         torch.compiler.is_compiling()
         or not torch.is_grad_enabled()

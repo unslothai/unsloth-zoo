@@ -74,7 +74,6 @@ from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compi
 EMPTY = inspect._empty
 
 def raise_error(f: str, exception: Any = None):
-    # Raises error only if logging is on
     if UNSLOTH_ENABLE_LOGGING:
         logger.error(
             f"==================\n"\
@@ -218,7 +217,6 @@ def process_return(
             return_dict = {key : return_dict[key] for key in chosen_keys}
         return output_class(**return_dict)
     except:
-        # We inspect the argument then only allow those arguments
         return_dict_keys = return_dict.keys()
         allowed_keys = set(inspect.signature(output_class).parameters.keys())
         chosen_keys  = allowed_keys & return_dict_keys
@@ -241,8 +239,7 @@ try:
     t_Unpack = t.Unpack
 except:
     from typing_extensions import Unpack as t_Unpack
-# Stale modules after mid-session upgrades (Kaggle/Colab) fail when new files use upgraded-only symbols; PIL is fixed by
-# clearing sys.modules, numpy/scipy C extensions cannot be reloaded so raise a restart error.
+# Mid-session upgrades: clear sys.modules for PIL; numpy/scipy C extensions need a restart.
 import sys as _sys
 from importlib.metadata import version as _get_pkg_version
 try:
@@ -288,8 +285,7 @@ from importlib.abc import MetaPathFinder as _MetaPathFinder, Loader as _Loader
 from importlib.machinery import ModuleSpec as _ModuleSpec
 
 
-# Metaclass so sentinel classes chain via attribute access (AffineQuantizedTensor.subattr is another sentinel); peft's
-# isinstance(weight, AffineQuantizedTensor) needs a real type.
+# Chains sentinel attributes via metaclass; peft isinstance needs real AffineQuantizedTensor.
 class _ROCmSentinelMeta(type):
     def __getattr__(cls, name):
         # Dunders must miss: a sentinel __wrapped__ sends inspect.unwrap down an endless chain.
@@ -327,7 +323,6 @@ def _rocm_make_torchao_stub(name):
         if attr.startswith("__"):
             raise AttributeError(attr)
         full = f"{name}.{attr}"
-        # Reuse an already-imported sub-module; else a sentinel class.
         if full in _s.modules:
             obj = _s.modules[full]
         else:
@@ -363,8 +358,7 @@ class _ROCmTorchaoFinder(_MetaPathFinder):
         return None
 
 
-# Only Windows + ROCm (HIP) torch needs this stub, where import torchao crashes on the missing torch.distributed
-# C-extensions; elsewhere the stub would fake torchao's presence.
+# Windows+ROCm only: torchao crashes without torch.distributed; else the stub fakes torchao.
 _is_windows_rocm = False
 if _sys_rocm_stub.platform == "win32":
     try:
@@ -697,10 +691,8 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
         param_kind = param.kind.value # 4 is type VAR_KEYWORD **kwargs
         annotation = param.annotation
 
-        # Canonicalize any **kwargs name to "kwargs".
         if "kwargs" in param_name.lower():
             param_name = "kwargs"
-            # Default the annotation when untyped.
             if \
                 (param_kind == VAR_KEYWORD_ID) and \
                 (annotation == EMPTY) and \
@@ -1003,9 +995,8 @@ def _in_non_reentrant_checkpoint():
     return _walk_for_checkpoint_frame()
 
 
-# Set when a compiled call ran under a non-reentrant checkpoint pack hook (activations packed COMPILED, backward still
-# owed); asking only if the current call is in a region is false once its forward returns, so latching mid-step left
-# eager recompute in backward (abort or wrong grads).
+# Set when compiled code ran under a non-reentrant checkpoint pack hook; the in-region check is
+# false once forward returns, so latching mid-step forces eager recompute (abort or wrong grads).
 _PACKED_COMPILED_IN_CHECKPOINT = False
 
 
@@ -1240,9 +1231,8 @@ def _backend_compile_errors():
     except Exception:
         pass
     else:
-        # What Dynamo wraps a backend failure in when it does not surface the
-        # Inductor class directly. Not a superset: on some versions only one of
-        # the two ever reaches the caller, so both are needed.
+        # Dynamo wraps backend failures in BackendCompilerFailed when the Inductor class is not
+        # surfaced; on some versions only one of the two reaches the caller, so both are needed.
         _e = getattr(_exc, "BackendCompilerFailed", None)
         if isinstance(_e, type) and issubclass(_e, BaseException):
             found.append(_e)
@@ -1383,8 +1373,7 @@ def _is_our_own_disabled_hook(exc):
     )
 
 
-# torch 2.7 renamed both recompile budgets and kept the old names as aliases, so bumping whichever of each pair the
-# installed torch reads is the only portable way to allow a few more compiles this step.
+# torch 2.7 renamed budgets (old names alias); bump the name the installed torch reads.
 _RECOMPILE_LIMIT_NAMES = (
     ("recompile_limit", "cache_size_limit"),
     ("accumulated_recompile_limit", "accumulated_cache_size_limit"),
@@ -1394,16 +1383,13 @@ _RECOMPILE_LIMIT_NAMES = (
 _RECOMPILE_LIMIT_BUMP = 16
 _MAX_RECOMPILE_LIMIT_BUMPS = 4
 
-# The budgets live on process-global torch._dynamo.config, so the per-wrapper
-# cap bounds nothing on its own: N wrappers, or several models in one process,
-# each spend their 4 bumps and the global limit ends up hundreds higher,
-# permanently, for every unrelated compiled function. Cap the total and put the
-# originals back once the debt is settled.
+# Budgets live on process-global torch._dynamo.config, so a per-wrapper cap alone bounds nothing: N
+# wrappers or models in one process each spend 4 bumps and leave the global limit hundreds higher
+# permanently; cap the total and restore originals once the debt is settled.
 _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
 _GLOBAL_BUMPS = 0
 _ORIGINAL_RECOMPILE_LIMITS = {}
-# Key baselines by bumped value; restore only a name still holding a value we wrote, back to the baseline that value
-# came from, since bumps nest in config.patch and need opposite restores.
+# Baselines keyed by bumped value; restore names still holding our value, since bumps nest.
 _BUMPED_RECOMPILE_LIMITS = {}
 
 
@@ -1625,8 +1611,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     if not errors and not graph_break_errors and not backend_errors:
         return compiled_func
 
-    # Warn once; eager and pending are keyed by label because per-call wrappers die with their forward; whether the
-    # compiled callable returned is deliberately NOT held here but in _COMPILED_OK_LABELS.
+    # Keyed by label as wrappers die with forward; returned flag is in _COMPILED_OK_LABELS.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
              "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
              # Whether the compiler was off at the wrapper's first call; None until then, then decided once.
@@ -1822,9 +1807,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
             and label in _COMPILED_OK_LABELS
         )
-        # _note_packed_under_checkpoint set the process-wide marker before a call that refused at compile time, so
-        # nothing compiled was packed; the marker must be restored or an unrelated wrapper's _give_up ends the step for
-        # no reason.
+        # _note_packed_under_checkpoint sets the marker before a compile-time refusal, so nothing
+        # compiled was packed; restore it or an unrelated wrapper's _give_up ends the step.
         _PACKED_COMPILED_IN_CHECKPOINT = marker_before
         state["eager"] = True
         _LATCHED_EAGER_LABELS.add(label)
@@ -2050,11 +2034,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         except backend_errors as e:
             # Ordered before the recompile-limit clause: the classes are disjoint, but a backend refusal is never a budget problem and must not consume budget.
             if not _is_backend_refusal_we_handle(e):
-                # Either the caller asked for a hard failure, or some other
-                # backend refused. Only Inductor's simplifier gaps are
-                # known-benign enough to run through eagerly; a custom backend
-                # raising is a configuration or programming error and hiding it
-                # would cost the user their diagnosis.
+                # Only Inductor's simplifier gaps are known-benign enough to run eagerly; anything
+                # else is re-raised, since a caller's hard-failure request must not be hidden and
+                # hiding a custom backend's error would cost the user their diagnosis.
                 raise
             return _give_up_on_backend(e, args, kwargs, marker_before)
         except errors as e:
@@ -2065,22 +2047,19 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 # Return the eager retry's value as is; marking it compiled would recompute a pack in the wrong mode.
                 return result.value
             if result is not _NO_RESULT:
-                # The retry COMPILED and returned, so this region may now have
-                # packed compiled activations. Without this the `else:` below is
-                # never reached on the retry path and a later backend refusal in
-                # the same step would fall back to eager against a compiled pack.
+                # The retry compiled, so this region may now hold compiled packs; skipping
+                # _note_compiled_ok() lets a later backend refusal in the same step fall back to
+                # eager against a compiled pack.
                 _note_compiled_ok()
                 return result
             return _give_up(e, args, kwargs)
         except graph_break_errors as e:
             # On torch 2.4 cache exhaustion arrives as our torch.compiler.disable hook; other breaks still raise.
             if _is_recompile_limit_unsupported(e):
-                # The 2.4 route to the same place as the typed arm above, so it
-                # needs the same two things: a refusal from the retry must reach
-                # the backend fallback, and a retry that COMPILED must be
-                # recorded as having packed compiled. Neither happened here, so
-                # cache exhaustion on 2.4 followed by a codegen refusal in the
-                # same step took the opposite decision from 2.7+.
+                # The torch 2.4 route needs the typed arm's two steps: a retry refusal must reach
+                # the backend fallback, and a compiled retry must be recorded as packed; without
+                # both, a codegen refusal after cache exhaustion on 2.4 takes the opposite decision
+                # from 2.7+.
                 result = _retry_catching_backend_refusal(
                     args, kwargs, marker_before)
                 if type(result) is _EagerFallbackTaken:
@@ -2117,8 +2096,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     wrapper._unsloth_fallback_state = state
     wrapper._unsloth_fallback_label = label
     _EAGER_FALLBACK_WRAPPERS.append(weakref.ref(wrapper))
-    # GRPO re-wraps accumulate_chunk on every backward, so the registry grew without bound and scans went quadratic;
-    # compacting once the list doubles keeps appends amortised O(1).
+    # GRPO re-wraps accumulate_chunk every backward, so compact the registry once it doubles.
     global _EAGER_FALLBACK_PRUNE_AT
     if len(_EAGER_FALLBACK_WRAPPERS) >= _EAGER_FALLBACK_PRUNE_AT:
         _EAGER_FALLBACK_WRAPPERS[:] = [
@@ -2280,8 +2258,7 @@ def unsloth_decode_compile():
                         _claim_current_stance(owned[1])
 
 
-# Thread-local flag set only during eager one-token no-grad decode in generate(); never set while tracing or with grad
-# on, and only read outside tracing, so training and outer compiles keep the compiled path.
+# Set only in eager no-grad decode; read outside tracing so training keeps its compiled path.
 _EAGER_DECODE_STATE = threading.local()
 
 
@@ -2711,7 +2688,6 @@ def patch_function_past_key_values(
         except Exception as e:
             error = str(e)
             continue
-        # Check if either is provided
         for key in ("past_key_value", "past_key_values",):
             if key in new_keys and (key in old_keys or (
                 key == "past_key_values" and "cache" in old_keys and "cache" not in new_keys
@@ -2762,9 +2738,8 @@ def restore_original(
         return False
 
 
-# Forced float32 patches follow UNSLOTH_FORCE_FLOAT32, which each load resets, on classes shared by
-# every live model of that family. Stash the original only once (patch_function re-stashes whatever
-# is installed, so a second pass would record our own forward) so a later flag "0" load can undo them.
+# Forced float32 patches follow UNSLOTH_FORCE_FLOAT32 on classes shared by live models; stash the
+# original once, since patch_function re-stashes our forward; a later flag-0 load can undo them.
 def patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
     stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
     return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)

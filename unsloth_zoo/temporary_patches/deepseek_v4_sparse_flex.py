@@ -192,9 +192,8 @@ def _pack(selected, num_blocks):
 
 
 def deepseek_v4_block_mask(attention_mask, batch):
-    """Returns (BlockMask, bias or None) for the additive [B|1, 1, S, KV] mask; entries at or below half the dtype
-    minimum (or -inf) are hard-masked, others are added to the score as eager does; empty 128 x 128 tiles are
-    skipped."""
+    """Returns (BlockMask, bias or None) for additive [B|1,1,S,KV] mask: entries <= half the dtype
+    min (or -inf) hard-masked; others added as in eager; empty 128x128 tiles skipped."""
     from torch.nn.attention.flex_attention import BlockMask
     from unsloth_zoo.flex_attention.sparse import additive_bias_present
 
@@ -204,8 +203,7 @@ def deepseek_v4_block_mask(attention_mask, batch):
     visible = attention_mask[:, 0] > torch.finfo(attention_mask.dtype).min / 2
     table = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK), dtype = torch.bool)
     table[:, :q_len, :kv_len] = visible
-    # transformers' masks are 0 / min only, and reading a bias per score is slow, so it is added only when present;
-    # inside a compiled graph the bias is always kept.
+    # Masks are 0 / min only; per-score bias is slow, so add only when present or compiling.
     bias = None
     if torch.compiler.is_compiling() or additive_bias_present(attention_mask[:, 0], visible, "deepseek_v4"):
         bias = attention_mask.new_zeros((attention_mask.shape[0], nq * _BLOCK, nk * _BLOCK))

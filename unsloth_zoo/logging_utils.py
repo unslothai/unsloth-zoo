@@ -83,7 +83,6 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
     set_Trainer_metrics = frozenset(Trainer_metrics)
 
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
-        # Only for when there is no evaluation
         if args.eval_strategy == IntervalStrategy.NO and "loss" in logs:
             values = {}
 
@@ -93,8 +92,7 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
                     values[metric.replace("/", " / ")] = logs[metric]
             pass
 
-            # 2) Dynamic per-reward-function metrics (rewards/*): user-defined
-            #    names, so sort for stable column ordering across steps.
+            # 2) Dynamic rewards/* metrics: user-defined names, sorted for stable column order.
             dynamic_reward_keys = sorted(
                 k for k in logs
                 if k.startswith("rewards/") and k not in set_Trainer_metrics
@@ -244,7 +242,6 @@ def get_trl_metrics():
             elif x.lower().startswith("eval"):
                 end.append(x)
             else:
-                # Check if we want to move to the end
                 moved = False
                 for move_end in METRICS_MOVE_TO_END:
                     if move_end in lowered:
@@ -267,7 +264,6 @@ pass
 
 
 def PatchRLStatistics(algorithm = "grpo_trainer", other_metrics = []):
-    # Get notebook statistics columns to show up
     all_metrics = get_trl_metrics()
     if algorithm not in all_metrics:
         print(

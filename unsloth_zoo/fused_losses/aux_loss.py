@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GA weighting for MoE router aux and z-loss terms: scale each micro-batch aux mean by its token share (local /
-N_total), since added in full it carries G times its weight; approximate when the router loss averages over every
-token."""
+"""GA weighting of MoE router aux/z-loss by each micro-batch's token share (local / N_total): added
+in full, each carries G times its weight; approximate if loss averages over every token."""
 
 __all__ = [
     "unsloth_ga_scale_aux_loss",

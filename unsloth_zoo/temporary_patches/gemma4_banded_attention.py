@@ -52,8 +52,7 @@ def _block_mask(w, nb, device):
     m = base[None].expand(nb, w, 2 * w).clone()           # (nb, w, 2w)
     m[0] &= (torch.arange(2 * w, device=device)[None, :] >= w)  # block 0: drop phantom prev-block
     m = m[:, None]                                         # (nb, 1, w, 2w)
-    # FIFO-bounded cache: varying seq lengths make many (w, nb) keys, so the oldest entry is evicted at the cap (dict is
-    # insertion-ordered) to avoid an unbounded leak.
+    # FIFO-bounded at 8 entries to avoid a leak: varying seq lengths make many (w, nb) keys.
     if len(_MASK_CACHE) >= 8:
         _MASK_CACHE.pop(next(iter(_MASK_CACHE)))
     _MASK_CACHE[key] = m
@@ -81,8 +80,7 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
         return not _packed_documents(packed_seq_lengths)
     if not torch.is_tensor(mask) or mask.dim() != 4:
         return False
-    # Under torch.compile the band check (.item() control flow, tensor attribute mutation) is untraceable and breaks
-    # fullgraph; defer to the original SDPA while compiling.
+    # Band check (.item(), attr mutation) breaks fullgraph; use original SDPA while compiling.
     if torch.compiler.is_compiling():
         return False
     # Inference tensors have no version counter, so they are keyed by (S, w) only; otherwise every sliding layer re-scans the shared mask during prefill.
@@ -94,8 +92,7 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     if mask.shape[1] != 1 or mask.shape[-2] != S or mask.shape[-1] != S:
         ok = False
     else:
-        # Validate every batch element, not just batch 0: per-sample padding (e.g. left padding in batched generation)
-        # is honoured by neither the window nor the block kernel and would be dropped.
+        # Every batch row, not just 0: per-sample left padding is dropped by both kernels.
         m = mask[:, 0]                                    # (B, S, S)
         # Scan in row blocks to avoid a dense S x S band (gigabytes at 16k/32k); a float mask must also have no in-band
         # bias (exactly 0), else the bias is silently dropped.

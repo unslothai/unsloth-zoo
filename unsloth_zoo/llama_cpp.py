@@ -77,7 +77,6 @@ except (ImportError, NotImplementedError):
         return _IS_APPLE_SILICON
 
 logger = logging.getLogger(__name__)
-# Configure basic logging if not already configured elsewhere
 if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s: %(message)s')
 
@@ -458,8 +457,7 @@ def _resolve_monolith_bundle_convert_script(require_gguf_py = True):
 pass
 
 
-# `sys.path` and `sys.modules` are process-global, so concurrent swaps of different gguf trees would interleave; the
-# lock is reentrant because a swap can reach another swap of the same tree.
+# sys.path/sys.modules are process-global, so swaps must lock; RLock since swaps can nest.
 _GGUF_MODULE_SWAP_LOCK = threading.RLock()
 
 
@@ -490,8 +488,7 @@ def _use_local_gguf(gguf_py_path):
     try:
         if os.path.exists(gguf_py_path):
             logger.debug(f"Adding {gguf_py_path} to sys.path")
-            # Insert at index 0, ahead of the script directory Python puts there, since a process started inside another
-            # gguf-py checkout has that at sys.path[0].
+            # Insert at index 0 so this gguf-py beats the script dir at sys.path[0].
             sys.path.insert(0, gguf_py_path)
 
             # Drop system gguf modules to force a reimport from gguf-py
@@ -845,14 +842,12 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
         stderr = stderr or ""
         all_output = stdout + stderr
 
-        # Check exit code
         if sp.returncode != 0:
             error_msg = f"[FAIL] Command `{command}` failed with exit code {sp.returncode}\n"
             if stdout: error_msg += f"stdout: {stdout}\n"
             if stderr: error_msg += f"stderr: {stderr}\n"
             raise RuntimeError(error_msg)
 
-        # Process output
         for line in all_output.splitlines(keepends=True):
             if line.rstrip().endswith(SHELL_COMMAND_NOT_FOUND):
                 raise RuntimeError(f"Command not found: {command}")
@@ -2748,8 +2743,7 @@ _UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
 
 # Same for the gguf attribute guard patch.
 _GGUF_GUARD_LINE = b"except AttributeError: gguf."
-# Reads back names already guarded, anchored on the except half: `try: gguf.X` is also what the reference scan matches,
-# so one pattern for both could not tell them apart.
+# Anchored on the except half, since `try: gguf.X` also matches the reference scan.
 _GGUF_GUARD_PATTERN = re.compile(rb"except AttributeError: gguf\.([\.A-Z_0-9]{3,}) = None")
 # Matches the whole guard so the reference scan can run with previous guards stripped; otherwise it finds gguf.X inside its own guards and re-guards every name.
 _GGUF_GUARD_BLOCK_PATTERN = re.compile(
@@ -2777,8 +2771,7 @@ pass
 # export and, under UNSLOTH_CONVERTER_SCAN_STRICT, refused the export itself.
 # A cap below the thing it is meant to read is not a safety margin.
 MAX_CONVERSION_PACKAGE_FILES = 256
-# Bounds the traversal, not just files read: empty directories never reach the file cap, so a huge tree was walked on
-# every export through the cache key; generous next to real packages of dozens of entries.
+# Caps traversal: empty dirs skip the file cap, and a huge tree was walked on every export.
 MAX_CONVERSION_PACKAGE_ENTRIES = 4096
 # And a bound on how many places get that allowance. Every root directory became
 # a location of its own, with no limit on how many there could be, so a tree with
@@ -2793,8 +2786,7 @@ MAX_SCAN_LOCATIONS = 64
 # could then import and run it.
 GENERATED_CONVERTER_NAME = "unsloth_convert_hf_to_gguf.py"
 
-# No module is read whole: past MAX_MODULE_BYTES (the scanner's 8 MiB cap) a module cannot be judged anyway, and reading
-# one enormous or sparse module exhausted memory before any finding.
+# Not read whole: past MAX_MODULE_BYTES a module can't be judged; a huge one exhausted memory.
 MAX_MODULE_BYTES = 8 * 1024 * 1024
 MODULE_READ_CHUNK = 1024 * 1024
 
@@ -2865,7 +2857,6 @@ def _purge_regenerable_bytecode(
                             if recursive:
                                 pending.append(entry.path)
                             elif entry.name == "__pycache__" and root == package_dir:
-                                # As above: the cache belonging to this directory.
                                 pending.append(entry.path)
                             continue
                     except OSError:
@@ -3929,8 +3920,7 @@ def _conversion_package_modules(
                 continue
             seen_directories.add(identity)
         try:
-            # Uses scandir, not walk: walk lists a whole directory's names at once, so a huge directory was listed
-            # before either budget was checked; this iterator checks per entry.
+            # scandir, not walk: walk lists all names at once; budgets are checked per entry.
             with os.scandir(root) as scanner:
                 for entry in scanner:
                     entries += 1
@@ -3945,8 +3935,7 @@ def _conversion_package_modules(
                         if recursive:
                             pending.append(entry.path)
                         elif entry.name == "__pycache__" and root == conversion_dir:
-                            # The cache of this directory's own modules, not a subtree; skipping it let a planted
-                            # __pycache__/gguf.<tag>.pyc run in place of the scanned source.
+                            # Own cache only; skipping it lets a planted .pyc shadow source.
                             pending.append(entry.path)
                         continue
                     name = entry.name
@@ -3967,9 +3956,8 @@ def _conversion_package_modules(
                             sorted(found)[:file_limit], False, tuple(unreadable),
                         )
         except OSError:
-            # An unreadable subdirectory is recorded and the walk goes on, since aborting would silence a readable
-            # malicious module beside it, even in strict mode; an unreadable conversion/ root still fails the whole
-            # package.
+            # Unreadable subdirectories are recorded and skipped, since aborting would hide a
+            # malicious module nearby, even in strict mode; an unreadable conversion/ root fails.
             if root == conversion_dir:
                 return PackageWalk(None, False, (".",))
             unreadable.append(
@@ -4647,10 +4635,9 @@ def _download_convert_hf_to_gguf_cached(
 pass
 
 
-# Preserve the pre-split lru_cache surface (cache_clear, cache_info,
-# cache_parameters) so external callers keep working. __wrapped__ is not
-# forwarded because the inner function takes a private (name, _local_script_info)
-# pair while the public wrapper is a single-arg callable.
+# Keeps the lru_cache surface (cache_clear, cache_info, cache_parameters) for external callers;
+# __wrapped__ is not forwarded because the inner function takes a private (name, _local_script_info)
+# pair while the public wrapper is single-arg.
 _download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
 _download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
 _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
@@ -4981,8 +4968,7 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     parts = sorted(input_folder.glob("model*.safetensors"))
     if parts:
         index_path = input_folder / "model.safetensors.index.json"
-        # llama.cpp gives the canonical index precedence whenever any
-        # safetensors part exists, including alongside model.safetensors.
+        # llama.cpp prefers the index over model.safetensors when any safetensors part exists.
         if index_path.is_file():
             return any(_is_mtp(name) for name in _names_from_index(index_path))
         from safetensors import safe_open
@@ -5534,8 +5520,7 @@ def _converter_gguf_requirements(script_path, architecture = None, is_vlm = None
         module_certain, module_advisory = _gguf_requirements_from_source(source)
         certain |= module_certain
         advisory |= module_advisory
-    # Another architecture's module: imported only by load_all_models, which
-    # swallows the failure.
+    # Another architecture's module, imported only by load_all_models, which swallows errors.
     for path in advisory_sources:
         try:
             with open(path, "rb") as f:
@@ -6804,21 +6789,18 @@ pass
 
 GGUF_ARCHITECTURE_KEY = "general.architecture"
 
-# Read by llama_model_base::load_hparams with no required = false, so a missing one throws before any tensor;
-# {arch}.attention.head_count and {arch}.feed_forward_length are deliberately NOT here, as get_key_or_arr(..., false)
-# reads them optionally.
+# Read by llama_model_base::load_hparams without required = false, so a missing one throws;
+# {arch}.attention.head_count and {arch}.feed_forward_length are read optionally, so not listed.
 GGUF_UNIVERSAL_REQUIRED_KEYS = (
     "{arch}.context_length",    # ml.get_key(LLM_KV_CONTEXT_LENGTH,   hparams.n_ctx_train)
     "{arch}.embedding_length",  # ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd)
     "{arch}.block_count",       # ml.get_key(LLM_KV_BLOCK_COUNT,      hparams.n_layer_all)
 )
 
-# A tensor namespace implies the metadata namespace describing it:
-# (tensor marker, required keys, exempt architectures, why).
-# A key qualifies only if every architecture carrying the namespace reads it with
-# no trailing `false` in `src/models/*.cpp`; optional readers go in the exempt set,
-# anything weaker in GGUF_CONDITIONAL_ADVISORY_KEYS. A hit here refuses to publish.
-# Verified against llama.cpp b49650adb31f2e49a0d76113aeb1792134fd8413.
+# A tensor namespace implies its metadata keys: required only if every architecture with it reads
+# them with no trailing `false` in `src/models/*.cpp`; optional readers are exempt, weaker ones
+# advisory; a hit refuses to publish; verified against llama.cpp
+# b49650adb31f2e49a0d76113aeb1792134fd8413.
 GGUF_CONDITIONAL_REQUIRED_KEYS = (
     (
         ".indexer",
@@ -7174,8 +7156,7 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
             continue
         tensor_names.extend(tensor.name for tensor in shard_reader.tensors)
 
-    # Runs BEFORE the architecture exemption: that exemption covers which metadata keys a loader reads, and a corrupt
-    # shard is unloadable whatever the architecture.
+    # Before the architecture exemption (metadata keys only); a corrupt shard is unloadable.
     if unreadable_shards and report_structural:
         listed = ", ".join(f"`{name}`" for name in unreadable_shards)
         return [
@@ -7266,8 +7247,7 @@ GGUF_VERIFY_WINDOW_DEFAULT = 4096
 # 262k vocabulary, and the first and last tensors are always sampled).
 GGUF_VERIFY_DEEP_MAX_ELEMENTS = 64 * 1024 * 1024
 
-# The only in-block weights a published method deliberately zeroes: LLaMA Pro block expansion (arXiv 2401.02415)
-# zero-inits o_proj and down_proj so the copy is identity; llama.cpp loads it.
+# LLaMA Pro (arXiv 2401.02415) zero-inits o_proj, down_proj for identity; llama.cpp loads it.
 GGUF_IDENTITY_INIT_SUFFIXES = (".attn_output.weight", ".ffn_down.weight")
 
 
@@ -7900,7 +7880,6 @@ def check_linux_type():
     if system != "linux":
         return "unknown"
 
-    # Check if it's Debian/Ubuntu-based:
     if os.path.exists('/etc/debian_version'):
         return 'debian'
 

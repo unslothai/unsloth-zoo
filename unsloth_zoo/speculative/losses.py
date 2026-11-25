@@ -84,9 +84,8 @@ def chunked_lm_loss(
     lk_eta = 3.0,
     logit_softcap = None,
 ):
-    """Draft-head loss over the vocabulary in row chunks; returns (loss_sum, n_tokens, n_correct) over rows whose label
-    is not ignore_index, so callers can normalize across microbatches; chunk logits are recomputed in backward, so
-    peak memory follows chunk_size."""
+    """Returns (loss_sum, n_tokens, n_correct) over rows with label != ignore_index so callers
+    normalize across microbatches; logits recomputed in backward, so memory follows chunk_size."""
     if loss_type not in LOSS_TYPES:
         raise ValueError(f"Unsloth: loss_type must be one of {LOSS_TYPES}, got {loss_type!r}.")
     if loss_type != "ce" and teacher_hidden is None:

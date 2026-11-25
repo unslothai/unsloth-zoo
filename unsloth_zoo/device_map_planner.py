@@ -185,8 +185,7 @@ def _config_attr(holder, name, default = None):
         return default
 
 
-# Names PretrainedConfig.get_text_config searches, in order; asking the method is not enough, since T5Gemma returns self
-# on transformers 4.56.x, hiding config.decoder's soft cap.
+# On transformers 4.56.x get_text_config() returns self for T5Gemma, hiding decoder's cap.
 _TEXT_CONFIG_ATTRS = ("text_config", "decoder", "text_encoder")
 
 
@@ -211,9 +210,8 @@ def _model_config(model_or_config):
     return model_or_config
 
 
-# Composites with their own lm_head over a bare AutoModel tower never apply the tower's declared scale (logit_scale
-# absent from aya_vision and cohere2_vision), so it is not credited; Granite Speech (builds an AutoModelForCausalLM, so
-# it divides) and Gemma 3n (re-applies its cap) are excluded.
+# Own-head composites over a bare AutoModel tower never apply its logit_scale (absent in aya_vision,
+# cohere2_vision), so none is credited; Granite Speech divides, Gemma 3n re-applies its cap.
 _OWN_UNTRANSFORMED_HEAD = frozenset({"aya_vision", "cohere2_vision"})
 
 # Config field -> which magnitude it contributes, by default.
@@ -225,8 +223,7 @@ _TRANSFORM_FIELDS = (
     ("logit_scale_divide", ("logits_scaling",)),
 )
 
-# logits_scaling is not one knob: Granite divides logits by it, HyperCLOVA X multiplies, and MiniCPM3 scales hidden
-# states before the head; overrides are keyed on the source config's model_type.
+# logits_scaling differs: Granite divides, HyperCLOVA X multiplies, MiniCPM3 scales pre-head.
 _BUCKET_OVERRIDES = {
     ("logits_scaling", "hyperclovax"): "logit_scale_multiply",
     ("logits_scaling", "minicpm3"): None,
@@ -313,8 +310,7 @@ def detect_logit_transforms(model_or_config) -> dict:
                     try:
                         found[bucket] = float(value)
                     except Exception:
-                        # Catches anything, since a huge int raises OverflowError in float(), and the outer handler
-                        # would otherwise discard the fields already read.
+                        # Huge int: float() raises OverflowError, outer handler drops fields.
                         continue
                     break
         return found
@@ -522,8 +518,7 @@ def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]
 def resolve_no_split_classes(model: nn.Module) -> list[str]:
     """Decoder / encoder block classes that must not be split across devices."""
     classes = getattr(model, "_no_split_modules", None)
-    # [] means the model declares nothing atomic, as several transformers models do (camembert, colpali, colqwen2,
-    # efficientnet, fuyu); only None, the base-class default, means not declared, so detect.
+    # [] declares nothing atomic (camembert, fuyu do it); only None triggers detection.
     if classes is not None:
         declared = {str(c) for c in classes}
         # transformers 4.x declares a composite's blocks on its sub-models, not the root (unsloth#2864).
@@ -751,8 +746,7 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
             attempts.append(({"hf_quantizer": hf_quantizer}, True))
         elif size_kwargs:
             supported = {k: v for k, v in size_kwargs.items() if k in accepted}
-            # Drop extras one at a time: an older accelerate without special_dtypes still gets the storage dtype, which
-            # is the term that actually moves the number.
+            # Older accelerate lacks special_dtypes; storage dtype is what moves the number.
             if supported:
                 attempts.append((supported, supported.keys() >= size_kwargs.keys()))
             if "dtype" in supported and len(supported) > 1:
@@ -1185,9 +1179,8 @@ def _split_units(
     units: list[tuple[str, int]] = []
 
     def walk(prefix: str, module: nn.Module) -> None:
-        # Uses _modules, not named_children(), which drops repeated registrations of one object (nn.ModuleList([block] *
-        # n)); else the remove_duplicate=False coverage check reports aliases as an internal failure; alias units are
-        # zero bytes, co-located with the name that carries the weight.
+        # Use _modules, not named_children(), which drops repeated registrations; aliases are zero
+        # bytes beside the weight's name, else the remove_duplicate=False coverage check fails.
         children = [(n, m) for n, m in module._modules.items() if m is not None]
         size = sizes.get(prefix, 0)
         if prefix and (type(module).__name__ in no_split or not children or size == 0):
@@ -1199,31 +1192,23 @@ def _split_units(
         # Direct parameters and buffers owned by this module (not a child) travel with it, so they are kept as their own unit.
         own_tensors = list(module.named_parameters(recurse=False)) + \
                       list(module.named_buffers(recurse=False))
-        # Sizes direct state from the quantiser-aware table minus children, not element_size(): a preprocessed meta
-        # Params4bit reports the unpacked float32 shape, so units would stop summing to total_weight_bytes, and the
-        # planner would refuse a model that fits.
+        # Direct state: quantiser-aware table minus children, not element_size(): meta Params4bit is
+        # unpacked float32, so units miss total_weight_bytes and a fitting model is refused.
         child_bytes = sum(
             sizes.get(f"{prefix}.{child_name}" if prefix else child_name, 0)
             for child_name, _ in children
         )
-        # Emit the unit whenever direct state exists, even at zero bytes: a
-        # tensor tied to one counted elsewhere weighs nothing here, and dropping
-        # its unit would leave the parameter uncovered and fail the coverage
-        # check at the end of `plan_device_map`.
+        # Emit the unit even at zero bytes: a tensor tied to one counted elsewhere weighs nothing
+        # here, and dropping it would leave the parameter uncovered and fail plan_device_map's
+        # coverage check.
         own = max(0, size - child_bytes) if own_tensors else 0
         if own_tensors and prefix:
             units.append((prefix, own))
         elif own_tensors:
-            # State registered directly on the ROOT module. There is no module
-            # name to hang it on -- the prefix is "" -- and accelerate reads ""
-            # as a catch-all default for everything unlisted, which would fight
-            # the explicit entries this planner exists to produce. So name each
-            # tensor instead: accelerate's lookup walks a parameter name up to
-            # its longest present prefix and tries the full name first, so an
-            # exact key matches immediately. Without this the coverage check at
-            # the end of plan_device_map reports the state as unplaced and
-            # raises, so a model with a root-level scale or bias could not be
-            # planned at all.
+            # Root-level state has an empty prefix, which accelerate reads as a catch-all default
+            # that would fight explicit entries, so each tensor is named; its lookup tries the full
+            # name first, and without this plan_device_map's coverage check raises on a root-level
+            # scale or bias.
             for tensor_name, tensor in own_tensors:
                 units.append((tensor_name, sizes.get(
                     tensor_name, tensor.numel() * tensor.element_size()
@@ -1476,8 +1461,7 @@ def plan_device_map(
     if len(devices) < 2:
         return None
 
-    # _colocate is internal (tower, excluded blocks) pairs sharing a device; None tries whole, then anchored, then the
-    # old split, so previously plannable models still plan.
+    # None tries whole, anchored, then old split, so previously plannable models still plan.
     if _colocate is None:
         towers = [] if no_split_module_classes is not None else _sub_model_towers(model)
         if not towers:
@@ -1592,16 +1576,14 @@ def plan_device_map(
             )
 
     unit_size = dict(units)
-    # Pin units below and above each pinned module: a composite head split into lm_head.proj, or inside an atomic
-    # ancestor in no_split_module_classes, never appears by its own name; an exact filter lost it, so its headroom
-    # landed on the wrong GPU.
+    # Pin units above and below each pinned module by prefix: a head split into lm_head.proj or
+    # inside an atomic ancestor never shows by name; exact matching misplaces its headroom.
     pinned = list(dict.fromkeys(
         u for p in pinned for u, _ in units
         if u == p or u.startswith(p + ".") or p.startswith(u + ".")
     ))
 
-    # Co-locate every group sharing a parameter, not just the embedding pair: compute_module_sizes counts a shared
-    # tensor once, so splitting owners makes accelerate copy it and OOM at dispatch.
+    # Co-locate every group sharing a tensor; sizes count it once, but split copies would OOM.
     unit_names = [u for u, _ in units]
     parent = {u: u for u in unit_names}
 
@@ -1666,8 +1648,7 @@ def plan_device_map(
             _group_index[root] = len(free_groups)
             free_groups.append(((name,), size))
 
-    # A caller-measured reserve is a constraint; only a guessed reserve may be relaxed (see `attempt`), else a measured
-    # per-device map could silently drop to zero and OOM.
+    # Measured reserve is a constraint (relaxing it can OOM); only guessed reserves relax.
     reserve_is_explicit = activation_reserve_bytes is not None
     requested_reserve = activation_reserve_bytes
 
@@ -1687,10 +1668,9 @@ def plan_device_map(
         value = requested_reserve
         if value is None:
             if free_space_policy == "balanced":
-                # Equal activation split plus logit headroom on the head's device is a heuristic, right only for
-                # symmetric demand; a vision-LM whose GPU 0 also holds the vision tower, input embedding and KV cache
-                # can OOM there (measured: a 30B 4-bit GRPO step OOMed on GPU 0 under the equal split); pass a
-                # per-device mapping when you have measurements.
+                # An equal activation split plus logit headroom on the head's device is a heuristic
+                # for symmetric demand; a vision-LM whose GPU 0 also holds the vision tower,
+                # embedding and KV cache can OOM there; pass a per-device mapping when measured.
                 slack = sum(raw_budgets.values()) - total
                 value = max(0, (slack - headroom) // len(devices))
                 # Cap each device at its own budget less the weight it holds, the head card also paying headroom,
@@ -1713,8 +1693,7 @@ def plan_device_map(
                     )))
                     for d in devices
                 }
-                # The flat-average planner's reserve, kept with the shared pinned floor so this mapping reproduces the
-                # old planner exactly; `attempt` walks its ladder too.
+                # Flat planner's reserve with pinned floor reproduces the old planner exactly.
                 flat_reserve[head_device] = {
                     d: int(max(0, min(
                         value,
@@ -1750,9 +1729,8 @@ def plan_device_map(
         if reserve_is_explicit:
             return _fill(head_device, reserve, max(reserve.values()))
 
-        # Try every rung either planner would have tried, stepping down from the per-device range and its floor, since
-        # relaxing from the top alone can land below the floor; head reserve is relaxed too, as relaxing only other
-        # cards can refuse a fitting model; logit headroom is never touched
+        # Try every rung either planner tried, down from the per-device range and floor; head
+        # reserve relaxes too, as other cards alone may refuse a fit; logit headroom never moves.
         def ladder(base: dict[int, int]) -> list[dict[int, int]]:
             top, floor = max(base.values()), min(base.values())
             rungs = sorted(
@@ -1799,8 +1777,7 @@ def plan_device_map(
                 filled[key] = _fill(head_device, kept, max(kept.values()))
             return filled[key]
 
-        # The legacy ladder is the flat planner's own; a candidate must be at least its reserve on every card, as
-        # ordering by the smallest reserve is not monotone.
+        # Legacy rungs must meet the reserve on each card; min-reserve order isn't monotone.
         legacy_kept = None
         for kept in _ordered(legacy):
             if _below_floor(kept):
@@ -1820,8 +1797,7 @@ def plan_device_map(
         return None
 
     def _fill(head_device: int, reserve: dict[int, int], other_reserve: int):
-        # Reserve kept per device, which the plan reports: `attempt` relaxes non-head cards, so a single scalar would
-        # promise headroom the accepted packing did not keep.
+        # Per-device reserve: attempt relaxes non-head cards, so a scalar overstates headroom.
         kept = {d: reserve[d] if d == head_device else min(reserve[d], other_reserve)
                 for d in devices}
         budget = {
@@ -1881,8 +1857,7 @@ def plan_device_map(
         return peak
 
     def _walk_in_order(free, budget, head_device: int):
-        # `head_max` pushes weight off the head's card by walking it last; plain device order fills it first when the
-        # head is not the last device, leaving later GPUs empty.
+        # head_max walks head last; plain order fills non-last head, leaving later GPUs empty.
         order = devices
         if free_space_policy == "head_max":
             order = [d for d in devices if d != head_device] + [head_device]
@@ -2131,8 +2106,7 @@ def plan_device_map(
 
     assign, weight_bytes, budgets, reserve_kept = result
     activation_reserve_bytes = max(reserve_kept.values()) if reserve_kept else 0
-    # The map must cover every parameter and buffer: use `remove_duplicate=False`, since accelerate's `check_device_map`
-    # walks `state_dict()`, which lists tied tensors under every name.
+    # Cover all params/buffers: remove_duplicate=False, as check_device_map walks state_dict().
     uncovered = []
     for pname, _ in list(model.named_parameters(remove_duplicate=False)) + \
                     list(model.named_buffers(remove_duplicate=False)):

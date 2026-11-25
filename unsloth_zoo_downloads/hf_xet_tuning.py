@@ -105,8 +105,7 @@ def _walk_to_root(root: Path, rel: Optional[str]) -> list[Path]:
 
 
 def _cgroup_v2_dirs() -> list[Path]:
-    """Candidate cgroup v2 dirs for this process, innermost first; /sys/fs/cgroup/memory.max usually does not exist, so
-    the real limit lives at the /proc/self/cgroup path."""
+    """Cgroup v2 dirs, innermost first; root memory.max is often absent; use /proc/self/cgroup."""
     root = CGROUP_ROOT
     if not root.is_dir():
         return []
@@ -120,8 +119,7 @@ def _cgroup_v2_dirs() -> list[Path]:
 
 
 def _cgroup_v1_dirs(controller: str) -> list[Path]:
-    """Candidate cgroup v1 dirs for controller, innermost first, then the mount root; outside a container the root reads
-    the unlimited sentinel and hides Slurm or systemd limits."""
+    """Cgroup v1 dirs, innermost first; root reads unlimited outside containers, hiding Slurm."""
     root = CGROUP_ROOT / controller
     if not root.is_dir():
         return []
@@ -192,8 +190,7 @@ class SystemProfile:
     cpu_count: int
     ram_source: str
     cpu_source: str
-    # Free space where the download lands: a multi-GB buffer for a transfer the disk cannot hold just wastes RAM, and a
-    # nearly full disk predicts a doomed download.
+    # Free disk: a buffer it cannot hold wastes RAM; a near-full disk dooms the download.
     free_disk_bytes: int = 0
     disk_source: str = "unknown"
 
@@ -252,8 +249,7 @@ def _free_disk(cache_dir: "Optional[str | Path]" = None) -> "tuple[int, str]":
 
 
 def system_profile(cache_dir: "Optional[str | Path]" = None) -> SystemProfile:
-    """Usable RAM and cores for this process, preferring a cgroup limit over host totals; cache_dir is the real download
-    destination, so the disk reading follows the bytes."""
+    """Usable RAM and cores (cgroup limit over host totals); disk is measured at cache_dir."""
     host_total, host_available = _psutil_memory()
     if host_total is None:
         host_total = _sysconf_memory()
@@ -391,9 +387,8 @@ def xet_env_overrides(
     }
 
     if not fail_fast:
-        # xet-core reads config once per process, so these fail-fast keys apply to every CAS call, including uploads and
-        # direct huggingface_hub downloads our ladder does not catch; process-wide a transient CAS 5xx becomes a hard
-        # error after ~12s instead of ~363s of retries.
+        # xet-core reads config once per process, so fail-fast keys apply to every CAS call, incl.
+        # uploads and direct hub downloads our ladder misses; a transient 5xx fails fast.
         for key in _FAIL_FAST_KEYS:
             env.pop(key, None)
     return env
@@ -460,9 +455,8 @@ def apply_xet_env(
             if target is os.environ and key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
                 del target[key], _SEEDED_INTO_ENVIRON[key]
 
-    # A user's high-performance flag keeps the headroom, so our caps are dropped rather than left alongside it; read it
-    # as xet-core does (configuration_utils.rs get_high_performance_flag): HF_XET_HIGH_PERFORMANCE wins if set at all,
-    # HF_XET_HP only otherwise.
+    # A user's high-performance flag drops our caps; xet-core reads it (configuration_utils.rs
+    # get_high_performance_flag): HF_XET_HIGH_PERFORMANCE wins if set at all, HF_XET_HP otherwise.
     primary, alias = XET_HIGH_PERFORMANCE_VARS
     user_wants_hp = _is_true(target[primary]) if primary in target else _is_true(target.get(alias))
     forcing_caps = _is_true(os.environ.get("UNSLOTH_XET_FORCE_CAPS"))
@@ -480,8 +474,7 @@ def apply_xet_env(
         if force or key not in target or key in overwritable:
             target[key] = value
             written[key] = value
-    # Record what we wrote into the real os.environ, and on what terms, so a later resize redoes only our own values,
-    # the same way, and leaves user settings alone.
+    # Record our os.environ writes and throttled terms; a resize redoes only those.
     if target is os.environ:
         global _SEEDED_THROTTLED
         _SEEDED_INTO_ENVIRON.update(written)
@@ -496,9 +489,8 @@ def resize_for_cache_dir(
     fail_fast: bool = True,
     throttled: "Optional[bool]" = None,
 ) -> dict[str, str]:
-    """Recomputes only the sizing values this process seeded into the environment, since setdefault would keep them for
-    the wrong cache; values we never wrote, or that changed since, are left alone; throttled defaults to the seeding
-    call's."""
+    """Recomputes only env sizing values this process seeded and still unchanged (setdefault would
+    keep them for the wrong cache); throttled defaults to the seeding call's."""
     if throttled is None:
         throttled = _SEEDED_THROTTLED
     for key, value in list(_SEEDED_INTO_ENVIRON.items()):

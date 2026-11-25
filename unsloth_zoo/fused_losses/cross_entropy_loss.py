@@ -52,8 +52,7 @@ N_CHUNKS = os.environ.get("UNSLOTH_CE_LOSS_N_CHUNKS", None)
 FP32_HEAD_GRAD = os.environ.get("UNSLOTH_CE_FP32_HEAD_GRAD", "0") == "1"
 _HALF_DTYPES = (torch.float16, torch.bfloat16)
 
-# Register grad_and_value_impl in trace_rules: grad_impl is registered but grad_and_value_impl is not, which can cause
-# GB0149 'Unsupported functorch tracing attempt' in some configurations.
+# Register grad_and_value_impl in trace_rules: grad_impl alone can raise GB0149 (functorch).
 try:
     from torch._dynamo.trace_rules import manual_torch_name_rule_map as _trace_map
     from torch._dynamo.variables.higher_order_ops import FunctorchHigherOrderVariable as _FHOV
@@ -645,13 +644,11 @@ class UnslothFusedLoss(torch.autograd.Function):
         scaling = ctx.scaling if ctx.scaling is not None else 1.0
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
 
-        # Collapse tensor scaling to a Python float at the boundary: current callers pass a float
-        # (GradScaler.get_scale()), a tensor caller pays one .item() sync.
+        # Callers pass a float (GradScaler.get_scale()); a tensor scale costs one .item() sync.
         if torch.is_tensor(scaling):
             scaling = float(scaling.detach().item())
 
-        # scaling == 0 zeroes the saved gradient (forward differentiates loss * scaling); grad_output *
-        # d(loss)/d(hidden) cannot be recovered, so only safe when grad_output is 0, else raise.
+        # Scaling 0 zeroes grads (loss*scaling); unrecoverable, grad_output must be 0 or raise.
         if scaling == 0.0:
             if torch.is_tensor(grad_output):
                 go_is_zero = bool(torch.all(grad_output == 0).item())
@@ -710,8 +707,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                         f"Fused losses grad_output scaled by {scale_factor_val} (got {grad_scale_val}, expected {scaling})"
                     )
 
-        # Out-of-place mul so ctx.saved_tensors' version counter does not bump, keeping retain_graph and double-backward
-        # working; peak memory cost is under 3 MB.
+        # Out-of-place mul: no version counter bump keeps retain_graph/double backward; <3 MB.
         grad_inputs = grad_inputs * scale_factor
         if grad_lm_head is not None: grad_lm_head = grad_lm_head * scale_factor
         if grad_lm_head_bias is not None: grad_lm_head_bias = grad_lm_head_bias * scale_factor
@@ -876,8 +872,7 @@ def _lm_head_module_reason(lm_head):
         if getattr(type(module), "adapter_layer_names", None) is None or not hasattr(module, "base_layer"):
             continue
         if getattr(module, "disable_adapters", False):
-            # Disabled: PEFT's forward unmerges a merged adapter first, then runs base_layer(x); unmerged it is
-            # already base_layer(x), which the kernel scores from lm_head.weight.
+            # Merged+disabled: refused, PEFT unmerges first. Unmerged, base_layer(x) is scored.
             if getattr(module, "merged_adapters", None):
                 return f"disabled {type(module).__name__}"
         elif not _adapter_containers_fully_merged(module):
@@ -981,8 +976,7 @@ def _module_head_chunkable(lm_head, base, hidden_states, n_targets, scaling):
         return False
     if _fp16_without_scaler(lm_head, hidden_states, scaling):
         return False
-    # Only PEFT LoRA layers are known to be row-wise and deterministic (LoHa / LoKr sample rank / module
-    # dropout once per forward with torch.rand); FSDP1 flat parameters leave lm_head.parameters() empty.
+    # Only PEFT LoRA is row-wise/deterministic; LoHa/LoKr draw per forward; FSDP1 hides params.
     if not type(lm_head).__module__.startswith("peft.tuners.lora"):
         return False
     if getattr(lm_head, "_is_fsdp_managed_module", False) or next(lm_head.parameters(), None) is None:
@@ -1106,8 +1100,7 @@ def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_la
         base = base.base_layer
     weight = getattr(base, "weight", None)
     if weight is not None:
-        # As the kernel feeds its matmul: in a floating head's dtype outside autocast, but never in a packed or
-        # 8-bit storage dtype (bitsandbytes, FP8), which the base dequantizes itself.
+        # Weight dtype if floating, outside autocast, not packed/8-bit (base dequantizes).
         dtype = hidden_states.dtype
         if (weight.is_floating_point() and weight.element_size() >= 2
                 and type(weight) in (torch.Tensor, torch.nn.Parameter)
@@ -1124,9 +1117,8 @@ def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_la
     if _module_head_chunkable(lm_head, base, hidden_states, targets.numel(), scaling):
         return _module_head_chunked_ce(lm_head, base.out_features, hidden_states, targets, n_items, scaling, kwargs)
     if type(base) is torch.nn.Linear and targets.numel() == rows.numel():
-        # A row-wise head over a plain Linear: zero the ignored inputs so a half precision overflow inside the
-        # adapter (lora_A) on a row the loss never reads cannot reach backward as 0 * inf. Same shape, so per-row
-        # adapter_names and dropout see the batch they would.
+        # Row-wise head over a plain Linear: zero ignored inputs so a half precision overflow in
+        # lora_A cannot reach backward as 0*inf; same shape keeps per-row adapter_names/dropout.
         hidden_states = hidden_states.masked_fill((targets == ignore_index).reshape(rows).unsqueeze(-1), 0)
     logits = lm_head(hidden_states)
     targets = targets.to(logits.device)
@@ -1182,8 +1174,7 @@ def unsloth_fused_ce_loss(
     scaling = scaler if scaler is not None else scaling
     if _LABEL_SMOOTHING.active:
         n_items, kwargs = _apply_label_smoothing_override(n_items, kwargs)
-    # A live PEFT adapter on the head (lm_head_module): lm_head_weight is its base weight, which would drop the
-    # adapter (no gradient, the base head's loss). Same reduction on the head's own logits.
+    # Live PEFT adapter on the head: use the module forward; lm_head_weight would drop it.
     if lm_head_needs_module_forward(lm_head_module):
         return _module_head_ce_loss(lm_head_module, hidden_states, labels, mask, n_items, shift_labels, kwargs,
                                     scaling = scaling)
@@ -1266,8 +1257,7 @@ def unsloth_count_aware_cross_entropy(
     # float32 per token losses without a float32 copy of the logits (stock rounds each to the logits' dtype).
     nll = cross_entropy_rows(logits, labels, ignore_index = ignore_index)
     if n_items is None:
-        # Stock mean over labelled tokens (NaN when all labels are ignored) in stock's dtype: autocast runs
-        # cross_entropy in float32, so a half mean would overflow GradScaler's scaled grad.
+        # Stock dtype (NaN if all ignored); autocast CE is fp32, so half overflows GradScaler.
         mean = nll.sum() / (labels != ignore_index).sum()
         return mean if _autocast_enabled(logits.device.type) else mean.to(logits.dtype)
     loss = nll.sum()

@@ -84,8 +84,7 @@ def cpu_bf16_supported():
     return False
 
 
-# Runs in a child interpreter: a bf16 matmul on a CPU whose torch build picks an instruction the CPU lacks dies with
-# an illegal instruction (Windows 0xc000001d, exit 132), which would otherwise kill the user's process.
+# Child interpreter: bf16 matmul on unsupported instructions (exit 132) would kill the user.
 _BF16_PROBE_CODE = """
 import time
 import torch
@@ -194,8 +193,7 @@ def _linux_physical_cores(cpus, root = "/sys/devices/system/cpu"):
                 core = f.read().strip()
             with open(base + "physical_package_id") as f:
                 package = f.read().strip()
-            # Unknown topology reads as package -1 (and core 0 everywhere): it names no real core, so the caller
-            # falls back to counting CPUs instead of collapsing them all into one.
+            # Negative package/core: unknown topology; callers count CPUs, not one merged core.
             if int(package) < 0 or int(core) < 0:
                 return None
             cores.add((package, core))
@@ -214,8 +212,7 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
         return None
     for line in lines:
         hierarchy, _, path = line.partition(":")[2].partition(":")
-        # The process's own cgroup and every ancestor up to the mount root bound it; a path that does not exist under
-        # the mount (a host path seen inside a container) just falls through to the levels that do.
+        # Own cgroup and ancestors up to the mount root bound it; absent paths are skipped.
         parts = [p for p in path.split("/") if p]
         if hierarchy == "":  # v2 unified
             for depth in range(len(parts), -1, -1):
@@ -267,9 +264,8 @@ def cpu_compute_cores():
 
 
 def _affinity_split_per_rank(ranks):
-    """True when a launcher pinned this rank to its own slice of CPUs (torchrun --numa-binding, mpirun --bind-to):
-    the parent launcher's affinity is wider than ours and holds a slice this size for every local rank. A whole job
-    pinned with taskset shares one mask with its parent, so its ranks still split it."""
+    """True when a launcher (torchrun --numa-binding, mpirun --bind-to) gave this rank its own CPU
+    slice (the parent mask is wider); a taskset-pinned job still splits its shared mask."""
     if ranks <= 1 or not sys.platform.startswith("linux"):
         return False
     try:
@@ -306,10 +302,9 @@ _THREADS_FITTED = None
 
 
 def fit_cpu_threads():
-    """Sizes torch's intra-op pool for CPU training. Idempotent; returns (threads, reason).
-    UNSLOTH_CPU_THREADS wins; a user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept; otherwise one thread per physical
-    core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate. Never raises the
-    count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
+    """Sizes torch's intra-op threads (idempotent). UNSLOTH_CPU_THREADS wins; user OMP_NUM_THREADS /
+    MKL_NUM_THREADS kept; else one thread per physical core (affinity/cgroup quota), split across
+    local ranks; never above torch's default unless undoing launcher's OMP_NUM_THREADS=1."""
     global _THREADS_FITTED
     import torch
     if _THREADS_FITTED is not None:
@@ -368,9 +363,8 @@ def fit_cpu_threads():
 
 
 def _pin_omp_env(threads):
-    """Accelerate's PartialState (built later by TrainingArguments) sets torch threads to physical cores / local
-    ranks on a multi-CPU launch whenever OMP_NUM_THREADS is unset (mpirun), undoing this fit and UNSLOTH_CPU_THREADS.
-    Exporting the fitted count keeps it there, and hands the same count to spawned workers."""
+    """Exports the fitted count as OMP_NUM_THREADS, since Accelerate's PartialState sets torch
+    threads when unset (mpirun), undoing this fit and UNSLOTH_CPU_THREADS; workers inherit it."""
     if not os.environ.get("OMP_NUM_THREADS", "").strip():
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(threads)))
 
@@ -462,9 +456,8 @@ def apply_cpu_security_patches():
 
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temporary_patches")
     applied = []
-    # deepseek_v41: device-independent training fixes for the DeepSeek-V4.1 port (no-ops without it).
-    # fp8_partial_block_dequant: FP8 checkpoints are dequantized on load on CPU; keep partial edge blocks right.
-    # hybrid_sliding_masks: StaticCache generate on Inkling models past the sliding window.
+    # Guards: deepseek_v41 (DeepSeek-V4.1 port fixes; no-op without it), fp8_partial_block_dequant
+    # (CPU FP8 edge blocks), hybrid_sliding_masks (StaticCache on Inkling past sliding window).
     for name in ("datasets_folder_metadata", "deepseek_v41", "fp8_partial_block_dequant", "hybrid_sliding_masks"):
         module_name = f"{__package__}._guard_{name}"
         module = sys.modules.get(module_name)

@@ -162,10 +162,9 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
 redirect_hf_cache_if_readonly()
 
-# Size hf_xet buffers from this machine's RAM and cores; HF_XET_HIGH_PERFORMANCE=1 (old default here) meant a 64GB
-# buffer cap and multi-GB RSS spikes, so it is turned off unless the user set it.
-# _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and returns None entries
-# instead of raising when home is unresolvable.
+# Size hf_xet buffers from RAM and cores; HF_XET_HIGH_PERFORMANCE=1 (64GB buffer cap, multi-GB RSS
+# spikes) stays off unless the user set it; _active_caches mirrors Hub's env layering
+# (XDG_CACHE_HOME included) and returns None entries instead of raising when home is unresolvable.
 from .hf_xet_tuning import apply_xet_env
 _, _, xet_cache = _active_caches()
 apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
@@ -220,10 +219,9 @@ if _is_mlx_only:
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
-    # Opt-in: a download-only helper child (e.g. hf_xet_fallback) sets
-    # UNSLOTH_ZOO_DISABLE_GPU_INIT=1 to skip the heavy torch/transformers/device
-    # init it never uses. Off by default, so normal CUDA/CPU runs are unchanged.
-    # The HF cache redirect above still runs, so the child shares the parent's cache.
+    # Opt-in via UNSLOTH_ZOO_DISABLE_GPU_INIT=1 (off by default) skips heavy
+    # torch/transformers/device init for download-only children like hf_xet_fallback; the HF cache
+    # redirect still runs so they share the parent's cache.
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
     if _SKIP_GPU_INIT:
@@ -235,8 +233,7 @@ else:
 
 _IS_CPU_BACKEND = False
 
-# Stub CUDA-only imports when GPU init is skipped (MLX host or download child) so they resolve to a loud no-op, not a
-# hard ImportError; CUDA/CPU keeps real modules.
+# Skipped GPU init stubs CUDA-only imports as loud no-ops, not ImportError; CUDA/CPU stay real.
 if _SKIP_GPU_INIT:
     from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
@@ -279,8 +276,7 @@ class _LazyMLXAlias(_types.ModuleType):
         return real
 
     def __getattr__(self, name):
-        # Dunder lookups raise AttributeError so torch walking sys.modules during init does not trigger an mlx import;
-        # real attributes such as FastMLXModel still resolve.
+        # Dunder lookups raise AttributeError so torch's sys.modules walk does not import mlx.
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         try:

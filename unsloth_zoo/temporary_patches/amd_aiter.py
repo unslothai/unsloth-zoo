@@ -30,8 +30,7 @@ _DISABLE_ENV = "UNSLOTH_DISABLE_AITER"
 # flash_attn_func applies 1/sqrt(head_dim) itself and takes no softmax_scale, so a model with a different scale must not take this path.
 _SCALE_RTOL = 1e-6
 
-# Kwargs the interface delivers but this kernel ignores: RoPE is already applied to q/k and cache bookkeeping is outside
-# it; measured on transformers 4.57.6, 5.0.0 and 5.14.1.
+# Ignored kwargs: RoPE pre-applied to q/k, cache outside (transformers 4.57.6, 5.0.0, 5.14.1).
 _BENIGN_KWARGS = frozenset((
     "position_ids", "use_cache", "cache_position", "past_key_value",
     "past_key_values", "layer_idx", "layer_head_mask", "output_attentions",

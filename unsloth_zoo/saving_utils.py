@@ -34,9 +34,8 @@ from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
-# Import each independently: convert_moe_packed_tensors_cpu is injected by Unsloth's mxfp4 patch and absent from stock
-# transformers; one combined import nulls both names, wrongly tripping the convert_moe_packed_tensors is None guard
-# though the base exists in transformers.
+# Import separately: convert_moe_packed_tensors_cpu is injected by Unsloth's mxfp4 patch, absent in
+# stock transformers; a combined import wrongly nulls convert_moe_packed_tensors too.
 try:
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 except (ImportError, ModuleNotFoundError):
@@ -403,8 +402,7 @@ _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 
 
 def _torch_save_spool(tensor, path, pickle_module, pickle_protocol):
-    # Skip torch.save's CRC32 (~half the spool cost): only our own mmap load reads it back.
-    # torch < 2.6 has no set_crc32_options, so it keeps the CRC32.
+    # Skip torch.save CRC32 (only our mmap load reads it back); torch < 2.6 keeps CRC32.
     get_crc32 = getattr(torch.serialization, "get_crc32_options", None)
     set_crc32 = getattr(torch.serialization, "set_crc32_options", None)
     if get_crc32 is None or set_crc32 is None:
@@ -1638,8 +1636,7 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
 
 
 # MoE-quant save dispatch: each quant kind (FP8 now, bnb4bit later) registers a handler in
-# unsloth_zoo.temporary_patches.moe_utils_fp8._MOE_QUANT_HANDLERS, reached via apply_moe_quant_load rather than inlined
-# here.
+# unsloth_zoo.temporary_patches.moe_utils_fp8._MOE_QUANT_HANDLERS, reached via apply_moe_quant_load.
 try:
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         apply_moe_quant_load as _apply_moe_quant_load,
@@ -2615,8 +2612,7 @@ def _mxfp4_base_returns_transposed(convert_cpu_variant, transformers_version):
     if convert_cpu_variant is not None:
         return False
     try:
-        # Compare the release tuple so 4.56.0 pre-releases (4.56.0.dev*, 4.56.0rc*) count as 4.56.0, which
-        # self-transposes; a plain Version compare sorts them below and would double-transpose them.
+        # Release tuple: 4.56.0 pre-releases are 4.56.0; plain Version double-transposes them.
         return Version(transformers_version).release >= (4, 56, 0)
     except Exception:
         # Version unparseable: assume the modern stock behaviour (self-transposes).
@@ -2930,8 +2926,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     return count, safetensor_keys_seen
 pass
 
-# FP8 weight dtypes and their companion scale suffixes, dropped on merge; underscore variants cover fused params whose
-# scale is <key>_scale(_inv), not <key>.weight_scale.
+# FP8 dtypes and scale suffixes are dropped on merge; underscore variants cover fused params.
 _FP8_WEIGHT_DTYPES = tuple(
     getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
 )
@@ -3448,8 +3443,7 @@ pass
 
 
 def _tied_tensor_key(x):
-    # Tied embeddings are one tensor under two names and written once; views into a shared arena (Block Swap) are
-    # distinct tensors, so this cannot key on storage id like the shard splitter.
+    # Tied names share one tensor; Block Swap arena views are distinct, so no storage-id key.
     if not isinstance(x, torch.Tensor) or x.is_meta or is_traceable_wrapper_subclass(x):
         return None
     try:
@@ -3461,8 +3455,7 @@ pass
 
 
 def _save_size_in_bytes(state_dict, element_size, safe_serialization = True):
-    # torch.save writes each storage whole; for safetensors transformers clones disjoint views (Block Swap's arena) and
-    # drops tied aliases, so each distinct view is written once at its own bytes.
+    # For safetensors, transformers clones disjoint views, drops ties: count each view once.
     seen, total = set(), 0
     for x in state_dict.values():
         size = get_torch_storage_size_new(x, element_size)
@@ -3520,7 +3513,6 @@ def prepare_saving(
             private = private,
             token = token,
         )
-        # Check if temporary folder is needed
         if os.path.isdir(save_directory) or use_temp_file:
             temp_file = tempfile.TemporaryDirectory(ignore_cleanup_errors = True)
             save_directory = temp_file.name
@@ -3529,8 +3521,7 @@ def prepare_saving(
     pass
 
     if output_dtype is None: output_dtype = _get_dtype(dtype_from_config(model.config))
-    # output_dtype (from config.json by default) is interpolated into the generated save_pretrained source, so this
-    # raise is its only guard; an assert vanishes under python -O.
+    # output_dtype is interpolated into generated source; raise, not assert (stripped by -O).
     if output_dtype not in (torch.float32, torch.float16, torch.float64, torch.bfloat16):
         raise ValueError(f"Unsloth: Unsupported output dtype `{output_dtype}`.")
     assert(type(torch.bfloat16) is torch.dtype)
@@ -3550,7 +3541,6 @@ def prepare_saving(
             raise RuntimeError(f"Unsloth: Error creating directory {save_directory} with error = {str(error)}")
     pass
 
-    # Check if directory has enough space
     total, used, free = shutil.disk_usage(save_directory)
     free = int(free*0.95)
 
@@ -3616,8 +3606,7 @@ def _remove_quantization_config(config_path: Path):
     assert config_path.exists(), "Given config does not exist"
     with open(config_path, "r", encoding = "utf-8") as f:
         config = json.load(f)
-    # Strip quantization_config at every depth: VLMs nest it under text_config/vision_config, where a leftover
-    # load_in_4bit makes reload build a bnb quantizer for bf16 weights (meta tensor error).
+    # Strip quantization_config recursively: VLMs nest it; leftover load_in_4bit breaks reload.
     def _strip_quantization_config(obj):
         removed = False
         if isinstance(obj, dict):
@@ -3668,8 +3657,7 @@ def _remove_transformers_version(config_path: Path):
     pass
 pass
 
-# transformers drops mtp.* tensors on load (Qwen3.5's _keys_to_ignore_on_load_unexpected), so a round-tripped export
-# declares an MTP head it no longer has, and llama.cpp / vLLM break on the stale key.
+# transformers drops mtp.* on load, so exports keep a stale MTP head; llama.cpp, vLLM break.
 MTP_CONFIG_KEY = "mtp_num_hidden_layers"
 
 # Prefix group is repeatable and order free: Qwen3.5 writes
@@ -3724,8 +3712,7 @@ def _checkpoint_tensor_names(folder):
     return None
 
 
-# The other MTP spelling: DeepSeek-V3 / GLM store the head as extra layers.N blocks past num_hidden_layers; detected
-# only so this repair does not fire on such a checkpoint (mlx/utils.py and llama_cpp.py handle those).
+# DeepSeek-V3/GLM store the MTP head as layers.N past num_hidden_layers; repair skips those.
 _LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
 
 
@@ -3905,7 +3892,6 @@ pass
 
 
 def fix_tokenizer_config_json(tokenizer, saved_folder):
-    # Add "chat_template" to tokenizer_config.json
     tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
     if os.path.exists(tokenizer_config_path) and tokenizer is not None:
         old_chat_template = getattr(tokenizer, "chat_template", None)
@@ -4161,8 +4147,7 @@ pass
 
 
 def _text_configs(config):
-    # Where a composite config keeps its text vocab: get_text_config() also finds sections not named text_config
-    # (qwen2_5_omni, t5gemma) and returns config itself for a plain LM.
+    # get_text_config() also finds sections not named text_config (qwen2_5_omni, t5gemma).
     holders = []
     try: holders.append(config.get_text_config())
     except Exception: pass
@@ -4190,8 +4175,7 @@ pass
 
 
 def _carry_over_vocab_pad_records(base_config, trained_config):
-    # Runs on every merged export so must not raise: _text_configs tolerates composite configs whose get_text_config()
-    # needs an encoder/decoder choice; without records nothing moves.
+    # Runs on every merged export, so must not raise; without records nothing moves.
     sources = _text_configs(trained_config) + [trained_config]
     targets = _text_configs(base_config) or [base_config]
     for key in ("unsloth_vocab_pad_ids", "unsloth_vocab_pad_suppressed_ids"):
@@ -4272,8 +4256,7 @@ pass
 
 
 def _rope_config_holder(config):
-    # Nested first, as the vocab carry-over: a repo-code composite whose get_text_config() returns itself keeps the
-    # language model's RoPE and window in llm_config / language_config, which is what its reload reads.
+    # Nested first: repo-code composites keep RoPE and window in llm_config / language_config.
     holders = _text_configs(config)
     nested = [holder for holder in holders if holder is not config]
     return nested[0] if nested else config
@@ -4382,9 +4365,8 @@ def _reject_unsafe_shard_index(index_path):
     try:
         with open(index_path, "rb") as file:
             raw = file.read()
-        # Decodes permissively (surrogateescape), not strict UTF-8: transformers reads the index in the locale encoding
-        # and parses bytes strict UTF-8 rejects; refusing to decode would pass that index on to a reader that still
-        # follows its traversal.
+        # Decodes with surrogateescape, not strict UTF-8: transformers reads the index in the locale
+        # encoding; refusing would pass it to a reader that still follows its traversal.
         index_data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
     except Exception:
         return None
@@ -4569,8 +4551,7 @@ pass
 
 
 def _export_shard_entries(save_directory):
-    # Every shard entry (file or link) under the export, nested ones too; never inside a linked
-    # directory or the private backup and staging directories.
+    # Shard files and links anywhere under the export; never inside linked or .unsloth-* dirs.
     for root, dirs, names in os.walk(save_directory):
         dirs[:] = [d for d in dirs if not d.startswith(".unsloth-")]
         for name in names:
@@ -4633,10 +4614,8 @@ def _restore_previous_export_shards(kept):
                 (os.path.islink(path) or os.path.isfile(path)):
             os.remove(path)
     for i, (path, payload) in enumerate(metadata.items()):
-        # Staged in the private backup directory and renamed over the entry, so a link the
-        # export holds under any name is replaced, never followed.
+        # Renamed over the entry from the backup dir, so a link is replaced, never followed.
         if isinstance(payload, str):
-            # A link the previous export held: leave it if the refresh kept it, else relink it.
             if os.path.islink(path) and os.readlink(path) == payload:
                 continue
             staged = os.path.join(backup_dir, f"link-{i}")
@@ -4670,8 +4649,7 @@ pass
 
 
 def _download_shard_over_previous_export(repo_id, filename, save_directory, cache_dir, token, revision = None):
-    # Download into a private folder beside the output, then rename over the previous shard, so a failed download keeps
-    # the old shard and no second copy is kept.
+    # Download beside the output, then rename over the old shard: a failed download keeps it.
     file_path = os.path.join(save_directory, filename)
     staging_dir = tempfile.mkdtemp(dir = save_directory, prefix = ".unsloth-fetch-")
     try:
@@ -5301,8 +5279,7 @@ pass
 
 
 def _float32_merge_peak_bytes(total_16bit_bytes, max_shard_16bit_bytes, uploads_as_it_goes = False):
-    # Widened shard may be rewritten again (grown vocab), holding two float32 copies; local keeps earlier shards widened
-    # (2 x total plus one more 16bit shard); streamed uploads remove them (total + 3 x shard).
+    # Float32 merge peak: 2 x total + 2 x shard locally, or total + 3 x shard when streamed.
     if uploads_as_it_goes:
         return total_16bit_bytes + 3 * max_shard_16bit_bytes
     return 2 * total_16bit_bytes + 2 * max_shard_16bit_bytes
@@ -6612,8 +6589,7 @@ def _try_copy_all_from_cache(
             )
             cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
         except LocalEntryNotFoundError:
-            # For a commit with no cached snapshot (the repo moved, often a README edit): reuse the cached main copy
-            # when it is the same file at that commit, rather than re-downloading.
+            # No snapshot at this commit: reuse the cached main copy if it is the same file.
             cached_path_str = _cached_file_matching_revision(
                 repo_id, filename, hf_cache_dir, token, revision,
             ) if revision is not None else None
@@ -6691,8 +6667,7 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
         )
         os.close(_fd)
         shutil.copy2(str(src_path), _staging) # Use string paths for shutil
-        # Re-export keeps the existing output's mode (a 0600 file the user restricted stays 0600); a first copy takes
-        # the source's mode narrowed by the umask.
+        # Re-export keeps the existing mode; a first copy takes the source's mode, less umask.
         keep_mode(_staging, dst_path, source_mode = stat.S_IMODE(os.stat(_staging).st_mode), add = stat.S_IWUSR)
         os.replace(_staging, dst_path)
     except Exception as e:
@@ -6875,8 +6850,7 @@ def merge_and_dequantize_lora(
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantizes model to 16bit weights and merges LoRA
 
-    # Both writers forward this to save_pretrained, where None is falsy and selects a pickle, so passing None to force
-    # safetensors wrote a .bin (unslothai/unsloth 1792).
+    # None is falsy in save_pretrained and selects a pickle .bin (unslothai/unsloth 1792).
     safe_serialization = normalize_safe_serialization(safe_serialization)
 
     inner_model = model.base_model.model if isinstance(model, PeftModelForCausalLM) else model
@@ -6909,8 +6883,7 @@ def merge_and_dequantize_lora(
     save_pretrained = save_pretrained.split("\n")
     save_pretrained = "\n".join(x[spaces:] for x in save_pretrained)
 
-    # transformers 5.x rewrote save_pretrained and its source anchors are gone, so this falls back to vanilla
-    # save_pretrained without the LoRA merge; callers must model.merge_and_unload() first.
+    # transformers 5.x: no anchors, so this is plain save_pretrained; merge_and_unload() first.
     _required_anchors = [
         "state_dict_split = split_torch_state_dict_into_shards",
         "state_dict[tensor].contiguous()",
@@ -7164,8 +7137,7 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
     for model_class in _model_classes_named(model_class_name):
-        # A model Unsloth ships natively (DeepSeek-V4.1) loads a foreign checkpoint layout through
-        # renames transformers scopes per submodule; it states them here for the merge.
+        # DeepSeek-V4.1 loads a foreign layout; its renames are stated here for the merge.
         mapping = getattr(model_class, '_unsloth_checkpoint_conversion_mapping', None) or \
             getattr(model_class, '_checkpoint_conversion_mapping', {})
         if mapping:
@@ -7185,7 +7157,6 @@ def detect_keys_format(keys_to_check, forward_mapping):
     count_matches_new_pattern = 0
 
     old_regex_compiled = [re.compile(p) for p in forward_mapping.keys()]
-    # New patterns (mapping values) are matched as literal prefixes
     new_regex_compiled = [re.compile(r"^" + re.escape(val)) for val in forward_mapping.values()]
 
     for key in keys_to_check:
@@ -7203,7 +7174,6 @@ def detect_keys_format(keys_to_check, forward_mapping):
     if count_matches_new_pattern > 0 and count_matches_old_pattern == 0: return "new"
     if count_matches_old_pattern > 0 and count_matches_new_pattern == 0: return "old"
 
-    # Mixed: go with the majority
     if count_matches_new_pattern > count_matches_old_pattern: return "new"
     if count_matches_old_pattern > count_matches_new_pattern: return "old"
 
@@ -7622,8 +7592,7 @@ def _reverse_renamed_backed_key(key, reverse_mapping, key_set, valid_prefixes, m
                     if candidate in seen: continue
                     if _lora_key_has_backing(candidate, key_set, valid_prefixes = valid_prefixes):
                         return candidate
-                    # A checkpoint without the base-model prefix (DeepSeek-V4.1's `layers.0.attn.wq_a`
-                    # under `model.layers.0.self_attn.q_a_proj`): transformers adds it at load.
+                    # Without the model. prefix (DeepSeek-V4.1); transformers adds it at load.
                     head, dot, rest = candidate.partition(".")
                     if dot and head == "model" and rest and \
                             _lora_key_has_backing(rest, key_set, valid_prefixes = valid_prefixes):
@@ -8088,8 +8057,7 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
     tensors = _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
                                         tie_word_embeddings = tie_word_embeddings)
     if not tensors: return {}
-    # The seeded key keeps its own dtype in the header and the in-place merge cannot change it, so cast here or the head
-    # is the one fp32 tensor in a bf16 export.
+    # Merge can't change a seeded key's dtype, so cast here or it stays the lone fp32 tensor.
     if output_dtype is not None:
         tensors = {key : tensor.to(output_dtype) for key, tensor in tensors.items()}
 
@@ -8097,9 +8065,8 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
     target = min(sizes, key = sizes.get)
     path = os.path.join(save_directory, target)
 
-    # safetensors is flat, so adding a key rewrites the shard through a temp copy that must fit; appending moves every
-    # offset, so there is no in-place fallback; refuse loudly rather than drop the head, since a silent drop is the bug
-    # this fixes.
+    # safetensors is flat, so adding a key rewrites the shard through a temp copy that must fit; no
+    # in-place fallback, so refuse loudly rather than silently drop the head.
     needed = sizes[target] + sum(t.numel() * t.element_size() for t in tensors.values())
     margin = 64 * 1024 * 1024
     try: free_bytes = shutil.disk_usage(save_directory).free
@@ -8218,9 +8185,8 @@ except ImportError:
     _HUB_INVALID_ID_ERRORS = (HFValidationError,)
 
 try:
-    # A disabled repo (DisabledRepoError) is unusable, not retryable, and unlike the other 4xx errors in the absent set
-    # it does not subclass RepositoryNotFoundError, so it must be named here or the catch-all reports a connectivity
-    # problem.
+    # DisabledRepoError is unusable, not retryable, and does not subclass RepositoryNotFoundError,
+    # so it must be named here or the catch-all reports a connectivity problem.
     from huggingface_hub.errors import DisabledRepoError
     _HUB_DISABLED_REPO_ERRORS = (DisabledRepoError,)
 except ImportError:
@@ -8277,9 +8243,8 @@ def _hub_addresses_typed_model_uris():
             return True
     except Exception:
         pass
-    # The prefix is mapped only where resolve_path delegates to the URI parser, so both halves are required; read the
-    # code object, not source text, since a source match counts a parse_hf_uri mention in a comment and getsource fails
-    # where source is missing.
+    # The prefix counts only where resolve_path delegates to the URI parser, so check the code
+    # object, not source text (a comment can mention parse_hf_uri; getsource fails without source).
     try:
         code = HfFileSystem.resolve_path.__code__
         referenced = set(code.co_names)
@@ -8315,16 +8280,13 @@ def _as_hub_addressed(model_name):
     name = str(model_name)
     explicit_uri = name.startswith("hf://")
     if explicit_uri: name = name[len("hf://"):]
-    # A root URI names the repo itself: `resolve_path("hf://org/repo/")` answers repo_id
-    # `org/repo` with an empty path in repo, so the trailing slash must not count toward
-    # the depth test below. Only under an explicit `hf://`, since a bare `outputs/model/`
-    # is how a directory is written and stripping there would send it to the Hub.
+    # A root URI names the repo: resolve_path of hf://org/repo/ gives repo_id org/repo, so the
+    # trailing slash must not count toward the depth test; only an explicit hf:// strips it, since a
+    # bare outputs/model/ is a local directory that stripping would send to the Hub.
     if explicit_uri: name = name.rstrip("/")
-    # `models/` is a type prefix only under an explicit `hf://`. Bare, the commoner
-    # reading is a local directory (`models/base/checkpoint-500` is what a Trainer
-    # writes), and stripping it there would turn that path into the plausible repo id
-    # `base/checkpoint-500` and send a local base to the Hub. Gated on the parser too,
-    # since a version that does not map the prefix would probe a different repo.
+    # models/ is a type prefix only under explicit hf://; bare, it is usually a local dir (stripping
+    # would send it to the Hub); also gated on the parser, since a version without the mapping would
+    # probe another repo.
     if explicit_uri and name.startswith("models/") and _hub_addresses_typed_model_uris():
         name = name[len("models/"):]
     # Split a revision only when what precedes it is addressable (zero or one slash), leaving an @ in ordinary paths
@@ -8368,9 +8330,8 @@ def _is_single_segment_id_rejection(model_name, e):
     return bool(_SINGLE_SEGMENT_REJECTION.search(str(e)))
 pass
 
-# HfFileSystem.ls reports an absent repo, revision or path as FileNotFoundError, reached after _repo_and_revision_exists
-# catches the not-found and validation errors; 429, 5xx, DNS, timeouts and OfflineModeIsEnabled propagate, so absent is
-# told apart from unreachable.
+# HfFileSystem.ls raises FileNotFoundError for an absent repo, revision or path; 429, 5xx, DNS,
+# timeouts and OfflineModeIsEnabled propagate, so absent is told apart from unreachable.
 _HUB_ABSENT_ERRORS = (
     FileNotFoundError,
     RepositoryNotFoundError,
@@ -8578,7 +8539,6 @@ def check_local_model_exists(model_path):
         if os.path.exists(target_path):
             return target_path
 
-        # Split path into components
         parts = target_path.split(os.sep)
         current_path = ""
 
@@ -8598,7 +8558,6 @@ def check_local_model_exists(model_path):
             if os.path.exists(current_path):
                 continue
 
-            # Try to find case-insensitive match
             parent_path = os.path.dirname(current_path) if i > 0 else "."
             target_name = os.path.basename(current_path).lower()
 
@@ -8620,25 +8579,19 @@ def check_local_model_exists(model_path):
 
         return current_path if os.path.exists(current_path) else None
 
-    # List of path patterns to check
     paths_to_check = []
 
-    # 1. Exact path as given
     paths_to_check.append(model_path)
 
-    # 2. Case-insensitive version of full path
     case_insensitive_full = find_case_insensitive_path(model_path)
     if case_insensitive_full:
         paths_to_check.append(case_insensitive_full)
 
-    # 3. If path contains "/", also check just the model name part
     if "/" in model_path:
         model_name = model_path.split("/")[-1]  # Get part after last "/"
 
-        # Exact model name
         paths_to_check.append(model_name)
 
-        # Case-insensitive model name in current directory
         try:
             for item in os.listdir("."):
                 if item.lower() == model_name.lower():
@@ -8647,7 +8600,6 @@ def check_local_model_exists(model_path):
         except (OSError, PermissionError):
             pass
 
-    # Remove duplicates while preserving order
     seen = set()
     unique_paths = []
     for path in paths_to_check:
@@ -8655,7 +8607,6 @@ def check_local_model_exists(model_path):
             seen.add(path)
             unique_paths.append(path)
 
-    # Check each path and verify it contains safetensors
     for path in unique_paths:
         if has_safetensors(path):
             return os.path.abspath(path)  # Return absolute path
@@ -9234,7 +9185,6 @@ def get_memory_stats():
     stats = {}
     import psutil
 
-    # CPU Memory
     cpu_mem = psutil.virtual_memory()
     stats['cpu'] = {
         'total': cpu_mem.total,
@@ -9244,7 +9194,6 @@ def get_memory_stats():
         'free': cpu_mem.available,  # Available is more accurate than free
     }
 
-    # GPU Memory (for each GPU)
     stats['gpus'] = []
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
@@ -9284,17 +9233,14 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     """
     import math
 
-    # Calculate tensor dimensions
     *prefix_shape, G, B = blocks_tensor.shape
     rows_total = math.prod(prefix_shape) * G
 
-    # Estimate memory requirements
     base_memory_per_row = B * 35 if B else 128 * 35
     input_size = blocks_tensor.numel() + scales_tensor.numel() * 4
     output_size = rows_total * B * 2 * 2
     persistent_memory = input_size + output_size
 
-    # Device-specific safety factors
     GPU_SAFETY_FACTOR = 0.75  # GPUs can handle higher utilization
     CPU_SAFETY_FACTOR = 0.75  # CPUs need more headroom for OS and other processes
 
@@ -9351,7 +9297,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
                 'combined_score': combined_score,
             })
 
-    # Check CPU strategy
     cpu_safe_usable_memory = calculate_safe_usable_memory(
         free_memory=stats['cpu']['available'],
         safety_factor=CPU_SAFETY_FACTOR,
@@ -9418,7 +9363,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     fallback_options.sort(key=lambda x: x['available'], reverse=True)
     best_fallback = fallback_options[0]
 
-    # Calculate minimal safe chunk size for fallback
     remaining_memory = best_fallback['available'] - persistent_memory
     if remaining_memory > 0:
         fallback_chunk_size = max(1024, min(8192, int(remaining_memory // base_memory_per_row), rows_total))
@@ -9865,13 +9809,11 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         key_metadata = header_metadata[output_key]
         index_L, index_R = key_metadata["data_offsets"]
 
-        # Adjust for header offset
         index_L += 8 + length_of_header
         index_R += 8 + length_of_header
 
         expected_size = index_R - index_L
 
-        # Convert tensor to the correct format using pure PyTorch
         tensor_formatted = tensor.to(output_dtype).contiguous().cpu()
 
         tensor_bytes = tensor_formatted.untyped_storage().nbytes()
@@ -9886,7 +9828,6 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         tensor_view = tensor_formatted.detach().reshape(-1).view(torch.uint8)
         mm[index_L:index_R] = memoryview(tensor_view.numpy())
 
-        # Clear memory
         del tensor_view
         del tensor_formatted
         del tensor
