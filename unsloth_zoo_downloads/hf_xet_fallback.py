@@ -3271,7 +3271,6 @@ _SIBLINGS_TRUST_LIMIT = 1000
 
 
 def _hub_tree_cache_module() -> Any:
-    """huggingface_hub >= 1.25 tree listing cache module, else None."""
     try:
         from huggingface_hub import _tree_cache
     except ImportError:
@@ -3326,14 +3325,13 @@ def _warm_snapshot_without_child(
     cached_dir: str,
 ) -> Optional[str]:
     """cached_dir when the Hub's file list proves the child would fetch and write nothing, else None (spawn).
-
-    The metadata call runs on a daemon thread with no executor so abandoned work cannot hold interpreter exit."""
+    Daemon thread, no executor: abandoned work cannot hold interpreter exit."""
     try:
         from huggingface_hub import constants as hub_constants
         from huggingface_hub.utils import filter_repo_objects
 
         if getattr(hub_constants, "HF_HUB_OFFLINE", False):
-            return None  # the child resolves offline from cache
+            return None
     except Exception:
         return None
     snapshots_dir, cached_commit = os.path.split(cached_dir)
@@ -3382,7 +3380,7 @@ def _warm_snapshot_without_child(
         return None
     commit, repo_files = box["result"]
     if commit != cached_commit:
-        return None  # a newer remote commit is the child's to fetch
+        return None
     ref_name = revision if revision is not None else "main"
     if ref_name != commit:
         try:
