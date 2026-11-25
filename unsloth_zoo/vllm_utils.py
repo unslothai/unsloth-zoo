@@ -913,6 +913,142 @@ def patch_vllm_stacked_moe_lora(config):
 pass
 
 
+
+# vLLM >= 0.16 (csrc/cumem_allocator.cpp) asks cuMemCreate for a FABRIC handle whenever the device reports fabric
+# support, and on CUDA_ERROR_NOT_PERMITTED / NOT_SUPPORTED (no IMEX channel, i.e. every single-node box) creates
+# again with a POSIX fd. It does that on every standby wake_up, and the refused attempt is the slow part: about
+# 0.45 s per wake for a 16 GB KV cache on an L4. The refusal is fixed per process and device, so it is probed once
+# here; afterwards the wake maps a POSIX fd handle directly with the flags vLLM's own fallback would use, and writes
+# the handle back where vLLM's unmap_and_release reads it. Any failure falls back to vLLM's create_and_map.
+_CUMEM_FAST_STATE = {}
+
+
+def _cumem_driver():
+    import ctypes
+    state = _CUMEM_FAST_STATE
+    if "lib" in state: return state["lib"]
+    lib = None
+    try:
+        lib = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        lib = None
+    state["lib"] = lib
+    return lib
+pass
+
+
+def _cumem_prop(device, handle_type):
+    import ctypes
+
+    class _Location(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+    class _AllocFlags(ctypes.Structure):
+        _fields_ = [("compressionType", ctypes.c_ubyte), ("gpuDirectRDMACapable", ctypes.c_ubyte),
+                    ("usage", ctypes.c_ushort), ("reserved", ctypes.c_ubyte * 4)]
+
+    class _Prop(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("requestedHandleTypes", ctypes.c_int), ("location", _Location),
+                    ("win32HandleMetaData", ctypes.c_void_p), ("allocFlags", _AllocFlags)]
+
+    lib = _cumem_driver()
+    prop = _Prop()
+    prop.type = 1                      # CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.requestedHandleTypes = handle_type
+    prop.location.type = 1             # CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device
+    rdma = ctypes.c_int(0)
+    # CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED = 116, as vLLM sets it
+    if lib.cuDeviceGetAttribute(ctypes.byref(rdma), 116, device) == 0 and rdma.value:
+        prop.allocFlags.gpuDirectRDMACapable = 1
+    return prop
+pass
+
+
+def _cumem_fabric_refused(device):
+    """True when this device reports fabric support but cuMemCreate refuses a FABRIC handle (vLLM then retries)."""
+    import ctypes
+    state = _CUMEM_FAST_STATE.setdefault("fabric_refused", {})
+    if device in state: return state[device]
+    refused = False
+    lib = _cumem_driver()
+    fab = ctypes.c_int(0)
+    # CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128
+    if lib is not None and lib.cuDeviceGetAttribute(ctypes.byref(fab), 128, device) == 0 and fab.value:
+        handle = ctypes.c_ulonglong(0)
+        granularity = ctypes.c_size_t(0)
+        prop = _cumem_prop(device, 8)  # CU_MEM_HANDLE_TYPE_FABRIC
+        lib.cuMemGetAllocationGranularity(ctypes.byref(granularity), ctypes.byref(prop), 0)
+        ret = lib.cuMemCreate(ctypes.byref(handle), ctypes.c_size_t(max(granularity.value, 1 << 21)),
+                              ctypes.byref(prop), ctypes.c_ulonglong(0))
+        if ret == 0:
+            lib.cuMemRelease(handle)
+        refused = ret in (800, 801)  # CUDA_ERROR_NOT_PERMITTED, CUDA_ERROR_NOT_SUPPORTED
+    state[device] = refused
+    return refused
+pass
+
+
+def _vllm_cumem_requests_fabric():
+    # The FABRIC first attempt is in vLLM 0.16.0 and later; older vLLM creates with no handle type at all.
+    state = _CUMEM_FAST_STATE
+    if "requests_fabric" not in state:
+        try:
+            state["requests_fabric"] = Version(vllm_version) >= Version("0.16.0")
+        except Exception:
+            state["requests_fabric"] = False
+    return state["requests_fabric"]
+pass
+
+
+def _cumem_create_and_map(handle, vllm_create_and_map):
+    """vLLM's create_and_map, without the refused FABRIC attempt it repeats on every wake (see above)."""
+    import ctypes
+    if (
+        os.environ.get("UNSLOTH_VLLM_STANDBY_FAST_WAKE", "1") == "0"
+        or getattr(torch.version, "hip", None) is not None
+        or not isinstance(handle, tuple) or len(handle) != 4
+        or not _vllm_cumem_requests_fabric()
+        or _cumem_driver() is None
+    ):
+        return vllm_create_and_map(handle)
+    try:
+        device, size, d_mem, p_handle = (int(x) for x in handle)
+        if not p_handle or not _cumem_fabric_refused(device):
+            return vllm_create_and_map(handle)
+        lib = _cumem_driver()
+        current = ctypes.c_void_p(0)
+        if lib.cuCtxGetCurrent(ctypes.byref(current)) != 0 or not current.value:
+            return vllm_create_and_map(handle)
+        new_handle = ctypes.c_ulonglong(0)
+        prop = _cumem_prop(device, 1)  # CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, vLLM's fallback
+        if lib.cuMemCreate(ctypes.byref(new_handle), ctypes.c_size_t(size), ctypes.byref(prop), ctypes.c_ulonglong(0)) != 0:
+            return vllm_create_and_map(handle)
+        if lib.cuMemMap(ctypes.c_ulonglong(d_mem), ctypes.c_size_t(size), ctypes.c_size_t(0), new_handle, ctypes.c_ulonglong(0)) != 0:
+            lib.cuMemRelease(new_handle)
+            return vllm_create_and_map(handle)
+
+        class _Location(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+        class _Access(ctypes.Structure):
+            _fields_ = [("location", _Location), ("flags", ctypes.c_int)]
+
+        access = _Access()
+        access.location.type, access.location.id, access.flags = 1, device, 3  # device, PROT_READWRITE
+        if lib.cuMemSetAccess(ctypes.c_ulonglong(d_mem), ctypes.c_size_t(size), ctypes.byref(access), ctypes.c_size_t(1)) != 0:
+            lib.cuMemUnmap(ctypes.c_ulonglong(d_mem), ctypes.c_size_t(size))
+            lib.cuMemRelease(new_handle)
+            return vllm_create_and_map(handle)
+        # vLLM's unmap_and_release reads the handle through this pointer on the next sleep.
+        ctypes.c_ulonglong.from_address(p_handle).value = new_handle.value
+        _CUMEM_FAST_STATE["fast_maps"] = _CUMEM_FAST_STATE.get("fast_maps", 0) + 1
+        return None
+    except Exception:
+        return vllm_create_and_map(handle)
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     if DEVICE_TYPE == "xpu":
         # Probe the module, not the version: nightly XPU builds before 0.23.0 ship it.
@@ -1041,7 +1177,8 @@ def patch_vllm_enable_sleep_mode():
                 continue
             if tags is None or data.tag in tags:
                 handle = data.handle
-                create_and_map(handle)
+                if DEVICE_TYPE == "xpu": create_and_map(handle)
+                else: _cumem_create_and_map(handle, create_and_map)
                 if hasattr(data, "is_asleep"):
                     data.is_asleep = False
                 if data.cpu_backup_tensor is not None:
