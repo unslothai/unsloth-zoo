@@ -6544,7 +6544,6 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
 _DENSE_QMM_LOCK = RLock()
 _DENSE_QMM_VERIFIED = {}
-_STAGED_QMM_VERIFIED = {}
 _DENSE_QMM_MIN_ROWS = 1024
 # MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
 # and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
@@ -6697,7 +6696,7 @@ def _dense_prefill_qmm(module, x, bindings):
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
-    if x.size == x.shape[-1]:  # one row: the staged and dense routes need 1024, the tiled tile pads past stock's
+    if x.size == x.shape[-1]:  # one row: the dense route needs 1024, the tiled tile pads past stock's
         return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
     if not isinstance(w, mx.array) or w.ndim != 2 or not isinstance(scales, mx.array):
@@ -6705,10 +6704,6 @@ def _dense_prefill_qmm(module, x, bindings):
     N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
     if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
         return None
-    if module.__dict__.get("_unsloth_staged_qmm") and not module.training and _bindings_intact(bindings):
-        staged = _staged_prefill_qmm(module, x, w, scales, biases, M, N, K)
-        if staged is not None:
-            return staged
     if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
         if module.__dict__.get("_unsloth_tiled_qmm"):
@@ -6745,33 +6740,6 @@ def _dense_prefill_qmm(module, x, bindings):
             if module.__dict__.get("_unsloth_tiled_qmm") else None)
 
 
-def _staged_prefill_qmm(module, x, w, scales, biases, M, N, K):
-    group_size, bits, mode = module.group_size, module.bits, module.mode
-    if (mx.default_device() != mx.gpu or not matmul.staged_qmm_supported(M, N, K, group_size, bits, mode)
-            or not isinstance(biases, mx.array) or not x.dtype == scales.dtype == biases.dtype
-            or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
-            or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
-        return None
-    key = (M, N, K, group_size, bits, x.dtype)
-    verified = _STAGED_QMM_VERIFIED.get(key)
-    if verified is False:
-        return None
-    routed = matmul.differentiable_staged_qmm(group_size, bits)(x.reshape(M, K), w, scales, biases)
-    if verified is None:
-        native = mx.quantized_matmul(x.reshape(M, K), w, scales, biases, transpose = True,
-                                     group_size = group_size, bits = bits)
-        _staged_ready()
-        try:
-            verified = _settled(bool(mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()))
-        except (RuntimeError, ValueError) as error:
-            _unless_failed_buffer(error)
-            return None
-        _STAGED_QMM_VERIFIED[key] = verified
-        if not verified:
-            logger.warning("staged prefill differs from native for %s; the staged route stays disabled", key)
-    return routed.reshape(*x.shape[:-1], N) if verified else None
-
-
 def _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings):
     group_size, bits, mode = module.group_size, module.bits, module.mode
     if (mx.default_device() != mx.gpu or mode != "affine" or bits not in _TILED_QMM_BITS
@@ -6800,7 +6768,7 @@ def _dense_prefill_in_scope(module, x):
 
 def prefill_route(module, rows):
     """The route a `rows`-row call of this quantized linear takes under the scopes it holds now: "int8", "dense",
-    "staged", "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
+    "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
     d, w, scales = module.__dict__, module["weight"], module["scales"]
     N, K, dtype = w.shape[0], scales.shape[-1] * module.group_size, scales.dtype
     low = getattr(module, "_unsloth_nax_int8_prefill_rows", 0)
@@ -6809,9 +6777,6 @@ def prefill_route(module, rows):
         return "int8"
     if not d.get("_unsloth_dense_qmm_scopes"):
         return "stock"
-    if (d.get("_unsloth_staged_qmm") and matmul.staged_qmm_supported(rows, N, K, module.group_size, module.bits, module.mode)
-            and _STAGED_QMM_VERIFIED.get((rows, N, K, module.group_size, module.bits, dtype)) is not False):
-        return "staged"
     if (mx.__version__ in _DENSE_QMM_DISPATCH_MLX and rows >= _DENSE_QMM_MIN_ROWS and N != 1
             and -(-rows // 16) * -(-N // 16) > _DENSE_QMM_MIN_TILES and N * K <= _DENSE_QMM_MAX_WEIGHTS):
         biases = module.get("biases")
@@ -6856,8 +6821,6 @@ def dense_prefill_linear(model, *, _modules = None):
     run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
     construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
     turns that off.
-    On NAX GPUs, eligible affine prefill uses staged loads with native accumulation order, checked by a probe
-    and per shape on first use. `UNSLOTH_MLX_STAGED_PREFILL=0` turns this off; native vjps are retained.
     """
     changed = []
     try:
@@ -6867,7 +6830,6 @@ def dense_prefill_linear(model, *, _modules = None):
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
                 tiled = None   # its probe waits for a linear it could serve
-                staged = None
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -6884,14 +6846,11 @@ def dense_prefill_linear(model, *, _modules = None):
                     else:
                         if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
                             tiled = _tiled_prefill_enabled()
-                            staged = matmul.staged_qmm_available()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
                         if tiled:
                             module.__dict__["_unsloth_tiled_qmm"] = True
-                        if staged:
-                            module.__dict__["_unsloth_staged_qmm"] = True
                     changed.append((module, fused))
         yield model
     finally:
@@ -6903,7 +6862,6 @@ def dense_prefill_linear(model, *, _modules = None):
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
-                    module.__dict__.pop("_unsloth_staged_qmm", None)
 
 
 _WINDOW_MASK_LOCK = RLock()

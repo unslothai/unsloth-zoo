@@ -707,11 +707,11 @@ def _set_mlx_windowed_attention(enabled: bool) -> None:
             setattr(module, attr, original)
 
 
-def _train_qmm_call(native, routes):
+def _train_qmm_call(native):
     from . import matmul
 
     def call(self, x):
-        routed = matmul.call_train_qmm_route(self, x, routes) if mlx_training_patches_active() else None
+        routed = matmul.call_dense_train_qmm(self, x) if mlx_training_patches_active() else None
         if routed is None:
             return native(self, x)
         return routed + self["bias"] if "bias" in self else routed
@@ -727,9 +727,8 @@ def _set_mlx_train_qmm(enabled: bool) -> None:
     # A __call__ someone else rebound keeps its behaviour: only mlx's own method takes the route.
     if enabled and original is None and getattr(current, "__module__", "").startswith("mlx.nn."):
         from . import matmul
-        routes = matmul.available_train_qmm_routes()
-        if routes:
-            nn.QuantizedLinear.__call__ = _train_qmm_call(current, routes)
+        if matmul.dense_train_qmm_available():
+            nn.QuantizedLinear.__call__ = _train_qmm_call(current)
     elif not enabled and original is not None:
         nn.QuantizedLinear.__call__ = original
 
