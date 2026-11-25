@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Warm snapshot short-circuit from one Hub metadata call (offline, mock-based, plus one local-socket exit test).
-
-A glob allow list (tokenizer / adapter pre-download) used to spawn the download child even when every file was
-cached. The Hub's file list for the commit is now checked in-process first; only a provable "nothing to fetch" skips
-the child, every other outcome spawns it as before."""
+"""Warm snapshot short-circuit: one in-process Hub metadata call skips the child only when nothing would be fetched."""
 
 from __future__ import annotations
 
@@ -107,7 +103,6 @@ def _hub(monkeypatch, snap: Path, files, *, sha = SHA, info_result = None, tree 
 @pytest.fixture(autouse = True)
 def _isolated(monkeypatch):
     monkeypatch.setattr(hf_constants, "HF_HUB_OFFLINE", False)
-    # Default: a hub without the tree listing cache; tests that need one install it.
     monkeypatch.setattr(xf, "_hub_tree_cache_module", lambda: None)
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
@@ -236,8 +231,7 @@ def test_stale_branch_ref_spawns_child(tmp_path, monkeypatch, _isolated):
 
 
 def test_tree_cache_missing_spawns_child_present_uses_it(tmp_path, monkeypatch, _isolated):
-    """On a hub that keeps trees/<commit>.json the child writes it when absent; defer then, and once it exists use its
-    listing (what the child filters) without any listing request; a commit revision then needs no request at all."""
+    """Absent trees/<commit>.json defers to the child; a present one is used without a listing request."""
     snap = _cache(tmp_path)
     storage = snap.parent.parent
     tree_file = storage / "trees" / f"{SHA}.json"
@@ -360,10 +354,7 @@ _EXIT_SCRIPT = textwrap.dedent('''
 
 @pytest.mark.parametrize("mode", ["stall", "partial"])
 def test_abandoned_metadata_call_does_not_delay_exit(tmp_path, mode):
-    """A stalled Hub (repo_info never answers) or a partial cache with stalling per-file HEADs must not leave any
-    non-daemon thread behind: the helper returns within its bound and the interpreter exits right after. Exit is
-    timed from the helper's own return marker, so interpreter start-up and import cost on a cold runner do not count.
-    The stub Hub stalls for 600 s, so a leaked request shows up as a hang; the 30 s limits only absorb a loaded runner."""
+    """A stalled Hub leaves no non-daemon thread: the helper returns within its bound and the interpreter exits."""
     root = Path(xf.__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
     env.pop("HF_HUB_OFFLINE", None)

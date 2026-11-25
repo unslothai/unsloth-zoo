@@ -3264,15 +3264,14 @@ def hf_hub_download_with_xet_fallback(
     )
 
 
-# Bound on the in-process metadata check below: hub's tree listing carries no timeout of its own, and a stalled answer
-# must reach the killable child instead of holding the load.
+# Hub sends metadata calls with timeout=None; a stall must reach the killable child, not hold the load.
 DEFAULT_METADATA_TIMEOUT = 10.0
-# Above this many siblings repo_info's list is not trusted (hub's own LARGE_REPO_THRESHOLD); list the tree instead.
+# hub's LARGE_REPO_THRESHOLD: above it repo_info siblings are not trusted.
 _SIBLINGS_TRUST_LIMIT = 1000
 
 
 def _hub_tree_cache_module() -> Any:
-    """hub's tree listing cache module (huggingface_hub >= 1.25), or None when this hub keeps no such cache."""
+    """huggingface_hub >= 1.25 tree listing cache module, else None."""
     try:
         from huggingface_hub import _tree_cache
     except ImportError:
@@ -3283,9 +3282,7 @@ def _hub_tree_cache_module() -> Any:
 def _repo_commit_and_files(
     *, repo_id: str, repo_type: str, revision: Optional[str], token: Optional[str], tree_cache_files: Any,
 ) -> "tuple[str, list]":
-    """(commit, repo file paths) from ONE repo_info call (plus a tree listing for an empty or very large sibling list),
-    on the caller's thread, with no executor. tree_cache_files(commit) supplies hub's cached tree listing when this hub
-    keeps one, which is the list its snapshot_download filters."""
+    """(commit, repo file paths) from one repo_info call, plus a tree listing for an empty or huge sibling list."""
     from huggingface_hub import HfApi
     from huggingface_hub.file_download import REGEX_COMMIT_HASH
     from huggingface_hub.hf_api import RepoFile
@@ -3308,7 +3305,7 @@ def _repo_commit_and_files(
     siblings = getattr(info, "siblings", None)
     if siblings and len(siblings) <= _SIBLINGS_TRUST_LIMIT:
         return commit, [s.rfilename for s in siblings]
-    # A superset of what any hub's snapshot_download lists, so a skip it allows is one the child would also make.
+    # Superset of what snapshot_download lists, so any skip is one the child would also make.
     files = [
         entry.path
         for entry in api.list_repo_tree(repo_id, recursive = True, revision = commit, repo_type = repo_type)
@@ -3328,15 +3325,9 @@ def _warm_snapshot_without_child(
     cancel_event: Optional[threading.Event],
     cached_dir: str,
 ) -> Optional[str]:
-    """cached_dir (the local_files_only answer, i.e. the folder the child returns) when the Hub's file list proves the
-    child would fetch and write nothing, else None.
+    """cached_dir when the Hub's file list proves the child would fetch and write nothing, else None (spawn).
 
-    The metadata call runs on a daemon thread bounded by DEFAULT_METADATA_TIMEOUT with no executor, so an abandoned
-    call can neither hold the load nor delay interpreter exit; it transfers no Xet data and writes nothing. Accepted
-    only when the remote commit is the one cached_dir holds (so refs/<revision> already names it), every file hub's
-    own pattern filter selects has a pointer there that resolves (a dangling link to a missing blob defers), and
-    hub's tree listing cache, when this hub keeps one, is already on disk (else the child would write it). Any doubt
-    (offline, error, timeout, cancel, a missing file, nothing matched) returns None and the caller spawns the child."""
+    The metadata call runs on a daemon thread with no executor so abandoned work cannot hold interpreter exit."""
     try:
         from huggingface_hub import constants as hub_constants
         from huggingface_hub.utils import filter_repo_objects
@@ -3357,12 +3348,10 @@ def _warm_snapshot_without_child(
     def _tree_cache_files(commit: str):
         if hub_tree_cache is None:
             return None
-        # The child reads trees/<commit>.json and writes it when missing; only a cache already on disk keeps the dir
-        # identical, and its listing is exactly the one the child filters.
+        # The child writes trees/<commit>.json when missing, so only an on-disk one keeps the dir identical.
         tree_path = hub_tree_cache._tree_cache_path(storage_folder, commit)
         entries = hub_tree_cache.read_tree_cache(storage_folder, commit) if os.path.isfile(tree_path) else None
         if entries is None:
-            # Stop before any further request: the child must run to write it.
             raise LookupError(f"no cached tree listing for {commit}")
         return list(entries.keys())
 
@@ -3396,7 +3385,6 @@ def _warm_snapshot_without_child(
         return None  # a newer remote commit is the child's to fetch
     ref_name = revision if revision is not None else "main"
     if ref_name != commit:
-        # The child rewrites refs/<revision>; it already names this commit unless a writer raced us.
         try:
             with open(os.path.join(storage_folder, "refs", ref_name)) as f:
                 if f.read() != commit:
@@ -3412,7 +3400,7 @@ def _warm_snapshot_without_child(
         parts = name.split("/") if isinstance(name, str) else []
         if not parts or any(part in ("", ".", "..") for part in parts) or os.path.isabs(name):
             return None  # hub refuses such a name; let the child raise its own error
-        # exists() follows the symlink: a dangling pointer means a missing blob the child would re-fetch.
+        # exists() follows the symlink: a dangling pointer is a missing blob.
         if not os.path.exists(os.path.join(cached_dir, *parts)):
             return None
     return cached_dir
@@ -3487,8 +3475,7 @@ def snapshot_download_with_xet_fallback(
         except Exception as e:
             cached_dir = None
             logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
-        # Glob allow lists and caches the strict gate cannot prove land here even when nothing is missing; ask the Hub
-        # for the file list first, so a warm cache returns without spawning a child that would fetch nothing.
+        # Strict gate cannot prove globs; ask the Hub for the file list before spawning a no-op child.
         if isinstance(cached_dir, str):
             warm_dir = _warm_snapshot_without_child(
                 repo_id = repo_id,
@@ -3500,7 +3487,7 @@ def snapshot_download_with_xet_fallback(
                 cancel_event = cancel_event,
                 cached_dir = cached_dir,
             )
-            # Same post-download gate the child's result passes, so a dir the ladder would retry is never returned.
+            # Same post-download gate the child's result passes.
             if warm_dir is not None and not _snapshot_payload_incomplete(
                 warm_dir,
                 repo_type = repo_type,
