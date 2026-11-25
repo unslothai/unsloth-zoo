@@ -163,30 +163,57 @@ def save_attention_offload():
 # Automatic mode: compute capability -> the shortest query length where Colab measured it faster
 # than the A/A noise (Qwen3-4B LoRA): T4 and A100 from 8K, L4 from 16K (noisy and +1.6% at 8K).
 _AUTO_MIN_SEQ = {(7, 5): 8192, (8, 0): 8192, (8, 9): 16384}
+# ROCm: gcnArchName -> the same, measured on AMD CI (Qwen3-0.6B LoRA, 8192 tokens): gfx1151 (Strix
+# Halo) -5.6% to -14.2% per step, losses bit-identical. Other gfx targets stay off until measured.
+_AUTO_MIN_SEQ_ROCM = {"gfx1151": 8192}
 _AUTO_ACTIVE = [False]
 
 
-def save_attention_auto_min_seq():
-    """Automatic mode: the query length from which training attention calls should go through
-    saved_attention_call, or None when the mode is off (=0, an explicit setting, ROCm, CPU, an
-    unmeasured GPU). A caller that routes calls marks the mode active, which turns on the frames."""
-    if _save_attention_setting() != "auto":
-        return None
-    if getattr(torch.version, "hip", None) or not torch.cuda.is_available():
-        return None
+def _auto_device_min_seq(index):
+    """The measured automatic-mode query length for one GPU, or None (unmeasured, unreadable)."""
     try:
-        capability = tuple(torch.cuda.get_device_capability())
+        if getattr(torch.version, "hip", None):
+            arch = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", "") or "")
+            return _AUTO_MIN_SEQ_ROCM.get(arch.split(":", 1)[0].strip().lower())
+        return _AUTO_MIN_SEQ.get(tuple(torch.cuda.get_device_capability(index)))
     except Exception:
         return None
-    min_seq = _AUTO_MIN_SEQ.get(capability)
-    if min_seq is None:
-        return None
+
+
+def _auto_min_seq_override(min_seq):
     try:
         min_seq = int(os.environ.get("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", min_seq))
     except ValueError:
         pass
-    _AUTO_ACTIVE[0] = True
     return max(min_seq, 1)
+
+
+def save_attention_auto_min_seq(device = None):
+    """Automatic mode: the query length from which training attention calls should go through
+    saved_attention_call, or None when the mode is off (=0, an explicit setting, CPU, an unmeasured
+    GPU). With no ``device``, the shortest over the visible GPUs (a caller routes from there, before its
+    rank picks a GPU); each checkpoint then applies its own device's length. A caller that routes calls
+    marks the mode active, which turns on the frames."""
+    if _save_attention_setting() != "auto":
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        if device is None:
+            indices = range(max(torch.cuda.device_count(), 1))
+        else:
+            device = torch.device(device)
+            if device.type != "cuda":
+                return None
+            indices = [device.index if device.index is not None else torch.cuda.current_device()]
+    except Exception:
+        return None
+    measured = [m for m in (_auto_device_min_seq(i) for i in indices) if m is not None]
+    if not measured:
+        return None
+    if device is None:
+        _AUTO_ACTIVE[0] = True
+    return _auto_min_seq_override(min(measured))
 
 
 class _Budget:
@@ -295,6 +322,10 @@ def _auto_admit(frame, tensors):
             budget.floor = allocated - budget.live
             if budget.peak_floor is None:
                 budget.peak_floor = budget.floor  # a peak seen before any floor reading
+    if query.shape[-2] < frame.min_seq.get(query.device, 0):
+        # Shorter than this device's measured length (a mixed-GPU host routes from the shortest).
+        SAVED_ATTENTION_STATS["declined_short"] += 1
+        return False
     if estimate > budget.measured:
         SAVED_ATTENTION_STATS["declined_unmeasured"] += 1
         return False
@@ -345,9 +376,9 @@ def _auto_release(frame, measured):
 
 
 class SavedAttentionFrame:
-    __slots__ = ("entries", "cursor", "replaying", "offload", "loaded", "auto", "kept", "estimate", "__weakref__")
+    __slots__ = ("entries", "cursor", "replaying", "offload", "loaded", "auto", "kept", "estimate", "min_seq", "__weakref__")
 
-    def __init__(self, auto = False):
+    def __init__(self, auto = False, min_seq = None):
         self.entries = []
         self.cursor = 0
         self.replaying = False
@@ -356,6 +387,7 @@ class SavedAttentionFrame:
         self.auto = auto
         self.kept = []
         self.estimate = {}
+        self.min_seq = dict(min_seq or {})
 
     def __del__(self):
         try:
@@ -363,6 +395,20 @@ class SavedAttentionFrame:
                 _auto_release(self, False)
         except Exception:
             pass
+
+
+def _auto_frame_min_seq(device):
+    """Automatic mode: the query length from which a checkpoint on ``device`` keeps attention, or None
+    for no frame (an unmeasured GPU; on ROCm also an SDPA that selects no kernel kept here, or no
+    answer). CPU / meta: 0 (no budget reading there, so nothing is kept anyway)."""
+    if device.type != "cuda":
+        return 0
+    min_seq = save_attention_auto_min_seq(device)
+    if min_seq is None:
+        return None
+    if getattr(torch.version, "hip", None) and _rocm_sdpa_is_kept(device) is not True:
+        return None
+    return min_seq
 
 
 def new_saved_attention_frame(tensors):
@@ -375,9 +421,14 @@ def new_saved_attention_frame(tensors):
     asked = set()
     for t in tensors:
         if isinstance(t, torch.Tensor) and t.requires_grad and t.device not in asked:
-            # Explicit mode: eligibility of the device the checkpoint runs on (ROCm reads it per device).
-            if auto or save_attention_enabled(t.device):
-                return SavedAttentionFrame(auto)
+            # Eligibility of the device the checkpoint runs on (ROCm reads it per device).
+            if not auto:
+                if save_attention_enabled(t.device):
+                    return SavedAttentionFrame()
+            else:
+                min_seq = _auto_frame_min_seq(t.device)
+                if min_seq is not None:
+                    return SavedAttentionFrame(True, {t.device: min_seq})
             asked.add(t.device)
     return None
 
