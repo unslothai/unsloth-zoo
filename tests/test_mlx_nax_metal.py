@@ -85,7 +85,7 @@ def test_every_gap_names_the_pinned_mlx_release():
     pinned = set(re.findall(r'"mlx==([0-9.]+)', pyproject))
     assert len(pinned) == 1
     for name, gap in nax._GAPS.items():
-        assert pinned <= set(gap.open_in), f"re-measure {name} for mlx {pinned}"
+        assert gap.closed_on_main or pinned <= set(gap.open_in), f"re-measure {name} for mlx {pinned}"
 
 
 @pytest.mark.parametrize("version,closed_on_main,expected", [

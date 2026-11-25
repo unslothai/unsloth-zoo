@@ -191,38 +191,28 @@ def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_s
     ({"nax": False, "L": 2048, "S": 2048, "dtype": mx.float32}, False),
     ({"nax": False, "L": 2048, "S": 2048, "mask": "bool"}, False),
     ({"dtype": mx.float16}, True),
-    ({"tf32": "0"}, True),
+    ({"tf32": 0}, True),
     ({"dtype": mx.float32}, True),
-    ({"dtype": mx.float32, "tf32": "0"}, False),
-    ({"dtype": mx.float32, "qdtype": mx.bfloat16, "tf32": "0"}, False),   # the result dtype decides
-    ({"dtype": mx.float32, "tf32": None}, True),   # unset means on
-    ({"dtype": mx.float32, "tf32": " 0"}, False),
-    ({"dtype": mx.float32, "tf32": "abc"}, False),
-    ({"dtype": mx.float32, "tf32": "-1"}, True),
+    ({"dtype": mx.float32, "tf32": 0}, False),
+    ({"dtype": mx.float32, "qdtype": mx.bfloat16, "tf32": 0}, False),   # the result dtype decides
+    ({"dtype": mx.float32, "tf32": -1}, True),
     ({"D": 512, "L": 4096, "S": 4096}, True),
     ({"D": 512, "L": 4096, "S": 4096, "nax": False}, False),
-    ({"D": 512, "L": 4096, "S": 4096, "dtype": mx.float32, "tf32": "0"}, False),
+    ({"D": 512, "L": 4096, "S": 4096, "dtype": mx.float32, "tf32": 0}, False),
 ])
 def test_wide_head_prefill_is_fused_where_mlx_fuses_it(monkeypatch, case, expected):
     from unsloth_zoo.mlx import attention, nax
 
     c = {"L": 1024, "S": 1024, "D": 256, "mask": "causal", "nax": True, "dtype": mx.bfloat16,
-         "tf32": "1", **case}
+         "tf32": 1, **case}
     c.setdefault("Dv", c["D"])
     monkeypatch.setattr(nax, "nax_available", lambda: c["nax"])
-    if c["tf32"] is None:
-        monkeypatch.delenv("MLX_ENABLE_TF32", raising=False)
-    else:
-        monkeypatch.setenv("MLX_ENABLE_TF32", c["tf32"])
     cache = _cache(1, 2, c["S"], c["D"], 8, dtype=c["dtype"], Dv=c["Dv"])
     queries = _queries(1, 8, c["L"], c["D"], dtype=c.get("qdtype", c["dtype"]))
     mask = {"bool": mx.ones((c["L"], c["S"]), mx.bool_),
             "additive": mx.zeros((c["L"], c["S"]), c["dtype"])}.get(c["mask"], c["mask"])
-    attention._tf32_enabled.cache_clear()
-    try:
+    with mx.config.scoped_update(MLX_ENABLE_TF32 = c["tf32"]):
         assert fused_kernel_exists(queries, *cache, GS, mask) is expected
-    finally:
-        attention._tf32_enabled.cache_clear()
 
 
 def test_head_dim_256_prefill_on_nax_is_the_dequantized_kernel(monkeypatch):
@@ -260,8 +250,8 @@ def test_head_dim_256_prefill_on_nax_is_the_dequantized_kernel(monkeypatch):
     (512, 512, 8, 1, 1024, None, None, False),
     (512, 512, 16, 2, 1024, None, None, False),
     (512, 512, 16, 1, 1024, "bool", None, False),
-    (512, 512, 16, 1, 512, None, "512", True),
-    (512, 512, 8, 2, 16, "bool", "0", True),
+    (512, 512, 16, 1, 512, None, 512, True),
+    (512, 512, 8, 2, 16, "bool", 0, True),
     (96, 64, 8, 16, 512, None, None, True),
     (96, 64, 8, 1, 512, None, None, True),
     (96, 64, 8, 32, 16, "causal", None, False),
@@ -272,13 +262,10 @@ def test_head_dim_512_and_96_64_are_fused_where_mlx_has_a_kernel(monkeypatch, D,
     from unsloth_zoo.mlx import nax
 
     monkeypatch.setattr(nax, "nax_available", lambda: True)
-    if min_keys is None:
-        monkeypatch.delenv("MLX_SDPA_D512_MIN_KL", raising=False)
-    else:
-        monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", min_keys)
     mask = mx.ones((L, S), mx.bool_) if mask == "bool" else mask
     cache = _cache(1, 2, S, D, 8, group_size=32, Dv=Dv)
-    assert fused_kernel_exists(_queries(1, HQ, L, D), *cache, 32, mask) is expected
+    with mx.config.scoped_update(**({} if min_keys is None else {"MLX_SDPA_D512_MIN_KL": min_keys})):
+        assert fused_kernel_exists(_queries(1, HQ, L, D), *cache, 32, mask) is expected
 
 
 @pytest.mark.parametrize("D,Dv,HQ,HKV,L,S,mask", [
@@ -676,43 +663,6 @@ def test_each_width_is_forced_at_the_width_measured_to_help(fused_attention, mon
         assert seen == [(head_dim, head_dim, value_dim, False)]
     else:
         assert seen == [(widths[0], widths[0], widths[1], True)]
-
-
-@pytest.mark.parametrize("change", [None, "row_mask", "key_mask", "no_mask", "causal", "bfloat16", "28_simdgroups",
-                                    "newer_gpu"])
-def test_m1_m2_fp16_head_dim_256_rows_stay_under_the_vector_thread_limit(fused_attention, monkeypatch, change):
-    # 24/4 heads over 5 rows send 30 simdgroups; M1/M2 allow 28 in the unmasked and array-masked fp16 builds.
-    from unsloth_zoo.mlx import attention
-
-    HQ, L, dtype = 24, 5, mx.float16
-    if change == "28_simdgroups":
-        HQ, L = 28, 4
-    if change == "bfloat16":
-        dtype = mx.bfloat16
-    monkeypatch.setattr(attention, "_thread_limited_gpu", lambda: change != "newer_gpu")
-    q = mx.random.normal((2, HQ, L, 256), key=mx.random.key(0)).astype(dtype)
-    k, v = (mx.random.normal((2, 4, 2048, 256), key=mx.random.key(i)).astype(dtype) for i in (1, 2))
-    pads = mx.array([0, 9])[:, None, None, None]
-    mask = {"row_mask": mx.arange(2048) >= pads + mx.arange(L)[:, None] * 300, "no_mask": None,
-            "key_mask": mx.arange(2048) >= 9,
-            "causal": "causal"}.get(change, mx.broadcast_to(mx.arange(2048) >= pads, (2, 1, 1, 2048)))
-    launched = []
-
-    def spy(q, k, v, **kw):
-        launched.append(q.shape[-3] // k.shape[-3] * q.shape[-2])
-        return fused_attention(q, k, v, **kw)
-
-    out = attention.fused_sdpa_over(spy)(q, k, v, scale=256 ** -0.5, mask=mask)
-    split = change in (None, "row_mask", "key_mask", "no_mask")
-    assert launched == ([18, 12] if split else [HQ // 4 * L])
-    if split:
-        # One-row calls share the whole call's key partition and launch on M1/M2 too, so the bits must match.
-        rows = isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] > 1
-        want = mx.concatenate([fused_attention(q[..., i : i + 1, :], k, v, scale=256 ** -0.5,
-                                               mask=mask[..., i : i + 1, :] if rows else mask) for i in range(L)], axis=-2)
-        assert mx.array_equal(out, want).item()
-    if nax._gpu_generation() not in (13, 14):
-        assert mx.array_equal(out, fused_attention(q, k, v, scale=256 ** -0.5, mask=mask)).item()
 
 
 def test_the_padded_copies_count_against_dequantizing_and_only_where_a_call_is_forced(monkeypatch):
@@ -1138,39 +1088,6 @@ def test_invariant_attention_covers_kv_cache_layouts(change):
     assert invariant_attention_supported(q, k, v) == covered
 
 
-@pytest.mark.parametrize("change", [None, "max_gpu", "4096_keys", "newer_gpu", "bfloat16", "gqa_4", "min_kl_0"])
-def test_m1_m2_head_dim_512_decode_leaves_the_one_pass_vector_kernel(fused_attention, monkeypatch, change):
-    # Gemma 4's global layers: one row, GQA 8, head dim 512; M1/M2 cannot launch mlx's one-pass build of that call.
-    from unsloth_zoo.mlx import attention
-
-    HQ, S, dtype, arch = 16, 2048, mx.float16, "applegpu_g13g"
-    HQ = 8 if change == "gqa_4" else HQ
-    S = 4096 if change == "4096_keys" else S
-    dtype = mx.bfloat16 if change == "bfloat16" else dtype
-    arch = "applegpu_g14s" if change == "max_gpu" else arch
-    if change == "min_kl_0":
-        monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
-    monkeypatch.setattr(nax, "_gpu_architecture", lambda: arch)
-    monkeypatch.setattr(attention, "_thread_limited_gpu", lambda: change != "newer_gpu")
-    q = mx.random.normal((1, HQ, 1, 512), key=mx.random.key(0)).astype(dtype)
-    k, v = (mx.random.normal((1, 2, S, 512), key=mx.random.key(i)).astype(dtype) for i in (1, 2))
-    masks = []
-
-    def spy(q, k, v, **kw):
-        masks.append(kw.get("mask"))
-        return fused_attention(q, k, v, **kw)
-
-    out = attention.fused_sdpa_over(spy)(q, k, v, scale=512 ** -0.5, mask=None)
-    if change is not None:
-        assert masks == [None]
-        return
-    mask, = masks
-    with pytest.raises(ValueError, match="no fused kernel"):
-        fused_attention(q, k, v, scale=512 ** -0.5, mask=mask, force_fused=True)
-    want = fused_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=512 ** -0.5, mask=mask)
-    assert mx.abs(out.astype(mx.float32) - want).max().item() <= 2e-3
-
-
 _REFUSED_LAUNCHES = {
     "d256_rows": ("float16", 24, 4, 5, 4096, 256),
     "d512_decode": ("float16", 16, 2, 1, 2048, 512),
@@ -1181,9 +1098,6 @@ import sys, mlx.core as mx
 dtype, HQ, HKV, L, S, D = sys.argv[1], *map(int, sys.argv[2:7])
 q = mx.random.normal((1, HQ, L, D), key=mx.random.key(0)).astype(getattr(mx, dtype))
 k, v = (mx.random.normal((1, HKV, S, D), key=mx.random.key(i)).astype(q.dtype) for i in (1, 2))
-if sys.argv[-1] == "zoo":
-    from unsloth_zoo.mlx.attention import install_fused_attention
-    install_fused_attention()
 out = mx.fast.scaled_dot_product_attention(q, k, v, scale=D ** -0.5)
 want = mx.fast.scaled_dot_product_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=D ** -0.5, mask=mx.ones((1, 1, 1, 1), dtype=mx.bool_))
 print("MAXERR", mx.abs(out.astype(mx.float32) - want).max().item())
@@ -1191,33 +1105,16 @@ print("MAXERR", mx.abs(out.astype(mx.float32) - want).max().item())
 
 
 @pytest.mark.parametrize("case", sorted(_REFUSED_LAUNCHES))
-def test_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
+def test_launches_mlx_0_32_4_refused_on_m1_m2_run_on_stock(case):
+    # mlx 0.32.5 falls back where a kernel exceeds M1/M2 thread limits (ml-explore/mlx#4708, #4719), so zoo routes none.
     import subprocess
 
     if not mx.metal.is_available():
         pytest.skip("needs Metal")
-    args = [sys.executable, "-c", _LAUNCH, *map(str, _REFUSED_LAUNCHES[case])]
-    run = functools.partial(subprocess.run, capture_output=True, text=True, timeout=120)
-    stock = run([*args, "stock"])
-    if stock.returncode == 0:
-        pytest.skip(f"{nax._gpu_architecture()!r} launches {case}")
-    assert "threads per threadgroup" in stock.stderr, stock.stderr[-2000:]
-    zoo = run([*args, "zoo"])
-    assert zoo.returncode == 0, (nax._gpu_architecture(), zoo.stderr[-2000:])
-    assert float(zoo.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), zoo.stdout
-
-
-@pytest.mark.parametrize("arch, limited", [("applegpu_g13g", True), ("applegpu_g14s", True), ("air64_v27", True),
-                                           ("applegpu_g15s", False), ("applegpu_g17p", False), ("", False)])
-def test_thread_limited_gpus_include_paravirtual_ones(monkeypatch, arch, limited):
-    from unsloth_zoo.mlx import attention
-
-    monkeypatch.setattr(nax, "_gpu_architecture", lambda: arch)
-    attention._thread_limited_gpu.cache_clear()
-    try:
-        assert attention._thread_limited_gpu() == limited
-    finally:
-        attention._thread_limited_gpu.cache_clear()
+    stock = subprocess.run([sys.executable, "-c", _LAUNCH, *map(str, _REFUSED_LAUNCHES[case])], capture_output=True,
+                           text=True, timeout=120)
+    assert stock.returncode == 0, (nax._gpu_architecture(), stock.stderr[-2000:])
+    assert float(stock.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), stock.stdout
 
 
 @pytest.mark.parametrize("kernel", ["shape_generic", "per_shape"])

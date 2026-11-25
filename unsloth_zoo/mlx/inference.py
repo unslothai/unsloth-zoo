@@ -205,7 +205,7 @@ def _staged_forward_rows(inputs):
 
 @functools.cache
 def _staged_submit_window():
-    if mx.__version__ != "0.32.4":
+    if mx.__version__ != "0.32.5":
         return 0
     if not mx.metal.is_available():
         return 0
@@ -1793,7 +1793,7 @@ def _qwen4_qmv(linear, fast):
         return False
     N, K = linear.weight.shape[0], linear.weight.shape[1] * 32 // linear.bits
     aligned = K % ((32 // linear.bits) * 64) == 0
-    # Both 0.32.3 and 0.32.4 take qmv_fast for aligned K and whole 8-row tiles; qmv_quad serves K of 64 or 128.
+    # MLX takes qmv_fast for aligned K, qmv_quad for K of 64 or 128; this route also needs whole 8-row tiles.
     return N % 8 == 0 and (aligned if fast else not aligned and K not in (64, 128))
 
 
@@ -1812,17 +1812,17 @@ def _qwen4_inject_qmv(linear, streams, width, dtype):
     call = type(linear).__call__
     if call is not nn.QuantizedLinear.__call__ and call not in _ONE_ROW_STOCK_CALLS:
         return False
-    # 0.32.4 takes qmv_fast for K in whole fast blocks whatever N is; 0.32.3 only for whole 8-row tiles.
+    # MLX 0.32.5 takes qmv_fast for K in whole fast blocks whatever N is.
     return (linear.mode == "affine" and linear.bits in (4, 8) and "bias" not in linear
             and linear.scales.dtype == dtype and linear.biases.dtype == dtype
             and linear.weight.shape == (streams, width * linear.bits // 32) and streams < 8
             and linear.group_size in (32, 64, 128) and width % (32 // linear.bits * 64) == 0
-            and mx.__version__ == "0.32.4")
+            and mx.__version__ == "0.32.5")
 
 
 @functools.cache
 def _qwen4_ordered_down_kernel():
-    if mx.__version__ != "0.32.4" or not mx.metal.is_available():
+    if mx.__version__ != "0.32.5" or not mx.metal.is_available():
         return None
     try:
         seen = set()
@@ -2010,7 +2010,7 @@ def _qwen4_stream_down_source(reuse = 1):
 
 @functools.cache
 def _qwen4_stream_kernels():
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+    if (mx.__version__ != "0.32.5" or not mx.metal.is_available()
             or mx.device_info().get("architecture") != "applegpu_g15s"):
         return None
     try:
@@ -4756,7 +4756,7 @@ METAL_FUNC void plain_qmv(const device T* x, const device uint* w, const device 
 
 @functools.cache
 def _plain_moe_kernels(rows = False):
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+    if (mx.__version__ != "0.32.5" or not mx.metal.is_available()
             or mx.device_info().get("architecture") != "applegpu_g15s"):
         return None
     try:
@@ -6551,11 +6551,11 @@ _DENSE_QMM_MIN_ROWS = 1024
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
-_DENSE_QMM_DISPATCH_MLX = ("0.32.4",)  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
+_DENSE_QMM_DISPATCH_MLX = ("0.32.5",)  # MLX's thin NAX case needs N <= 64, so M > 16384 here
 
 
 def _dense_qmm_rows(M, N, K):
-    """MLX 0.32.3/0.32.4's row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles,
+    """MLX 0.32.5's row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles,
     K blocks, row alignment; qmm reads rows only in bounds checks): one comparison per distinct tuple."""
     widest = max(M, N)
     return (K >= 3 * widest, M <= 2048 and N <= 2048, K >= 8192 and K > M + N, N > M, M * N >= 1 << 20,
@@ -6580,7 +6580,7 @@ _TILED_QMM_SOURCE = """
 TILED_QMM_PROBE_KEY = "tiled_qmm:" + hashlib.sha256(
     _TILED_QMM_SOURCE.format(template = "", **_TILED_QMM_TILE).encode()).hexdigest()[:12]
 # Releases whose quantized matmul dispatch `_tile_shape_loses` keeps clear of split-K and qmv.
-_TILED_QMM_DISPATCH_MLX = ("0.32.4",)
+_TILED_QMM_DISPATCH_MLX = ("0.32.5",)
 # Stock may run qmv up to 32 rows, and fewer rows pad one 64-row tile past stock's 32-row one.
 _TILED_QMM_MIN_ROWS = _TILED_QMM_TILE["BM"] // 2 + 1
 
@@ -6910,7 +6910,7 @@ _WINDOW_MASK_LOCK = RLock()
 _WINDOW_MASK_MODULE = "mlx_vlm.models.gemma4.language"
 _WINDOW_MASK_CONTRACT = {
     _WINDOW_MASK_MODULE: {
-        "Gemma4TextModel._make_masks": ("d02d670a2d988a1d", "bc6547b19c9add74"),
+        "Gemma4TextModel._make_masks": ("d02d670a2d988a1d", "1aa47525d32da822"),
         "Gemma4TextModel.__call__": "bad1bb823b9aa527",
         "create_attention_mask": "a5e4c86965a3c8dc",
         "RotatingKVCache.make_mask": "7868d53d8c02ff7c",
@@ -6928,7 +6928,7 @@ def _native_window_mask_source_matches(original):
     leaf = original
     seen = set()
     try:
-        while isinstance(leaf, FunctionType) and _ast_fingerprint(leaf) == "bc6547b19c9add74":
+        while isinstance(leaf, FunctionType) and _ast_fingerprint(leaf) == "1aa47525d32da822":
             if id(leaf) in seen:
                 return False
             seen.add(id(leaf))
@@ -8470,7 +8470,7 @@ def _exact_attention_kernels():
 def _sdpa_vector_blocks(gqa, keys):
     """The block count of MLX 0.32.3's 2-pass vector SDPA for one head-dim-256 query row over `keys` keys, or None off that kernel."""
     device = nax._gpu_architecture()[-1:]
-    if not ((device in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)) or os.environ.get("MLX_SDPA_BLOCKS"):
+    if not ((device in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)) or attention.mlx_setting("MLX_SDPA_BLOCKS", 0) > 0:
         return None
     return _vector_blocks(gqa, keys)
 
@@ -8498,7 +8498,7 @@ def _vector_launch(gqa, rows, keys, dim):
     """MLX's unmasked vector SDPA launch for `rows` query rows per head: passes, key interleave, one-row GQA kernel."""
     if not ((_gpu_class() in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)):
         return 1, 0, False
-    # MLX 0.32.4 gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
+    # MLX gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
     grouped = rows == 1 and keys >= 8192 and (gqa == 8 and dim in (64, 128) or gqa in (12, 16) and dim == 128)
     return 2, _vector_blocks(gqa * rows, keys), grouped
 
@@ -8560,7 +8560,7 @@ def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)
             or queries.shape[1] % keys.shape[1] or queries.shape[1] // keys.shape[1] > 16):
         return None
     length, gqa, dim = queries.shape[2], queries.shape[1] // keys.shape[1], queries.shape[-1]
-    prefix, forced = keys.shape[2] - length, os.environ.get("MLX_SDPA_BLOCKS")
+    prefix, forced = keys.shape[2] - length, attention.mlx_setting("MLX_SDPA_BLOCKS", 0)
     # The fused kernel serves at most 8 query rows and 32 across a GQA group; each chunk's keys end at its last row,
     # where the lower-right causal mask aligns. A launch other than a row's own reduces it in another order.
     chunks = _causal_chunks(gqa, dim, prefix, length, min(8, 32 // gqa), forced)
@@ -10727,7 +10727,7 @@ def _launch_simds(dtype = mx.bfloat16):
 
 def _vector_blocks(simds, keys):
     """The key-interleave count MLX 0.32.3's sdpa_vector_2pass picks for this launch."""
-    forced = int(os.environ.get("MLX_SDPA_BLOCKS", "0") or 0)
+    forced = attention.mlx_setting("MLX_SDPA_BLOCKS", 0)
     if forced > 0:
         return (forced + 31) // 32 * 32
     gpu = _gpu_class()
@@ -10806,8 +10806,8 @@ _WIDE_ATTENTION_CONTRACT = {
 
 
 def _wide_head_decode_attention(queries, keys, values, scale, mask):
-    # MLX 0.32.4 prefetches four D512 BF16 keys per thread; do not shadow a later tuned dispatch.
-    if mx.__version__ != "0.32.4":
+    # MLX 0.32.5 prefetches four D512 BF16 keys per thread; do not shadow a later tuned dispatch.
+    if mx.__version__ != "0.32.5":
         return None
     if not (mask is None or isinstance(mask, str) and mask == "causal"):
         return None
@@ -10816,7 +10816,7 @@ def _wide_head_decode_attention(queries, keys, values, scale, mask):
             and queries.shape[2:] == (1, 512) and keys.shape[3] == 512
             and queries.dtype == keys.dtype == values.dtype == mx.bfloat16
             and keys.shape[1] > 0 and queries.shape[1] == 8 * keys.shape[1]
-            and keys.shape[2] >= attention._atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
+            and keys.shape[2] >= attention.mlx_setting("MLX_SDPA_D512_MIN_KL", 1024)
             and _two_pass_keys(keys.shape[2]) and _vector_attention_kernels() is not None):
         return None
     blocks = _vector_blocks(8, keys.shape[2])
@@ -10877,12 +10877,12 @@ def _wide_attention_class(base, helper, cache_type):
 
 @contextmanager
 def fused_decode_attention(model, *, _modules = None):
-    """Route MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
+    """Route MLX 0.32.5's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
     everything else, training and distributed models stay native."""
     changed = []
     try:
         with _WIDE_ATTENTION_LOCK:
-            if mx.__version__ == "0.32.4" and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+            if mx.__version__ == "0.32.5" and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 specs = {}
                 for path, contract in _WIDE_ATTENTION_CONTRACT.items():
                     bindings = _resolved_bindings({path: contract})
@@ -11292,7 +11292,7 @@ _QSA_DECODE_SOURCE = "15388c560af7468e7c3c9641bdb454ec4991167b94496fec24a7d0685e
 
 @functools.cache
 def _qsa_decode_kernel(source):
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+    if (mx.__version__ != "0.32.5" or not mx.metal.is_available()
             or hashlib.sha256(source.encode()).hexdigest() != _QSA_DECODE_SOURCE):
         return None
     # Keep native arithmetic and geometry; only K/V integer addresses change. Feature views read their strides too.

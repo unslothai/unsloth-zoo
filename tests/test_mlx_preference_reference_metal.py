@@ -208,7 +208,9 @@ def test_a_qualified_vision_plan_is_surveyed_and_planned_for_compile():
 
 def _tiny_gemma4_vlm(seed):
     from mlx_vlm.models import gemma4
+    from unsloth_zoo.mlx.utils import apply_gelu_approx_finite_grad
 
+    apply_gelu_approx_finite_grad()   # as from_pretrained and every trainer do, before the first trace
     mx.random.seed(seed)
     return gemma4.Model(gemma4.ModelConfig(image_token_id=500, vocab_size=512, text_config=gemma4.TextConfig(
         hidden_size=64, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2, head_dim=32, global_head_dim=64, vocab_size=512,

@@ -692,7 +692,7 @@ def test_vlm_stream_turboquant_rows_quantize_their_own_cache_as_a_single_decode_
 
 
 @metal_only
-def test_vlm_stream_prefills_a_short_arrival_ahead_of_a_long_prefill_bitwise():
+def test_vlm_stream_prefills_a_short_arrival_ahead_of_a_long_prefill():
     from mlx_vlm import load
     from mlx_vlm.prompt_utils import apply_chat_template
     from unsloth_zoo.mlx.generate import BatchStream, GenerationDefaults, GenerationRequest
@@ -719,8 +719,10 @@ def test_vlm_stream_prefills_a_short_arrival_ahead_of_a_long_prefill_bitwise():
     (alone_short,), _ = run(short)
     (got_long, got_short), order = run(long, short)
     assert got_long.prompt_token_count > 3 * 2048 and order == [1, 0]
-    for got, alone in ((got_long, alone_long), (got_short, alone_short)):
-        assert (got.token_ids[0], got.logprobs[0]) == (alone.token_ids[0], alone.logprobs[0])
+    assert (got_short.token_ids[0], got_short.logprobs[0]) == (alone_short.token_ids[0], alone_short.logprobs[0])
+    # The arrival splits the long prefill into other chunk sizes, and bf16 matmul is not row-count invariant.
+    assert got_long.token_ids[0] == alone_long.token_ids[0]
+    assert abs(got_long.logprobs[0] - alone_long.logprobs[0]) <= 0.125
 
 
 @metal_only
@@ -1296,6 +1298,12 @@ def test_nax_small_m_qmm_scales_with_gpu_cores_and_keys_rows_by_generation(monke
 _EVERY_ROW = ((4, None, 0, None, 1, 16), (8, None, 0, None, 1, 16))
 
 
+def _open_small_m_gap(monkeypatch):
+    # mlx 0.32.5 closes the NAX small-row gap; the scope machinery it shares with int8 prefill stays under test.
+    from unsloth_zoo.mlx import nax
+    monkeypatch.setitem(nax._GAPS, "small_m_qmm", nax.Gap(open_in = (mx.__version__,), closed_on_main = False))
+
+
 class _QuantizedHead(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1322,6 +1330,7 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
     monkeypatch.setattr(nax, "small_m_qmm", lambda *args: calls.append((len(args[0]), args[5])) or kernel(*args))
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    _open_small_m_gap(monkeypatch)
     # The 8-bit projection routes up to 8 rows only, so at 12 only the 4-bit embedding does.
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): (_EVERY_ROW[0], (8, None, 0, None, 1, 8))})
     monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
@@ -1375,6 +1384,7 @@ def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch
     monkeypatch.setattr(nax, "small_m_qmm", lambda *args: kernel(*args) * 1.1)
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    _open_small_m_gap(monkeypatch)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
     native = model.proj(x := mx.random.normal((3, 512), key = mx.random.key(3)).astype(mx.bfloat16))
@@ -1411,6 +1421,7 @@ def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
 
     model = _QuantizedHead()
     model.alias = model.proj   # reachable under two paths, as tied or shared modules are
+    _open_small_m_gap(monkeypatch)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
@@ -1889,6 +1900,7 @@ def test_dense_prefill_linear_composes_with_the_nax_scope(monkeypatch):
     few = mx.random.normal((1, 8, 512), key = mx.random.key(3)).astype(mx.bfloat16)
     native = model(x)
     mx.eval(native)
+    _open_small_m_gap(monkeypatch)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
@@ -3068,6 +3080,7 @@ def test_nax_int8_prefill_probes_gate_their_own_route(monkeypatch):
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "_gpu_generation", lambda: 17)
     _int8_prefill_dense_from_64_rows(monkeypatch)
+    _open_small_m_gap(monkeypatch)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {8: (20, 20)})
     for failed in (nax.QMM_PROBE_KEY, nax.INT8_QMM_PROBE_KEY, nax.SORTED_GATHER_PROBE_KEY):
