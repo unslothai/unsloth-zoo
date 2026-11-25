@@ -1565,6 +1565,119 @@ def patch_vllm_processed_logprobs_fast_path():
 pass
 
 
+# GRPO vLLM IS correction: rollout logprobs scaled by temperature but taken before min_p / top_k / top_p, so
+# pi_train / pi_vllm compare full-vocabulary distributions and the trainer need not rebuild the kept set (which
+# cost +27% s/step with min_p and +67% with top_p + top_k on Qwen3-0.6B). Off unless a GRPO trainer turns it on.
+UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS = {"on": False, "installed": False, "calls": 0}
+_UNTRUNCATED_CAPTURE = {"on": False, "scaled": None}
+
+
+def patch_vllm_untruncated_logprobs():
+    """Patch vLLM's V1 and V2 samplers (0.11 to 0.34+) to return log_softmax(logits / temperature) from before
+    min_p / top_k / top_p when the engine runs processed_logprobs and the flag above is on. True if a sampler
+    was patched."""
+    state = UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
+    if state["installed"]:
+        return True
+    capture = _UNTRUNCATED_CAPTURE
+    installed = False
+    try:
+        from vllm.v1.sample.sampler import Sampler as V1Sampler
+    except Exception:
+        V1Sampler = None
+    if V1Sampler is not None and hasattr(V1Sampler, "apply_temperature") and hasattr(V1Sampler, "sample"):
+        original_temperature = V1Sampler.__dict__["apply_temperature"]
+        original_temperature = getattr(original_temperature, "__func__", original_temperature)
+        original_sample = V1Sampler.sample
+
+        def apply_temperature(logits, *args, **kwargs):
+            out = original_temperature(logits, *args, **kwargs)
+            if capture["on"]:
+                capture["scaled"] = out.clone()
+            return out
+
+        @functools.wraps(original_sample)
+        def sample(self, logits, sampling_metadata, *args, **kwargs):
+            mode = str(kwargs.get("logprobs_mode_override") or self.logprobs_mode)
+            if not (
+                state["on"] and mode in ("processed_logprobs", "processed_logits")
+                and (getattr(sampling_metadata, "max_num_logprobs", None) is not None
+                     or getattr(sampling_metadata, "logprob_token_ids", None))
+            ):
+                return original_sample(self, logits, sampling_metadata, *args, **kwargs)
+            capture.update(on = True, scaled = None)
+            try:
+                sampled, processed = original_sample(self, logits, sampling_metadata, *args, **kwargs)
+                scaled = capture["scaled"]
+            finally:
+                capture.update(on = False, scaled = None)
+            if processed is not None and scaled is not None and scaled.shape == processed.shape:
+                processed = torch.log_softmax(scaled, dim = -1) if mode == "processed_logprobs" else scaled
+                state["calls"] += 1
+            return sampled, processed
+
+        V1Sampler.apply_temperature = staticmethod(apply_temperature)
+        V1Sampler.sample = sample
+        installed = True
+    try:
+        import vllm.v1.worker.gpu.sample.sampler as v2_sampler
+        from vllm.v1.worker.gpu.sample.states import SamplingStates
+    except Exception:
+        v2_sampler = None
+    score_name = None
+    if v2_sampler is not None:
+        score_name = next(
+            (n for n in ("compute_topk_scores", "compute_topk_logprobs") if hasattr(v2_sampler, n)), None
+        )
+    if score_name is not None and hasattr(SamplingStates, "apply_min_p") and hasattr(v2_sampler, "Sampler"):
+        original_min_p = SamplingStates.apply_min_p
+        original_call = v2_sampler.Sampler.__call__
+        original_score = getattr(v2_sampler, score_name)
+
+        @functools.wraps(original_min_p)
+        def apply_min_p(self, logits, *args, **kwargs):
+            # V2 applies temperature in place just before min_p, then top_k / top_p.
+            if capture["on"]:
+                capture["scaled"] = logits.clone()
+            return original_min_p(self, logits, *args, **kwargs)
+
+        @functools.wraps(original_call)
+        def __call__(self, *args, **kwargs):
+            if not (state["on"] and str(getattr(self, "logprobs_mode", "")) in ("processed_logprobs", "processed_logits")):
+                return original_call(self, *args, **kwargs)
+            capture.update(on = True, scaled = None)
+            try:
+                return original_call(self, *args, **kwargs)
+            finally:
+                capture.update(on = False, scaled = None)
+
+        @functools.wraps(original_score)
+        def score(logits, *args, **kwargs):
+            scaled = capture["scaled"]
+            if capture["on"] and scaled is not None and scaled.shape == logits.shape:
+                logits = scaled
+                state["calls"] += 1
+            return original_score(logits, *args, **kwargs)
+
+        SamplingStates.apply_min_p = apply_min_p
+        v2_sampler.Sampler.__call__ = __call__
+        setattr(v2_sampler, score_name, score)
+        installed = True
+    state["installed"] = installed
+    return installed
+pass
+
+
+def set_vllm_untruncated_logprobs(on):
+    """Turn the untruncated rollout logprobs on or off (UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS=0 keeps them off).
+    Returns whether they are on."""
+    state = UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
+    on = bool(on) and os.environ.get("UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS", "1") != "0"
+    state["on"] = on and patch_vllm_untruncated_logprobs()
+    return state["on"]
+pass
+
+
 def patch_vllm(debug = True):
     # Disable vLLM multiprocessing so we can access model_executor.
     logger.info(f'Unsloth: Patching vLLM')
