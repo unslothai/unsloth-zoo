@@ -611,6 +611,34 @@ def _plain_head_weight(head):
     return None
 
 
+@functools.lru_cache(maxsize = None)
+def _forward_takes_index_logits_to_keep(cls):
+    """True when cls.forward slices with transformers' `slice(-k, None) if isinstance(logits_to_keep, int) else
+    logits_to_keep`, i.e. it also takes a tensor of positions."""
+    try:
+        source = inspect.getsource(cls.forward)
+    except (OSError, TypeError):
+        return False
+    return "isinstance(logits_to_keep, int)" in source and "slice(-logits_to_keep, None)" in source
+
+
+def _logits_to_keep_as_index(model, input_ids, inputs_embeds, logits_to_keep):
+    """An int logits_to_keep slices hidden[:, -k:] as a strided view, which torch < 2.14 does not fold into one GEMM
+    for a bf16 / fp16 head: matmul expands the [V, H] head per row and copies it ([B, H, V], 4.6 s and 1.2 GB for
+    Qwen3-0.6B at B = 4, every generate() prefill and GRPO log-prob pass). The same positions as an index tensor
+    gather a contiguous [B, k, H] and run one GEMM: bit-identical logits. fp32 heads already fold."""
+    if not isinstance(logits_to_keep, int) or isinstance(logits_to_keep, bool) or logits_to_keep <= 0:
+        return logits_to_keep
+    tokens = input_ids if input_ids is not None else inputs_embeds
+    length = tokens.shape[1] if tokens is not None and tokens.dim() >= 2 else 0
+    weight = getattr(model.get_output_embeddings(), "weight", None)
+    if length <= logits_to_keep or not isinstance(weight, torch.Tensor) \
+            or weight.dtype not in (torch.bfloat16, torch.float16) or weight.device.type != "cpu" \
+            or not _forward_takes_index_logits_to_keep(type(model)):
+        return logits_to_keep
+    return torch.arange(length - logits_to_keep, length, device = tokens.device)
+
+
 def patch_chunked_causal_lm_loss(model):
     """Routes training forwards with labels through chunked_linear_cross_entropy, per instance; logits come back None,
     so unsloth_zoo.cpu.trainer makes TRL skip logits-only metrics. Returns True when installed."""
@@ -652,6 +680,7 @@ def patch_chunked_causal_lm_loss(model):
                 or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
                 kwargs["shift_labels"] = shift_labels
+            logits_to_keep = _logits_to_keep_as_index(self, input_ids, inputs_embeds, logits_to_keep)
             call = functools.partial(original_func, self) if original_func is not None else original_forward
             return call(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
