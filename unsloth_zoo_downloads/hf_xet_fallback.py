@@ -3264,6 +3264,160 @@ def hf_hub_download_with_xet_fallback(
     )
 
 
+# Bound on the in-process metadata check below: hub's repo_info / list_repo_tree calls carry no timeout of their own,
+# and a stalled answer must reach the killable child instead of holding the load.
+DEFAULT_DRY_RUN_TIMEOUT = 10.0
+
+
+def _silent_hub_tqdm_class() -> Optional[type]:
+    """hub tqdm subclass that never draws, so the in-process dry run prints nothing (the child sets
+    HF_HUB_DISABLE_PROGRESS_BARS for the same reason); None when hub's tqdm is unavailable."""
+    try:
+        from huggingface_hub.utils import tqdm as hub_tqdm
+    except Exception:
+        return None
+
+    class _SilentTqdm(hub_tqdm):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+
+    return _SilentTqdm
+
+
+def _warm_snapshot_from_dry_run(
+    *,
+    repo_id: str,
+    repo_type: str,
+    revision: Optional[str],
+    token: Optional[str],
+    cache_dir: Optional[str],
+    allow_patterns: Any,
+    ignore_patterns: Any,
+    cancel_event: Optional[threading.Event],
+    cached_dir: str,
+) -> Optional[str]:
+    """cached_dir (the local_files_only answer) when hub's dry run proves the child would fetch nothing, else None.
+
+    Runs snapshot_download(dry_run=True) (huggingface_hub >= 1.0) in-process with the child's arguments: metadata
+    only (repo_info / tree listing / HEAD), never a Xet or blob transfer, on a daemon thread bounded by
+    DEFAULT_DRY_RUN_TIMEOUT. Accepted only when every listed file is cached at one commit with its pointer present,
+    the branch ref already names that commit, the pointers sit in cached_dir (the folder snapshot_download returns
+    for that commit, so the child's path) and hub's tree listing cache (when this hub has one) is on disk, so the
+    child would write nothing either. Any doubt (offline, older hub, error, timeout, cancel, a file to fetch, no file
+    matched) returns None and the caller spawns the child as before."""
+    try:
+        import inspect
+
+        from huggingface_hub import constants as hub_constants
+        from huggingface_hub import snapshot_download
+
+        if getattr(hub_constants, "HF_HUB_OFFLINE", False):
+            return None  # the child resolves offline from cache; the dry run would only raise
+        if "dry_run" not in inspect.signature(snapshot_download).parameters:
+            return None  # huggingface_hub < 1.0
+    except Exception:
+        return None
+
+    kwargs: dict = {
+        "repo_id": repo_id,
+        "repo_type": repo_type,
+        "revision": revision,
+        "token": token,
+        "cache_dir": cache_dir,
+        "allow_patterns": allow_patterns,
+        "ignore_patterns": ignore_patterns,
+        "dry_run": True,
+    }
+    tqdm_class = _silent_hub_tqdm_class()
+    if tqdm_class is not None:
+        kwargs["tqdm_class"] = tqdm_class
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["result"] = snapshot_download(**kwargs)
+        except BaseException as e:  # noqa: BLE001 - any failure means "spawn the child"
+            box["error"] = e
+
+    worker = threading.Thread(target = _run, name = "unsloth-hf-dry-run", daemon = True)
+    worker.start()
+    deadline = time.monotonic() + DEFAULT_DRY_RUN_TIMEOUT
+    while worker.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.debug("Dry run for %s did not answer in %.0fs; downloading.", repo_id, DEFAULT_DRY_RUN_TIMEOUT)
+            return None
+        if cancel_event is not None and cancel_event.is_set():
+            return None  # the caller raises Cancelled
+        worker.join(min(remaining, _POLL_INTERVAL) if cancel_event is not None else remaining)
+    if "error" in box:
+        logger.debug("Dry run for %s failed (%s); downloading.", repo_id, box["error"])
+        return None
+    infos = box.get("result")
+    if not isinstance(infos, list) or not infos:
+        return None  # nothing matched: the child decides what an empty selection returns
+    snapshot_folder = None
+    commit_hash = None
+    for info in infos:
+        filename = getattr(info, "filename", None)
+        local_path = getattr(info, "local_path", None)
+        commit = getattr(info, "commit_hash", None)
+        if (
+            getattr(info, "will_download", True) is not False
+            or getattr(info, "is_cached", False) is not True
+            or not isinstance(filename, str) or not filename
+            or not isinstance(local_path, str)
+            or not isinstance(commit, str) or not commit
+        ):
+            return None
+        if commit_hash is None:
+            commit_hash = commit
+        elif commit != commit_hash:
+            return None
+        relative = os.path.join(*filename.split("/"))
+        if not local_path.endswith(os.sep + relative):
+            return None
+        folder = local_path[: -len(relative) - 1]
+        if snapshot_folder is None:
+            snapshot_folder = folder
+        elif folder != snapshot_folder:
+            return None
+        # exists() follows the symlink: a dangling pointer means a missing blob the child would re-fetch.
+        if not os.path.exists(local_path):
+            return None
+    if snapshot_folder is None or commit_hash is None or snapshot_folder != cached_dir:
+        return None
+    snapshots_dir, commit_dir = os.path.split(snapshot_folder)
+    if commit_dir != commit_hash or os.path.basename(snapshots_dir) != "snapshots":
+        return None
+    storage_folder = os.path.dirname(snapshots_dir)
+    ref_name = revision if revision is not None else "main"  # hub's DEFAULT_REVISION
+    if ref_name != commit_hash:
+        # The child writes refs/<revision>; the dry run wrote it too, so a mismatch means a racing writer: defer.
+        try:
+            with open(os.path.join(storage_folder, "refs", ref_name)) as f:
+                if f.read() != commit_hash:
+                    return None
+        except OSError:
+            return None
+    try:
+        from huggingface_hub import _tree_cache as hub_tree_cache
+    except ImportError:
+        hub_tree_cache = None  # this hub keeps no tree listing cache, so the child writes none
+    except Exception:
+        return None
+    if hub_tree_cache is not None:
+        # The child writes trees/<commit>.json when it is missing; let it, so the cache dir ends up identical.
+        try:
+            tree_path = hub_tree_cache._tree_cache_path(storage_folder, commit_hash)
+            if not os.path.isfile(tree_path) or hub_tree_cache.read_tree_cache(storage_folder, commit_hash) is None:
+                return None
+        except Exception:
+            return None
+    return snapshot_folder
+
+
 def snapshot_download_with_xet_fallback(
     repo_id: str,
     *,
@@ -3285,7 +3439,7 @@ def snapshot_download_with_xet_fallback(
 ) -> str:
     """Snapshot Xet-then-HTTP warm-up in a killable child before from_pretrained's in-process load; transient faults
     raise DownloadTransportError, not a bare RuntimeError a caller could mistake for a skippable pre-download
-    failure; variant forces the child."""
+    failure; variant forces the child unless hub's dry run proves nothing would be fetched."""
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Expand ~ as huggingface_hub does, so the probe and the child resolve to the same location.
     if isinstance(cache_dir, (str, os.PathLike)):
@@ -3331,7 +3485,31 @@ def snapshot_download_with_xet_fallback(
                 return cached_dir
             logger.debug("Cached snapshot for %s is incomplete; downloading.", repo_id)
         except Exception as e:
+            cached_dir = None
             logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
+        # Glob allow lists and caches the strict gate cannot prove land here even when nothing is missing; ask hub's
+        # metadata-only dry run first, so a warm cache returns without spawning a child that would fetch nothing.
+        if isinstance(cached_dir, str):
+            warm_dir = _warm_snapshot_from_dry_run(
+                repo_id = repo_id,
+                repo_type = repo_type,
+                revision = revision,
+                token = token,
+                cache_dir = cache_dir,
+                allow_patterns = allow_patterns,
+                ignore_patterns = ignore_patterns,
+                cancel_event = cancel_event,
+                cached_dir = cached_dir,
+            )
+            # Same post-download gate the child's result passes, so a dir the ladder would retry is never returned.
+            if warm_dir is not None and not _snapshot_payload_incomplete(
+                warm_dir,
+                repo_type = repo_type,
+                allow_patterns = allow_patterns,
+                ignore_patterns = ignore_patterns,
+                variant = variant,
+            ):
+                return warm_dir
 
     return _download_with_xet_fallback(
         repo_id = repo_id,
