@@ -77,14 +77,34 @@ def _fp8_experts(device):
     return experts, hidden, top_k_index, top_k_weights
 
 
-def _run_fp8(device, monkeypatch, backend, autocast):
+def _run_fp8(device, monkeypatch, backend, autocast, fused = "0"):
     monkeypatch.setenv("UNSLOTH_MOE_BACKEND", backend)
+    # "0": the whole-stack dequant path these checks spy on; "auto": the W8A16 grouped GEMM where it engages.
+    monkeypatch.setenv("UNSLOTH_MOE_FP8_FUSED", fused)
     # select_moe_backend is lru_cached.
     moe_utils.select_moe_backend.cache_clear()
     try:
-        _run_fp8_checks(device, monkeypatch, autocast)
+        if fused == "0":
+            _run_fp8_checks(device, monkeypatch, autocast)
+        else:
+            _run_fp8_fused_checks(device, autocast)
     finally:
         moe_utils.select_moe_backend.cache_clear()
+
+
+def _run_fp8_fused_checks(device, autocast):
+    from unsloth_zoo.temporary_patches import moe_fp8_grouped
+    if not moe_fp8_grouped.fp8_fused_enabled(torch.device(device, torch.cuda.current_device())):
+        pytest.skip(reason = "no W8A16 grouped GEMM on this GPU (CUDA sm89+, not ROCm)")
+    experts, hidden, top_k_index, top_k_weights = _fp8_experts(device)
+    before = moe_fp8_grouped.FP8_FUSED_STATS["fwd"]
+    with torch.no_grad():
+        reference = moe_utils_fp8.forward_moe_backend_fp8(experts, hidden.bfloat16(), top_k_index, top_k_weights)
+        with torch.autocast(device, dtype = torch.bfloat16, enabled = autocast):
+            out = moe_utils_fp8.forward_moe_backend_fp8(experts, hidden, top_k_index, top_k_weights)
+    assert moe_fp8_grouped.FP8_FUSED_STATS["fwd"] - before == 4  # gate_up + down, both calls
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, reference.float(), rtol = 0, atol = 0)
 
 
 def _run_fp8_checks(device, monkeypatch, autocast):
@@ -113,6 +133,13 @@ def test_fp8_experts_dequantize_to_bf16_for_float32_activations_cpu(monkeypatch,
     # The Triton dequant needs a GPU driver; the vectorized torch dequant is the CPU path.
     monkeypatch.setattr(moe_utils_fp8, "_dequantize_full_expert_weights_unsloth", lambda *a, **k: None)
     _run_fp8("cpu", monkeypatch, "native_torch", autocast)
+
+
+@pytest.mark.gpu
+@needs_cuda_bf16
+@pytest.mark.parametrize("autocast", [True, False])
+def test_fp8_experts_take_the_fused_gemm_in_bf16_for_float32_activations(monkeypatch, autocast):
+    _run_fp8("cuda", monkeypatch, "grouped_mm", autocast, fused = "auto")
 
 
 @pytest.mark.gpu
