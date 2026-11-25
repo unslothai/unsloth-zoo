@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Which models are Unsloth's.
-
-Several zoo patches replace a transformers class forward or module function, so they also run for models
-loaded with plain transformers in the same process. Once Unsloth calls `require_model_marker()` (at its
-import), those patches keep their Unsloth behaviour only for models passed to `mark_model` (every Unsloth
-load, and every model an Unsloth-patched Trainer is given); any other model runs as without Unsloth. An
-Unsloth that never calls `require_model_marker()` keeps every model on the patched behaviour, as before.
-"""
+"""Zoo patches replace transformers code process-wide. After require_model_marker() (Unsloth's import) they
+apply only to models passed to mark_model; without it every model is patched, as before."""
 
 __all__ = ["MODEL_MARKER", "mark_model", "require_model_marker", "model_marker_required", "is_unsloth_model"]
 
@@ -38,7 +32,6 @@ def model_marker_required() -> bool:
 
 
 def mark_model(model) -> None:
-    """Mark every transformers model inside `model` (PEFT and trainer wrappers included)."""
     try:
         from transformers import PreTrainedModel  # noqa: PLC0415
         modules = model.modules()
@@ -53,5 +46,4 @@ def mark_model(model) -> None:
 
 
 def is_unsloth_model(module) -> bool:
-    """True unless the marker is required and `module` lacks it."""
     return not _REQUIRE_MARKER[0] or getattr(module, MODEL_MARKER, False) is True

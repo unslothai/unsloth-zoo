@@ -73,8 +73,7 @@ _INSTALL_DONE = False  # set once install_modeling_import_hook has run
 
 
 def _fuses_model(module) -> bool:
-    # The installed forward replaces the class forward, so a model loaded with plain transformers runs it
-    # too: only Unsloth's models (model_marker) take the fused branch and its empty logits.
+    # Class-wide forward: plain transformers models must keep their logits.
     return is_unsloth_model(module)
 
 
