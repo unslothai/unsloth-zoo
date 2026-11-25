@@ -380,9 +380,13 @@ def test_temp_patches_misc_pretrained_tokenizer_base_top_level():
 # unsloth_zoo/temporary_patches/gemma.py
 
 def test_temp_patches_gemma_processing_surface():
-    """unsloth_zoo/temporary_patches/gemma.py:93-97 five module-level imports are used to rebuild the Gemma3 processor; all must resolve."""
+    """unsloth_zoo/temporary_patches/gemma.py rebuilds the Gemma3 processor from these; all must resolve.
+
+    Gemma3ProcessorKwargs itself is optional: transformers 5.23 made it a deprecated alias of
+    ProcessingKwargs and 5.29 removes it, so the patch falls back to ProcessingKwargs."""
     _resolve_all([
-        "transformers.models.gemma3.processing_gemma3.Gemma3ProcessorKwargs",
+        "transformers.models.gemma3.processing_gemma3.Gemma3Processor",
+        "transformers.processing_utils.ProcessingKwargs",
         "transformers.image_utils.make_nested_list_of_images",
         "transformers.feature_extraction_utils.BatchFeature",
         "transformers.utils.to_py_obj",

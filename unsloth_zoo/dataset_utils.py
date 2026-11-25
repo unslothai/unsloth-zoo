@@ -312,6 +312,12 @@ def get_chat_template_parts(tokenizer):
     tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
     _gen_on, _gen_off = render(end_user, True), render(end_user, False)
     asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
+    # The user turn's terminator can be plain text (Apriel "\n<|end|>\n", where <|end|> is not an
+    # added token), which strip_shared keeps, gluing it onto the header. When the generation prompt
+    # only appends to the terminator, the header is exactly what it appends.
+    if asst_header and tail(_gen_off) and tail(_gen_on).startswith(tail(_gen_off)) and \
+        tail(_gen_on)[len(tail(_gen_off)):].strip():
+        asst_header = tail(_gen_on)[len(tail(_gen_off)):]
     user_term = tail(_gen_off)
     _rest = user_term
     while _rest:
@@ -336,8 +342,60 @@ def get_chat_template_parts(tokenizer):
         # anchor (e.g. "\n### Human:") instead of being glued to eos and dropped, which
         # left a bare marker that could match inside message content. strip_lead skips
         # empty prefixes, so an unset eos never strips a bare "\n".
+        # Leading special tokens shared by both gaps are an end-of-message token closing both
+        # the user and the assistant turn (gpt-oss "<|end|>", Inkling-2 "<|end_message|>"): they
+        # belong to the previous turn, not to either role marker, so drop them. When the
+        # generation prompt exposes the assistant header, it marks where the role marker starts
+        # (gpt-oss "<|start|>assistant"). Otherwise peel shared special tokens one at a time,
+        # stopping at a token that opens the conversation (a role opener such as "<|start|>").
+        # Plain-text shared runs (a bare "\n") are kept as anchors.
+        # The header may also run past the gap (Olmo-3-Think "<|im_start|>assistant\n<think>").
+        _p = -1
+        if asst_header:
+            _q = 0
+            while _q < len(resp_gap):
+                _r = resp_gap[_q:]
+                if _q and (_r.startswith(asst_header) or asst_header.startswith(_r)) and \
+                    any(s in _r for s in specials):
+                    _p = _q; break
+                _t = next((s for s in specials if _r.startswith(s)), None) or \
+                     (re.match(r"\s+", _r) and re.match(r"\s+", _r).group())
+                if not _t: break
+                _q += len(_t)
+        _lead = resp_gap[:_p] if _p > 0 else ""
+        if _lead and instr_gap.startswith(_lead) and any(s in _lead for s in specials):
+            resp_gap, instr_gap = resp_gap[_p:], instr_gap[_p:]
+        elif not asst_header:
+            _open = strip_lead(full, bos).lstrip()
+            _open = next((s for s in specials if _open.startswith(s)), None)
+            while True:
+                _t = next((s for s in specials if resp_gap.startswith(s)), None)
+                if not _t or _t == _open or not instr_gap.startswith(_t): break
+                if len(_t) >= len(resp_gap) or len(_t) >= len(instr_gap): break
+                resp_gap, instr_gap = resp_gap[len(_t):], instr_gap[len(_t):]
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
+        # bos can itself open every user turn (Hunyuan "<|eos|><|startoftext|>"): keep it then.
+        if not instruction_part.strip():
+            instruction_part = strip_lead(instr_gap, " ", "\t", eos)
+
+    # The instruction marker must start at the user role marker: any leading special tokens that
+    # do not open the first user turn close the previous assistant turn (an end-of-turn token
+    # that is not eos), and masking them means the model never learns to stop. Trim the longest
+    # such run whose remainder (still holding a special token) is how the first user turn opens.
+    # Whitespace is peeled only to reach a later special token.
+    _first_user = full[:full.find(U)]
+    _k = 0
+    while _k < len(instruction_part):
+        _rem = instruction_part[_k:]
+        if _first_user.endswith(_rem) and any(s in _rem for s in specials):
+            # Only drop runs holding an end token; a bare leading newline is an anchor.
+            if _k and any(s in instruction_part[:_k] for s in specials): instruction_part = _rem
+            break
+        _t = next((s for s in specials if _rem.startswith(s)), None) or \
+             (re.match(r"\s+", _rem) and re.match(r"\s+", _rem).group())
+        if not _t: break
+        _k += len(_t)
 
     # Command A Vision splits the terminator with an image: "<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>".
     if user_term and response_part.startswith(user_term) and len(user_term) < len(response_part):
@@ -1005,12 +1063,35 @@ def train_on_responses_only(
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
 
+    # The special tokens every rendered conversation opens with act like a bos: they start a new
+    # packed sample. GLM-4.x opens with "[gMASK]<sop>" (no bos_token, no assistant end token), so
+    # without this the last answer of a row ran into the next sample's system prompt.
+    sample_start = []
+    try:
+        _render_tok = processor if getattr(processor, "chat_template", None) is not None else tokenizer
+        if getattr(_render_tok, "chat_template", None) is not None:
+            _probe = "⁠SAMPLEPROBE⁠"
+            _text  = _render_tok.apply_chat_template([{"role": "user", "content": _probe}], tokenize = False)
+            _text  = _text[:_text.find(_probe)] if _probe in _text else ""
+            for i in (tokenizer(_text, add_special_tokens = False).input_ids if _text else []):
+                if i not in special_ids or not getattr(added_tokens.get(i), "content", "").strip(): break
+                # Stop at the first role marker: only what precedes every role opens a sample.
+                if i in (Q_first, A_first) or (message_start and i == message_start[0]): break
+                sample_start.append(i)
+    except Exception:
+        sample_start = []
+    # Only a prefix no marker already handles, and never one that begins a role marker.
+    if not sample_start or sample_start[0] in (A_first, Q_first, bos_token_id, eos_token_id) or \
+        (message_start and sample_start[0] == message_start[0]):
+        sample_start = []
+
     # Every boundary test below fires only on one of these ids: one set lookup per token
     # replaces four comparisons, over every token of every row.
     boundary_first = {A_first}
     if bos_token_id is not None: boundary_first.add(bos_token_id)
     if eos_token_id is not None: boundary_first.add(eos_token_id)
     if message_start: boundary_first.add(message_start[0])
+    if sample_start:  boundary_first.add(sample_start[0])
     inner_stop_ids = tuple(boundary_first | {Q_first})
 
     torch_Tensor = torch.Tensor
@@ -1160,6 +1241,8 @@ def train_on_responses_only(
                             if token == bos_token_id or \
                                 (message_start and token == message_start[0] and \
                                  input_ids[j : j + len(message_start)] == message_start) or \
+                                (sample_start and token == sample_start[0] and \
+                                 input_ids[j : j + len(sample_start)] == sample_start) or \
                                 (token == A_first and input_ids[j : j + len_A_must] == A_must):
                                 spans.append((assistant_k, j))
                                 # Revisit the boundary so a following assistant is not skipped.

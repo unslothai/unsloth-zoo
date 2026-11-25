@@ -1151,6 +1151,14 @@ def gradient_checkpointing_bypassed():
         _GC_BYPASS_DEPTH.set(depth)
 
 
+def exempt_from_gradient_checkpointing(model):
+    """Layers of ``model`` skip the class-level checkpoint wrapper, which an inference engine sharing the layer classes
+    would otherwise run, re-assigning its parameters, on every forward."""
+    for _, module in model.named_modules():
+        module._unsloth_no_checkpoint = True
+    return model
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -1158,7 +1166,7 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        if _GC_BYPASS_DEPTH.get() and not self.training:
+        if getattr(self, "_unsloth_no_checkpoint", False) or (_GC_BYPASS_DEPTH.get() and not self.training):
             return fn(self, *args, **kwargs)
         slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot, _PrefixStateSlot))), None)
         if slot is None and isinstance(kwargs.get("cache"), (_PrefixKVSlot, _PrefixStateSlot)):
@@ -3528,16 +3536,21 @@ def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=Non
 
 
 def _get_backbone_embed_kwarg(backbone):
-    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either.
-    try:
-        params = inspect.signature(backbone.__call__).parameters
-    except (AttributeError, TypeError, ValueError):
-        return None
-    for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
-        if name in params and params[name].kind in (
-            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
-        ):
-            return name
+    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either. An override that only
+    # forwards **kwargs (SenseNova Loop over Qwen3.5) hides its parent's, so the MRO is walked past it.
+    calls = [klass.__dict__["__call__"] for klass in type(backbone).__mro__ if "__call__" in klass.__dict__]
+    for call in calls or [getattr(backbone, "__call__", None)]:
+        try:
+            params = inspect.signature(call).parameters
+        except (TypeError, ValueError):
+            return None
+        for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
+            if name in params and params[name].kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return name
+        if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return None
     return None
 
 
@@ -4073,6 +4086,7 @@ def _build_qwen_position_ids(
     image_token_id,
     video_token_id,
     spatial_merge_size,
+    video_time_intervals=None,
 ):
     batch_size, seq_length = input_ids.shape
     position_ids = np.ones((3, batch_size, seq_length), dtype=np.int32)
@@ -4128,19 +4142,23 @@ def _build_qwen_position_ids(
                 llm_pos_ids_list.append(text_ids + start_idx)
                 start_idx += text_len
 
+            time_interval = 1
             if ed_image < ed_video:
                 t, h, w = image_grids[image_index]
                 image_index += 1
             else:
                 t, h, w = video_grids[video_index]
+                if video_time_intervals is not None:
+                    time_interval = video_time_intervals[video_index]
                 video_index += 1
 
             llm_grid_t = int(t)
             llm_grid_h = int(h) // spatial_merge_size
             llm_grid_w = int(w) // spatial_merge_size
 
+            # In float32 and truncated per frame, as mlx-vlm does: float64 lands a frame lower for some rates.
             t_index = np.broadcast_to(
-                np.arange(llm_grid_t, dtype=np.int32)[:, None],
+                (np.arange(llm_grid_t, dtype=np.float32) * np.float32(time_interval)).astype(np.int32)[:, None],
                 (llm_grid_t, llm_grid_h * llm_grid_w),
             ).reshape(-1)
             h_index = np.broadcast_to(
@@ -4729,6 +4747,16 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     return batch_dict
 
 
+@lru_cache(maxsize=None)
+def _qwen2_5_vl_spaces_video_by_time():
+    """Whether the installed mlx-vlm spaces Qwen2.5-VL video frames by tokens_per_second (HF parity, 0.8.1+)."""
+    try:
+        language = importlib.import_module("mlx_vlm.models.qwen2_5_vl.language")
+        return "tokens_per_second" in inspect.getsource(language.LanguageModel.get_rope_index)
+    except Exception:
+        return False
+
+
 def _vlm_positions_for_compile(batch_dict, config):
     """Records absolute-position constants and width-derived sidecars from the final text arrays; planned padding tails never shift a content position."""
     model_type = _config_get(config, "model_type")
@@ -4736,6 +4764,14 @@ def _vlm_positions_for_compile(batch_dict, config):
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+    video_timing = batch_dict.pop("_unsloth_second_per_grid_ts", None)
+    video_time_intervals = None
+    if model_type == "qwen2_5_vl" and video_grid_thw and _qwen2_5_vl_spaces_video_by_time():
+        tokens_per_second = vision_config.get("tokens_per_second", 2)
+        video_time_intervals = [
+            np.float32(tokens_per_second) * np.float32(video_timing[i] if video_timing else 1)
+            for i in range(len(video_grid_thw))
+        ]
 
     if model_type in _VLM_QWEN_POSITION_MODEL_TYPES:
         if model_type in _VLM_QWEN_FRAME_SPLIT_MODEL_TYPES and video_grid_thw:
@@ -4758,6 +4794,7 @@ def _vlm_positions_for_compile(batch_dict, config):
                 image_token_id=int(_config_get(config, "image_token_id", _config_get(config, "image_token_index"))),
                 video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
                 spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
+                video_time_intervals=video_time_intervals,
             )
             batch_dict["_unsloth_collated_position_ids"] = True
 
@@ -9542,8 +9579,10 @@ def _processor_vlm_inputs(
 
     if audio_kwarg is None:
         inputs = _require_video_output(_run_layouts())
-        # Unused on MLX; as free-form floats/Mappings they fracture compile families.
-        inputs.pop("second_per_grid_ts", None)
+        # As free-form floats/Mappings they fracture compile families; the positions phase consumes the timing.
+        timing = inputs.pop("second_per_grid_ts", None)
+        if timing is not None:
+            inputs["_unsloth_second_per_grid_ts"] = tuple(float(t) for t in np.asarray(timing).reshape(-1))
         inputs.pop("video_metadata", None)
         if text_only and "text_pair" in base_kwargs:
             inputs["labels"] = np.where(
@@ -14977,8 +15016,8 @@ def _inherit_target_permissions(tmp_file, target):
     try:
         # Group before mode: chown clears the setgid bit on some systems, so applying the mode afterwards keeps it; the owner is left alone.
         os.chown(str(tmp_file), -1, info.st_gid)
-    except OSError:
-        pass  # Not a member of that group, or a filesystem without ownership.
+    except (OSError, AttributeError):
+        pass  # Not a member of that group, a filesystem without ownership, or Windows (no os.chown).
     try:
         os.chmod(str(tmp_file), info.st_mode & 0o7777)
     except OSError:

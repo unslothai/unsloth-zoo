@@ -23,6 +23,7 @@ import json
 import os
 
 import torch
+from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
 
 from .runtime import available_ram, cpu_bf16_supported, cpu_fp16_supported
 
@@ -333,7 +334,7 @@ def _auto_cpu_gradient_checkpointing(model, training_args):
     if needed * ranks > available // 4:
         return False
     _args_checkpointing_off(training_args)
-    if getattr(model, "is_gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_disable"):
+    if _is_activation_checkpointing(model) and hasattr(model, "gradient_checkpointing_disable"):
         # PEFT forwards this to the transformers model; input require-grads hooks stay (a no-op without checkpointing).
         model.gradient_checkpointing_disable()
     print(f"Unsloth (CPU): activations for {batch} x {length} tokens (~{needed / 1024 ** 3:.2f} GB) fit in RAM "
@@ -386,6 +387,102 @@ def _patch_cpu_fp16_accelerator(trainer_cls):
         return result
 
     create_accelerator_and_postprocess._unsloth_cpu = True
+    trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
+
+
+def _chunked_ce_model(trainer, model):
+    """The CPU model whose forward Unsloth patched (patch_chunked_causal_lm_loss), behind accelerate / PEFT wrappers."""
+    unwrapped = trainer.accelerator.unwrap_model(model) if getattr(trainer, "accelerator", None) is not None else model
+    for candidate in (unwrapped, getattr(unwrapped, "base_model", None), getattr(getattr(unwrapped, "base_model", None), "model", None)):
+        # vars(), not getattr: PEFT forwards attribute reads to the inner model, but writes stay on the wrapper.
+        if candidate is not None and vars(candidate).get("_unsloth_cpu_chunked_ce", False):
+            return candidate
+    return None
+
+
+def _orpo_chunked_forward(trainer, original):
+    """TRL's ORPO concatenated_forward without the [2B, L, V] logits: the policy's next-token log-probs come from the
+    last hidden state in row chunks (cpu_chunked_log_probs, the CPU twin of TRL's fused LM head, which TRL's DPO / KTO
+    already use). Its nll loss, length-averaged log-probs and logits metric are those same per-token values. Only
+    the plain decoder case; anything else, or UNSLOTH_CPU_CHUNKED_PREFERENCE=0, runs TRL's own forward."""
+    from .ops import _plain_head_weight
+
+    def concatenated_forward(model, batch):
+        target = _chunked_ce_model(trainer, model)
+        head = _plain_head_weight(target.get_output_embeddings()) if target is not None else None
+        # head.device: a CPU-patched model moved to an accelerator keeps TRL's forward (the chunked scorer is CPU-only).
+        if head is None or head.device.type != "cpu" or getattr(trainer, "is_encoder_decoder", False) \
+                or getattr(trainer, "aux_loss_enabled", False) or getattr(trainer, "label_pad_token_id", -100) != -100 \
+                or any(key in batch for key in ("pixel_values", "pixel_attention_mask", "image_sizes")):
+            return original(model, batch)
+        concatenated = trainer.concatenated_inputs(
+            batch, is_encoder_decoder = False, padding_value = trainer.padding_value, device = trainer.accelerator.device,
+        )
+        input_ids = concatenated["concatenated_input_ids"]
+        attention_mask = concatenated["concatenated_attention_mask"]
+        labels = concatenated["concatenated_labels"][:, 1:]
+        targets = input_ids[:, 1:]
+        label_mask = labels != -100
+        if labels.shape != targets.shape or not torch.equal(labels[label_mask], targets[label_mask]):
+            return original(model, batch)  # labels that are not the next input token: TRL's two targets differ
+        len_chosen = batch["chosen_labels"].shape[0]
+        # The head runs inside the patched forward (ops.patch_chunked_causal_lm_loss), so a trainable lm_head under
+        # DDP is used inside the wrapped forward, and accelerate's autocast covers it as it covered TRL's lm_head.
+        target._unsloth_cpu_logps_targets = targets
+        try:
+            outputs = model(input_ids, attention_mask = attention_mask, use_cache = False)
+        finally:
+            target.__dict__.pop("_unsloth_cpu_logps_targets", None)
+        if not isinstance(outputs, dict) or "log_probs" not in outputs:
+            return original(model, batch)  # a wrapper replaced the patched forward
+        log_probs, mean_logits = outputs["log_probs"], outputs["mean_logits"]
+        # nn.CrossEntropyLoss over the chosen rows' attended next tokens (TRL's ORPO nll over prompt + response).
+        nll_mask = attention_mask[:len_chosen, 1:] == 1
+        chosen_nll_loss = -log_probs[:len_chosen][nll_mask].sum() / nll_mask.sum()
+        # get_batch_logps(average_log_prob = True)
+        all_logps = (log_probs * label_mask).sum(-1) / label_mask.sum(-1)
+        # TRL only ever takes .mean() of the logits it returns: per-token vocabulary means average to the same value.
+        return (all_logps[:len_chosen], all_logps[len_chosen:], mean_logits[:len_chosen], mean_logits[len_chosen:],
+                chosen_nll_loss)
+
+    concatenated_forward._unsloth_cpu = True
+    return concatenated_forward
+
+
+def _install_chunked_preference_forward(trainer):
+    """Per trainer instance: TRL's own ORPOTrainer (trl.trainer.orpo_trainer up to 0.2x, trl.experimental.orpo in 1.x),
+    not a subclass that overrides concatenated_forward or what it replaces / feeds (its scoring and logits consumer)."""
+    if os.environ.get("UNSLOTH_CPU_CHUNKED_PREFERENCE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    for name in ("concatenated_forward", "concatenated_inputs", "get_batch_logps", "get_batch_loss_metrics"):
+        module = getattr(getattr(type(trainer), name, None), "__module__", "") or ""
+        if not (module.startswith("trl.") and module.endswith("orpo_trainer")):
+            return False
+    bound = getattr(trainer, "concatenated_forward")
+    if getattr(bound, "_unsloth_cpu", False):
+        return True
+    trainer.concatenated_forward = _orpo_chunked_forward(trainer, bound)
+    return True
+
+
+def _patch_cpu_preference_trainers(trainer_cls):
+    """Trainer.__init__ builds the accelerator once per trainer: the hook that sees every TRL trainer instance without
+    importing trl.experimental (which warns on import)."""
+    original = trainer_cls.create_accelerator_and_postprocess
+    if getattr(original, "_unsloth_cpu_preference", False):
+        return
+
+    @functools.wraps(original)
+    def create_accelerator_and_postprocess(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        try:
+            _install_chunked_preference_forward(self)
+        except Exception:
+            pass
+        return result
+
+    create_accelerator_and_postprocess._unsloth_cpu = getattr(original, "_unsloth_cpu", False)
+    create_accelerator_and_postprocess._unsloth_cpu_preference = True
     trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
 
 
@@ -575,6 +672,7 @@ def install_cpu_training_defaults():
     _patch_post_init(TrainingArguments)
     if hasattr(Trainer, "create_accelerator_and_postprocess"):
         _patch_cpu_fp16_accelerator(Trainer)
+        _patch_cpu_preference_trainers(Trainer)
     try:
         import trl
         from trl.trainer import sft_trainer

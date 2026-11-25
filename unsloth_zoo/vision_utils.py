@@ -1541,15 +1541,25 @@ def process_vision_info(
     return image_inputs, video_inputs
 
 
+def _declared_placeholder_tokens(defaults, tokenizer, processor, names):
+    # Some processors (Inkling 2: <|unused_200054|>, Audio Flamingo 3: <sound>) keep the placeholder on the processor only.
+    tokens = list(defaults)
+    for owner in (tokenizer, processor):
+        for name in names:
+            token = getattr(owner, name, None)
+            if isinstance(token, str) and token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
 def get_padding_tokens_ids(tokenizer):
     global IMAGE_TOKENS, AUDIO_TOKENS
 
+    processor = tokenizer
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
-    placeholder_tokens = IMAGE_TOKENS + AUDIO_TOKENS
-    if hasattr(tokenizer, "image_token"):
-        placeholder_tokens = placeholder_tokens + [tokenizer.image_token]
-    if hasattr(tokenizer, "audio_token"):
-        placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
+    placeholder_tokens = _declared_placeholder_tokens(
+        IMAGE_TOKENS + AUDIO_TOKENS, tokenizer, processor, ("image_token", "video_token", "audio_token"),
+    )
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
     # Tokens missing from this tokenizer map to the unk id, so unk is not masked from loss (mirrors mlx/utils.py); pad_token_id is added separately below.
@@ -2556,9 +2566,7 @@ class UnslothVisionDataCollator:
             if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[-1] == seq_len
         ]
         tok = getattr(self.processor, "tokenizer", self.processor)
-        audio_tokens = list(AUDIO_TOKENS)
-        if getattr(tok, "audio_token", None) is not None:
-            audio_tokens.append(tok.audio_token)
+        audio_tokens = _declared_placeholder_tokens(AUDIO_TOKENS, tok, self.processor, ("audio_token",))
         # Audio strings missing from this tokenizer map to unk (as get_padding_tokens_ids does); excluding unk keeps a
         # truncated unk text token from being miscounted as audio and tripping the alignment check.
         unk_id = getattr(tok, "unk_token_id", None)
