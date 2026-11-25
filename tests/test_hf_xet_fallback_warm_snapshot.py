@@ -305,7 +305,9 @@ def test_incomplete_result_still_goes_to_child(tmp_path, monkeypatch, _isolated)
 
 
 _EXIT_SCRIPT = textwrap.dedent('''
-    import http.server, json, os, socketserver, sys, threading, time
+    import time
+    marks = {"start": time.time()}
+    import http.server, json, os, socketserver, sys, threading
     cache_dir, mode = sys.argv[1], sys.argv[2]
     sha = "a" * 40
     storage = os.path.join(cache_dir, "models--ztest--exit")
@@ -324,42 +326,61 @@ _EXIT_SCRIPT = textwrap.dedent('''
         def do_GET(self):
             if mode == "stall":
                 time.sleep(600)
-            body = json.dumps({"id": "ztest/exit", "sha": sha, "siblings": siblings}).encode()
+            if "/tree/" in self.path:  # hub's recursive listing: config.json cached, tokenizer.json to fetch
+                body = json.dumps([{"type": "file", "path": f["rfilename"], "size": 2, "oid": "0" * 40}
+                                   for f in siblings]).encode()
+            else:
+                body = json.dumps({"id": "ztest/exit", "sha": sha, "siblings": siblings}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-    class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    # socketserver.TCPServer, not http.server.HTTPServer: HTTPServer.server_bind calls socket.getfqdn(), a reverse
+    # lookup that takes ~35 s on macOS CI runners and has nothing to do with the code under test.
+    class S(socketserver.ThreadingMixIn, socketserver.TCPServer):
         daemon_threads = True
 
     srv = S(("127.0.0.1", 0), H)
     threading.Thread(target = srv.serve_forever, daemon = True).start()
     os.environ["HF_ENDPOINT"] = "http://127.0.0.1:%d" % srv.server_address[1]
+    marks["server_up"] = time.time()
     from unsloth_zoo_downloads import hf_xet_fallback as xf
+    marks["imported"] = time.time()
     xf.DEFAULT_METADATA_TIMEOUT = 0.5
-    xf._run_download_attempt = lambda *a, **k: ("ok", "/child/snapshot")
+    # Stand in for the whole child ladder: only the in-process metadata check is under test here.
+    xf._download_with_xet_fallback = lambda **k: "/child/snapshot"
     out = xf.snapshot_download_with_xet_fallback("ztest/exit", cache_dir = cache_dir, allow_patterns = ["*.json"])
-    print(json.dumps({"out": out, "threads": [t.name for t in threading.enumerate()
-                                              if not t.daemon and t is not threading.main_thread()]}), flush = True)
+    marks["helper_returned"] = time.time()
+    threads = [t.name for t in threading.enumerate() if not t.daemon and t is not threading.main_thread()]
+    print(json.dumps({"out": out, "threads": threads, "marks": marks}), flush = True)
 ''')
 
 
 @pytest.mark.parametrize("mode", ["stall", "partial"])
 def test_abandoned_metadata_call_does_not_delay_exit(tmp_path, mode):
     """A stalled Hub (repo_info never answers) or a partial cache with stalling per-file HEADs must not leave any
-    non-daemon thread behind: the process exits as soon as the child hand-off returns."""
+    non-daemon thread behind: the helper returns within its bound and the interpreter exits right after. Exit is
+    timed from the helper's own return marker, so interpreter start-up and import cost on a cold runner do not count.
+    The stub Hub stalls for 600 s, so a leaked request shows up as a hang; the 30 s limits only absorb a loaded runner."""
     root = Path(xf.__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")])}
     env.pop("HF_HUB_OFFLINE", None)
-    started = time.monotonic()
     proc = subprocess.run(
         [sys.executable, "-c", _EXIT_SCRIPT, str(tmp_path / "cache"), mode],
-        capture_output = True, text = True, env = env, timeout = 60,
+        capture_output = True, text = True, env = env, timeout = 120,
     )
-    elapsed = time.monotonic() - started
+    exited = time.time()
     assert proc.returncode == 0, proc.stderr[-2000:]
     report = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert report == {"out": "/child/snapshot", "threads": []}
-    assert elapsed < 20, f"interpreter exit took {elapsed:.1f}s"
+    marks = report.pop("marks")
+    phases = {
+        "startup_to_server": round(marks["server_up"] - marks["start"], 2),
+        "import": round(marks["imported"] - marks["server_up"], 2),
+        "helper": round(marks["helper_returned"] - marks["imported"], 2),
+        "exit": round(exited - marks["helper_returned"], 2),
+    }
+    assert report == {"out": "/child/snapshot", "threads": []}, phases
+    assert phases["helper"] < 30, f"helper outlived its 0.5 s bound: {phases}"
+    assert phases["exit"] < 30, f"interpreter exit was delayed: {phases}"
