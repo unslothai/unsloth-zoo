@@ -189,8 +189,7 @@ def test_interleave_cache_is_tied_to_the_source_weight(monkeypatch):
 
 
 def test_interleave_cache_built_in_inference_mode_is_saved_for_backward(monkeypatch):
-    # generate() runs under inference_mode and fills the cache; the next training step hits it and
-    # _SonicGatedGroupedMM saves the interleaved weight for backward. The sonic GEMMs are torch math here.
+    # Sonic GEMMs replaced by torch math.
     monkeypatch.setenv("UNSLOTH_MOE_SONIC_CACHE_GIB", "1")
     S._INTERLEAVE_CACHE.clear()
 

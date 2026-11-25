@@ -428,7 +428,7 @@ def _interleaved_gate_up(weight):
     perm = torch.empty(two_i, dtype=torch.long, device=weight.device)
     perm[0::2] = torch.arange(0, half, device=weight.device)
     perm[1::2] = torch.arange(half, two_i, device=weight.device)
-    # Normal tensor even when first built in generate()'s inference_mode: _SonicGatedGroupedMM saves it for backward.
+    # Not an inference tensor: _SonicGatedGroupedMM saves it for backward.
     with torch.inference_mode(False), torch.no_grad():
         interleaved = weight[:, :, perm].contiguous()
     _INTERLEAVE_CACHE[key] = (stamp[0], stamp[1], stamp[2], interleaved,
