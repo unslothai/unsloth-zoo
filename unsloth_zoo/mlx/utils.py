@@ -5049,24 +5049,28 @@ def _get_vlm_image_size(config, processor):
                     candidate = h
         elif isinstance(sz, int) and sz > 0:
             candidate = sz
-        if candidate is not None:
-            def _pos_int(obj, *keys):
-                for key in keys:
-                    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
-                    if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                        return val
-                return None
-
-            tile = 0
-            for src in (vc, ip):
-                if src is not None:
-                    patch = _pos_int(src, "native_patch_size", "patch_size")
-                    if patch is not None:
-                        merge = _pos_int(src, "adapter_merge_size", "spatial_merge_size", "merge_size") or 1
-                        tile = max(tile, patch * merge)
-            if candidate > tile:
-                return candidate
+        if candidate is not None and candidate > _vlm_encoder_tile(vc, ip):
+            return candidate
     return 512
+
+
+def _vlm_pos_int(obj, *keys):
+    for key in keys:
+        val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+    return None
+
+
+def _vlm_encoder_tile(*sources):
+    """Largest patch * merge side across vision_config / image processor (Inkling 2: 20 * 2 = 40)."""
+    tile = 0
+    for src in sources:
+        patch = None if src is None else _vlm_pos_int(src, "native_patch_size", "patch_size")
+        if patch is not None:
+            merge = _vlm_pos_int(src, "adapter_merge_size", "spatial_merge_size", "merge_size") or 1
+            tile = max(tile, patch * merge)
+    return tile
 
 
 def _is_vlm_no_resize_image_size(image_size):
