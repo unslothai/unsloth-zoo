@@ -1114,6 +1114,7 @@ def create_completion_attention_mask(
     max_left_pad: int,
     pad_token_id: int,
     eos_rows: Optional[torch.Tensor] = None,
+    real_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build a completion mask that zeros leading prompt and trailing pad tokens.
 
@@ -1123,6 +1124,9 @@ def create_completion_attention_mask(
     eos_rows (bool [B], from grpo_pad_is_eos_rows) is only set when the pad id is an EOS id: the rows
     it marks keep their first pad-id token after the completion start, which is the real EOS, as TRL
     keeps it. With eos_rows None the mask is the id rule above, unchanged.
+
+    real_mask (bool, same shape, from grpo_prompt_real_mask after the same packing) replaces the id rule:
+    every token it marks real counts, wherever it sits in the completion.
     """
     batch_size, completion_len = completion_input_ids.shape
     device = completion_input_ids.device
@@ -1133,6 +1137,8 @@ def create_completion_attention_mask(
     shift_mask = indices >= num_tokens_to_mask.unsqueeze(1)
 
     non_padding_mask = (completion_input_ids != pad_token_id)
+    if real_mask is not None:
+        non_padding_mask = real_mask.to(device = device, dtype = torch.bool)
 
     if eos_rows is not None:
         # Left packing puts every pad-id token after the row's real tokens, so the first one past
@@ -1271,12 +1277,14 @@ def grpo_prompt_real_mask(
 ) -> Optional[torch.Tensor]:
     """Real-token mask for [left-padded prompt | right-padded completion] rows, or None when the id rule already gives it.
 
-    The GRPO text path finds prompt padding by token id. When the pad id is also a real prompt token
+    The GRPO text path finds padding by token id. When the pad id is also a real token
     (``tokenizer.pad_token = "<|im_end|>"`` with a chat template that ends every turn in it), those
-    tokens are counted as left padding and moved out of the prompt. TRL's prompt_mask knows which
-    prompt tokens are real, so only pad-id prompt tokens it marks as real are kept here. The
-    completion section keeps the id rule. Returns None, and so changes nothing, unless some prompt
-    token has the pad id and attention mask 1, and (when eos_token_ids is given) the pad id is an EOS id.
+    tokens are counted as padding and moved out of place: prompt turn ends, each completion's EOS, and
+    the turn ends inside a multi-turn / tool completion. TRL's prompt_mask and completion_mask know
+    which tokens are real, so pad-id tokens they mark as real are kept here, in both sections. Returns
+    None, and so changes nothing, unless some token has the pad id and attention mask 1, and (when
+    eos_token_ids is given) the pad id is an EOS id. Unsloth's old / ref scorer uses the same mask
+    (it imports this as grpo_real_token_mask), so both lay rows out alike.
     """
     if (
         pad_token_id is None
@@ -1287,13 +1295,14 @@ def grpo_prompt_real_mask(
     ):
         return None
     real = input_ids != pad_token_id
-    prompt_pad_kept = (~real[:, :-logits_to_keep]) & attention_mask[:, :-logits_to_keep].to(torch.bool)
-    if not bool(prompt_pad_kept.any()):
+    pad_kept = (~real) & attention_mask.to(device = input_ids.device, dtype = torch.bool)
+    if not bool(pad_kept.any()):
         return None
-    real[:, :-logits_to_keep] |= prompt_pad_kept
-    return real
+    return real | pad_kept
 pass
 RL_REPLACEMENTS["grpo_prompt_real_mask"] = grpo_prompt_real_mask
+# The name Unsloth's old / ref scorer probes: present only where the mask covers the completion too.
+grpo_real_token_mask = grpo_prompt_real_mask
 
 
 def align_logprobs_with_mask(
@@ -3990,6 +3999,9 @@ def grpo_accumulated_loss(
                 and (ref_logps is None or _logps_cover_eos)
             ):
                 pad_eos_rows = None
+            if prompt_real_mask is not None:
+                # The real-token mask already keeps every EOS TRL keeps, in place.
+                pad_eos_rows = None
 
             if prompt_real_mask is None:
                 input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
@@ -4000,7 +4012,11 @@ def grpo_accumulated_loss(
                 prompt_real_mask = torch.gather(prompt_real_mask, 1, _real_order)
 
             completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
-            completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id, eos_rows = pad_eos_rows).to(attention_mask.dtype)
+            completion_mask = create_completion_attention_mask(
+                completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id,
+                eos_rows = pad_eos_rows,
+                real_mask = None if prompt_real_mask is None else prompt_real_mask[:, -completion_input_ids.shape[1]:],
+            ).to(attention_mask.dtype)
 
             if sampling_per_token_logps is not None:
                 sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
@@ -4009,7 +4025,7 @@ def grpo_accumulated_loss(
             completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
             attention_mask =  input_ids != trainer.processing_class.pad_token_id
             if prompt_real_mask is not None:
-                # Real prompt tokens that share the pad id stay visible (completion section: id rule).
+                # Real tokens that share the pad id stay visible.
                 attention_mask = prompt_real_mask.clone()
             if pad_eos_rows is not None:
                 # The kept EOS is a real token: the packed forward below must score it.
@@ -4529,6 +4545,7 @@ def grpo_accumulated_loss(
                         _pack_cm = create_completion_attention_mask(
                             input_ids[:, -_pack_W:], left_pad_tokens_per_prompt, max_left_pad, _pack_pad_id,
                             eos_rows = pad_eos_rows,
+                            real_mask = None if prompt_real_mask is None else _pack_keep[:, -_pack_W:],
                         ).float()
                         _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
                         if UNSLOTH_ENABLE_LOGGING:
