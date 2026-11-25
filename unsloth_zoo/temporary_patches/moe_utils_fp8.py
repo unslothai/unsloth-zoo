@@ -1152,6 +1152,20 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             )
             return scaled_grouped_mm_output
 
+    # 1b. Block-FP8 experts: decode inside the grouped GEMM (W8A16) instead of dequantizing both stacks per call.
+    if backend == "grouped_mm":
+        from .moe_fp8_grouped import fp8_experts_as_packed
+        packed = fp8_experts_as_packed(self, hidden_states)
+        if packed is not None:
+            _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 experts are using the fused W8A16 grouped GEMM.")
+            output = swap_moe_weights_for_call(
+                self, packed[0], packed[1], forward_native_grouped_mm,
+                hidden_states.to(torch.bfloat16), top_k_index, top_k_weights,
+            )
+            if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
+                output = output.to(hidden_states.dtype)
+            return output
+
     # 2. Dequant FP8 weights to bf16/fp16, run through normal MoE forward
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
     gate_up_base, gate_up_quant, gate_up_qkind = _get_moe_weight_and_quant_info(self, "gate_up_proj")

@@ -25,6 +25,7 @@ import torch
 __all__ = [
     "Nvfp4ExpertParam",
     "Mxfp8ExpertParam",
+    "Fp8BlockExpertParam",
     "is_packed_expert_param",
     "is_new_packed_expert_param",
     "nvfp4_experts_dequantize",
@@ -478,6 +479,48 @@ class Mxfp8ExpertParam(_PackedExpertParam):
                                         token_counts = token_counts, out = out)
 
 
+class Fp8BlockExpertParam(_PackedExpertParam):
+    """Block-FP8 stack viewed as packed for one experts call (moe_fp8_grouped): e4m3 bytes ``(E, N, K)`` (the
+    checkpoint's storage, not a copy), fp32 ``packed_scales`` ``(E, ceil(N / bn), ceil(K / bk))`` and ``packed_block``
+    ``(bn, bk)``."""
+
+    packed_format = "fp8_block"
+
+    def __new__(cls, data, requires_grad = False, packed_block = None, **kwargs):
+        if packed_block is None and isinstance(data, Fp8BlockExpertParam):
+            packed_block = data.packed_block
+        param = super().__new__(cls, data, requires_grad, **kwargs)
+        E, N, K = param.data.shape
+        p, q = param.packed_scales.shape[1:]
+        if packed_block is None:
+            packed_block = (-(-N // max(p, 1)), -(-K // max(q, 1)))
+        packed_block = (int(packed_block[0]), int(packed_block[1]))
+        if p != -(-N // packed_block[0]) or q != -(-K // packed_block[1]):
+            raise ValueError(f"Unsloth: FP8 block scales {(p, q)} do not match codes {(N, K)} at block {packed_block}")
+        param.packed_block = packed_block
+        return param
+
+    @classmethod
+    def _validate(cls, param):
+        E = param.data.shape[0]
+        scales = param.packed_scales
+        if scales.dim() != 3 or scales.shape[0] != E or scales.dtype != torch.float32:
+            raise ValueError(f"Unsloth: FP8 block scales must be fp32 (E, rows / bn, cols / bk), got {tuple(scales.shape)}")
+
+    def packed_dims(self):
+        return tuple(self.data.shape)
+
+    def _init_kwargs(self):
+        kwargs = super()._init_kwargs()
+        kwargs["packed_block"] = self.packed_block
+        return kwargs
+
+    def _decode(self, codes, scales, glob, dtype, transpose, token_counts, out = None):
+        from unsloth_zoo.temporary_patches.moe_fp8_grouped import _dequant_stack
+        dense = _dequant_stack(codes.view(torch.float8_e4m3fn), scales, self.packed_block, dtype)
+        return dense.transpose(-2, -1).contiguous() if transpose else dense
+
+
 def is_new_packed_expert_param(param) -> bool:
     return isinstance(param, _PackedExpertParam)
 
@@ -609,8 +652,11 @@ class _PackedGroupedLinear(torch.autograd.Function):
 
 
 def packed_expert_grouped_linear(inputs, param, counts, transpose_b):
-    """``inputs`` (expert-sorted rows) @ W_e for a frozen NVFP4 / MXFP8 stack; ``transpose_b``: the grouped GEMM's
-    (E, K, N) operand is the transpose of the packed (E, N, K) rows. Forward and dX only (frozen base)."""
+    """``inputs`` (expert-sorted rows) @ W_e for a frozen NVFP4 / MXFP8 / block-FP8 stack; ``transpose_b``: the grouped
+    GEMM's (E, K, N) operand is the transpose of the packed (E, N, K) rows. Forward and dX only (frozen base)."""
+    if param.packed_format == "fp8_block":
+        from unsloth_zoo.temporary_patches.moe_fp8_grouped import fp8_block_grouped_linear
+        return fp8_block_grouped_linear(inputs, param, counts, transpose_b)
     if not torch.compiler.is_compiling():
         PACKED_EXPERT_STATS["calls"] += 1
     scales, glob = param._companions()
