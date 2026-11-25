@@ -227,7 +227,7 @@ def _launch(x, w, s, counts, out, transpose_b, block, launcher, lora_in = None, 
         E_POW2 = max(16, _pow2(E)), BSK = BSK, BSN = BSN,
         BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, GROUP_M = group_m, EVEN_K = K % BK == 0,
         HAS_A2 = has_a2, BLOCK_K2 = max(16, _pow2(K2)),
-        num_warps = warps, num_stages = stages,
+        num_warps = warps, num_stages = stages, enable_fp_fusion = True,
     )
     return out
 
