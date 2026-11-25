@@ -39,9 +39,8 @@ def _env(monkeypatch):
     for name in list(os.environ):
         if name.startswith("UNSLOTH_SPARSE_"):
             monkeypatch.delenv(name, raising = False)
-    import torch._dynamo
-    with torch._dynamo.config.patch(disable = True):
-        yield
+    # No dynamo.config.patch(disable=True) here: it leaks into the compiled mask builders later tests rely on.
+    yield
 
 
 def _glm5_next():
