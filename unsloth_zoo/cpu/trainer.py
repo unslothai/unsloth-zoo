@@ -887,6 +887,9 @@ def install_cpu_training_defaults():
     if os.environ.get("UNSLOTH_CPU_SDPA_GQA", "1") != "0":
         from .ops import patch_cpu_sdpa_gqa
         patch_cpu_sdpa_gqa()
+    if os.environ.get("UNSLOTH_CPU_LORA_INPUT_CAST", "0") != "1":
+        from .ops import patch_peft_lora_autocast_input
+        patch_peft_lora_autocast_input()
     from transformers import Trainer, TrainingArguments
     _patch_post_init(TrainingArguments)
     if hasattr(Trainer, "create_accelerator_and_postprocess"):
