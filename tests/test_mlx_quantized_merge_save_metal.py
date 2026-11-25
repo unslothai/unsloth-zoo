@@ -467,6 +467,30 @@ def test_scaled_nvfp4_lora_forward_grad_and_fuse(kind, scale_name, with_pre_quan
         assert float(mx.abs(req_y - base_y).max()) > 0.5
 
 
+@pytest.mark.parametrize("scale_name", ["weight_scale_2", "weight_global_scale"])
+def test_scaled_nvfp4_merged_4bit_widens_a_saturated_global_scale(scale_name):
+    nvfp4 = pytest.importorskip("mlx_vlm.quantization.nvfp4")
+    from unsloth_zoo.mlx.loader import _mlx_lora_from_base, _mlx_lora_type_specs
+
+    mx.random.seed(5)
+    w_eff = mx.random.normal((16, 32))
+    amax = mx.abs(w_eff).max()
+    # ModelOpt sets weight_scale_2 = amax / (6 * 448): the largest group already sits at the NVFP4 limit.
+    gs = amax / 2688.0 if scale_name == "weight_scale_2" else 2688.0 / amax
+    dense = nn.Linear(32, 16, bias=False)
+    dense.weight = w_eff / gs if scale_name == "weight_scale_2" else w_eff * gs
+    base = nvfp4.ScaledQuantizedLinear(nn.QuantizedLinear.from_linear(dense, 16, 4, mode="nvfp4"), gs, scale_name)
+    lora = _mlx_lora_from_base(base, {"rank": 4, "scale": 1.0, "dropout": 0.0, "use_dora": False}, specs=_mlx_lora_type_specs())
+    lora.lora_b = mx.random.normal(lora.lora_b.shape) * 4.0
+    x = mx.random.normal((3, 32))
+    expected = lora.fuse(dequantize=True)(x)
+    merged = lora.fuse(dequantize=False)
+    mx.eval(expected, merged.parameters())
+    assert not mx.array_equal(merged.global_scale, gs)
+    rel = mx.abs(merged(x) - expected).max() / mx.abs(expected).max()
+    assert rel.item() < 0.1
+
+
 def test_scaled_nvfp4_save_merged_model_roundtrip(tmp_path):
     nvfp4 = pytest.importorskip("mlx_vlm.quantization.nvfp4")
     from mlx_vlm.models.switch_layers import SwitchLinear as VlmSwitchLinear

@@ -15324,6 +15324,9 @@ def _vlm_nvfp4_types():
     )
 
 
+_NVFP4_MAX = 6.0 * 448.0
+
+
 def _fuse_scaled_quantized(linear, delta, dequantize):
     base_weight, effective_weight, scale_name, scale, pre = _scaled_quantized_weight_components(linear)
     bias = getattr(linear, "bias", None)
@@ -15333,6 +15336,14 @@ def _fuse_scaled_quantized(linear, delta, dequantize):
     else:
         pre_delta = delta / pre if pre is not None else delta
         weight = base_weight + (pre_delta * scale if scale_name == "weight_global_scale" else pre_delta / scale)
+        # NVFP4 saturates at 6 * 448: widen the global scale where the merged weight outgrows it, else keep it.
+        amax = mx.abs(weight).max(axis=-1, keepdims=True)
+        amax = amax.max() if scale.size == 1 else amax.max(axis=-2, keepdims=True) if scale.shape[-2] == 1 else amax
+        factor = mx.maximum(amax / _NVFP4_MAX, 1.0)
+        stored = getattr(linear, scale_name)
+        widened = (scale / factor if scale_name == "weight_global_scale" else scale * factor).astype(stored.dtype)
+        weight = weight * (widened.astype(mx.float32) / scale if scale_name == "weight_global_scale" else scale / widened.astype(mx.float32))
+        global_scale = widened.reshape(stored.shape)
     is_switch = weight.ndim == 3
     layer = (
         _scaled_switch_linear_class(linear)(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
@@ -15351,7 +15362,7 @@ def _fuse_scaled_quantized(linear, delta, dequantize):
     )
     pre_quant_scale = getattr(linear, "pre_quant_scale", None)
     extra = (pre_quant_scale,) if pre_quant_scale is not None else ()
-    return type(linear)(quantized, getattr(linear, scale_name), scale_name, *extra)
+    return type(linear)(quantized, global_scale, scale_name, *extra)
 
 
 class LoRAScaledQuantizedLinear(nn.Module):
