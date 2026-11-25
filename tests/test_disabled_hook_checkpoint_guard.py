@@ -114,8 +114,7 @@ def test_an_unrelated_graph_break_still_raises():
 # R2: the new behaviour, only on the fix tree.
 
 def test_refusal_after_compiling_ok_inside_a_live_region():
-    """Bug: this label compiled ok so a compiled pack is outstanding; flipping to eager mid-region desynchronises pack
-    and recompute (corruption); main returns eager silently, the fix raises."""
+    """Compiled-ok label flipped to eager mid-region desyncs pack and recompute; fix raises."""
     U._COMPILED_OK_LABELS.add(LABEL)
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     w = _wrap(_raiser())
@@ -217,8 +216,7 @@ def test_changed_path_has_no_platform_or_device_branch():
 
 
 def test_conservative_when_another_region_packed_compiled_this_step():
-    """Deliberately pessimistic: a label that compiled ok plus any compiled pack under a checkpoint this step raises,
-    even if this wrapper packed nothing; ending a fine step is cheap, wrong gradients are not."""
+    """A compiled-ok label raises on any compiled pack this step; wrong gradients cost more."""
     U._COMPILED_OK_LABELS.add(LABEL)          # compiled fine earlier
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # some region packed compiled
     w = _wrap(_raiser())

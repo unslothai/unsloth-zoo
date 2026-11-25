@@ -162,7 +162,6 @@ def test_real_bailing_hybrid_save_round_trips(tmp_path):
         assert reloaded[key] == config.to_dict()[key]
 
 
-# --- converter side -------------------------------------------------------------------------------
 
 def _load_llama_cpp_module():
     module_path = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "llama_cpp.py"

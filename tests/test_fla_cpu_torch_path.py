@@ -281,8 +281,7 @@ def test_a_separately_implemented_export_is_never_rebound(monkeypatch):
 
 
 def test_cpu_decode_reset_gate_clears_the_state_instead_of_nan(monkeypatch):
-    """g = -inf is a full reset (decay exp(g) = 0): fla's fused_recurrent kernel and the fp64 recurrence
-    give a finite output and state; the chunk reference forms -inf - -inf = NaN in its decay matrix."""
+    """-inf gate is a full reset; chunk ref gives NaN from -inf - -inf, recurrent stays finite."""
     package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
     _run_patch_vendor_fla(monkeypatch)
     q, k, v, g, beta = _inputs(1, 1, 2, 4, 8, 8)
@@ -399,9 +398,8 @@ def test_gpu_host_cold_reference_first_call_compiles_fullgraph(monkeypatch, entr
 
 @pytest.mark.parametrize("has_gpu", [True, False])
 def test_install_imports_no_modeling_module_on_a_gpu_host(monkeypatch, has_gpu):
-    """Routing the live fla at `import unsloth` must not import transformers' Qwen3-Next modeling on a GPU host (about
-    a second for every model): there the reference comes from a modeling module already imported, or from the first
-    CPU call. A host with no GPU still resolves it at install, outside any trace."""
+    """Live fla at `import unsloth` must not import Qwen3-Next modeling on GPU hosts; they use an
+    imported module or first CPU call; no-GPU hosts resolve at install, outside any trace."""
     import importlib
 
     package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)

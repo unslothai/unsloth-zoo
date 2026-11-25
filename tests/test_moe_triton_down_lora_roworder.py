@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Down-LoRA row order: the second grouped GEMM uses permute_y=True (token order); the expert-sorted LoRA delta must be
-scattered through gather_indices or rows land on wrong tokens."""
+"""Down-LoRA delta must scatter through gather_indices; permute_y=True keeps token order."""
 
 import sys
 import types

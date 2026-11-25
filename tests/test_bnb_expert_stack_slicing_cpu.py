@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert-stack slicing arithmetic without CUDA or bitsandbytes, against a stand-in for the 4-bit contract (whole
-blocks, one absmax per block, two weights per byte); compares sliced output byte for byte with one unsliced call and
-records each call's element count."""
+"""Expert-stack slicing without CUDA or bitsandbytes, against 4-bit stand-in (whole blocks, one
+absmax per block, two weights per byte); sliced output matches one unsliced call byte for byte."""
 from __future__ import annotations
 
 import importlib.util
@@ -141,8 +140,7 @@ def _install_fake_bitsandbytes(monkeypatch):
 
 @pytest.fixture
 def M(monkeypatch):
-    """Private copy of moe_utils_bnb4bit bound to the stand-in, loaded under its own name so reloading does not leak the
-    double into other tests; package prefix keeps from .common import resolving."""
+    """Package-prefixed private moe_utils_bnb4bit copy so reloads don't leak; .common resolves."""
     _install_fake_bitsandbytes(monkeypatch)
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
 
@@ -374,8 +372,7 @@ def test_round_trip_through_both_sliced_paths(M):
 # ---------------------------------------------------------------------------
 
 class _PretendCuda(torch.Tensor):
-    """CPU tensor whose is_cuda returns True, so the gate in _make_expert_params4bit runs without a GPU; only the gate
-    reads it, the rest is the same integer arithmetic."""
+    """CPU tensor whose is_cuda is True, so the _make_expert_params4bit gate runs GPU-free."""
 
     @property
     def is_cuda(self):
@@ -390,8 +387,7 @@ def test_the_cap_is_the_measured_bitsandbytes_limit():
 
 
 def test_every_threshold_comparison_is_inclusive_at_the_cap():
-    """Inkling-Small's w2_weight (256, 4096, 2048) is exactly 2**31 elements, so the cap is inclusive: using > instead
-    of >= at any gate leaves that stack aborting; checked over the source for future gates."""
+    """Cap is inclusive: Inkling-Small's w2_weight is exactly 2**31 elements, so > would abort."""
     import ast
 
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
@@ -463,9 +459,8 @@ def test_dequant_slices_a_stack_of_exactly_the_cap(M):
 
 
 def test_a_plain_tuple_original_shape_counts_the_same(M):
-    """The size check uses torch.Size.numel() when available and multiplies dims otherwise, so a plain tuple
-    _original_shape must count the same; the load path always sets a torch.Size, and other tests all take that route,
-    so a broken fallback would go unnoticed."""
+    """Size check uses torch.Size.numel() when available, else multiplies dims, so a plain tuple
+    _original_shape must count alike; other tests use torch.Size and miss a broken fallback."""
     value = _stack(experts = 8)
     assert value.numel() > SMALL_CAP
 

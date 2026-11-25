@@ -25,8 +25,7 @@ def _modules():
 
 def _load_module(monkeypatch, free_bytes):
     ce, tiled = _modules()
-    # _free_target_gb calls memory_budget._default_target_gb, so the backend is mocked there; one shared budget
-    # implementation avoids a CE copy that measures something else.
+    # Backend mocked in memory_budget, which _free_target_gb calls; CE shares one budget.
     monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising=False)
     fake_cuda = types.SimpleNamespace(
         is_available=lambda: True,
@@ -137,8 +136,7 @@ def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
 
 @pytest.mark.parametrize("device_type", ["cpu", "mlx", "cuda"])
 def test_a_machine_with_no_gpu_still_gets_a_chunk_size(monkeypatch, device_type):
-    """mem_get_info raises on a torch built without CUDA, so a CPU or Apple Silicon forward must not die in a memory
-    query; a cuda device type with no GPU counts too."""
+    """mem_get_info raises without CUDA; CPU, Apple Silicon and no-GPU cuda must not die in it."""
     ce = _no_device_pool(monkeypatch, device_type)
     assert ce._free_target_gb() == ce._CE_TARGET_GB_CAP
     assert ce.get_chunk_size(1, 8, 32_000) >= 1

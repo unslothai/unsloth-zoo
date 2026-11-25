@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""higher_precision_layernorms reads only the norm class it found when picking UNSLOTH_HIGH_PRECISION_LAYERNORM from
-markers like self.weight.float(); a neighbour's markers must not decide."""
+"""higher_precision_layernorms reads only its own class's markers; neighbours must not decide."""
 
 import os
 

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks load_vllm's startup banner reads the chunked prefill budget and swap space from engine_args after the
-good_keys filter, which drops swap space on vLLM >= 0.18.0; AST-based, no GPU."""
+"""Banner reads swap space after good_keys, which drops it on vLLM >= 0.18.0; AST-based, no GPU."""
 
 import ast
 import pathlib

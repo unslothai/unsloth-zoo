@@ -111,7 +111,6 @@ def test_sparse_backward_matches_dense_and_float64(monkeypatch, temperature, top
     else:
         # Kept sets denser than ~1/64 (CSR ids + float32 z) are saved as the bit mask: dense backward, bit-equal.
         assert cs["kept_set_sparse_bwd"] == 0 and torch.equal(gs, gd)
-    # Forward untouched.
     assert torch.equal(out_d, out_s)
     ref, kept, h64 = _oracle(*args)
     (ref * weights.double()).sum().backward()
@@ -312,8 +311,7 @@ def test_kept_sets_go_through_saved_tensor_hooks(monkeypatch, mode):
 
 
 def test_outer_compile_traces_one_graph(monkeypatch):
-    # An outer torch.compile of the scorer: packed storage and no route counters while tracing, so fullgraph holds
-    # (the data-dependent CSR size check and the backward counter write each broke it).
+    # Outer compile: no CSR size check or counter write while tracing; else fullgraph breaks.
     monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", raising = False)
     monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", raising = False)
     torch._dynamo.reset()

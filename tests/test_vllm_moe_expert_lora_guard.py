@@ -13,9 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""load_lora refuses only adapters vLLM would accept and silently ignore: vLLM >= 0.12 serves MoE expert LoRA via
-FusedMoE3DWithLoRA, so refusal is for the engine not picking the 3D wrapper, a rank past the fused ceiling,
-bitsandbytes weights, or an adapter key naming a module the engine lacks."""
+"""load_lora refuses only adapters vLLM would silently ignore: engine not on FusedMoE3DWithLoRA
+(vLLM >= 0.12), rank past the fused ceiling, bitsandbytes weights, or an unknown module key."""
 import pytest
 
 from unsloth_zoo.vllm_utils import _is_moe_expert_lora_key
@@ -214,9 +213,8 @@ from unsloth_zoo.vllm_utils import (
     _vllm_lora_target_names,
 )
 
-# vLLM is optional (not in pyproject, no CPU CI lane installs it), so a module-level import made the whole file
-# uncollectable; skip only tests needing a real vLLM class, as tests/test_upstream_signatures.py does, since
-# importorskip would skip the whole module.
+# vLLM is optional (not in pyproject or CPU CI), so a top-level import broke collection; skip only
+# tests needing vLLM like tests/test_upstream_signatures.py (importorskip skips whole module).
 try:
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.fused_moe import MoERunner
@@ -367,9 +365,7 @@ def test_mixed_moe_lora_format_is_refused():
 
 @requires_vllm
 def test_mixed_moe_mode_is_read_off_the_lora_manager_not_the_model():
-    """Qwen3VLMoe and InternS1Pro set is_3d_moe_weight but never assign self.vllm_config, so reading the mode off the
-    model put stacked adapters in the 2D wrapper; read it from the LoRA manager; unsloth LoRARequest never sets
-    is_3d_lora_weight, so rollouts decay silently to base experts."""
+    """Read mode from LoRA manager, not model (no vllm_config); LoRARequest omits is_3d_lora_weight."""
     vllm_model = _build_vllm_model(QWEN_PATHS, is_3d_moe_weight = True)
     assert not hasattr(vllm_model, "vllm_config")
 

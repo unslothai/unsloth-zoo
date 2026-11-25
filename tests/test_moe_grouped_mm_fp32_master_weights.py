@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fp16 full finetune of an MoE on GPUs without bf16 (T4, V100): fp32 expert masters under fp16 autocast, which does not
-cast torch._grouped_mm inputs, hit a dtype mismatch; equal-dtype paths (LoRA, bf16) must stay bit-for-bit unchanged,
-tested on CPU"""
+"""fp16 full finetune of an MoE without bf16 (T4, V100): autocast skips torch._grouped_mm inputs, so
+fp32 expert masters mismatch; equal-dtype paths stay bit-for-bit unchanged, tested on CPU."""
 
 import pytest
 import torch

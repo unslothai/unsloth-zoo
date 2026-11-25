@@ -6,8 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or (at
 # your option) any later version.
 
-"""Pins importable symbols for every upstream reference in unsloth_zoo source, checked against installed transformers,
-trl, peft, datasets, accelerate and vllm; each test cites its file:line."""
+"""Pins importable upstream symbols from transformers, trl, peft, datasets, accelerate, vllm."""
 
 from __future__ import annotations
 
@@ -311,8 +310,7 @@ def test_peft_utils_peft_tuners_lora_module():
 # unsloth_zoo/temporary_patches/utils.py
 
 def test_temporary_patches_utils_kwargs_typing():
-    """temporary_patches/utils.py:146, 211, 231, 244: KWARGS_TYPE comes from a try-cascade over Unpack,
-    TransformersKwargs, FlashAttentionKwargs and LossKwargs; if none resolves, NameError at zoo import."""
+    """KWARGS_TYPE tries four transformers types; none resolving gives NameError at zoo import."""
     found_any = False
     for path in (
         "transformers.processing_utils.Unpack",
@@ -340,8 +338,7 @@ def test_temporary_patches_utils_transformers_version():
 # unsloth_zoo/temporary_patches/misc.py
 
 def test_temp_patches_misc_loss_for_causal_lm_loss():
-    """temporary_patches/misc.py:162 and 248 import ForCausalLMLoss from transformers.loss.loss_utils; CSM patches
-    monkey-rebind it, so a rename silently disables them."""
+    """CSM patches monkey-rebind ForCausalLMLoss; a rename silently disables them."""
     _resolve("transformers.loss.loss_utils.ForCausalLMLoss")
 
 
@@ -380,9 +377,8 @@ def test_temp_patches_misc_pretrained_tokenizer_base_top_level():
 # unsloth_zoo/temporary_patches/gemma.py
 
 def test_temp_patches_gemma_processing_surface():
-    """unsloth_zoo/temporary_patches/gemma.py rebuilds the Gemma3 processor from these; all must resolve.
-
-    Gemma3ProcessorKwargs itself is optional: transformers 5.23 made it a deprecated alias of
+    """unsloth_zoo/temporary_patches/gemma.py rebuilds the Gemma3 processor from these, all must
+    resolve; Gemma3ProcessorKwargs is optional: transformers 5.23 made it a deprecated alias of
     ProcessingKwargs and 5.29 removes it, so the patch falls back to ProcessingKwargs."""
     _resolve_all([
         "transformers.models.gemma3.processing_gemma3.Gemma3Processor",

@@ -271,8 +271,7 @@ def test_compiler_self_config_ignore_index_replacement():
 
 
 def test_compiler_per_layer_projection_inplace_regex():
-    """compiler.py:1404-1407 rewrites Gemma 3N's in-place per_layer_projection *=
-    self.per_layer_projection_scale.to(...) to a non-inplace form; this test pins that pattern."""
+    """compiler.py:1404-1407 rewrites Gemma 3N in-place *= to non-inplace; this test pins it."""
     pytest.importorskip("transformers")
     try:
         import transformers.models.gemma3n.modeling_gemma3n as g3n
@@ -587,8 +586,7 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
          "position_embeddings"],
         # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.9
         _QWEN2_VL_SIG_ROTARY,
-        # 4.53.1-4.53.3 add attention_mask as the fifth positional parameter and pass it at the call site; compiler.py's
-        # 4.x + attention_mask entry targets this; gone by 4.54.
+        # 4.53.1-4.53.3 add attention_mask as 5th param; compiler.py targets it; gone by 4.54.
         _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK,
         # transformers 5.10+ -- rotary_pos_emb dropped; from 5.15 max_seqlen
         # rides in kwargs
@@ -789,8 +787,7 @@ def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
     torch.manual_seed(0)
     attn = attn_cls(config)
 
-    # Two ragged images of 4 and 5 tokens: max_seqlen 5 differs from the total 9 and the first segment 4, so a recompute
-    # from the wrong tensor cannot match by chance.
+    # Ragged 4+5 token images: a recompute from the wrong tensor cannot match max_seqlen 5.
     grid_thw = torch.tensor([[1, 2, 2], [1, 1, 5]], dtype = torch.long)
     cu_seqlens, caller_max_seqlen = get_vision_attention_seqlens(
         grid_thw, config, kwargs = {},
@@ -856,8 +853,7 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recompute
 
 
 def test_compiler_moe_routing_weights_cast_pattern():
-    """compiler.py:2423-2425 MOE_ROUTING_WEIGHTS_CAST_PATTERN targets routing_weights =
-    routing_weights.to(hidden_states.dtype), needed for the bf16 router-logit dtype fix."""
+    """Pins compiler.py's MOE_ROUTING_WEIGHTS_CAST_PATTERN for the bf16 router-logit dtype fix."""
     _skip_if_transformers_5x(
         "MoE forwards refactored -- the explicit "
         "`routing_weights = routing_weights.to(hidden_states.dtype)` "
@@ -895,8 +891,7 @@ def test_compiler_moe_routing_weights_cast_pattern():
 
 
 def test_compiler_peft_lora_forward_pinned_strings():
-    """compiler.py:2542-2543 pins output = lora_B(lora_A(dropout(x))) * scaling and result = result +
-    lora_B(lora_A(dropout(x))) * scaling; if peft drops the parens or names, fast LoRA never installs."""
+    """Pins compiler.py's LoRA forward lines; if peft changes them, fast LoRA never installs."""
     pytest.importorskip("peft")
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
@@ -1049,8 +1044,7 @@ def test_compiler_causal_mask_find_regex_pattern():
 
 
 def test_compiler_trainer_running_training_logger_regex():
-    """compiler.py:3988-3990 re.search-matches the logger.info('***** Running training *****') line in
-    Trainer._inner_training_loop; the Unsloth banner is spliced before it."""
+    """The banner splice relies on re.search matching Trainer's 'Running training' log line."""
     pytest.importorskip("transformers")
     from transformers.trainer import Trainer
     try:
@@ -1278,8 +1272,7 @@ def test_unsloth_import_fixes_make_inputs_require_grads_inner_fn():
 
 
 def test_compiler_no_update_causal_mask_attribute_probe():
-    """compiler.py:3524, 3762 hasattr-probes _update_causal_mask; modern Llama/Mistral/Qwen3 dropped it while legacy
-    models like Bamba/Falcon still expose it; pass if any model has it."""
+    """Pins the _update_causal_mask hasattr probe; passes if any probed model still exposes it."""
     _skip_if_transformers_5x(
         "_update_causal_mask removed across all probed model classes -- "
         "mask construction moved into the central masking-utils path. "

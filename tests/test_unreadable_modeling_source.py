@@ -34,8 +34,7 @@ SRC = COMPILER.read_text(encoding="utf-8")
 
 
 def _require_index(anchor: str, what: str) -> int:
-    """Looks up an anchor in SRC with a message naming the contract; a bare .index miss names neither, and issue 967's
-    rename failed six tests at the test file's own line."""
+    """Anchor lookup names the contract on a miss; bare .index did not name it (issue 967)."""
     i = SRC.find(anchor)
     assert i != -1, (
         f"{what}: no `{anchor}` in compiler.py. Either the guard is gone, or "
@@ -44,11 +43,8 @@ def _require_index(anchor: str, what: str) -> int:
 
 
 def _guard_region() -> str:
-    """The modeling-file guard and its handler.
-
-    Anchored on the call, not on "except (OSError, TypeError)": the torch
-    forward guard uses the same clause and is defined earlier in the file.
-    """
+    """Returns the modeling-file guard region, anchored on the call rather than on except (OSError,
+    TypeError), which the earlier torch forward guard also uses."""
     i = _require_index(
         "full_source = inspect.getsource(modeling_file)",
         "the modeling-file guard")
@@ -65,8 +61,7 @@ def _caught_names(handler) -> set:
 
 
 def _catches(caught: set, name: str) -> bool:
-    """Whether name is caught, matched only by a spelling this module can resolve: compiler.py imports the tokenize
-    module, not TokenError, so a bare handler would be a NameError."""
+    """Matches only resolvable spellings; compiler.py imports tokenize, not TokenError."""
     if name in caught:
         return True
     bare = name.rsplit(".", 1)[-1]
@@ -130,9 +125,8 @@ def test_it_warns_so_the_slowdown_is_not_silent():
 
 
 def test_the_logger_name_exists_in_this_module():
-    """compiler.py imports `logger` from .log; there is no module-level
-    `logger_compiler` at runtime. A warning that raises NameError inside an
-    exception handler would replace a clear failure with a confusing one."""
+    """compiler.py imports `logger` from .log and has no module-level `logger_compiler`; a warning
+    raising NameError in a handler would replace a clear failure with a confusing one."""
     import unsloth_zoo.compiler as C
     assert hasattr(C, "logger")
 
@@ -178,9 +172,8 @@ def test_a_bare_return_is_the_functions_contract():
 
 
 def _nn_forward_read() -> tuple:
-    """Returns (name, statement) of the forward read, matched by shape so a correct rename (issue 967 moved
-    function.forward to original_forward) does not fail it; pinned by
-    test_the_forward_source_is_read_from_the_pinned_original."""
+    """Returns (name, statement) of the forward read, shape-matched so renames like issue 967's
+    original_forward pass; pinned by test_the_forward_source_is_read_from_the_pinned_original."""
     found = []
     for node in ast.walk(ast.parse(SRC)):
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -235,9 +228,8 @@ def test_the_forward_source_is_read_from_the_pinned_original():
 
 
 def test_the_nn_forward_patch_loop_is_guarded():
-    """An unreadable torch.nn forward raises OSError out of FastModel.from_pretrained, so the model fails to load; seen
-    in tests/saving/text_to_speech_models after another model loaded in the same process; trigger not fully
-    characterised, so this guards the observed state."""
+    """Unreadable torch.nn forward raises OSError from FastModel.from_pretrained after another model
+    loads in the same process; trigger not fully known, so this guards the observed state."""
     guards = _getsource_guards(NN_FORWARD_GETSOURCE)
     assert guards, f"`{NN_FORWARD_GETSOURCE}` is no longer inside a try"
     for caught in guards:
@@ -247,8 +239,7 @@ def test_the_nn_forward_patch_loop_is_guarded():
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
-    """The handler must continue like every other unsupported case in this loop, since raising would abandon the
-    remaining modules too; checked on the parsed AST, not the text."""
+    """Handler must continue, not raise, else later modules are skipped; checked on the AST."""
     tree = ast.parse(SRC)
     # Matches only the try whose body is this assignment; other blocks also call getsource on a forward and their handlers may legitimately do something else.
     target = NN_FORWARD_READ
@@ -272,8 +263,7 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
 
 
 def test_the_compiler_config_check_is_kept():
-    """The hasattr get_compiler_config check catches torch.compile wrappers, a different case from our exec'd
-    replacements, so the new guard adds to it rather than replacing it."""
+    """hasattr get_compiler_config check catches torch.compile wrappers; new guard adds to it."""
     region = _nn_patch_region()
     assert 'hasattr(function.forward, "get_compiler_config")' in region
 
@@ -314,9 +304,8 @@ def unreadable_llama(monkeypatch):
     import transformers.models.llama.modeling_llama as modeling
 
     _break_getsource(monkeypatch, modeling)
-    # Both markers must be restored with their saved values: restoring only __UNSLOTH_PATCHED__ leaves a module that
-    # reports itself done yet declines to answer, and a later test's supports_sdpa accumulator is silently left
-    # untouched.
+    # Both markers must be restored: __UNSLOTH_PATCHED__ alone leaves a module reporting done yet
+    # declining to answer, and a later test's supports_sdpa accumulator is left untouched.
     _MISSING = object()
     saved = {name: getattr(modeling, name, _MISSING)
              for name in ("__UNSLOTH_PATCHED__", "__UNSLOTH_SUPPORTS_SDPA__")}
@@ -332,8 +321,7 @@ def unreadable_llama(monkeypatch):
 
 
 def test_sdpa_is_reported_unsupported(unreadable_llama):
-    """The caller seeds supports_sdpa as [True] and only the normal path writes it, so a silent return leaves SDPA
-    selected for a model whose source never claimed it; eager always exists, guessing does not."""
+    """A silent return keeps SDPA for a model that never claimed it; eager always exists."""
     from unsloth_zoo import compiler
 
     supports_sdpa = [True]
@@ -370,8 +358,7 @@ def test_a_supports_sdpa_of_none_is_still_allowed(unreadable_llama):
 
 
 def test_the_torch_dtype_patches_still_run():
-    """The torch dtype patches read torch's source, not the model's, so an unreadable model is no reason to skip them;
-    skipping turned a load-time failure into a first-forward-pass failure."""
+    """Dtype patches use torch's source, so an unreadable model is no reason to skip them."""
     tree = ast.parse(SRC)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef)
@@ -476,8 +463,7 @@ def test_the_unreadable_forward_is_wrapped_rather_than_dropped():
 
 
 def test_the_tensor_may_arrive_by_keyword():
-    """The wrapper becomes the public forward; torch.nn.RMSNorm declares x, not input, so a hard-coded parameter name
-    would break keyword calls such as rms_norm(x = t) with TypeError."""
+    """Keep RMSNorm's x name: keyword calls like rms_norm(x = t) raise TypeError."""
     import torch
 
     from unsloth_zoo.compiler import _dtype_safe_forward

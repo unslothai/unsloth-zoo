@@ -57,8 +57,7 @@ print("RESULT " + json.dumps(out))
 '''
 
 
-# Router decorator follows its own compile mode, not the caller's; UNSLOTH_COMPILE_DISABLE=1 (exported by the Core zoo
-# job) rightly skips routers; both modes are pinned.
+# Routers use their own compile mode, not the caller's; UNSLOTH_COMPILE_DISABLE=1 skips them.
 @pytest.mark.parametrize(
     "compile_disable, expected_prefix",
     [(None, "torch_compile_with_fallback("), ("1", "torch_compiler_disable_unless_decode")],

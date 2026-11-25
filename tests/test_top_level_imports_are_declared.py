@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Every third-party package a zoo module imports at module level must be declared: import unsloth_zoo loads them
-eagerly, and requests arrived only via datasets, which dropped it in 5.x."""
+"""Module-level third-party imports must be declared; unsloth_zoo imports them eagerly."""
 
 from __future__ import annotations
 

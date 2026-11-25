@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests end-to-end merge of a trained head the base lacks: merged_16bit rewrites base shards in place, so a
-modules_to_save head with no base key was dropped silently; assert it reloads bit-identical, since a shape match
-passes for a random init."""
+"""Tests merging a trained head the base lacks: merged_16bit rewrites shards in place and silently
+dropped it; assert bit-identical reload, since a shape match passes for random init."""
 
 from __future__ import annotations
 
@@ -227,8 +226,7 @@ def test_a_backed_head_is_not_seeded_twice():
 
 @pytest.mark.parametrize("name", ["lm_head", "embed_tokens", "model.language_model.lm_head"])
 def test_backbone_tensors_are_never_seeded(name):
-    """gemma3 ties text embeddings, so it has no lm_head slot; seeding one added an unexpected key and broke the
-    text_only resize on transformers 4.51.3, hence this exclusion."""
+    """Seeding an lm_head for tied gemma3 broke text_only resize on transformers 4.51.3."""
     import collections
     from unsloth_zoo.saving_utils import LoraStats, _unbacked_trained_tensors
 

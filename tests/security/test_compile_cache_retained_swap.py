@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""create_new_function(overwrite = False) (the RL trainers, the dtype-safe forwards) reads the cache file, finds it equal
-to the generated source and keeps it. Rank 0's decision then digests the file a second time, so a writer to the cache
-folder that swaps the file between the two reads had its bytes approved and executed even without
-UNSLOTH_COMPILE_OVERWRITE=0. The swap is simulated by wrapping the decision."""
+"""Guards against a cache-folder writer swapping the file between create_new_function(overwrite =
+False)'s equality read and rank 0's second digest, which approved and executed its bytes even
+without UNSLOTH_COMPILE_OVERWRITE=0; the swap is simulated by wrapping the decision."""
 import os
 import sys
 import tempfile

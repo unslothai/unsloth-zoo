@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_SUFFIX_DECODING (off by default) makes load_vllm pass speculative_config with method 'suffix' only when
-vLLM >= 0.11.1 lists it and Arctic Inference imports; else it refuses; wiring is checked on the AST since load_vllm
-needs a GPU."""
+"""UNSLOTH_VLLM_SUFFIX_DECODING, off by default, needs vLLM >= 0.11.1 and Arctic Inference."""
 
 import ast
 import json

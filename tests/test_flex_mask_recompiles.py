@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Training flex masks keep one mask_mod structure for padded and unpadded rows of any length:
-tiny Gemma-3 vision recompiled every block at the second length and at the first unpadded batch."""
+"""Padded and unpadded flex masks keep one mask_mod structure; Gemma-3 recompiled per length."""
 
 import pytest
 import torch

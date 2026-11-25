@@ -210,9 +210,8 @@ def test_a_preset_opt_out_still_blocks_flashinfer():
 
 
 def test_only_the_import_blocker_is_guarded_on_flashinfer_being_installed():
-    """Only the import blocker is guarded on FlashInfer being installed: forced env vars must still clear, since an
-    inherited VLLM_USE_FLASHINFER_SAMPLER=1 makes TopKTopPSampler's unguarded import raise when the package is
-    absent."""
+    """Forced env vars clear without FlashInfer; inherited VLLM_USE_FLASHINFER_SAMPLER=1 raises at
+    import."""
     import ast
 
     node = _flashinfer_chain()

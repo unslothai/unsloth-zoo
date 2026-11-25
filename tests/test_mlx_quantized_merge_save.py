@@ -99,9 +99,8 @@ def test_switch_linear_experts_are_detected():
 
 
 def test_qqlinear_is_detected():
-    """QQLinear subclasses no quantized type and is not Quantized*-named, so a class list and a name prefix both miss it
-    and merged_4bit would pack an already-packed model a second time; it holds uint32 weights only in eval mode,
-    which save_merged_model puts the model in."""
+    """QQLinear subclasses no quantized type and is not Quantized*-named, so merged_4bit would
+    re-pack it; it holds uint32 weights only in eval mode, as save_merged_model sets it."""
     quantized = pytest.importorskip("mlx.nn.layers.quantized")
     qq_linear = getattr(quantized, "QQLinear", None)
     if qq_linear is None:
@@ -161,9 +160,8 @@ def _tiny_llama_config(hidden_size=128, intermediate_size=256, vocab_size=512,
 
 
 def test_quantize_for_save_emits_a_loadable_top_level_grid():
-    """mlx-lm's loader indexes quantization["group_size"] unconditionally, and quantize_model emits per-layer entries
-    instead of the grid when the config already has a quantization key; stale metadata must not flip that, or reload
-    raises KeyError."""
+    """mlx-lm's loader indexes quantization["group_size"] unconditionally, so stale quantization
+    metadata must not replace the grid with per-layer entries (KeyError on reload)."""
     model = _tiny_llama(mx.float16)
     model._config = _tiny_llama_config(quantization={}, quantization_config={})
 

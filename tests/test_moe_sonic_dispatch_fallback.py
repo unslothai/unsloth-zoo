@@ -178,7 +178,6 @@ def test_qwen3_vl_moe_experts_forward(monkeypatch, selected, backend, expected):
     import unsloth_zoo.temporary_patches.qwen3_vl_moe as Q
     import unsloth_zoo.temporary_patches.moe_utils_sonic as S
 
-    # Restore every class attribute the patch replaces.
     for cls in (experts_cls, modeling.Qwen3VLMoeTextSparseMoeBlock):
         for name, value in list(vars(cls).items()):
             if not name.startswith("__") or name == "__init__":

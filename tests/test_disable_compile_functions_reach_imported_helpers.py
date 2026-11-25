@@ -72,8 +72,7 @@ def test_every_fullgraph_emit_site_consults_the_detector():
 
 
 def _run_compiler_child(script, cwd):
-    """Runs in its own interpreter: the rewriter sets __UNSLOTH_PATCHED__ on the modeling module and swaps the emitted
-    classes into it, so a compile run is one-way for its process."""
+    """Own process: the rewriter sets __UNSLOTH_PATCHED__ on the module; compiles are one-way."""
     # conftest's GPU-free harness does not reach a subprocess.
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
@@ -215,8 +214,7 @@ def test_synthetic_imported_helper_demotes_its_caller_and_nothing_else(tmp_path)
     # The fixture must be the module the compiler actually read, not a same-named leftover elsewhere on sys.path.
     assert payload["modeling_file"].startswith(str(tmp_path)), payload["modeling_file"]
 
-    # Precondition the whole rule rests on: the helper is imported, never defined here, so called_functions cannot see
-    # it and Dynamo inlines the raw upstream body.
+    # Helper is only imported, so called_functions misses it and Dynamo inlines the raw body.
     assert f"def {listed}(" not in generated, (
         f"the fixture now defines {listed} itself, which puts it in `called_functions` "
         f"and makes this test prove nothing."
@@ -246,9 +244,8 @@ _UPSTREAM_CLASS = "MiniMaxM3VL3DRotaryEmbedding"
 
 
 def _upstream_shape_is_shipped():
-    """transformers 5.17 renamed the class and moved the helper call into MiniMaxM3VLVisionModel.forward, a
-    never-compiled PreTrainedModel; paddleocr_vl, which defines the helper, is the only plain nn.Module caller;
-    source is read, not imported, to avoid leaking a half-patched transformers."""
+    """transformers 5.17 moved the helper call into a never-compiled PreTrainedModel; paddleocr_vl
+    is the only plain nn.Module caller; source is read so transformers is not half-patched."""
     try:
         import transformers.vision_utils  # noqa: F401
 

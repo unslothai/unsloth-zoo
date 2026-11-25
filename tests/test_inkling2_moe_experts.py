@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Inkling 2 experts (transformers >= 5.24) take `act_fn(gate, up)`, a softcapped SwiGLU, and accumulate in fp32: the
-MoE backends must run the experts' own `_apply_gate`, not `act_fn(gate) * up`."""
+"""Inkling 2 (transformers >= 5.24): MoE backends must run _apply_gate, not act_fn(gate) * up."""
 
 import pytest
 import torch

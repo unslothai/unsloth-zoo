@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression tests for the sparse attention review findings (unsloth-zoo #2509): dispatch latches, input
-validation, the no-sink form, empty / -inf rows, layouts, the Qwen4Exp patch guards. CUDA tests skip on CPU."""
+"""Sparse attention review regressions (unsloth-zoo #2509); CUDA tests skip on CPU."""
 
 import os
 import subprocess
@@ -120,7 +119,6 @@ def test_window_entry_validates_operands(bad):
         sa.sparse_attn_window(q, win, kv, idx, sink, 0.25, 4, backend = "torch")
 
 
-# 35: windows must be positive.
 @pytest.mark.parametrize("window", [0, -3])
 def test_window_must_be_positive(window):
     q, kv, sink, idx = _cpu_inputs()
@@ -209,12 +207,10 @@ def test_interval_rows_check_the_interior():
     assert sa._contiguous_rows(torch.tril(torch.ones(1, s, s, dtype = torch.bool))) is not None
 
 
-# 20: the shared-memory helper answers 0 off CUDA.
 def test_shared_memory_off_cuda():
     assert sa._shared_memory(torch.device("cpu")) == 0
 
 
-# 26: the environment can force hd512 for the window form only.
 def test_env_backend_parser_accepts_hd512_for_windows(monkeypatch):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "hd512")
     assert sa._forced_backend(window = True) == "hd512"
@@ -424,7 +420,6 @@ def test_strided_sink(form):
     torch.testing.assert_close(got, want, rtol = 0, atol = 0)
 
 
-# 19: the native support predicate checks the KV geometry.
 @cuda_only
 def test_native_support_checks_kv_geometry():
     from unsloth_zoo import sparse_mqa_kernel as mk

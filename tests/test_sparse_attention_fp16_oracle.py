@@ -35,8 +35,7 @@ import torch
 
 from unsloth_zoo import sparse_attention as sa
 
-# NVIDIA CUDA only: the forced index kernel skips its own HIP exclusion (sparse_mqa_supported), and a CPU wheel under
-# the consolidated is_available() spoof has no torch.version.cuda.
+# NVIDIA only: forced index kernel skips its HIP exclusion; CPU spoof lacks torch.version.cuda.
 _CUDA = torch.cuda.is_available() and torch.version.cuda is not None and torch.version.hip is None
 _F16_EPS = torch.finfo(torch.float16).eps
 
@@ -117,8 +116,7 @@ def test_triton_fp16_backward_precision_vs_fp64_split_d(monkeypatch, seed):
 
 def _check_backward_precision(monkeypatch, mk, shape, seed):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "triton")
-    # Both torch arms are fp32 / fp64 einsums: TF32 left on by another test would move the bounds. Saved and
-    # restored by hand: monkeypatch cannot undo an attribute of torch's cuBLASModule.
+    # TF32 must stay off or bounds move; monkeypatch can't undo cuBLASModule: restore by hand.
     tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:

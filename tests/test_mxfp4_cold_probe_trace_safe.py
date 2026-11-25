@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MXFP4 kernel self-checks (torch.equal / torch.allclose) may first run inside a fullgraph trace, so they must not fail
-or cache a verdict; each case uses a fresh process."""
+"""Self-checks may run inside a fullgraph trace, so they must not fail or cache a verdict."""
 
 import os
 import subprocess

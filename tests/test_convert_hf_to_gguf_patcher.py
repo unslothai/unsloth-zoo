@@ -316,8 +316,7 @@ def test_conversion_sibling_info_none_when_there_is_nothing_on_disk(tmp_path):
 
 
 def test_conversion_sibling_info_covers_a_module_the_patcher_never_edits(package_layout):
-    """The key decides whether the package is rescanned, so it must cover every conversion/ module: a key built from
-    only __init__.py, base.py and qwen.py missed a changed fourth one."""
+    """Key must cover every conversion/ module, even unedited ones, or changes skip the rescan."""
     llama_cpp = _load_llama_cpp_module()
     other = package_layout / "conversion" / "zz_helper.py"
     other.write_bytes(b"VALUE = 1\n")
@@ -438,12 +437,10 @@ def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     assert resolved == str(root)
     sib = llama_cpp._conversion_sibling_info(resolved)
     assert sib is not None
-    # By membership, not by index: the tuple now carries every module in
-    # conversion/, so the scan is re-run when any of them changes. What this row
-    # is about is the DIRECTORY.
-    # Element 0 is the header and everything after it is one module. Pinned,
-    # because widening the header in place is what silently handed this slice a
-    # bare flag where it expected a (path, digest) pair.
+    # This row is about the DIRECTORY: the tuple holds every conversion/ module by membership, so
+    # any change re-runs the scan; element 0 is the header, the rest one entry per module, pinned
+    # because widening the header in place silently handed this slice a bare flag, not a (path,
+    # digest) pair.
     assert isinstance(sib[0], tuple), sib[0]
     # Each sibling entry is a (path, size, digest) tuple; the slice is pinned rather than open-ended, so widening it is a deliberate edit.
     assert all(isinstance(entry, tuple) and len(entry) == 3 for entry in sib[1:]), sib

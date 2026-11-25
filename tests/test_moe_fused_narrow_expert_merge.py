@@ -52,9 +52,8 @@ def _build(hidden, intermediate, dtype=torch.float32):
 
 
 def _reference(W, A, B, alpha):
-    """PEFT's merged-weight packing written out independently: lora_A is expert-slowest (contiguous row block per
-    expert), lora_B expert-fastest (plane e of an (out, rank, num_experts) reshape); so the expectation cannot mirror
-    the helper under test"""
+    """PEFT's packing written out independently: lora_A is expert-slowest (contiguous row block per
+    expert), lora_B expert-fastest; so the expectation cannot mirror the helper under test."""
     out = W.clone().to(torch.float64)
     for e in range(NUM_EXPERTS):
         b_e = B.reshape(B.shape[0], RANK, NUM_EXPERTS)[:, :, e].to(torch.float64)

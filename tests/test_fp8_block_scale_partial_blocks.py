@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Rebuilding a block FP8 projection from vLLM must accept dims smaller than or not multiples of the block; the scale
-grid has ceil(dim / block) entries, not dim // block."""
+"""vLLM block FP8 scale grid is ceil(dim / block), not dim // block, for partial blocks."""
 
 import pytest
 

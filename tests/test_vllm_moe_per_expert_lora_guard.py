@@ -108,9 +108,8 @@ def test_per_expert_adapter_still_goes_through_the_name_check(engine):
         vu._check_lora_is_servable(_model(), PER_EXPERT_KEYS, "the training model", {"r": 16})
 
 
-# Unstubbed name check: vLLM's manager builds packed_modules_mapping with process_packed_modules_mapping, mapping
-# experts to every experts.<i>.<proj> from get_expert_mapping on 2D MoE; with no reachable manager the check must
-# rebuild that or every per-expert key looks missing.
+# Unstubbed check: vLLM's process_packed_modules_mapping maps 2D MoE experts to experts.<i>.<proj>
+# via get_expert_mapping; if none is reachable, rebuild that or per-expert keys look missing.
 import sys
 
 import torch.nn as nn
@@ -319,9 +318,8 @@ def test_per_expert_keys_resolve_through_the_real_name_check(monkeypatch, fake_v
         vu._check_lora_is_servable(model, keys + bad, "the training model", {"r": 16})
 
 
-# LoRAModelManager passes force_2d_moe = enable_mixed_moe_lora_format, so a 3D model in mixed mode also gets the
-# per-expert expansion; with no reachable manager the fallback must pass the same flag, else the refusal check admits
-# the adapter and the name check rejects every expert key.
+# LoRAModelManager passes force_2d_moe = enable_mixed_moe_lora_format; the no-manager fallback must
+# pass it too, or the refusal check admits it and the name check rejects every expert key.
 @pytest.mark.parametrize("arch", sorted(ARCHS))
 def test_mixed_mode_3d_model_without_manager_expands_per_expert_names(monkeypatch, fake_vllm, arch):
     vllm_model, _, _ = _build_engine(arch, "main")

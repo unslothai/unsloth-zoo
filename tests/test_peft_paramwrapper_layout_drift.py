@@ -81,8 +81,7 @@ def test_paramwrapper_lora_shape_is_one_of_two_known_layouts():
     except TypeError:
         pytest.skip("Installed PEFT does not accept target_parameters yet")
 
-    # Must not skip: PEFT advertises target_parameters, so failing to wrap a correctly nested GPT-OSS-shaped parameter
-    # is the drift; skipping hid it on PEFT 0.20.0.
+    # Must not skip: PEFT advertises target_parameters, so a missed wrap is drift.
     peft_model = get_peft_model(base, cfg)
 
     lora_A = lora_B = None

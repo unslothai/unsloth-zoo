@@ -184,8 +184,7 @@ def _for_loop_body(forward_source):
 
 
 def test_rewriter_two_tuple_entries_declare_no_bound_keyword(monkeypatch):
-    """A 2-tuple entry declares no bound keywords, but the layer's own **kwargs expansion must still move into the
-    callable, or its runtime keywords reach the checkpoint function."""
+    """A 2-tuple binds no keywords, but the layer's **kwargs still move into the callable."""
     forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE))
     assert "sentinel" not in forward
     branch = _for_loop_body(forward).body[0]
@@ -273,8 +272,7 @@ def test_rewriter_both_branches_call_the_layer_identically(monkeypatch):
 
 
 def test_rewritten_forward_survives_non_empty_runtime_kwargs(monkeypatch):
-    """Executed, not just emitted: with an empty **kwargs the old emission only worked by accident; one runtime keyword
-    makes reentrant torch.utils.checkpoint.checkpoint raise 'Unexpected keyword arguments'."""
+    """A runtime keyword makes reentrant torch.utils.checkpoint.checkpoint raise."""
     forward = _rewrite_toy(monkeypatch, (_TOY_FIND, _TOY_REPLACE, ("sentinel",)))
 
     seen = []
@@ -329,9 +327,7 @@ def test_rewriter_resolves_the_modulelist_layer_class():
 
 
 def test_rewriter_skips_a_replacement_the_layer_cannot_take(monkeypatch):
-    """A replacement may declare layer parameters it needs: Qwen2-VL call sites read the same in transformers 4.53.0-5.9
-    and 5.10-5.14, but only the first takes rotary_pos_emb; injecting it on 5.10-5.14 passed one positional too many,
-    so the entry is skipped when the parameter is absent."""
+    """Skip a replacement whose declared param is absent: Qwen2-VL 5.10-5.14 lacks rotary_pos_emb."""
     forward = _rewrite_named_toy(
         monkeypatch,
         (_TOY_NAMED_FIND, _TOY_NAMED_REPLACE, None, ("injected",)),
@@ -353,8 +349,7 @@ def test_rewriter_applies_a_replacement_the_layer_can_take(monkeypatch):
 
 def test_rewriter_applies_a_guarded_replacement_when_the_layer_is_unresolvable(
         monkeypatch):
-    """Unresolvable layer names must behave as before, never silently stop rewriting; the toy's ModuleList holds
-    torch.nn.Identity, which is not a name in its module."""
+    """Unresolvable layer names must not stop rewriting; toy's Identity layers are unnamed."""
     forward = _rewrite_toy(
         monkeypatch, (_TOY_FIND, _TOY_REPLACE, None, ("nothing_has_this",)),
     )
@@ -377,8 +372,7 @@ def test_qwen2_vl_rotary_entries_declare_the_parameter_they_depend_on():
 
 
 def test_qwen2_vl_5x_entry_declares_max_seqlen():
-    """The shipped transformers 5.x Qwen2-VL entry must keep max_seqlen and remove it from the positional list, else the
-    arg=arg demotion pushes it into a slot the block lacks."""
+    """5.x Qwen2-VL entry must pass max_seqlen by keyword, or arg=arg demotion misplaces it."""
     entries = compiler.custom_gradient_checkpointing_replacements
     matching = [e for e in entries if "max_seqlen=max_seqlen" in e[0]]
     assert len(matching) == 1, "expected exactly one 5.x max_seqlen entry"
@@ -503,15 +497,12 @@ def test_unsloth_gradient_checkpointer_still_accepts_a_one_tuple_return():
     assert torch.allclose(x.grad, torch.full_like(x, 3.0))
 
 
-# Tensor keywords must stay autograd inputs: a non-leaf tensor closed over by functools.partial is not a Function input,
-# so a shared one breaks on second backward.
+# Tensor kwargs must be Function inputs: a shared non-leaf in partial breaks second backward.
 
 
 @pytest.fixture
 def cpu_offload_globals(monkeypatch):
-    """Lets UnslothCheckpointFunction run on CPU: its globals are normally seeded by
-    initialize_unsloth_gradient_checkpointing() (needs pinned memory, streams, device count); MINIMUM_SIZE keeps
-    offload off."""
+    """Seeds globals so UnslothCheckpointFunction runs on CPU; MINIMUM_SIZE keeps offload off."""
     from unsloth_zoo import gradient_checkpointing as gc_module
     for name, value in (
         ("FIRST_PASS", False), ("LAST_GC_INDEX", 0), ("CURRENT_GC_INDEX", 0),
@@ -550,8 +541,7 @@ def test_offloaded_wrapper_matches_torch_checkpoint(cpu_offload_globals, preserv
 
 
 def test_offloaded_wrapper_reinitialises_after_an_unpatch(cpu_offload_globals, monkeypatch):
-    """Wrapper must re-initialise CPU_BUFFERS left None by unpatch_unsloth_smart_gradient_checkpointing
-    (prepare_model_for_training calls it for non-'unsloth' modes); len(None) would be a TypeError."""
+    """Wrapper re-inits CPU_BUFFERS left None by the unpatch; len(None) would be a TypeError."""
     gc_module = cpu_offload_globals
     monkeypatch.setattr(gc_module, "CPU_BUFFERS", None, raising = False)
 

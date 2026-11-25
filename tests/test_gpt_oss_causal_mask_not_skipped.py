@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt-oss inference must never get a None causal mask: the flex-training skip keys on the training flag, not
-requires_grad (enable_input_require_grads() sets it at inference too); the patch is skipped under
-UNSLOTH_COMPILE_DISABLE; CPU-only."""
+"""gpt-oss inference must never get a None causal mask: the flex skip keys on the training flag, not
+requires_grad (set at inference too); skipped under UNSLOTH_COMPILE_DISABLE; CPU-only."""
 import os
 import sys
 import types

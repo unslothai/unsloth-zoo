@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression for PR 95: assert_same_keys must resolve inner_model with the guarded find_lora_base_model walk, since
-model.base_model.model raised AttributeError when base_model has no .model (Phi-3, Phi-4-mini); the same walk keeps
-key comparison like-for-like."""
+"""Regression for PR 95: assert_same_keys uses the guarded find_lora_base_model walk, since
+model.base_model.model raised AttributeError when base_model has no .model (Phi-3, Phi-4-mini)."""
 import pytest
 import torch
 import torch.nn as nn

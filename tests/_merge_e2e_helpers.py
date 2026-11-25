@@ -89,9 +89,8 @@ def _module_to_key(name: str, param_name) -> str:
 
 
 def seed_lora(peft_model, seed: int = SEED):
-    """Fill lora_A/lora_B with deterministic asymmetric nonzero values seeded by safetensor key via hashlib (hash() is
-    per-process random), so order is independent of module iteration; the shaped ramp exposes transpose/slice bugs on
-    tiny tensors."""
+    """Fill lora_A/lora_B with asymmetric nonzero values seeded by hashlib on safetensor key (hash()
+    is per-process random), so order is independent; ramp exposes transpose/slice bugs."""
     with torch.no_grad():
         for name, mod in _iter_lora_modules(peft_model):
             key = _module_to_key(name, getattr(mod, "parameter_name", None))
@@ -194,9 +193,8 @@ _LORA_REMNANT_MARKERS = (".lora_A", ".lora_B", ".lora_embedding",
 
 
 class KeyResolutionError(AssertionError):
-    """Adapted module has no base safetensor key; raised (not for value mismatches) when on-disk layout differs from the
-    LoRA path, e.g. composite VLM prefixes or fused vs per-expert serialization that varies by transformers version;
-    tests skip on it."""
+    """Adapted module has no base safetensor key; raised for on-disk layout differences (VLM
+    prefixes, fused vs per-expert), not value mismatches; tests skip on it."""
 
 
 def _resolve_key(adapted_key: str, base_keys: set[str]) -> str | None:
@@ -220,9 +218,8 @@ def _load_named_params(model_dir: str) -> dict[str, torch.Tensor]:
 
 def assert_merge_correct_model_space(*, family, base_dir, out_dir,
                                      adapted: dict[str, _Adapted], save_dtype):
-    """Verify a merge in re-packed in-memory space: experts packed in memory but saved per-expert have no single
-    safetensor key; loading base and merged re-packs them, so adapted keys match parameter names for
-    _ref_fused/_ref_dense; base_dir stays the pre-merge reference."""
+    """Verify in re-packed in-memory space: per-expert saved experts lack one safetensor key;
+    re-packing base and merged makes adapted keys match parameter names; base_dir is pre-merge."""
     from unsloth_zoo.saving_utils import _MOE_MERGE_STATE
 
     base_p = _load_named_params(base_dir)
@@ -281,9 +278,8 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
     leaked = [k for k in merged if any(m in k for m in _LORA_REMNANT_MARKERS)]
     assert not leaked, f"[{family}] adapter remnants in merged output: {leaked[:5]}"
 
-    # Fused experts may serialize per-expert on disk (e.g. qwen3_5_moe), so the packed adapted key maps to no single
-    # safetensor; saving_utils._merge_moe_* handles it; verify in the in-memory fused space, where param names match
-    # adapted keys.
+    # Fused experts may be saved per-expert (e.g. qwen3_5_moe), so the adapted key has no single
+    # safetensor; saving_utils._merge_moe_* handles it; verify in-memory, where names match.
     if any(a.fused and _resolve_key(ak, base_keys) is None for ak, a in adapted.items()):
         assert base_dir is not None, (
             f"[{family}] base_dir is required to verify per-expert-serialized "

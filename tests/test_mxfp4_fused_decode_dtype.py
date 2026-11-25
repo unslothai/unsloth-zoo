@@ -15,8 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Default fused packed MXFP4 decode returns the activation dtype even with float32 expert biases (transformers 5.x);
-bf16 eval without autocast then broke the next projection."""
+"""Fused MXFP4 decode keeps activation dtype with fp32 expert biases (transformers 5.x)."""
 
 import json
 import os

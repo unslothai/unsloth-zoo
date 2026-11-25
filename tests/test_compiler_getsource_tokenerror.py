@@ -204,8 +204,7 @@ def test_a_second_pass_does_not_read_its_own_generated_forward(tmp_path):
 
 
 def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
-    """getsource failing on a compile-folder forward must wrap rather than skip, so dtype casts survive without the
-    source; markers are stripped to reach it (issue 967)."""
+    """Forward getsource TokenError must wrap, not skip, so dtype casts survive (issue 967)."""
     proc = _run(
         """
         import torch
@@ -267,18 +266,8 @@ def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
 
 
 def test_the_probe_sets_cpu_mode_itself_rather_than_inheriting_it():
-    """The subprocess must not depend on conftest for its own importability.
-
-    A fresh interpreter inherits none of pytest's setup. These probes ran on a
-    CPU-only runner only because tests/conftest.py sets UNSLOTH_ALLOW_CPU at
-    import time and dict(os.environ) happened to carry it into the child;
-    neutering that single line makes every test in this file die inside the
-    child's `import unsloth_zoo.compiler`, before the handlers under test.
-
-    The checkout pin is already handled: the generated script starts with
-    sys.path.insert(0, ROOT), so the child imports this tree and not an
-    installed copy. Only the CPU flag was missing.
-    """
+    """The probe sets UNSLOTH_ALLOW_CPU itself, not via conftest.py's os.environ; without it the
+    child dies importing unsloth_zoo.compiler; sys.path.insert(0, ROOT) pins the checkout."""
     source = Path(__file__).read_text(encoding="utf-8")
     setup = source[source.index("env = dict(os.environ)"):source.index("return subprocess.run(")]
     assert 'env.setdefault("UNSLOTH_ALLOW_CPU", "1")' in setup

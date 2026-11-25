@@ -54,8 +54,7 @@ def dnp(monkeypatch):
     try:
         from unsloth_zoo import hf_xet_tuning
     except Exception:
-        # unsloth_zoo/__init__ can raise 'Please install Unsloth' after importing hf_xet_tuning, but the submodule stays
-        # cached in sys.modules, which the policy reaches.
+        # __init__ can raise after importing hf_xet_tuning, which stays cached in sys.modules.
         hf_xet_tuning = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if hf_xet_tuning is not None:
         for name, neutral in (
@@ -506,8 +505,7 @@ def test_the_advice_matches_what_the_resolver_actually_returns(dnp, monkeypatch)
 
 
 def test_probe_rejects_a_start_method_the_host_does_not_offer(monkeypatch, dnp):
-    """The probe must reject a start method the host does not offer: on Windows the private default context said fork
-    while only spawn was offered (issues 3211 and 3397)."""
+    """Reject start methods not offered; Windows' default said fork (issues 3211 and 3397)."""
     import sys as _sys
     import types
 
@@ -532,8 +530,7 @@ def test_probe_rejects_a_start_method_the_host_does_not_offer(monkeypatch, dnp):
 
 
 def test_the_module_imports_nothing_but_the_standard_library():
-    """Imports only the standard library; psutil and multiprocess stay inside functions behind try/except so a host
-    without them degrades to a conservative answer instead of failing to import"""
+    """Stdlib-only at import; psutil and multiprocess are optional, so their absence degrades."""
     tree = ast.parse(MODULE_PATH.read_text(encoding = "utf-8"))
     top_level = []
     for node in tree.body:
@@ -548,9 +545,8 @@ def test_the_module_imports_nothing_but_the_standard_library():
 
 
 def test_it_is_reachable_as_unsloth_zoo_dataset_num_proc():
-    """unsloth/models/rl.py bakes this dotted import into generated trainers, so a rename breaks cached code; run in a
-    subprocess with UNSLOTH_ZOO_DISABLE_GPU_INIT=1 because the package __init__ refuses to load without unsloth
-    installed; skipping would retire the canary on CPU CI"""
+    """unsloth/models/rl.py bakes this import into generated trainers; use a subprocess with
+    UNSLOTH_ZOO_DISABLE_GPU_INIT=1 (__init__ needs unsloth); skipping would retire the canary."""
     import os
     import subprocess
 
@@ -969,8 +965,7 @@ def test_an_explicit_count_the_host_can_afford_is_untouched_by_the_row_guard(mon
 
 
 def test_the_fixture_really_neutralises_the_zoo_readers(dnp):
-    """Patch the hf_xet_tuning entry in sys.modules, since unsloth_zoo/__init__ can raise after importing it; a clean
-    import leaves the real /sys/fs/cgroup readers live."""
+    """Patch hf_xet_tuning in sys.modules: unsloth_zoo/__init__ may raise after importing it."""
     module = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if module is None:
         pytest.skip("unsloth_zoo.hf_xet_tuning is not reachable here")
@@ -1012,8 +1007,7 @@ def test_standardize_data_formats_routes_through_the_policy(monkeypatch):
 def test_the_helper_backed_reader_pairs_v1_limits_with_their_own_usage(
     monkeypatch, dnp, tmp_path
 ):
-    """Pins the v1 branch of the helper-backed reader, a fallback the zoo never takes but the unaided reader mirrors; a
-    leaf's usage read against a slice's limit over-subscribes."""
+    """v1 limits pair with their own usage; a leaf's usage vs a slice limit over-subscribes."""
     slice_dir = tmp_path / "slurm"
     leaf = slice_dir / "job_1"
     leaf.mkdir(parents = True)

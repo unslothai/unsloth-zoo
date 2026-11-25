@@ -34,8 +34,7 @@ class Boom(Exception):
 
 @pytest.fixture(autouse=True)
 def _isolate_registry(monkeypatch):
-    """Gives each test its own wrapper registry; the module-global registry otherwise leaks wrappers between tests,
-    making force_eager_fallback()'s count order-dependent."""
+    """Per-test registry: leaked wrappers make force_eager_fallback()'s count order-dependent."""
     monkeypatch.setattr(U, "_EAGER_FALLBACK_WRAPPERS", [])
     monkeypatch.setattr(U, "_recompile_limit_errors", lambda: (Boom,))
     monkeypatch.setattr(U, "_disabled_hook_graph_break_error", lambda: ())
@@ -107,8 +106,7 @@ def test_an_unrelated_exception_still_propagates():
 
 
 def test_no_wrapper_at_all_when_torch_has_no_such_errors(monkeypatch):
-    """With no recompile-limit or backend compile exceptions the compiled callable must be returned unwrapped; both
-    tuples are stubbed, since the wrapper also catches Inductor codegen failures"""
+    """Empty tuples mean no wrapper; both are stubbed, since codegen errors are also caught."""
     monkeypatch.setattr(U, "_recompile_limit_errors", lambda: ())
     monkeypatch.setattr(U, "_backend_compile_errors", lambda: ())
     compiled, eager, _ = _pair()
@@ -201,8 +199,7 @@ def test_force_is_idempotent():
 
 
 def test_force_settles_a_deferral_whose_wrapper_is_already_gone():
-    """GRPO's accumulate_chunk is built inside the forward, so its deferring wrapper is collected before backward dies;
-    the pending label is the only evidence, as live wrappers alone returned 0."""
+    """Deferring wrapper is gone before backward, so the pending label is the only evidence."""
     U._PENDING_EAGER_LABELS.add("chunk.f")
 
     assert U.force_eager_fallback() > 0, "the deferral was not seen"
@@ -216,8 +213,7 @@ def test_force_settles_a_deferral_whose_wrapper_is_already_gone():
 
 
 def test_force_sees_a_latch_whose_wrapper_is_already_gone():
-    """Uses the real give-up, not a direct write to _LATCHED_EAGER_LABELS (permanent, holds earlier models' labels, so
-    not evidence alone); give-up writes it and _RECENT_EAGER_LABELS (this step)."""
+    """Uses the real give-up; _LATCHED_EAGER_LABELS is permanent, so not evidence alone."""
     compiled, eager, _ = _pair(fail_after = 0)
     w = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "chunk.f")
     w(1)
@@ -307,8 +303,7 @@ def test_the_boundary_does_not_discard_a_pending_flip():
 
 
 def test_the_wrapper_registry_does_not_grow_without_bound():
-    """GRPO re-wraps accumulate_chunk in every backward; dead weak references piled up one per step and every scan
-    walked them, so the registry must not grow without bound."""
+    """GRPO re-wraps accumulate_chunk each backward; dead weakrefs must not pile up unbounded."""
     def build(n):
         for i in range(n):
             compiled, eager, _ = _pair(fail_after = 100)

@@ -6,9 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Import-smoke suite for unsloth_zoo.temporary_patches: every submodule and the __init__ star-import chain must import;
-common.torch_compile_options must stay a dict (rl_replacements imports it at module top); runs GPU-free under
-tests/conftest.py."""
+"""Import smoke for unsloth_zoo.temporary_patches: submodules and the __init__ chain must import
+GPU-free; common.torch_compile_options must stay a dict (rl_replacements imports it at top)."""
 
 from __future__ import annotations
 
@@ -17,14 +16,12 @@ import os
 
 import pytest
 
-# pytest.importorskip('torch') because every temporary_patches submodule imports torch; without torch this is a
-# precondition failure, not a finding (macOS staging: pyproject has no torch on darwin/arm64).
+# Without torch this is a precondition failure, not a finding: every submodule imports torch.
 pytest.importorskip("torch")
 
 
-# Strip the GPU-init switch _GPU_INIT_GATE (UNSLOTH_ZOO_DISABLE_GPU_INIT) from child envs: when set, __init__.py:179
-# skips device detection (DEVICE_TYPE cpu, device_memory 0); hf_xet_fallback sets it on the parent around a download
-# spawn.
+# _GPU_INIT_GATE (UNSLOTH_ZOO_DISABLE_GPU_INIT) is stripped from child envs: when set,
+# __init__.py:179 skips device detection; hf_xet_fallback sets it on the parent around a download.
 _GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
 
 
@@ -193,8 +190,7 @@ def test_gpt_oss_imports_without_visible_gpus():
 
 
 def test_xet_submodule_import_does_not_query_free_device_memory():
-    """Importing the xet download submodule must not call mem_get_info, which creates an accelerator context; device
-    properties give the total capacity gpt_oss needs."""
+    """Xet submodule import must not call mem_get_info, which creates an accelerator context."""
     import subprocess
     import sys
 

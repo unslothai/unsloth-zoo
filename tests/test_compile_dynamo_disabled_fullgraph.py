@@ -28,8 +28,7 @@ pytestmark = pytest.mark.usefixtures("compile_enabled")
 
 @pytest.fixture(autouse = True)
 def clear_checkpoint_markers():
-    # A compiled call under a checkpoint sets these process-wide and only a step boundary clears them; left set, the
-    # recompile-limit arm re-raises instead of falling back in later tests
+    # Clear checkpoint markers: left set, the recompile-limit arm re-raises in later tests.
     yield
     u._PACKED_COMPILED_IN_CHECKPOINT = False
     u._COMPILED_OK_LABELS.clear()
@@ -164,8 +163,7 @@ def test_dynamo_tracing_disabled_reads_the_live_config():
 
 
 # ------------------------------------------------- checkpointing consistency
-# Non-reentrant checkpointing recomputes the forward and compares what each pass saved, so a pack and its recompute in
-# different modes raise CheckpointError; each was a live failure of a per-call read of the flag
+# Pack and recompute must agree on the flag; a per-call read caused CheckpointError.
 
 
 @pytest.mark.parametrize("disabled", [True, False])
@@ -181,14 +179,12 @@ def test_a_checkpointed_step_runs_with_the_compiler_either_way(disabled):
         torch._dynamo.config.disable = prev
     assert w.grad is not None
     if disabled:
-        # Eager, the forward and its recompute each run the Python body exactly once; compiled, the recompute replays a
-        # graph and never re-enters the Python body
+        # Eager, forward and recompute each run the body once; compiled, recompute skips it.
         assert len(calls) == 2
 
 
 def test_the_snapshot_survives_a_flip_between_a_forward_and_its_backward():
-    """Re-enabling mid-step must not recompute an eager pack as compiled; disabling over a compiled pack is torch's own
-    behavior and raises CheckpointError on main too"""
+    """Re-enabling mid-step must not recompute an eager pack as compiled."""
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
     try:

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 engram tables stream from the checkpoint; disk mode never reads a table tensor and
-matches the reference bit for bit; the port reference uses UNSLOTH_FROZEN_TABLE=gpu."""
+"""Disk mode never reads table tensors, is bit-exact; port ref uses UNSLOTH_FROZEN_TABLE=gpu."""
 
 import json
 import os
@@ -205,8 +204,7 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     with torch.no_grad():
         for k in tables:
             assert torch.equal(tables[k](ids), ref.model.engram_tables[k](ids)), k
-    # Training: logits, loss and every gradient bitwise equal. The model gathers each table once per forward, outside
-    # the decoder layers, so a layer recompute never reads it again.
+    # Bitwise-equal training; tables gather outside the layers, so recompute never reads them.
     x = torch.randint(0, 8, (2, 24))
     reset_frozen_table_stats()
     for m in (ref, model):
@@ -226,9 +224,8 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     if NATIVE:
         assert not [k for k in model.state_dict() if "engram_tables" in k]
         return
-    # Outside a full save nothing is exported (adapter saves never decode the table); inside one,
-    # bf16 is zero-copy and fp8 exports decoded rows equal to the port dequantized table, since fp8
-    # rows plus scales would reload raw.
+    # Only full saves export (adapter saves never decode): bf16 is zero-copy; fp8 exports decoded
+    # rows equal to the port's dequantized table, since fp8 rows plus scales would reload raw.
     sd = model.state_dict()
     if kind == "bf16":
         assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}

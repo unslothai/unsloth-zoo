@@ -33,14 +33,12 @@ PAYLOADS = [
 
 @pytest.mark.parametrize("model_type", PAYLOADS)
 def test_compile_stops_on_an_unnormalised_model_type(model_type):
-    """Returns None, not raises, for non-canonical names: raising would turn the silent skip into a hard failure for
-    callers passing raw config.model_type (38 shipped names are hyphenated)."""
+    """Returns None, not raises, for raw config.model_type: 38 shipped names are hyphenated."""
     assert unsloth_compile_transformers(model_type) is None
 
 
 def _shipped_non_canonical_model_types():
-    """Literal model_type values the installed transformers ships that fail the regex; derived, not hardcoded, since the
-    set varies by version and a missing name fails for the wrong reason."""
+    """Shipped model_type names failing the regex; derived, as the set varies by version."""
     import re as _re
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
@@ -96,8 +94,7 @@ def test_legitimate_generated_module_names_accepted(name):
 # --- no legitimate model_type may be rejected --------------------------------
 
 def test_every_shipped_model_type_passes_the_sink_guard():
-    """Everything the choke point emits must pass the sink guard, since a false rejection breaks loading a real model;
-    mirrors test_model_type_import_guard.py so they cannot drift."""
+    """Emitted model types must pass the sink guard, or real models stop loading."""
     import transformers.models
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 

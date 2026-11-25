@@ -329,8 +329,7 @@ def test_real_transformers_source_canary():
 
 
 def test_real_transformers_patch_applies_or_skips():
-    """Wrapper patches buggy installs, skips fixed, no-ops without gemma4; it mutates process-global classes, but other
-    tests use per-test synthetic classes, so ordering does not matter"""
+    """Mutates process-global classes; order is safe since other tests use per-test synthetic classes."""
     try:
         import transformers.models.gemma4.modeling_gemma4 as modeling
     except ImportError:

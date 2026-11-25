@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""16bit merge of a row-sharded fp8 table with one shared per-tensor scale (Qwen3.8-Flash-Next-FP8's n-gram
-table: `ngram_embedding.shard_<i>.weight` F8_E4M3 over many files, one `ngram_embedding.weight_scale`)."""
+"""16bit merge of a row-sharded fp8 n-gram table sharing one per-tensor scale across files."""
 from __future__ import annotations
 
 import json

@@ -69,9 +69,8 @@ def _templates(decode, **overrides):
     return files
 
 
-# Layouts of the real torch releases (pytorch tags): 2.6 - 2.8 keep the main kernel in kernel/flex_attention.py with
-# block pointers; 2.9 - 2.12 move it to templates with tensor descriptors and only flex_decode keeps block pointers.
-# The unknown rows: a 2.12 tree with a main template member missing reads as None, never as free of block pointers.
+# 2.6-2.8 keep block pointers in kernel/flex_attention.py; 2.9-2.12 use templates, only flex_decode
+# keeps block pointers; a missing 2.12 main template reads None, never as block-pointer-free.
 _TORCH_LAYOUTS = {
     "2.7": ({"_inductor/kernel/flex_attention.py": _BLOCK_PTR, "_inductor/kernel/flex_decoding.py": _BLOCK_PTR},
             True, True),
@@ -341,8 +340,7 @@ def _fresh_attention_sink(monkeypatch):
     stub.__dict__.update(U.__dict__)
     stub.__getattr__ = lambda name: None
     monkeypatch.setitem(sys.modules, U.__name__, stub)
-    # setitem / setattr record an absent binding too (delitem with raising = False does not), so undo restores both
-    # the sys.modules entry and the package attribute the import rebinds.
+    # setitem/setattr record absent names, delitem(raising=False) does not; undo restores both.
     name = "unsloth_zoo.flex_attention.attention_sink"
     monkeypatch.setattr(sys.modules["unsloth_zoo.flex_attention"], "attention_sink", None, raising = False)
     monkeypatch.setitem(sys.modules, name, None)

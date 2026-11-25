@@ -259,8 +259,7 @@ def test_repeated_patch_passes_wrap_once(monkeypatch):
 
 
 def test_sm75_calls_over_the_memory_budget_keep_fla(monkeypatch):
-    """The torch path's workspace estimate (tokens x value heads x bytes) over the budget: fla, counted; under it:
-    the torch path. The edge is exact, so the decision is a pure function of the shape."""
+    """Torch workspace (tokens x value heads x bytes) over budget keeps fla; the edge is exact."""
     package, _, _, calls = _fake_fla(monkeypatch)
     per = fla_vendor._SM75_BYTES_PER_TOKEN_HEAD["float16"]
     B, T, HV = 2, 70, 4

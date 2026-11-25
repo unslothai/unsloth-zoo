@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The bnb compute-dtype override must reach vLLM's quant registry: in-tree vLLM <= 0.27.1 re-imports BitsAndBytesConfig
-per call, so a swap works; a plugin's class object in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG hides it and
-UNSLOTH_bnb_4bit_compute_dtype is ignored."""
+"""Swap must reach vLLM's registry; a plugin class in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG hides it."""
 
 import importlib.machinery
 import sys

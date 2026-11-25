@@ -2,9 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Unified-memory GPUs (AMD APUs gfx1150/1151, NVIDIA GB10): "unsloth" gradient checkpointing keeps the checkpointed
-inputs on the device instead of copying them into host RAM, which is the same DRAM there. Detection runs on stub
-device properties; the checkpoint paths run on CPU with streams stubbed (as test_gc_retained_graph_slots.py does)."""
+"""Unified-memory GPUs (gfx1150/1151, GB10) keep checkpointed inputs on device, not host RAM."""
 import contextlib
 
 import pytest
@@ -395,9 +393,8 @@ def test_keep_message_names_the_reason(G, monkeypatch, capsys, forced, expect):
 
 
 def test_reset_after_training_when_every_device_keeps(G, monkeypatch):
-    """Every device keeping its inputs leaves CPU_BUFFERS empty on purpose. reset_unsloth_gradient_checkpointing_buffers
-    took that for "not initialized" and returned early: the next run inherited FIRST_PASS = False and the previous
-    model's LAST_GC_INDEX, and the allocator cache was never emptied after training."""
+    """Reset must not return early on empty CPU_BUFFERS (empty on purpose): that leaked FIRST_PASS
+    and LAST_GC_INDEX, and the allocator cache was never emptied after training."""
     monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
     monkeypatch.setattr(G, "_visible_device_count", lambda: 1)
     stubs = {n: getattr(G, n) for n in ("GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",

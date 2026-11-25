@@ -1,6 +1,5 @@
-"""Tests patch_vllm_reset_caches_on_sleep: reset_mm_cache (LLM) and reset_encoder_cache (llm_engine) run before
-gc.collect() and the original sleep; missing methods are no-ops, a raising reset is swallowed, double-patching is
-idempotent."""
+"""patch_vllm_reset_caches_on_sleep: reset_mm_cache and reset_encoder_cache precede gc.collect() and
+original sleep; missing methods are no-ops, raising resets swallowed, patching idempotent."""
 
 from __future__ import annotations
 

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dispatch matrix for _active_merge_device(), spoofing cuda/xpu/mps/hip to test the cuda (covers ROCm) -> xpu -> mps ->
-cpu cascade; guards the LoRA merge fix (PR 620); new PROFILES rows are auto-parametrized."""
+"""Tests _active_merge_device() cuda (ROCm) -> xpu -> mps -> cpu; LoRA merge fix (PR 620)."""
 
 from __future__ import annotations
 

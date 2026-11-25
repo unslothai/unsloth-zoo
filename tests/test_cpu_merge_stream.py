@@ -192,8 +192,7 @@ def test_streamed_merge_still_streams_plain_lora():
 
 
 def test_streamed_merge_reexport_removes_obsolete_shards(tmp_path):
-    """Exporting again into the same folder with another shard count leaves only the new export's weights, as
-    save_pretrained does; unrelated files (adapters, tokenizer, other names) stay."""
+    """Re-export leaves only the new weights, like save_pretrained; unrelated files stay."""
     import json
     from unsloth_zoo.cpu import loader
     model = _lora_model(_TINY, torch.float32)

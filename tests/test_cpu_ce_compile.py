@@ -78,8 +78,7 @@ def test_chunked_ce_compiles_fullgraph_without_breaks(masked, dynamic):
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("mark", [False, True])
 def test_chunked_ce_does_not_specialise_sequence_length(batch, mark):
-    # A Python range over the row count would pin sequence length: mark_dynamic fails at batch 1 (rows == length)
-    # and fullgraph hits the recompile limit after 8 lengths at any batch size.
+    # A range over rows pins length: mark_dynamic fails at batch 1, fullgraph past 8 lengths.
     torch._dynamo.reset()
     counters.clear()
     compiled = torch.compile(_loss, fullgraph = True, dynamic = True, backend = "aot_eager")

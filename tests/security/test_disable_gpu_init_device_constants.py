@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Under UNSLOTH_ZOO_DISABLE_GPU_INIT=1 the four device constants must stay reachable (compiler.py does from . import
-DEVICE_TYPE) but lazy, so torch is not loaded; run in subprocesses."""
+"""With UNSLOTH_ZOO_DISABLE_GPU_INIT=1 device constants stay reachable but lazy (no torch)."""
 
 from __future__ import annotations
 

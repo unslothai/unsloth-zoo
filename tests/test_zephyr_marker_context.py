@@ -20,8 +20,7 @@ def _tokenizer():
         )
     except Exception:
         return None
-    # Zephyr parses "</s>" mid-text as the eos token (normalized=False); the fixture tokenizer ships normalized=True and
-    # would split it, so the flag is flipped to match Zephyr.
+    # Zephyr parses `</s>` mid-text as eos (normalized=False); fixture ships normalized=True.
     d = json.loads(tok.backend_tokenizer.to_str())
     for t in d["added_tokens"]:
         if t["content"] == "</s>":

@@ -258,8 +258,7 @@ def _routed_all(T, monkeypatch):
 
 
 def test_scratch_cap_chunks_the_whole_stack_bit_exactly(monkeypatch):
-    """UNSLOTH_MOE_DEQUANT_MAX_MB bounds one projection's dequantized stack: every expert is routed (the auto plan
-    declines), yet the stack is read in chunks and the result is the whole-stack one bit for bit."""
+    """Scratch cap (UNSLOTH_MOE_DEQUANT_MAX_MB) chunks a fully routed stack, bit-exactly."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     experts = _Experts(True)
     hidden, top_k_index, top_k_weights, lora = _routed_all(64, monkeypatch)
@@ -308,8 +307,7 @@ def test_scratch_fraction_follows_the_experts_class_and_the_card(monkeypatch):
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), torch.device("cpu")) == 0
     chunk = mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0)
     assert chunk == int(cap // (2304 * 2304 * 2)) == 36   # 4 chunks
-    # Stacks up to twice the cap stay whole without reading free memory: Mini's down stack alone (0.63 GiB), or Mini
-    # on a 40 GB card.
+    # Stacks up to twice the cap stay whole with no free-memory read, e.g. Mini's down stack.
     calls = []
     _headroom(monkeypatch, 0.0, calls)
     assert mu._auto_dequant_chunk_experts(MINI[1:], torch.float16, _Flagged(), cuda0) == 0
@@ -328,9 +326,8 @@ def _checkpoint_frame():
 
 
 def test_auto_chunking_waits_for_memory_need(monkeypatch):
-    """A 24 GB card holds Mini's 1.27 GiB stack while memory is free: no chunking, so no host sync per MoE call. Once
-    the stack does not fit, that device chunks, and a checkpoint replay of that call chunks without a new reading (it
-    matches its first pass); other devices are unaffected."""
+    """A 24 GB card holds Mini's 1.27 GiB stack unchunked while memory is free (no host sync); a
+    device that cannot fit chunks, and checkpoint replays match their first pass."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     for index in (0, 1):
         monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, index, int(21.96 * 2**30))   # L4
@@ -356,9 +353,8 @@ def test_auto_chunking_waits_for_memory_need(monkeypatch):
 
 
 def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
-    """One short reading (an eval spike, a fragmented moment) must not chunk the device for the rest of the process:
-    the next call reads the headroom again and goes back to the whole stack (no host sync, kept checkpoint base). A
-    checkpoint replay instead takes its own first pass's decision back, whichever way memory moved since."""
+    """A transient low reading must not chunk a device for good; the next call re-reads and returns
+    to the whole stack, and checkpoint replays keep their first-pass decision."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
     cuda0 = torch.device("cuda", 0)
@@ -377,9 +373,8 @@ def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
 
 
 def test_replay_keeps_its_own_layers_first_pass_decision(monkeypatch):
-    """Two checkpointed layers on one card: A decides 0 at 8 GiB free, B decides 55 at 2.5 GiB. Each replay (B first,
-    as backward runs) takes its own first pass's decision back, whatever the headroom reads then, and a retained
-    graph's second backward does again; a device-wide verdict would hand B's 55 to A's replay."""
+    """Two checkpointed layers on one card decide chunk sizes 0 and 55 at different headroom; each
+    replay keeps its own first-pass decision, or a device-wide verdict would give A B's 55."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
     cuda0 = torch.device("cuda", 0)
@@ -459,8 +454,7 @@ def test_unflagged_models_skip_the_scratch_cap_prep(monkeypatch):
 
 
 def test_scratch_cap_keeps_a_sparse_plan_that_already_fits(monkeypatch):
-    """Two routed rows under a five-expert cap: the sync-free plan reads two experts, inside the cap, so it is kept
-    rather than replaced by a chunked whole-stack read (two chunks, six experts and a host sync)."""
+    """Sync-free plan under the cap is kept; chunking the whole stack would add a host sync."""
     experts = _Experts(True)
     sources = (experts.gate_up_proj, experts.down_proj)
     per_expert = 2 * I * H * 2
@@ -478,9 +472,8 @@ def test_scratch_cap_keeps_a_sparse_plan_that_already_fits(monkeypatch):
 
 
 def test_scratch_cap_chunks_only_the_routed_experts(monkeypatch):
-    """Over the cap the chunked plan already reads the counts on the host, so it reads the routed experts only (6 of
-    16 here, in chunks of 4), not every expert of each chunk a token reaches; values match the whole stack bit for
-    bit."""
+    """Over the cap the chunked plan reads counts on the host and only the routed experts, not every
+    expert a chunk reaches; values match the whole stack bit for bit."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     torch.manual_seed(0)
     experts = _Experts(True)

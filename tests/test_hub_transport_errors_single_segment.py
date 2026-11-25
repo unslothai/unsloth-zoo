@@ -268,8 +268,7 @@ def test_a_trailing_slash_on_an_hf_uri_is_not_depth(given, expected):
     "outputs/nested/mymodel/",
 ])
 def test_a_trailing_slash_without_the_scheme_still_reads_as_a_directory(given):
-    """Only an explicit hf:// makes a trailing slash a Hub root; bare, it marks a local directory, and stripping it
-    would send outputs/mymodel/ to the Hub as a repo id."""
+    """Only hf:// makes a trailing slash a Hub root; bare outputs/mymodel/ stays local."""
     assert saving_utils._is_hub_repo_id(given) is False
 
 
@@ -290,9 +289,7 @@ def test_a_root_uri_is_probed_rather_than_reported_absent(monkeypatch):
 
 @pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit", "merged_16bit", None])
 def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, save_method):
-    """Splitting on @ offers local outputs/my@model to the Hub as outputs/my, no different from an ordinary one-slash
-    directory, so the outcome must match before and after the split; asserted as an equivalence, so it survives a
-    policy change for local bases."""
+    """Local outputs/my@model must behave like a plain one-slash directory, not be sent to the Hub."""
     import huggingface_hub as _hub
 
     def _local_nf4(directory):
@@ -350,8 +347,7 @@ def test_a_bare_valueerror_with_no_rejection_wording_always_raises(monkeypatch):
 
 
 def test_classification_never_consults_the_installed_version(monkeypatch):
-    """Classification uses the message alone, never huggingface_hub.__version__: a version check hid the 1.0-1.15 gap
-    from a test that recomputed the same expression."""
+    """Classify by message alone, not __version__: a version check hid the 1.0-1.15 gap."""
     _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
     assert saving_utils.check_hf_model_exists("gpt2") is False
 

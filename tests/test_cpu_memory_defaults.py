@@ -265,9 +265,8 @@ def _stored_dtypes(model):
 
 
 def test_default_frozen_bf16_is_for_training_only():
-    """Frozen bf16 storage upcasts every projection per call, which made decode ~26% slower on CPUs without native
-    bf16. The default is kept for training only: generate() / for_inference upcast the frozen weights to fp32 once
-    (outputs unchanged), for_training / get_peft_model store them in bf16 again, bit for bit."""
+    """Frozen bf16 is train-only: upcasts slow decode without native bf16; generate()/for_inference
+    upcast once to fp32 (same outputs); for_training, get_peft_model restore bf16 exactly."""
     from unsloth_zoo.cpu import loader
     model, reference = _tiny_bf16_llama("training")
     original = {k: v.clone() for k, v in model.state_dict().items() if v.dtype == torch.bfloat16}

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Makes UNSLOTH_COMPILE_DISABLE reach the three bare @torch.compile helpers in rl_replacements.py, which ran at import
-before the compiler's gates; compiler.py and temporary_patches/utils.py already consult it; does not fix the shape
-bug."""
+"""UNSLOTH_COMPILE_DISABLE must reach the three bare @torch.compile helpers in rl_replacements.py,
+which ran at import before the compiler's gates; the shape bug is not fixed."""
 
 import re
 import os

@@ -99,8 +99,7 @@ QWEN2_AUDIO = (_text_stack("language_model.layers")
                + [f"audio_tower.layers.{i}.fc1" for i in range(2)]
                + [f"audio_tower.layers.{i}.fc2" for i in range(2)]
                + ["multi_modal_projector.linear"])
-# Whisper-style audio model with a language stack for get_peft_regex, plus an audio_model.encoder.layers encoder lacking
-# an audio_tower segment, proving the anchor.
+# Whisper layout: an audio_model.encoder decoy (no audio_tower segment) proves the anchor.
 WHISPER     = (_text_stack("language_model.layers")
                + [f"audio_model.encoder.layers.{i}.self_attn.{p}"
                   for i in range(2) for p in ("q_proj", "k_proj", "v_proj", "out_proj")])
@@ -281,8 +280,7 @@ def test_audio_only_does_not_match_language():
 
 
 def test_vision_only_no_language_does_not_touch_language():
-    # On Gemma 3N with vision on and language off, the only vision Linear is embed_vision.embedding_projection; the
-    # component-only fallback must not fire before the embedder branch and widen into language.
+    # Gemma 3N vision-only: embedder runs first; component fallback must not widen to language.
     model = _gemma3n()
     ns = linear_names(model)
     on = matched(get_peft_regex(model, finetune_vision_layers=True,
@@ -316,8 +314,7 @@ def all_module_names(model):
 @pytest.mark.parametrize("builder,name", [(lambda: _gemma4("E2B"), "gemma4_e2b"),
                                           (lambda: _gemma4("12B"), "gemma4_12b")])
 def test_gemma4_audio_matches_inner_linear_not_wrapper(builder, name):
-    # On Gemma 4 audio projections are Gemma4ClippableLinear wrappers (not nn.Linear) with an inner .linear; PEFT scans
-    # every module, so match only the inner Linear, never the wrapper.
+    # Gemma4ClippableLinear wrappers: PEFT scans all modules, so match only the inner .linear.
     model = builder()
     r = get_peft_regex(model, finetune_vision_layers=True, finetune_language_layers=True,
                        finetune_audio_layers=True)
@@ -376,8 +373,7 @@ def test_positional_target_modules_not_shadowed():
 
 
 def test_positional_tag_overrides_not_shadowed():
-    # The tag-override params keep their positional slots: a list as the 7th positional binds to vision_tags, not
-    # finetune_audio_layers, which now sits after the tag params.
+    # Tag-override params keep their positional slots; finetune_audio_layers comes after them.
     model = FakeModel(LLAMA)
     # 7th positional = vision_tags. A made-up tag should appear verbatim in the regex.
     r = get_peft_regex(model, True, True, True, True, None, ["zzvision"])

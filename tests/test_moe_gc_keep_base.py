@@ -281,9 +281,8 @@ class _Headroom(nn.Module):
 @needs_gpu
 @pytest.mark.parametrize("fold", ["0", "1"])
 def test_auto_dequant_chunk_decision_is_per_checkpoint_call(monkeypatch, fold):
-    """Two QLoRA layers on one card, the first with headroom (whole stack: kept base, LoRA fold), the second short
-    (chunked). Each layer's replay takes its own first pass's decision, so it runs the same plan and its output is
-    bitwise the first pass's; a device-wide verdict would chunk the first layer's replay after the second's."""
+    """Two QLoRA layers on one card: the first has headroom (whole stack), the second is chunked;
+    each replay reuses its own first-pass decision (bitwise), not a device-wide one."""
     pytest.importorskip("bitsandbytes")
     for name in ("UNSLOTH_MOE_SELECTIVE_DEQUANT", "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "UNSLOTH_MOE_DEQUANT_MAX_MB"):
         monkeypatch.delenv(name, raising = False)

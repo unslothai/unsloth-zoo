@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks every MLX-using unsloth_zoo module imports under the shim and exposes the symbols Unsloth integrations rely
-on; a failing symbol (`_Noop` / NotImplementedError) identifies a TODO in mlx_simulation/."""
+"""Every MLX module imports under the shim and exposes Unsloth's symbols; _Noop marks a TODO."""
 
 from __future__ import annotations
 
@@ -71,8 +70,7 @@ def test_full_finetune_dtype_default_matches_torch_bf16():
 
 
 def test_fast_mlx_model_save_helpers_exist():
-    """Unsloth calls model.save_pretrained_merged, save_lora_adapters and push_to_hub_merged on the FastMLXModel
-    instance from_pretrained returns; loader.py helpers are attached via types.MethodType."""
+    """Unsloth calls the save methods on FastMLXModel; loader.py helpers bind via MethodType."""
     import unsloth_zoo.mlx.loader as ml
     assert hasattr(ml, "_mlx_save_pretrained_merged")
     assert hasattr(ml, "_mlx_save_lora_adapters")

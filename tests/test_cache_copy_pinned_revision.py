@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests that an export pinned to the current Hub commit copies shards unchanged there (e.g. a README-only push) from a
-cached older main snapshot instead of downloading."""
+"""Export pinned to current commit copies unchanged shards from older cached main; no download."""
 
 import os
 import types
@@ -86,8 +85,7 @@ def test_pinned_commit_offline_still_misses(tmp_path, monkeypatch):
 
 
 def test_pinned_commit_finds_the_blob_from_an_older_snapshot(tmp_path, monkeypatch):
-    # refs/main already points at a newer partially cached commit lacking the shard, while the unchanged shard still
-    # lives under the older snapshot that fetched it.
+    # refs/main is a newer partial commit lacking the shard; it lives in the older snapshot.
     cache = _cache(tmp_path)
     repo = tmp_path / "cache" / "models--org--m"
     (repo / "snapshots" / SHA2).mkdir()

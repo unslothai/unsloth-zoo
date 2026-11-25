@@ -2,8 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Packed expert stacks take Tensor.to(..., copy = ...): compressed-tensors' offload sends every parameter through
-it on the first forward of a compressed checkpoint, and torch's _parse_to refuses the keyword."""
+"""Packed experts take Tensor.to(copy=...) from compressed-tensors offload; torch refuses it."""
 import pytest
 import torch
 

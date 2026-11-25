@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert-stack slicing for bitsandbytes' signed 32-bit element limit (2**31 elements aborts the process); tests lower
-the threshold and compare against one unsliced call."""
+"""Expert-stack slicing under bitsandbytes' 2**31 abort limit; results equal one unsliced call."""
 from pathlib import Path
 
 import pytest
@@ -148,8 +147,7 @@ def test_ragged_slice_at_the_end(small_threshold):
     "quant_storage", [torch.uint8, torch.float16, torch.bfloat16, torch.float32]
 )
 def test_the_configured_quant_storage_survives_slicing(small_threshold, quant_storage):
-    """FSDP asks for a floating point bnb_4bit_quant_storage; returning uint8 breaks that wrap, and indexing in bytes
-    when elements are 2 or 4 bytes reads past the end."""
+    """FSDP needs float bnb_4bit_quant_storage, not uint8; byte indexing overruns 2/4-byte."""
     value = _stack()
     sliced = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",
@@ -304,8 +302,7 @@ def test_the_forward_read_still_slices_from_the_cached_top_level_module(
 def test_a_sliced_stack_is_as_movable_and_shardable_as_an_unsliced_one(
     small_threshold, op
 ):
-    """Params4bit.__torch_function__ rebuilds the parameter from its attributes on torch.chunk and torch.split, reading
-    .module; a hand-built stack that never sets it raises AttributeError."""
+    """Params4bit.__torch_function__ needs .module on chunk/split, else AttributeError."""
     value = _stack()
     sliced = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",

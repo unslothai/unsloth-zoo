@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Offloaded activations must come back in their own dtype, not the staging buffer's: FORCE_FLOAT32 loads init bf16
-buffers but runs fp16/fp32 activations; ROCm gfx10 hit an LLVM abort."""
+"""Offloaded activations keep their dtype, not the bf16 buffers used under FORCE_FLOAT32."""
 import pytest
 
 torch = pytest.importorskip("torch")

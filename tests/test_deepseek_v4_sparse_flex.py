@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests DeepSeek-V4 attention on flex attention: routing, block mask, and parity with transformers' eager attention
-(fp32 exact check, bf16 vs fp32 oracle, prefill and decode)."""
+"""DeepSeek-V4 flex attention vs transformers eager: routing, block mask, fp32 and bf16 parity."""
 
 import copy
 
@@ -427,8 +426,7 @@ def test_older_torch_keeps_eager(monkeypatch):
 @needs_flex_gpu
 @pytest.mark.parametrize("rate", [0, 4, 128])
 def test_flex_graphs_stay_bounded_over_lengths(rate):
-    """Sliding (rate 0), CSA (4), HCA (128) masks over varying lengths and batch 1 or 2, fwd and bwd: at most four
-    graphs (first length static, then dynamic; batch 1 vs > 1), none added per new length."""
+    """Sliding (rate 0), CSA (4), HCA (128) masks: at most four graphs, none added per length."""
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()

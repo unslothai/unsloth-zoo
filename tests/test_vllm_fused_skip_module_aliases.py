@@ -14,15 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Merged 4bit exports must carry skip-module names vLLM can match (unslothai/unsloth issues 1886, 464): vLLM fuses
-leaves and is_layer_skipped_bnb only matches dotted ancestors, so a dense layer gets quantized and fails a shape
-assert."""
+"""Merged 4bit exports need vLLM-matchable skip names (unslothai/unsloth issues 1886, 464)."""
 
 import pytest
 
-# Identity fallback fires only when the module imports but the symbol is absent; a bare except ImportError would turn a
-# torch-less runner into 21 failures that look like a missing fix (macos-15), so import first and skip the file on
-# failure.
+# Bare except ImportError would fail 21 tests on torch-less runners; import first and skip the file.
 try:
     import unsloth_zoo.saving_utils as _saving_utils
 except ImportError as _e:
@@ -152,9 +148,7 @@ def test_idempotent():
     assert add_vllm_fused_skip_module_aliases(once) == once
 
 
-# Second mechanism (Transformers >= 4.52 multimodal nesting, verified on GPU):
-# unsloth/Qwen3-VL-4B-Instruct-unsloth-bnb-4bit writes model.language_model.layers.0.mlp, but vLLM 0.11.2 builds
-# language_model.model.layers.0.mlp.down_proj and dies on a uint8 vs bfloat16 shape.
+# Transformers >= 4.52 nesting: the Qwen3-VL bnb-4bit export mismatches vLLM 0.11.2 module names.
 
 vllm_compatible_skip_modules = getattr(
     _saving_utils, "vllm_compatible_skip_modules", add_vllm_fused_skip_module_aliases,
@@ -244,9 +238,8 @@ def test_namespace_alias_never_emits_a_bare_namespace_root():
             assert not name.endswith("."), f"bare namespace root {name!r} from {entry!r}"
 
 
-# Other half of the contract: an alias can also make Transformers skip more, since matching is by prefix and suffix, so
-# an alias that is a suffix of a real Linear keeps it 16-bit on reload; the trees below are real nn.Linear names
-# enumerated on the meta device.
+# Aliases can also make Transformers skip more (matching is by prefix and suffix): a suffix of a
+# real Linear keeps it 16-bit on reload. Trees are real nn.Linear names from the meta device.
 
 MODULE_TREES = {
     # text only
@@ -393,8 +386,7 @@ def test_the_widening_probe_can_actually_detect_widening():
 
 
 def test_transformers_5x_skip_matcher_matches_the_stock_transformers_clauses():
-    """Compared against the clauses written out literally, not the live should_convert_module, since patching_utils
-    replaces that at import time and the result would depend on import order."""
+    """Uses literal clauses; patching_utils replaces live should_convert_module at import time."""
     import random
     import re as _re
 

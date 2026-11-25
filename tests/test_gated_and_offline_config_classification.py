@@ -42,8 +42,7 @@ _ON_DISK = ("outputs", "mymodel")
 
 
 def _require_a_case_sensitive_filesystem(tmp_path):
-    """Probed, not assumed: only a case difference makes os.path.exists miss while check_local_model_exists hits; on
-    case-insensitive APFS/NTFS, macos-14 and windows-latest fail without the skip."""
+    """Needs a case-sensitive FS: case-insensitive APFS/NTFS (macos-14, windows-latest) fail."""
     probe = tmp_path / "case_probe"
     probe.mkdir(exist_ok = True)
     if os.path.exists(str(tmp_path / "CASE_PROBE")):
@@ -143,8 +142,7 @@ def test_gated_repo_warns_through_the_real_hf_file_system(monkeypatch):
 
 
 def test_the_real_ls_really_does_hide_the_gated_error(monkeypatch):
-    """Pins the upstream behaviour the fix depends on: ls raises FileNotFoundError with the GatedRepoError as __cause__,
-    so a change fails here, not as a dead clause."""
+    """Pins that ls raises FileNotFoundError, GatedRepoError as __cause__; changes fail here."""
     _patch_repo_info(monkeypatch, _gated())
     with pytest.raises(FileNotFoundError) as excinfo:
         huggingface_hub.HfFileSystem().ls("meta-llama/Llama-3.2-1B", detail = True)
@@ -313,8 +311,7 @@ def test_a_healthy_hub_base_is_used_when_the_local_config_cannot_be_read(monkeyp
     def fake_ls(self, path, detail = True, **kwargs):
         return [{"name": f"{path}/model.safetensors"}]
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
-    # Hub serves a readable config for the same name; stubbed at the download, not at check_model_quantization_status,
-    # so the directory still reaches the real raise.
+    # Hub serves a readable config; stub the download so the directory still hits the raise.
     good_config = tmp_path / "hub-config.json"
     good_config.write_text(json.dumps({"model_type": "llama"}), encoding = "utf-8")
     import huggingface_hub
@@ -371,9 +368,8 @@ def test_an_unreachable_hub_still_wins_over_an_unreadable_local_config(monkeypat
 
 
 def test_a_local_quantized_copy_does_not_answer_for_an_unquantized_hub_repo(monkeypatch, tmp_path):
-    """A local nf4 copy beside a 16bit Hub repo must not answer the Hub-side check: check_model_quantization_status
-    prefers the directory (HF_nf4, priority 4 not 3), so merged_16bit refused a base the Hub serves in full
-    precision."""
+    """A local nf4 copy must not answer the Hub-side check: check_model_quantization_status prefers
+    the directory (HF_nf4, priority 4 not 3), so merged_16bit refused a full-precision Hub base."""
     _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     directory = os.path.join("outputs", "mymodel")

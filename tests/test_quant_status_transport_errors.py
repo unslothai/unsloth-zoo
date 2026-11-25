@@ -81,8 +81,7 @@ def _hub_http_error(message):
 
 
 def _hub_error(cls, message):
-    """Same signature-based construction for the other Hub errors: RepositoryNotFoundError and GatedRepoError need
-    response on 1.x; EntryNotFoundError and OfflineModeIsEnabled do not."""
+    """Need response on 1.x: RepositoryNotFoundError, GatedRepoError; not EntryNotFoundError."""
     try:
         return cls(message)
     except TypeError:
@@ -122,8 +121,7 @@ def test_transport_failure_on_the_config_fetch_raises(monkeypatch, make_error):
 
 
 def test_the_error_says_it_is_not_a_statement_about_quantization(monkeypatch):
-    """The RuntimeError must say it is not a statement about quantization; 'not a missing model' is the wrong
-    reassurance for a caller asking whether weights are quantized."""
+    """RuntimeError must say it is not about quantization, not just 'not a missing model'."""
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(monkeypatch, _RateLimited())
 
@@ -152,14 +150,12 @@ _ABSENT_ERRORS = [
     pytest.param(lambda: _hub_error(EntryNotFoundError, "config.json not found"), id = "no-config-in-repo"),
     pytest.param(lambda: _hub_error(RepositoryNotFoundError, "404 repo not found"), id = "repo-absent"),
     pytest.param(lambda: FileNotFoundError("config.json"), id = "fsspec-file-not-found"),
-    # A bare ValueError from the download is deliberately not in the absent set: treating a malformed body as
-    # deterministic let a mangling proxy answer unquantized.
+    # Bare ValueError is not in the absent set: a mangling proxy must not answer unquantized.
 ]
 
 
 def test_a_mangled_proxy_response_on_the_download_raises(monkeypatch):
-    """Fetch and parse are classified separately: both JSONDecodeError classes subclass ValueError, so one except
-    ValueError would forgive a proxy corrupting the download."""
+    """Both JSONDecodeError classes subclass ValueError, so one except would hide corruption."""
     _patch_ls_present(monkeypatch)
     _patch_config_fetch(
         monkeypatch,
@@ -190,8 +186,7 @@ def test_a_config_that_cannot_be_parsed_raises(monkeypatch, tmp_path, body, labe
 
 
 def test_an_offline_cache_miss_on_the_config_raises(monkeypatch):
-    """LocalEntryNotFoundError subclasses EntryNotFoundError, so its clause must come before the absent set or an
-    offline run reports every remote base as unquantized."""
+    """Order matters: LocalEntryNotFoundError subclasses EntryNotFoundError, so check it first."""
     from huggingface_hub.errors import LocalEntryNotFoundError
     assert issubclass(LocalEntryNotFoundError, EntryNotFoundError), "premise of the ordering"
     _patch_ls_present(monkeypatch)
@@ -241,16 +236,14 @@ def test_an_absent_local_config_still_reports_unquantized(tmp_path):
     assert saving_utils.check_model_quantization_status(str(directory)) == (False, None)
 
 
-# Offline fallbacks still apply on the config fetch: it is reached only when os.path.exists(name) is False but
-# check_local_model_exists finds a case-differing copy (Outputs/MyModel vs outputs/mymodel).
+# Offline fallbacks apply: config fetch runs only if os.path.exists misses a case-only copy.
 
 _REQUESTED = "Outputs/MyModel"
 _ON_DISK = ("outputs", "mymodel")
 
 
 def _require_a_case_sensitive_filesystem(tmp_path):
-    """Probes case sensitivity and skips otherwise: only a case-only name difference makes os.path.exists miss while
-    check_local_model_exists hits; on APFS or NTFS these tests would test nothing."""
+    """Skips on case-insensitive disks (APFS, NTFS): these tests would test nothing there."""
     probe = tmp_path / "case_probe"
     probe.mkdir(exist_ok = True)
     if os.path.exists(str(tmp_path / "CASE_PROBE")):
@@ -356,8 +349,7 @@ def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch)
         "premise: this is why it needs naming rather than inheriting its way in"
     )
 
-    # Built via _hub_error: a bare DisabledRepoError(...) raises TypeError on hub 1.0 (required keyword-only response),
-    # which would read like the bug under test.
+    # Use _hub_error: bare DisabledRepoError raises TypeError on hub 1.0, which mimics the bug.
     error = _hub_error(DisabledRepoError, "403 disabled")
 
     def fake_ls(self, path, detail = True, **kwargs):

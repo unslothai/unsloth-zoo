@@ -27,9 +27,7 @@ def _is_guarded(name: str) -> bool:
 
 @pytest.fixture
 def reload_zoo(monkeypatch):
-    """Strips the offline env vars, then reloads unsloth_zoo; teardown restores unsloth_zoo* and bitsandbytes* in
-    sys.modules, since a reload swaps in a half-initialized package and the conftest guard flags bitsandbytes swaps;
-    the contract is to leave sys.modules as found."""
+    """Strips offline env vars and reloads unsloth_zoo; teardown restores sys.modules as found."""
     for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(v, raising = False)
 

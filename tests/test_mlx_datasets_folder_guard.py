@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX startup skips the GPU-only temporary_patches, so it must install the folder-dataset metadata
-guard itself (CVE-2026-66007: a metadata file_name of ../x or an absolute path lets imagefolder
-read any local file); a fresh interpreter loads the runtime module, so GPU init cannot mask the
-result."""
+"""MLX startup skips GPU-only temporary_patches, so it installs the folder-dataset metadata guard
+itself (CVE-2026-66007: a metadata file_name of ../x or an absolute path lets imagefolder read
+any local file); a fresh interpreter loads the runtime module, so GPU init cannot mask it."""
 
 import ast
 import json

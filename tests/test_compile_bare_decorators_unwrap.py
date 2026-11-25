@@ -253,8 +253,7 @@ def test_patch_function_survives_a_compiler_that_refuses():
              "assert this reproduces is unreachable",
 )
 def test_the_bare_decorators_do_not_assert():
-    """Each entry point decorating a carrier on torch 2.11+ must not raise AssertionError; nothing executes, so it stays
-    runnable on a CPU-only box with no working inductor backend"""
+    """Bare decorators on torch 2.11+ must not assert; nothing executes, so CPU-only is enough."""
     _run(_CARRIER, """
         import torch
         for fullgraph in (True, False):

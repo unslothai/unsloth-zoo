@@ -137,8 +137,7 @@ def test_the_package_init_registers_the_old_names_before_anything_heavy():
 
 
 def test_the_fallback_file_runs_as_the_spawn_childs_main_module():
-    """_run_download_attempt points __main__.__file__ at hf_xet_fallback.py, so spawn children run it as __mp_main__
-    with no parent package; a relative top-level import crashes the child."""
+    """Spawn child runs the file as __mp_main__ with no parent package; relative imports crash."""
     from unsloth_zoo_downloads import hf_xet_fallback
 
     loaded = _modules_loaded_by(

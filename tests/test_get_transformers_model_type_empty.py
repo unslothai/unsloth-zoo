@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Pins get_transformers_model_type: an unresolved config must not come back as [] (consumers index or join it), a
-single peft_config adapter unwraps whatever its key is, and ambiguous multi-adapter dicts raise; CPU-only,
-network-free."""
+"""Pins get_transformers_model_type: unresolved config must not return [] (consumers index or join
+it); single peft_config adapter unwraps whatever its key is; ambiguous multi-adapter dicts raise."""
 
 import json
 import os
@@ -19,8 +18,7 @@ _UNRESOLVED_MESSAGE = "Cannot determine model type for config file"
 
 @pytest.fixture(autouse = True)
 def _no_env_leak():
-    """get_transformers_model_type sets `UNSLOTH_MODEL_NAME` in os.environ for every PeftConfig input (hf_utils.py), so
-    restore it to keep temp paths out of other tests."""
+    """get_transformers_model_type sets UNSLOTH_MODEL_NAME for PeftConfig; restore it to isolate tests."""
     sentinel = object()
     previous = os.environ.get("UNSLOTH_MODEL_NAME", sentinel)
     try:
@@ -90,7 +88,6 @@ def test_empty_dict_raises():
         get_transformers_model_type({})
 
 
-# --- inputs that used to yield [] and then break the consumer -----------------
 
 def test_config_object_whose_to_dict_lacks_model_type_raises():
     class RemoteCodeConfig:
@@ -132,8 +129,7 @@ def test_peft_config_dict_keyed_default_unchanged(local_llama_base):
 # --- the swallowing call site in hf_utils.py must behave identically ---------
 
 def test_bare_except_call_site_still_swallows(local_llama_base):
-    """Bare except in get_auto_processor catches both the old IndexError and the new TypeError, leaving model_type None
-    so AutoTokenizer is used; the input is an ambiguous multi-adapter dict."""
+    """Bare except in get_auto_processor swallows the new TypeError too, so AutoTokenizer is used."""
     config = {
         "adapter_a": _lora_config(local_llama_base),
         "adapter_b": _lora_config(local_llama_base),
@@ -146,7 +142,6 @@ def test_bare_except_call_site_still_swallows(local_llama_base):
     assert model_type is None
 
 
-# --- the OTHER guard (the AutoConfig fallback) must be untouched -------------
 
 def test_peft_config_with_unresolvable_base_still_raises(tmp_path):
     """If AutoConfig cannot resolve the base, `retry_config` stays False and `model_types` is genuinely None at the guard; that path is unchanged."""

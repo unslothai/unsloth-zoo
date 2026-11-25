@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only with an existing labels column: labels arrive as plain lists under
-datasets.map(batched=True), so calling .tolist() on them unconditionally raised AttributeError; CPU-only, stub
-tokenizer."""
+"""train_on_responses_only with an existing labels column: datasets.map(batched=True) passes plain
+lists; unconditional .tolist() raised AttributeError; CPU-only, stub tokenizer."""
 
 import pytest
 import torch

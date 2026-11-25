@@ -60,8 +60,7 @@ def _injection_supported() -> bool:
 
 
 def _transformers_has_models(*names) -> bool:
-    # Model-binding subprocess tests skip on older Transformers that lack the modules (e.g. 4.57.x has qwen3_next but
-    # not qwen3_5 or olmo_hybrid) instead of ModuleNotFoundError.
+    # Model-binding tests skip if Transformers lacks a module, instead of ModuleNotFoundError.
     import importlib.util
 
     for name in names:
@@ -94,8 +93,7 @@ _NO_AUTORUN_SUBPROCESS = textwrap.dedent(
 
 
 def test_no_autorun_suppresses_import_time_injection():
-    # Runs in a fresh interpreter: conftest's import unsloth legitimately injects the vendored fla in-process, so the
-    # no-autorun invariant is checked in a subprocess without unsloth.
+    # No-autorun check runs in a subprocess; conftest's import unsloth injects fla in-process.
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.run(
@@ -273,8 +271,7 @@ _HYGIENE_SUBPROCESS = textwrap.dedent(
 
 
 def _rdna1_gpu_visible():
-    """Subprocess tests expect the vendored fla injected, but on RDNA1 (see _NO_DOT_INSTRUCTION_GFX) unsloth routes
-    gated-delta to pure torch by design, so that assertion is wrong there."""
+    """On RDNA1 unsloth routes gated-delta to pure torch, so expecting injected fla is wrong."""
     try:
         from unsloth_zoo.temporary_patches.fla_vendor import _gpu_lacks_dot_instructions
         return _gpu_lacks_dot_instructions()
@@ -665,8 +662,7 @@ def test_rocm_major9_device_not_treated_as_hopper():
 
 
 def test_hopper_at_nonzero_device_index_trips_guard():
-    # On a mixed host the model can run on a nonzero Hopper card while cuda:0 is another architecture; the guard must
-    # scan every visible device, not just device 0.
+    # Mixed hosts can put Hopper at a nonzero index, so the guard scans every visible device.
     import types
 
     from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
@@ -1099,8 +1095,7 @@ def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
 
 @requires_kernel_hub
 def test_force_fallback_rebinds_the_compiled_copy(monkeypatch):
-    """unsloth runs unsloth_compiled_module_<type>, which resolves fla on its own; on RDNA1 that copy must also be
-    forced to pure torch, or its forward re-enters fla and aborts with FDOT2."""
+    """Compiled module resolves fla itself; on RDNA1 force pure torch or it aborts with FDOT2."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     def original(): return "torch"
@@ -1226,8 +1221,7 @@ def test_dot_instruction_gate_is_rocm_only_and_fails_open():
 
 
 def test_rdna1_takes_the_pure_torch_gated_delta_path(monkeypatch):
-    """On RDNA1 patch_vendor_fla mirrors the Hopper opt-out: probe answers False, gated-delta module is unbound, reason
-    is reported, and injection (which would compile the kernels and abort) is never reached."""
+    """RDNA1 probe is False, gated-delta unbound, and injection (it would abort) is skipped."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     calls = []

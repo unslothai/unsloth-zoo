@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Memory checks: fused CE and JSD ops return stored gradients as extra outputs, so backward must not materialize zero
-[N, H] or trainable-head [V, H] gradients on each backward."""
+"""Fused CE/JSD return stored gradients; backward must not zero-fill [N,H] or trainable [V,H]."""
 
 import pytest
 import torch

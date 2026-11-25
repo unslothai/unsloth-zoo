@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression tests for the Gemma3 UNSLOTH_FORCE_FLOAT32 boundary dtype: activations follow the float projection
-weight dtype (fp32 full finetune), fp16 fallback for uint8 4bit blobs and unchanged for fp16 LoRA; behavioural, on
-real transformers modules."""
+"""CPU tests for the Gemma3 UNSLOTH_FORCE_FLOAT32 boundary dtype: activations follow the projection
+weight dtype (fp32 full finetune), fp16 fallback for uint8 4bit blobs, fp16 LoRA unchanged."""
 
 from __future__ import annotations
 
@@ -364,8 +363,7 @@ pass
 
 @requires_gemma3
 def test_forced_float32_mlp_downcasts_to_float16_when_4bit_weights_cannot_answer(forced_float32_patches):
-    """4bit QLoRA has no floating-point projection weight, so the boundary dtype is None; the forced output must still
-    fall back to float16 or down_proj gets float32."""
+    """4bit QLoRA: boundary dtype None; forced output still falls back to fp16, not fp32."""
     torch.manual_seed(0)
     mlp = gemma3.Gemma3MLP(_text_config()).to(torch.float16)
     _quantize_projections(mlp, ("gate_proj", "up_proj", "down_proj"))
@@ -445,8 +443,7 @@ _QUANT_STORAGE_DTYPES = [torch.uint8, torch.bfloat16, torch.float16, torch.float
 @pytest.mark.parametrize("storage_dtype", _QUANT_STORAGE_DTYPES,
                          ids = lambda d: str(d).split(".")[-1])
 def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_dtype):
-    """bnb_4bit_quant_storage is not the compute dtype: FSDP-QLoRA users set it to bfloat16 while weights stay packed
-    4bit, so a quantized weight must never answer the boundary dtype."""
+    """Quantized weights never answer; bnb_4bit_quant_storage is not the compute dtype."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     quantized = _Projections(**{
         name: _Projections(weight = _QuantizedWeight(
@@ -468,8 +465,7 @@ def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32],
                          ids = lambda d: str(d).split(".")[-1])
 def test_an_unquantized_weight_still_answers_and_the_skip_is_not_blanket(weight_dtype):
-    """Quantized weights are skipped by quant_state, not dtype: an unquantized bfloat16 weight must still answer, or
-    float32 full finetunes hit the mat1/mat2 dtype crash."""
+    """Skip quantized by quant_state, not dtype; unquantized bf16 must answer, or fp32 crashes."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     module = _Projections(**{
         name: torch.nn.Linear(4, 4, bias = False, dtype = weight_dtype) for name in names

@@ -302,8 +302,7 @@ def test_registered_in_rl_replacements():
     assert rr.RL_REPLACEMENTS["distillation_chunked_jsd"] is rr.distillation_chunked_jsd
 
 
-# The loss differentiates in forward with torch.func.grad_and_value and compiles that transform rather than per-chunk
-# gradient checkpointing; these tests pin the paths that introduces.
+# Compiles torch.func.grad_and_value in forward, not per-chunk checkpointing; tests pin it.
 
 
 def test_trainable_bias_receives_a_gradient():
@@ -321,8 +320,7 @@ def test_trainable_bias_receives_a_gradient():
 
 
 def test_frozen_bias_with_trained_head():
-    """Covers the (0, 1) argnums branch with a bias that exists but is frozen; _make already sets requires_grad False,
-    so assert that precondition or the test passes for a reason it does not name."""
+    """(0, 1) argnums branch, frozen bias; _make already freezes it, so the test asserts it."""
     sh, th, swt, twt, mask, sb, tb = _make(bias = True)
     sb.requires_grad_(False)
     assert not sb.requires_grad
@@ -442,9 +440,8 @@ def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
         sh.double(), th.double(), swt.double(), twt.double(), mask, beta = beta,
     )
     relative_error = (got.double() - reference).abs().item() / reference.abs().item()
-    # Threshold separates measured populations: dropping the float32 upcast gives ~0.45 (bfloat16) or up to 0.29
-    # (float16) relative error at interior betas, vs 1e-05 or better with it; an old 1e-4 bound, tuned on this box,
-    # failed on CPU-only runners.
+    # 1e-3 separates dropping the float32 upcast (~0.45 bfloat16, up to 0.29 float16 error) at
+    # interior betas from 1e-05 or better with it; old 1e-4 failed on CPU-only runners.
     assert relative_error < 1e-3, (
         f"{dtype} beta={beta} relative error {relative_error:.3e}; the divergence "
         "is no longer being computed in float32"
@@ -509,8 +506,7 @@ def test_trained_bias_with_frozen_head():
     assert sb.grad is not None and torch.isfinite(sb.grad).all()
     assert sh.grad is not None and torch.isfinite(sh.grad).all()
 
-    # The bias gradient must be the real one, not whatever sits at that tuple position; it must match a run with the
-    # head trainable, since it does not depend on that.
+    # Bias grad must be real, not the tuple slot's; a run with the head trainable must agree.
     sh2, th2, swt2, twt2, mask2, sb2, tb2 = _make(bias = True)
     sb2.requires_grad_(True)
     loss2, _, _ = rr.distillation_chunked_jsd(

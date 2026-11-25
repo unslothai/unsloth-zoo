@@ -41,8 +41,7 @@ NUM_EXPERTS = 4
 INTERMEDIATE = 8
 HIDDEN = 12
 TWO_INTER = 2 * INTERMEDIATE
-# Packings differ whenever NUM_EXPERTS and RANK both exceed one, and equal values do not make them agree; kept unequal
-# so an axis-confusing reshape cannot pass on shape alone.
+# Packings differ when NUM_EXPERTS and RANK exceed one; unequal sizes catch axis mix-ups.
 RANK = 3
 TOTAL_RANK = NUM_EXPERTS * RANK
 
@@ -62,8 +61,7 @@ requires_target_parameters = pytest.mark.skipif(
     reason="PEFT < 0.18 lacks target_parameters",
 )
 
-# The lora_B packing fix (unsloth_zoo 1269) makes rank_major the layout the separated forward trains; without it the
-# forward is always grouped_by_expert, so there is no default layout to test.
+# Packing fix (unsloth_zoo 1269): rank_major is the trained layout, else nothing to test.
 requires_packing_fix = pytest.mark.skipif(
     not callable(getattr(MU, "moe_lora_b_layout", None)),
     reason="needs the lora_B packing fix (unsloth_zoo#1269)",
@@ -95,9 +93,8 @@ def moe_param_wrapper_patch():
 
 @pytest.fixture
 def legacy_lora_b_layout(monkeypatch):
-    """Declares fused expert adapters grouped_by_expert (pre-fix packing); this is the only thing redirecting PEFT's
-    get_delta_weight, and it also makes the forward read them that way, so both agree whether or not unsloth_zoo 1269
-    has landed."""
+    """Declares fused adapters grouped_by_expert (pre-fix packing); this alone redirects PEFT's
+    get_delta_weight and the forward agrees, with or without unsloth_zoo 1269."""
     monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT)
 
 
@@ -182,8 +179,7 @@ def _wrap(target_parameters, experts_cls=_FusedExperts, seed=0, model=None,
 
 
 def _pristine_get_delta_weight():
-    """PEFT's own ParamWrapper.get_delta_weight, whether or not the patch is installed: import unsloth patches it on
-    transformers 5, and functools.wraps keeps the original at __wrapped__."""
+    """Pristine PEFT get_delta_weight via __wrapped__; unsloth patches it on transformers 5."""
     from peft.tuners.lora.layer import ParamWrapper
 
     function = ParamWrapper.get_delta_weight
@@ -199,8 +195,7 @@ def _seed_lora_b(wrapper, seed=1, adapter_name="default"):
 
 
 def _separated_forward_delta(wrapper, adapter_name="default"):
-    """Delta the separated MoE forward applies, in the base parameter's layout; built from the same extractor the
-    forward calls, so it is the packing, not a second opinion."""
+    """Delta the separated forward applies, via the extractor it calls: the packing itself."""
     weight_A = wrapper.lora_A[adapter_name].weight
     weight_B = wrapper.lora_B[adapter_name].weight
     first, second, scaling, _ = MU.extract_moe_lora_weights_for_grouped_mm(
@@ -221,9 +216,8 @@ def _separated_forward_delta(wrapper, adapter_name="default"):
 
 @requires_target_parameters
 def test_peft_still_packs_lora_b_rank_major():
-    """PEFT reads lora_B's E*R axis as (out, R, E), unchanged in 0.18.0, 0.19.0, 0.19.1, 0.20.0 and 0.21.0; the
-    separated forward is aligned to that, and a switch to (out, E, R) needs the packing fix and legacy merge
-    revisited."""
+    """PEFT packs lora_B as (out, R, E) in 0.18.0, 0.19.0, 0.19.1, 0.20.0, 0.21.0; the separated
+    forward matches; (out, E, R) would need the packing fix and legacy merge revisited."""
     model, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     weight_B = _seed_lora_b(wrapper)
@@ -277,8 +271,7 @@ def test_a_bitsandbytes_without_the_params4bit_class_is_treated_as_absent():
         "mod = types.ModuleType('bitsandbytes'); nn = types.ModuleType('bitsandbytes.nn')\n"
         "nn.Params4bit = object()\n"          # imports fine, is not a class
         "mod.nn = nn\n"
-        # Stub modules need __spec__: transformers 4.57's _is_package_available runs importlib.util.find_spec, which
-        # raises ValueError on a spec-less module; a real install always has a spec.
+        # Stubs need __spec__; transformers 4.57 find_spec raises ValueError without one.
         "mod.__spec__ = importlib.machinery.ModuleSpec('bitsandbytes', None)\n"
         "nn.__spec__ = importlib.machinery.ModuleSpec('bitsandbytes.nn', None)\n"
         "mod.__version__ = '0.48.0'\n"
@@ -312,8 +305,7 @@ def test_layout_of_a_fused_expert_wrapper_follows_the_declared_layout(
 def test_layout_of_a_fused_expert_wrapper_is_rank_major_by_default(
     moe_param_wrapper_patch, default_lora_b_layout,
 ):
-    """With the packing fix and nothing declared, the separated forward packs lora_B as PEFT does, so a fused expert
-    wrapper is rank_major and needs no marker or merge correction."""
+    """With packing fix and nothing declared, fused wrappers are rank_major: no marker needed."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     assert MU.moe_lora_b_layout_for_wrapper(wrappers["gate_up_proj"]) == \
         MU.LORA_B_LAYOUT_RANK_MAJOR
@@ -323,8 +315,7 @@ def test_layout_of_a_fused_expert_wrapper_is_rank_major_by_default(
 def test_get_delta_weight_is_pefts_own_unless_the_legacy_layout_is_declared(
     moe_param_wrapper_patch, default_lora_b_layout,
 ):
-    """Default must leave PEFT's get_delta_weight unpatched: it is correct for standard packing, and redirecting it
-    would also hit genuinely rank-major adapters not made by Unsloth."""
+    """Keep PEFT's get_delta_weight unless legacy: redirecting also hits rank-major adapters."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     _seed_lora_b(wrapper)
@@ -419,8 +410,7 @@ def test_merge_adapter_and_unmerge_adapter_go_through_the_same_delta(
 def test_the_delta_comes_back_in_the_parameters_dtype(
     dtype, moe_param_wrapper_patch, legacy_lora_b_layout,
 ):
-    """The merge adds the delta in place, so the reconstruction must return the base parameter's dtype: float32 for a
-    bf16 expert stack would raise or silently upcast."""
+    """Delta returns in the parameter's dtype; float32 for a bf16 stack would raise or upcast."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     wrapper.to(dtype)
@@ -434,8 +424,7 @@ def test_the_delta_comes_back_in_the_parameters_dtype(
 
 @requires_target_parameters
 def test_unfused_expert_parameters_keep_pefts_own_packing(moe_param_wrapper_patch):
-    """The separated forward claims only gate_up_proj and down_proj on a fused stack; the unfused 3D pair PEFT can
-    target (unsloth 11014) keeps PEFT's own packing and delta."""
+    """Only gate_up_proj and down_proj are claimed; unfused pairs (unsloth 11014) keep PEFT's."""
     from peft.tuners.lora.layer import ParamWrapper
 
     _, wrappers = _wrap(["experts.up_proj", "experts.down_proj"],
@@ -531,8 +520,7 @@ def test_the_marker_records_pefts_packing_when_peft_owns_the_wrapper(
 def test_a_non_main_process_save_writes_no_marker(
     tmp_path, moe_param_wrapper_patch, legacy_lora_b_layout,
 ):
-    """is_main_process=False means another rank owns the files; PEFT takes it positionally too, so the marker must read
-    it the same way or every rank rewrites adapter_config.json."""
+    """Marker reads is_main_process positionally like PEFT; else all ranks rewrite the config."""
     import inspect
 
     from peft import PeftModel
@@ -582,8 +570,7 @@ def test_a_dense_adapter_gets_no_marker(tmp_path, moe_param_wrapper_patch):
 def test_a_dense_adapter_beside_a_fused_one_gets_no_marker(
     tmp_path, moe_param_wrapper_patch, legacy_lora_b_layout,
 ):
-    """A PeftModel can hold a fused and a dense adapter; the marker must be per adapter, or a converter would repack the
-    dense adapter's weights, which are not packed that way."""
+    """Marker must be per adapter, or a converter would repack the dense adapter's weights."""
     model, wrappers = _wrap(["experts.gate_up_proj"], model=_ToyMoEWithDense())
     model.add_adapter(
         "dense",
@@ -645,8 +632,7 @@ def test_a_save_leaves_a_dense_adapters_own_keys_alone(tmp_path, moe_param_wrapp
     )
     model.save_pretrained(str(tmp_path))
 
-    # PEFT rewrites adapter_config.json from the LoraConfig on every save, so the planted key is set and the writer
-    # called directly; this tests the writer, not what survives a save.
+    # PEFT rewrites adapter_config.json on every save, so the writer is called directly.
     path = tmp_path / "dense" / "adapter_config.json"
     config = json.loads(path.read_text())
     config["lora_B_layout"] = "planted_by_someone_else"
@@ -801,8 +787,7 @@ def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(
     from peft.tuners.lora.layer import ParamWrapper
     from unsloth_zoo.temporary_patches.gpt_oss import patch_gpt_oss_moe_for_lora
 
-    # patch_gpt_oss_moe_for_lora rebinds GptOssExperts.forward process-wide; left in place, inspect.getsource returns
-    # Unsloth's wrapper, which upstream signature drift detectors read, so restore it.
+    # Patch rebinds GptOssExperts.forward process-wide; restore it so getsource sees upstream.
     experts_cls = modeling_gpt_oss.GptOssExperts
     saved = (ParamWrapper.forward, ParamWrapper.get_delta_weight, PeftModel.save_pretrained)
     saved_experts_forward = experts_cls.forward
@@ -848,8 +833,7 @@ def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(
                 "merge here"
             )
         if effect <= 1e-3:
-            # Skip, not assert, when the expert LoRA does not reach the forward: there is no forward to match, and a
-            # merge failure would blame the wrong defect; contract tests pin the arithmetic.
+            # Skip, not assert, if LoRA misses the forward: a merge failure would mislead.
             pytest.skip(
                 f"the expert LoRA does not reach the forward on this stack (effect "
                 f"{effect}), so merge parity cannot be measured here"
@@ -866,8 +850,7 @@ def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(
             for attribute in ("_unsloth_lora_patched", "_original_forward"):
                 if attribute in experts_cls.__dict__:
                     delattr(experts_cls, attribute)
-        # PEFT's parametrization leaves weakproxies that make a later test's gc.get_objects() tensor count raise, so
-        # references are dropped and gc.collect() runs.
+        # PEFT's weakproxies break a later test's gc.get_objects(); drop refs and collect.
         peft_model = merged = model = None
         gc.collect()
 
@@ -898,8 +881,7 @@ def test_a_cache_copy_that_matches_this_module_is_used():
 
 
 def test_a_cache_copy_from_another_version_is_ignored():
-    """install_to_cache swallows a failed copy, leaving an older cached moe_utils.py that callers prefer; byte equality
-    is pinned because a stale cache would silently drop this release's merge fix."""
+    """Failed copies are swallowed; a stale cached moe_utils.py silently drops this merge fix."""
     import pathlib
     import tempfile
 
@@ -924,8 +906,7 @@ def test_a_cache_copy_from_another_version_is_ignored():
 
 
 def test_an_unwritable_stale_cache_still_gets_this_releases_patches(tmp_path):
-    """End to end in a fresh interpreter: a pre-6930 moe_utils.py planted read-only in the cache, as in a container
-    image or read-only mount, must still end up with get_delta_weight patched."""
+    """A pre-6930 moe_utils.py in a read-only cache must still get get_delta_weight patched."""
     import pathlib
     import subprocess
     import textwrap
@@ -1069,8 +1050,7 @@ def test_the_atomic_rewrite_replaces_the_file_on_success(tmp_path):
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 @pytest.mark.parametrize("mode", [0o644, 0o664, 0o600])
 def test_the_atomic_rewrite_keeps_the_config_permissions(tmp_path, mode):
-    """The rewrite must keep the original mode: mkstemp creates 0600 files and os.replace keeps the new inode's mode,
-    tightening adapter_config.json to 0600 on every save."""
+    """adapter_config.json keeps its mode: mkstemp's 0600 would carry via os.replace on save."""
     path = tmp_path / "adapter_config.json"
     path.write_text(json.dumps({"peft_type": "LORA"}), encoding="utf-8")
     os.chmod(path, mode)

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fp16 full finetuning on T4/V100 (no bfloat16): forced fp16 RMSNorms broke fp32-weight matmuls, linears and SDPA in
-Gemma3/Gemma4-VL with Half vs float; CPU test; fp16 LoRA weights must stay bit-for-bit unchanged."""
+"""fp16 full finetune: forced fp16 norms broke fp32 matmuls; fp16 LoRA weights must stay bit-for-bit."""
 
 from __future__ import annotations
 

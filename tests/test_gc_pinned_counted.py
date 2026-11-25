@@ -2,8 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""torch 2.13+ host allocator settings: the pinned cap reads the allocator's own count. CPU only, with a
-small model of torch 2.14's CachingHostAllocator standing in for host_memory_stats / pinned allocs."""
+"""Pinned cap reads the allocator's own count; CPU only, models torch 2.14's host allocator."""
 import weakref
 
 import pytest

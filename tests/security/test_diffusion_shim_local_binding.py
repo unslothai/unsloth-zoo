@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the Host and Origin checks of the DiffusionGemma shim (no credential; loopback is no boundary against cross-site
-POST or DNS rebinding) and its generation ceiling that stops one caller holding the single-sequence decoder lock;
-in-process, no socket"""
+"""Pins the shim's Host and Origin checks (no credential; loopback is no boundary against cross-site
+POST or DNS rebinding) and generation ceiling bounding decoder-lock hold; in-process."""
 
 from __future__ import annotations
 

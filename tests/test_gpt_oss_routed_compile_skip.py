@@ -22,8 +22,7 @@ import torch
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 def test_table_check_runs_eagerly_when_the_compiled_frame_is_skipped():
-    # Inductor SkipFrame runs the table check eagerly; tracing it under Dynamo fails, so it stays
-    # out.
+    # Inductor SkipFrame runs the table check eagerly; under Dynamo it fails, so it stays out.
     import torch._dynamo
     from torch._dynamo.exc import SkipFrame
     from unsloth_zoo.temporary_patches import gpt_oss_routed as routed
@@ -147,8 +146,7 @@ def _run_skipped(step, *args):
 
 
 class _EagerProbe:
-    """An attribute read first on a forward's eager branch: a tensor op while traced (a non-empty graph, so the
-    backend sees and skips the frame), an untraceable call when run eagerly."""
+    """Read first: tensor op traced (non-empty graph, frame skipped), untraceable when eager."""
 
     def __init__(self, value):
         self.t, self.value, self.eager_reads = torch.zeros(1), value, 0

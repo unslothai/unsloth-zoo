@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Vendored fla backports for the KDA decode kernel (fla #1415 / #1416 / #1329 / #1135 /
-#1571 / #1414), the KDA output kernel score mask (fla #1582) and the cached backend
-package probe (fla #996)."""
+"""Vendored fla backports: KDA decode kernel (fla #1415 / #1416 / #1329 / #1135 / #1571 / #1414),
+KDA output kernel score mask (fla #1582) and cached backend package probe (fla #996)."""
 
 import os
 import pathlib
@@ -84,8 +83,7 @@ _PROBE_CHILD = textwrap.dedent(
 
 
 def test_backend_package_probe_is_cached():
-    # Every dispatched chunk_kda forward / backward calls is_available() on the FlashKDA
-    # backend; the find_spec behind it must run once per package, not once per call.
+    # Each chunk_kda call hits FlashKDA is_available(), so find_spec must run once per package.
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.run(

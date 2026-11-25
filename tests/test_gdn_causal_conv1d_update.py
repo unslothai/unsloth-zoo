@@ -94,7 +94,6 @@ def test_non_contiguous_state_view():
 
 @requires_cuda
 def test_repeated_decode_matches_full_conv():
-    # Token by token through the update == one causal conv over the whole sequence.
     B, D, T, W = 2, 192, 17, 4
     g = torch.Generator(device = "cuda").manual_seed(1)
     x = torch.randn(B, D, T, device = "cuda", generator = g, dtype = torch.float32)

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A device without torch._grouped_mm support must not reach it: torch 2.8 checks dprops->major == 9 exactly (B200 and
-A100 refused); the guard sits in _grouped_mm_with_backward_fix, the shared choke point; 2.6/2.7 lack it, 2.9 falls
-back internally."""
+"""Unsupported devices must not reach torch._grouped_mm: torch 2.8 checks dprops->major == 9 (B200,
+A100 refused); guard in _grouped_mm_with_backward_fix; 2.6/2.7 lack it, 2.9 falls back."""
 
 from unittest import mock
 
@@ -156,8 +155,7 @@ def test_an_empty_group_contributes_no_gradient(unsupported):
 
 
 def test_it_saves_only_shape_stable_tensors(unsupported):
-    """Saved shapes must depend only on inputs: a slice's shape is the router-decided group size, so saving slices made
-    non-reentrant checkpointing abort with CheckpointError (Qwen3_5_MoE on B200)."""
+    """Saved shapes must depend only on inputs: saved slices broke non-reentrant checkpointing."""
     inputs, weight, offsets = _case()
     inputs = inputs.requires_grad_(True)
     out = M._grouped_mm_with_backward_fix(inputs, weight, offsets)
@@ -180,8 +178,7 @@ def test_it_survives_non_reentrant_checkpointing(unsupported):
 
 
 def test_the_modulelist_stride_fallback_shares_the_same_helper():
-    """moe_grouped_modulelist._grouped_mm_fix had its own copy of the loop, and two callers tape its result, so the same
-    slice-shaped saved tensors were reachable via the 16-byte stride error."""
+    """Stride-error fallback must share the helper, or slice-shaped saves are reachable."""
     from unsloth_zoo.temporary_patches import moe_grouped_modulelist as G
 
     def _stride_error(*args, **kwargs):
@@ -310,8 +307,7 @@ def test_it_is_marked_as_not_compilable():
 
 
 def test_the_signature_ignores_autocast(unsupported):
-    """mv/mm are on the autocast lower-precision list and only the forward sees it, so FP32 inputs hashed bf16 on one
-    side and fp32 on the other, and every backward raised a routing error."""
+    """Signature ignores autocast: mv/mm lower to bf16 in forward only; else backward raises."""
     inputs = torch.randn(12, 8, dtype = torch.float32)
     offsets = torch.tensor([4, 8, 12], dtype = torch.int32)
 
@@ -322,8 +318,7 @@ def test_the_signature_ignores_autocast(unsupported):
 
 
 def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
-    """A dot product per row maps it to a scalar, so rows orthogonal to the projection hash like the zero row; swapping
-    such a pair across an expert boundary must still be seen."""
+    """Orthogonal rows hash like the zero row, so swapping across experts must still be seen."""
     hidden = 8
     ramp = torch.linspace(1.0, 2.0, hidden, dtype = torch.float32)
     p = torch.sin(ramp * M._SIGNATURE_STRIDES[0])
@@ -339,8 +334,7 @@ def test_a_row_orthogonal_to_the_projection_does_not_collide(unsupported):
 
 
 def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
-    """With grad off no node is built, so no signature is taken (the [T, hidden] projection is pure cost); a stash keyed
-    on the weight missed replays and pinned GPU tensors per decode step."""
+    """Grad-off calls take no signature (pure cost); a weight-keyed stash pinned GPU tensors."""
     inputs, weight, offsets = _case()
     taken = []
     real = M._routing_signature
@@ -376,8 +370,7 @@ def _live_tensor_count():
 
 
 def test_no_grad_decoding_retains_nothing(unsupported):
-    """Nothing module-level may grow across grad-off calls: an earlier stash held a strong ref to each weight, and PEFT
-    passes a fresh tensor per call, so long generations accumulated live GPU tensors."""
+    """Grad-off calls grow nothing: a stash held PEFT's fresh tensors, pinning live GPU memory."""
     import gc
 
     inputs, _, offsets = _case()
@@ -412,9 +405,8 @@ def test_the_live_tensor_walk_survives_a_dead_weakproxy():
 
 
 def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
-    """Four projections leave a hidden - 4 null space; the norm term is not linear in the row so it escapes that space,
-    and must reach the packed output. Checked structurally, since float32 cannot represent an exact null-space
-    collision."""
+    """Four projections leave a hidden-4 null space that the nonlinear norm escapes, and must reach
+    the output; checked structurally, since fp32 cannot form an exact null-space collision."""
     assert M._SIGNATURE_EXTRA == 1
     assert M._SIGNATURE_WIDTH == len(M._SIGNATURE_STRIDES) + M._SIGNATURE_EXTRA
 
@@ -444,8 +436,7 @@ def test_the_forward_does_not_sync_the_offsets_twice(unsupported):
 
 
 def test_the_norm_does_not_materialize_fp32_copies(unsupported):
-    """The norm uses vector_norm: (x.float() * x.float()).sum() held two fp32 copies and their product at once; asserted
-    on source since CPU tests cannot snapshot the allocator."""
+    """Checked on source (vector_norm, no fp32 copies); CPU tests can't snapshot the allocator."""
     import inspect
 
     body = inspect.getsource(M._routing_signature)
@@ -495,8 +486,7 @@ def test_a_cast_still_takes_the_temporary(unsupported):
 
 
 def test_writing_in_place_changes_no_gradient(unsupported):
-    """Each group's gradient must land in its own slice; compared by closeness, not torch.equal, since out= rounding
-    varies by BLAS build (a misplaced slice moves values by whole magnitudes)."""
+    """Group grads land in own slice; compare by closeness (out= rounding varies by BLAS)."""
     inputs, weight, offsets = _case(n_experts = 4, rows_each = 3, k = 6, n = 5)
     x = inputs.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)
@@ -595,8 +585,7 @@ def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkey
 
 
 def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
-    """_check_grouped_gemm_available must refuse without CUDA even when the kernel imports, since the kernel asserts
-    CUDA; the import is stubbed so the device check runs."""
+    """_check_grouped_gemm_available refuses without CUDA; kernel imports but asserts CUDA."""
     import sys, types
 
     for name in (

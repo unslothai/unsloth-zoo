@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Cached QSA decode (Qwen4Exp) must match the full-prefix recompute's logits and the reference
-indexer's tokens and pooled block keys across budget, padding, LoRA, mask, dtype and kill-switch
-cases; it also catches a block pooled before its tokens are written (SGLang #46125)."""
+"""Cached QSA decode (Qwen4Exp) must match the recompute's logits and the indexer's tokens and block
+keys across budget, padding, LoRA, mask, dtype; catches early pooling (SGLang #46125)."""
 
 import os
 
@@ -160,8 +159,7 @@ def _reference_block_keys(indexer, raw, full_cos, full_sin, start, n_blocks):
 
 
 def _install_checker(monkeypatch, record):
-    """Around every cached-decode step: the selection must equal the reference indexer's on the same inputs, and the
-    cached block keys must equal the reference's pooling of the complete blocks."""
+    """Each cached step must match the reference indexer's selection and complete-block keys."""
     real = _REAL_CACHED_DECODE
 
     def checked(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):

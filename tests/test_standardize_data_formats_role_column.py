@@ -135,8 +135,7 @@ def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
         assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
         assert out[0]["conversations"][0]["content"] == "Braund, Mr. Owen Harris"
     finally:
-        # previous is None in a fresh process, yet leaving the method pinned makes later tests order-dependent;
-        # set_start_method(None, force = True) clears _actual_context, it does not pick.
+        # Restore even a None start method, or later tests become order-dependent.
         multiprocess.set_start_method(previous, force = True)
 
 
@@ -238,8 +237,7 @@ def test_the_default_alias_lists_are_disjoint():
 
 
 def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
-    """Restoring only a non-None previous leaves the parametrised method globally pinned, so
-    test_start_method_probe_matches_the_pool_multiprocess_would_build skips and loses its assertion."""
+    """Restoring only a non-None previous leaves the method pinned, so the probe test skips."""
     multiprocess = pytest.importorskip("multiprocess")
 
     before = multiprocess.get_start_method(allow_none = True)

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests patch_datasets_map_worker_death_retry (temporary_patches/misc.py): retries only the 'abruptly died during map'
-error from an OOM-killed dataset_num_proc worker; real map errors propagate."""
+"""Tests patch_datasets_map_worker_death_retry: only OOM-killed worker map errors are retried."""
 
 import ast
 import inspect

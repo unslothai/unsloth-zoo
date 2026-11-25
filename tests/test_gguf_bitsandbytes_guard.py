@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests the bitsandbytes guard in llama_cpp.convert_to_gguf: llama.cpp has no bitsandbytes dequantizer and refuses only
-after reading the whole model, so the guard must fire before the subprocess; the detector recurses for VLM
-sub-configs."""
+"""llama.cpp has no bitsandbytes dequantizer and refuses only after reading the model, so the guard
+must fire before the subprocess; the detector recurses into VLM sub-configs."""
 
 import ast
 from pathlib import Path
@@ -81,7 +80,6 @@ def test_non_dict_inputs_are_safe():
 def test_guard_is_wired_into_convert_to_gguf():
     body = _SRC[_SRC.index("def convert_to_gguf("):]
     assert "_find_bitsandbytes_quantization(config_file)" in body
-    # The guard must precede the converter subprocess.
     guard = body.index("_find_bitsandbytes_quantization(config_file)")
     launch = body.index("subprocess.run")
     assert guard < launch

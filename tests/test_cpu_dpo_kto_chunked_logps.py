@@ -211,9 +211,8 @@ def test_chunked_bf16_close_to_trl(tmp_path, kind):
 
 @pytest.mark.parametrize("preference", ["1", "0"], ids = ["chunked", "trl"])
 def test_bf16_kto_lora_step_trains_the_adapters(tmp_path, monkeypatch, preference):
-    """KTO scores the KL completions under no_grad before the policy pass, inside the trainer's one autocast region:
-    a cached cast of the fp32 adapters left them without gradients, and gradient checkpointing's recompute failed.
-    UNSLOTH_CPU_BF16=1 forces bf16 so runners without native bf16 run it too (emulated, slower)."""
+    """KTO's no_grad scoring: a cached fp32 adapter cast left them without grads and broke
+    checkpoint recompute; UNSLOTH_CPU_BF16=1 forces bf16 on CPUs without native bf16 (emulated)."""
     from unsloth_zoo.cpu import runtime
     monkeypatch.setenv("UNSLOTH_CPU_BF16", "1")
     monkeypatch.setenv("UNSLOTH_CPU_CHUNKED_PREFERENCE", preference)

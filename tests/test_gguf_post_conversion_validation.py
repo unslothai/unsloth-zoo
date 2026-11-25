@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Post-conversion GGUF verification (unsloth 6056, unsloth 8360, unsloth 8513); builds GGUFs with `gguf.GGUFWriter`, so
-no network, model or llama.cpp build is needed."""
+"""Post-conversion GGUF checks (unsloth 6056, unsloth 8360, unsloth 8513); needs no llama.cpp."""
 
 import importlib.util
 import os

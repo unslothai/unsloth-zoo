@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision grid helpers in transformers/vision_utils.py must never compile fullgraph: grid_thw.tolist() gives unbacked
-SymInt shapes that raise UserError; names are enumerated, not hard-coded."""
+"""Never compile grid helpers fullgraph: grid_thw.tolist() yields unbacked SymInt, raising UserError."""
 
 import inspect
 

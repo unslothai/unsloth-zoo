@@ -157,8 +157,7 @@ def test_registered_replacement_inside_an_epoch_rebuilds(proj, what):
 
 @needs_cuda
 def test_moved_or_requantized_first_expert_inside_an_epoch_rebuilds():
-    # .data / quant_state surgery registers nothing; the sentinel watches the first expert of each list, which a
-    # move (.to / .cuda) or a requantization of all experts always changes.
+    # .data/quant_state edits go unregistered; first-expert sentinel sees moves and requants.
     ex = _Experts(True).eval()
     cache = _Cache()
     with torch.no_grad():
@@ -205,8 +204,7 @@ def test_generate_and_cache_reset_start_a_new_epoch(monkeypatch):
 @pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
 @pytest.mark.parametrize("what", ["module", "weight"])
 def test_registration_after_the_steps_epoch_capture_rebuilds(proj, what):
-    # The decode loop captures the epoch once per token, before its layers run: a replacement registered after
-    # that capture (a hook inside the step) must not be served from the old tables.
+    # Epoch is captured per token before layers; a replacement registered later must rebuild.
     ex = _Experts(True).eval()
     mid = E // 2
     cache = _Cache()

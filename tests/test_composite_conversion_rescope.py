@@ -33,8 +33,7 @@ from unsloth_zoo.temporary_patches.common import RESCOPE_PATCH_FLAG, WRAPPER_INN
 
 def _core_model_loading():
     core = pytest.importorskip("transformers.core_model_loading")
-    # On transformers 4.x unsloth installs an inert stand-in from unsloth/import_fixes.py whose renames do nothing; its
-    # __file__ is not a file on disk, so skip it.
+    # transformers 4.x unsloth stand-in: renames do nothing and __file__ is not on disk; skip.
     if not os.path.isfile(getattr(core, "__file__", None) or ""):
         pytest.skip(
             f"transformers.core_model_loading is a stand-in ({getattr(core, '__file__', None)!r}), "
@@ -181,8 +180,7 @@ def test_rescoped_renaming_refuses_an_unanchored_pattern():
 
 
 def test_on_a_fixed_transformers_the_rescope_changes_nothing(composite_model):
-    """On a release that already scopes submodule mappings the leaked signature remains, but transformers sets
-    scope_prefix so the entry is skipped and the caller's own list returns; checked by identity."""
+    """On fixed transformers, scope_prefix skips the leaked entry; the caller's list returns."""
     conversion_mapping = _requires_submodule_extraction()
     if not rescope._transformers_rescopes_submodule_prefix_renamings():
         pytest.skip("this transformers is inside the defect window; see the real-checkpoint matrix")
@@ -218,8 +216,7 @@ def test_a_non_composite_model_gets_its_own_list_back():
 
 
 def _base_mapping_fn(conversion_mapping):
-    """Walks past the wrappers TEMPORARY_PATCHES leave on the module attribute, so a test installs onto a clean
-    function, not one the already-installed check refuses."""
+    """Unwraps the wrappers TEMPORARY_PATCHES leave, so a test installs onto a clean function."""
     function = conversion_mapping.get_model_conversion_mapping
     for _ in range(8):
         following = (
@@ -273,8 +270,7 @@ def test_repair_detection_sees_both_packages_marks():
     on_top.__wrapped__ = unsloth_marked
     assert rescope._repair_already_installed(on_top) is True
 
-    # Marks only WRAPPER_INNER_ATTR (as moe_utils_bnb4bit.py does), since publishing __wrapped__ would make the rescope
-    # replace the MoE wrapper and drop per-expert converters.
+    # Mark only WRAPPER_INNER_ATTR: __wrapped__ makes the rescope drop per-expert converters.
     def moe_style():
         pass
     setattr(moe_style, WRAPPER_INNER_ATTR, zoo_marked)
@@ -391,9 +387,8 @@ def test_repair_probe_never_raises_without_transformers(monkeypatch):
 
 
 def test_the_sweep_leaves_a_wrapper_it_does_not_supersede(monkeypatch):
-    """The rebinding sweep is needed because a from-import holds the function object, but it must not overwrite a
-    third-party wrapper on the alias: our wrapper closes over the module attribute, so overwriting silently drops
-    their behaviour."""
+    """The sweep rebinds from-import aliases, which hold the function object, but must not overwrite
+    a third-party wrapper there, since that silently drops its behaviour."""
     conversion_mapping = _requires_submodule_extraction()
     if rescope._transformers_rescopes_submodule_prefix_renamings():
         pytest.skip("this transformers carries the upstream fix; the re-scope declines")

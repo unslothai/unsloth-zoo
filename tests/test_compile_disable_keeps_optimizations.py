@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks that UNSLOTH_COMPILE_DISABLE set to '1' or 'partial' only switches off torch.compile: rewritten classes, fast
-LoRA forward and SDPA mask fix stay on, eager, with no Dynamo frame traced; probed in a subprocess since the flag is
-read at import"""
+"""UNSLOTH_COMPILE_DISABLE=1 or partial only switches off torch.compile; the flag is read at import."""
 
 import json
 import os

@@ -185,8 +185,7 @@ def test_native_rope_below_the_window_is_untouched(tmp_path, native):
 
 
 def _unsloth_llama_rotary(applied):
-    """Stand-in for unsloth/models/llama.py's LlamaRotaryEmbedding, which keeps its frequencies as
-    _unsloth_inv_freq_cpu; when transformers cannot build the scaled ones it falls back to unscaled RoPE."""
+    """Stand-in for unsloth's LlamaRotaryEmbedding; unscaled RoPE if transformers can't scale."""
     from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
 
     class LlamaRotaryEmbedding(HFLlamaRotaryEmbedding):

@@ -80,7 +80,6 @@ USERS = ["Zebra question alpha", "Quokka inquiry bravo"]
 ASSTS = ["Penguin answer delta", "Dolphin reply echo"]
 PLAIN = [{"role": "user", "content": USERS[0]}, {"role": "assistant", "content": ASSTS[0]},
          {"role": "user", "content": USERS[1]}, {"role": "assistant", "content": ASSTS[1]}]
-# Reasoning probe: the final assistant turn carries a think block + answer.
 REASON = [{"role": "user", "content": "Reason user one"},
           {"role": "assistant", "content": "<think>HIDDENREASON</think>VISIBLEANSWER"}]
 # Second conversation concatenated after PLAIN to stand in for packing; it opens with a system message since, with no

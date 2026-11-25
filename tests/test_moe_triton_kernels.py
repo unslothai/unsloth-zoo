@@ -53,8 +53,7 @@ def _ptxas_fuses_rn_mul_add():
 
 
 def _max_fp32_bit_distance(out, ref, step = 1 << 24):
-    """Largest |int bits(out) - int bits(ref)|, in int64: int32 wraps a sign flip (2**31) to a negative distance.
-    Sliced so the int64 copies stay small next to multi-GB weights."""
+    """Max bit distance in int64: int32 would wrap a sign flip (2**31) to a negative value."""
     a, b = out.reshape(-1).view(torch.int32), ref.reshape(-1).view(torch.int32)
     worst = 0
     for i in range(0, a.numel(), step):

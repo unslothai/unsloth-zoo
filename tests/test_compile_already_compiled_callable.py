@@ -12,45 +12,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""`torch_compile` on a callable that has already been compiled.
-
-GPT-OSS inference dies at load on torch 2.11 with a bare, message-less
-
-    AssertionError:
-
-out of `patch_GptOssAttention` -> `_compile_or_fall_back` -> `torch.compile`.
-The assert is torch's own:
-
-    torch/_dynamo/eval_frame.py:
-        assert not hasattr(compile_wrapper, "get_compiler_config")
-
-`compile_wrapper` is built with `functools.wraps(fn)`, which copies
-`fn.__dict__`, so the assert says "the function you handed me is already a
-compiled one". Dynamo unwraps its own wrappers first (`innermost_fn`), so this
-can only be reached through a `functools.wraps` copy of a compiled function
-that forwards `get_compiler_config` -- which is exactly what
-`_fall_back_to_eager_on_recompile_limit` returns, on purpose, so that
-"is this compiled?" checks keep answering yes after the fallback is installed.
-
-The chain under GPT-OSS:
-
-  * `pre_compile` writes `unsloth_compiled_cache/unsloth_compiled_module_gpt_oss.py`,
-    whose `apply_rotary_pos_emb` carries
-    `@torch_compile_with_fallback(fullgraph = True, ...)`, and installs it on
-    `transformers.models.gpt_oss.modeling_gpt_oss`.
-  * `post_compile` re-runs `patch_GptOssAttention`, which imports that name and
-    calls `torch_compile(apply_rotary_pos_emb)` -- no `fullgraph`.
-
-Up to torch 2.10 `innermost_fn` followed `_torchdynamo_orig_callable`
-unconditionally, unwrapped the copy to the eager original and recompiled it, so
-none of this showed. torch 2.11 also requires
-`_torchdynamo_wrapper_id == id(fn)`, which a `functools.wraps` copy cannot
-satisfy, and the assert became reachable.
-
-`patch_function` has always hand-unwrapped `get_compiler_config` carriers via
-`__wrapped__` before compiling. The bare `torch_compile` / `_torch_compile`
-decorators never did.
-"""
+"""GPT-OSS load dies on torch 2.11: bare torch_compile of a functools.wraps copy of a compiled fn
+hits the get_compiler_config assert (torch 2.10 unwrapped it); patch_function unwraps
+__wrapped__, bare decorators never did"""
 
 import functools
 import os
@@ -206,8 +170,7 @@ def test_the_gpt_oss_load_sequence_does_not_assert():
 
 
 def test_a_refused_decoration_falls_back_to_eager_without_fullgraph():
-    """On the non-fullgraph branch a refused torch.compile decoration falls back to eager with a warning, as the
-    fullgraph branch does, rather than failing the model load."""
+    """A refused torch.compile falls back to eager with a warning instead of failing the load."""
     out = _run_with_compile_enabled("""
         import logging
         import torch

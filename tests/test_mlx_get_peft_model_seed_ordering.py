@@ -30,8 +30,7 @@ def _get_peft_model_source():
 
 
 def test_seed_immediately_precedes_each_linear_to_lora_layers_call():
-    """Every adapter-constructing call in get_peft_model must be preceded within ~20 lines by _seed_mlx_random_state
-    (seed right above it); farther, lazy MLX state diverges from mlx-lm CLI."""
+    """Seed within ~20 lines above each adapter call, else lazy MLX state diverges from mlx-lm."""
     src = _get_peft_model_source()
     lines = src.splitlines()
 

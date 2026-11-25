@@ -234,8 +234,7 @@ print(json.dumps({"after": str(getattr(p._GEMMA4_BOUNDARY, "dtype", None))}))
 
 
 def test_gemma4_boundary_does_not_leak_past_its_scope(tmp_path):
-    # Failing before: a stale float32 boundary made the multimodal embedder norm return float32 into its fp16
-    # projector ("expected m1 and m2 to have the same dtype, but got: float != c10::Half").
+    # Failing before: a stale float32 boundary fed float32 to fp16 projector (dtype mismatch).
     import pytest
 
     try:

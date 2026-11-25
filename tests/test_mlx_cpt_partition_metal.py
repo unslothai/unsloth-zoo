@@ -128,8 +128,7 @@ def test_all_linear_sentinel_accepts_set_form():
 
 
 def test_all_linear_expands_inside_a_mixed_cpt_target_list():
-    # In a CPT target list the sentinel is "all-linear"; a literal all-linear matches no module and the CPT entry
-    # silences the no-target guard, so layer adapters vanished
+    # A literal all-linear in CPT lists matches nothing and silences the no-target guard.
     m = _tiny()
     _peft(m, target_modules=["all-linear", "embed_tokens"])
     trn = set(dict(mu.tree_flatten(m.trainable_parameters())))

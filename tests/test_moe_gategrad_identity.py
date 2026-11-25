@@ -60,8 +60,7 @@ def test_exact_with_lora_down_projection():
 
 
 def test_matches_autograd_with_negative_gate():
-    # Gemma4 folds an unconstrained per_expert_scale into top_k_weights, so routing weights can be negative; divide by
-    # the signed weight, never clamp toward a positive floor
+    # Unconstrained per_expert_scale (Gemma4) can make weights negative: divide, never clamp.
     torch.manual_seed(2)
     inter = torch.randn(16, 24)
     gate = torch.randn(16) * 0.5
@@ -115,9 +114,8 @@ def test_matches_autograd_with_zero_gate():
 
 
 def test_fp16_gate_floors_in_fp32_without_output_leak():
-    # fp16 routing weights are floored in fp32 (eps 1e-12), not at fp16's smallest normal (~6e-5), which would leak
-    # eps*|Y| into a masked route's output at a magnitude fp16 can represent; mirrors the call-site upcast in
-    # forward_native_grouped_mm
+    # fp16 gates are floored in fp32 (eps 1e-12), not at fp16's smallest normal (~6e-5), which would
+    # leak eps*|Y| into masked routes; mirrors the upcast in forward_native_grouped_mm.
     torch.manual_seed(5)
     gate16 = torch.rand(8, dtype=torch.float16) * 0.5
     gate16[0] = 0.0

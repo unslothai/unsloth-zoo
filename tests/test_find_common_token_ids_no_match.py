@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_find_common_token_ids returns no core when the core is absent from the component, never the bare [0] sentinel (masks
-every <unk>/<pad>) or a sentinel-glued id (masks the whole dataset); train_on_responses_only raises a named error for
-it."""
+"""_find_common_token_ids returns no core when absent, never the bare [0] sentinel (masks every
+<unk>/<pad>) or a sentinel-glued id (masks the whole dataset); train_on_responses_only raises."""
 
 import pytest
 
@@ -116,8 +115,7 @@ def test_unlocated_core_raises_before_a_masking_function_exists():
 
 
 def test_same_marker_with_force_match_still_builds_a_masking_function():
-    """Guards that only the unrecoverable case is rejected: the same marker with force_match=True has a core equal to
-    its tokenization and still builds a masking function."""
+    """Only unrecoverable cases are rejected; the same marker with force_match=True builds."""
     tokenizer = StubTokenizer(NO_COMMON_CORE)
 
     mask_fn = train_on_responses_only(

@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Loader hook must restore GPT-OSS [E, G*B*2, D] after zoo's un-transposed convert: it patches dequantize (4.x) and
-dequantize_convertops (5.0+), since patching only dequantize had left 5.0+ with dims 1 and 2 swapped; subprocess as
-patching is process-wide."""
+"""Loader hook must patch dequantize (4.x) and dequantize_convertops (5.0+) to restore GPT-OSS layout."""
 
 import os
 import subprocess

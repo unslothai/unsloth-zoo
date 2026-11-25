@@ -46,8 +46,7 @@ def _apply_granite_patches(monkeypatch):
 
 
 def _norm(cls, hidden_size):
-    # transformers 5.23 normalises the gated norm per group (`group_size` is required); two groups per row make the
-    # rewritten forward match stock only if it keeps the grouping.
+    # transformers 5.23 gated norm needs group_size; two groups per row, so keep grouping.
     if "group_size" in inspect.signature(cls.__init__).parameters:
         return cls(hidden_size, group_size = hidden_size // 2)
     return cls(hidden_size)

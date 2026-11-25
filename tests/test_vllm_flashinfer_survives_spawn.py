@@ -115,8 +115,7 @@ def test_the_flag_is_reset_per_call():
 
 
 def test_both_blocking_arms_also_set_the_flag():
-    """The sys.modules block and the engine arg must never disagree, or parent and worker choose different backends;
-    each block arm also sets _UNSLOTH_FLASHINFER_UNUSABLE."""
+    """sys.modules block and engine arg must agree; each block arm sets _UNSLOTH_FLASHINFER_UNUSABLE."""
     source = inspect.getsource(vllm_utils.load_vllm)
     blocks = source.count("_block_flashinfer_import()")
     flags = source.count("_UNSLOTH_FLASHINFER_UNUSABLE = True")
@@ -232,8 +231,7 @@ def test_the_unblock_is_the_first_thing_delete_vllm_does():
 
 
 def _load_vllm_failure_arm():
-    """The except BaseException arm of the try that wraps load_vllm's whole engine build. Inner retry loops have their
-    own except BaseException arms, so the first one in the text is not necessarily this one."""
+    """except BaseException covers load_vllm's whole engine build; inner retry loops have their own arms."""
     source = textwrap.dedent(inspect.getsource(vllm_utils.load_vllm))
     fn = ast.parse(source).body[0]
     arms = [

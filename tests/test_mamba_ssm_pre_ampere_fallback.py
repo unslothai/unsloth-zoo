@@ -136,8 +136,7 @@ def env(monkeypatch):
             sys.modules[parent] = m
             saved.setdefault(parent, None)
     sys.modules["transformers"].utils = sys.modules["transformers.utils"]
-    # import a.b.c as x resolves through getattr, so this attribute outlives a sys.modules-only teardown and must be
-    # restored too, or later imports get the stub (test_vendor_fla.py, fla_vendor.py).
+    # import a.b.c as x uses getattr: restore the attribute or test_vendor_fla.py gets a stub.
     utils_mod = sys.modules["transformers.utils"]
     had_attr = hasattr(utils_mod, "import_utils")
     saved_attr = getattr(utils_mod, "import_utils", None)
@@ -235,9 +234,8 @@ def test_the_mixer_wrapper_is_applied_once(env):
 
 
 def _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk):
-    """transformers >= 5.3 shape: kernel resolution moved into the mixer __init__, so the module has no
-    is_fast_path_available until a mixer is built; availability is read from _HUB_KERNEL_MAPPING like
-    lazy_load_kernel, so unregistering Hub kernels disables it."""
+    """transformers 5.3+ resolves kernels in the mixer __init__, so is_fast_path_available is absent
+    until a mixer exists; availability reads _HUB_KERNEL_MAPPING like lazy_load_kernel."""
     mod = types.ModuleType(mod_name)
 
     def _kernels_available():
@@ -348,8 +346,7 @@ def test_the_config_flag_is_cleared_for_jamba_5_5(env):
 
 
 def _fake_config_module(mod_name, cls_name):
-    """Stand-in for jamba/zamba config: use_mamba_kernels defaults to True and is written into every config.json, so
-    both the default and an explicit True must end up cleared."""
+    """use_mamba_kernels defaults to True and is in every config.json; both must be cleared."""
     mod = types.ModuleType(mod_name)
 
     class Config:
@@ -473,8 +470,7 @@ def test_no_mamba_ssm_is_untouched(env):
     assert iu.is_mamba_ssm_available() is True
 
 
-# lazy_load_kernel resolves mamba-ssm from kernels-community when the `kernels` package is installed; it needs no local
-# wheel and never calls is_mamba_ssm_available, so the predicates above cannot reach it.
+# lazy_load_kernel never calls is_mamba_ssm_available, so the predicates cannot reach it.
 
 def test_pre_ampere_unregisters_the_hub_kernels(env):
     _model_mod, _iu, hk = env
@@ -784,8 +780,7 @@ def test_two_ampere_gpus_keep_the_fast_path(env, monkeypatch):
 
 # Keep last: it checks what the `env` fixture left behind after teardown.
 def test_the_fixture_leaves_no_stub_bound_on_transformers_utils():
-    """The stub must not outlive the fixture: import a.b.c as x resolves via getattr, so a leaked transformers.utils
-    attribute reaches later import_utils imports (tests/test_vendor_fla.py, fla_vendor.py)."""
+    """Stub must not leak: import a.b.c as x resolves via getattr, so later imports see it."""
     utils_mod = sys.modules.get("transformers.utils")
     if utils_mod is None or getattr(utils_mod, "__file__", None) is None:
         pytest.skip("real transformers.utils was never imported in this session")

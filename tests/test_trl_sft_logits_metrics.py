@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests trl's SFTTrainer logits metrics: outputs.logits is read twice, and on trl 1.x the second read runs first so the
-entropy rebind is inert; runs the real compute_loss and a trl 1.x stand-in that keeps liger-only kwargs out of the
-forward."""
+"""Tests trl's SFTTrainer logits metrics: outputs.logits is read twice, and on trl 1.x the second
+read runs first so the entropy rebind is inert; liger-only kwargs stay out of the forward."""
 import collections
 import contextlib
 import inspect
@@ -72,8 +71,7 @@ class _Model:
 
 @pytest.fixture(autouse = True)
 def _pin_the_accelerate_device(monkeypatch):
-    """accelerate.PartialState is process-global: an earlier Accelerator leaves cuda in its shared state, so the entropy
-    fallback fails on CPU tensors; pin it to cpu."""
+    """Process-global PartialState: earlier cuda breaks the CPU-tensor fallback; pin to CPU."""
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
 
@@ -84,8 +82,7 @@ def sft():
     sftmod = pytest.importorskip("trl.trainer.sft_trainer")
     if not hasattr(sftmod, "SFTTrainer"):
         pytest.skip("this trl has no SFTTrainer")
-    # trl 1.15 computes loss, entropy and accuracy via model(**inputs, fused_lm_head=True) and never reads
-    # outputs.logits, so the empty-logits path does not exist there.
+    # trl 1.15 uses fused_lm_head=True and never reads outputs.logits, so no empty-logits path.
     if "fused_lm_head" in inspect.getsource(sftmod.SFTTrainer.compute_loss):
         pytest.skip("this trl scores SFT through its fused LM head, not outputs.logits")
     from unsloth_zoo.temporary_patches.misc import (
@@ -125,8 +122,7 @@ def _inputs(B = 2, L = 6, V = 11):
 
 
 def _run_steps(sftmod, logits, steps = 3, pop_labels = False):
-    """Drive trl's real compute_loss with a Trainer.compute_loss that returns
-    `logits`, and report the metrics it accumulated."""
+    """Runs trl's real compute_loss over a stub returning logits; returns its metrics."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits")
     loss = torch.tensor(1.0)
@@ -134,8 +130,7 @@ def _run_steps(sftmod, logits, steps = 3, pop_labels = False):
 
     def fake(self, model, inputs, return_outputs = False, num_items_in_batch = None):
         calls[0] += 1
-        # transformers pops labels from inputs whenever compute_loss_func or label smoothing is set, so a retry reusing
-        # the same mapping runs a forward with no labels or loss.
+        # Labels get popped with compute_loss_func or label smoothing set; retries need copies.
         if pop_labels: inputs.pop("labels")
         assert "labels" in inputs or pop_labels
         out = Out(loss, logits)
@@ -276,8 +271,7 @@ def test_the_stub_covers_what_trl_reads(sft):
 
 
 # ---- against a stand-in for trl 1.x --------------------------------------
-# trl 1.x is not installed here; its liger branch runs BEFORE the forward and writes liger-only kwargs into the batch,
-# which decides whether the off switch is usable at all.
+# trl 1.x writes liger-only kwargs before forward, which decides if the off switch is usable.
 
 FORWARD_KWARGS_SEEN = []
 
@@ -421,8 +415,7 @@ def trl_logs_aux(sft):
 
 def _run_with_aux(sftmod, logits, steps = 3, aux = torch.tensor(0.25),
                   trainer_logs_aux = False):
-    """Like _run_steps but outputs carry aux_loss on a MoE trainer; trainer_logs_aux stands in for trl 1.x, which moved
-    aux_loss out of the use_liger_kernel branch and logs it itself."""
+    """Like _run_steps with aux_loss; trainer_logs_aux stands in for trl 1.x's own logging."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
     loss = torch.tensor(1.0)
@@ -470,8 +463,7 @@ def test_aux_loss_is_left_alone_when_the_run_is_not_moe(sft):
 
 
 def test_the_ordinary_call_shape_is_unchanged_for_a_dense_run():
-    """return_outputs is forced only when an aux_loss must be rescued; checked on the wrapper's own call into trl, since
-    trl passes return_outputs = True on every version."""
+    """Forces return_outputs only to rescue aux_loss; trl passes True, so check our own call."""
     from unsloth_zoo.temporary_patches.misc import _sft_call_without_logits_metrics
     seen = []
 
@@ -507,8 +499,7 @@ def test_a_trainer_that_asked_for_outputs_still_gets_them():
 
 
 def test_a_missing_logits_attribute_still_raises(sft):
-    """A getattr default of None would treat an absent logits attribute as unusable and retry with metrics off, turning
-    a broken output contract into silent training."""
+    """Missing logits must raise: a getattr None default would silently train with metrics off."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss")
 
@@ -607,8 +598,7 @@ def test_a_real_failure_leaves_the_entropy_flag_alone(sft):
 
 
 def _log_would_divide_by_zero(self):
-    """Returns names of empty metrics: SFTTrainer.log on trl 0.25.1 averages every key with sum(val) / len(val), so an
-    empty list is a ZeroDivisionError at the first log."""
+    """Names of empty metrics, which raise ZeroDivisionError in trl 0.25.1's SFTTrainer.log."""
     return sorted(n for n, v in self._metrics["train"].items() if len(v) == 0)
 
 
@@ -720,9 +710,8 @@ def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
 
 
 def test_a_failing_retry_does_not_latch_the_fast_path():
-    """Latch the fast path only after the retry succeeds: logits wanted elsewhere (loss_type='dft', custom loss) make
-    the retry raise, so an early latch keeps the no-logits path for the process, even with UNSLOTH_RETURN_LOGITS=1;
-    the detector reads a local named outputs."""
+    """Latch only after the retry succeeds: loss_type='dft' or custom loss make the retry raise, and
+    an early latch sticks even with UNSLOTH_RETURN_LOGITS=1; detector reads local outputs."""
     from unsloth_zoo.temporary_patches.misc import _sft_wrap_compute_loss
     Out = collections.namedtuple("Out", "loss logits")
     calls = []

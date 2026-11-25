@@ -95,9 +95,8 @@ def test_patching_utils_imports_when_bitsandbytes_cannot(poisoned_bitsandbytes):
 
 
 def test_vllm_utils_takes_the_no_bnb_path_when_bitsandbytes_cannot_import(poisoned_bitsandbytes):
-    """vllm_utils gated bitsandbytes on find_spec, which only proves the wheel is on disk, so a mismatched wheel passed
-    and raised; its else branch no-op stand-ins are the fallback. peft is preloaded before the stub since it dies
-    first on a broken wheel, upstream."""
+    """vllm_utils' find_spec gate only proves the wheel exists, so a mismatched wheel raised; no-op
+    stand-ins are the fallback; peft preloaded before the stub, as it dies first upstream."""
     out = _run(
         "import importlib, sys\n"
         "import peft\n"

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DoRA (use_dora=True) merge in the safetensors path: dense merges capture the magnitude and match PEFT's merged
-weight; MoE-expert DoRA is refused loudly rather than silently dropping the magnitude."""
+"""DoRA safetensors merge: dense matches PEFT; MoE-expert DoRA is refused rather than dropped."""
 import copy
 
 import pytest
@@ -118,9 +117,8 @@ def test_dora_on_moe_expert_is_refused():
 
 
 def test_dora_on_embedding_is_refused():
-    """DoRA on an Embedding captures a magnitude but no mergeable lora_A/lora_B (PEFT uses lora_embedding_A/B), so
-    _merge_lora would silently drop it; assert_same_keys ignores magnitude keys, so create_lora_statistics must fail
-    loud."""
+    """DoRA on Embedding has no mergeable lora_A/B (PEFT uses lora_embedding_A/B), so _merge_lora
+    would silently drop it; assert_same_keys ignores magnitude, so it must be refused loudly."""
     from peft import LoraConfig, get_peft_model
 
     class _WithEmbed(nn.Module):
@@ -141,8 +139,7 @@ def test_dora_on_embedding_is_refused():
 
 
 def test_dora_on_mxfp4_packed_moe_is_refused(monkeypatch, tmp_path):
-    """The MXFP4 packed-MoE rewrite merges experts via _merge_lora directly, not the dense helpers, so it must refuse
-    DoRA too; otherwise an opaque 3D shape error replaces the clear message."""
+    """MXFP4 MoE merge uses _merge_lora directly; must refuse DoRA, else an opaque 3D error."""
     import unsloth_zoo.saving_utils as su
     from safetensors.torch import save_file
 

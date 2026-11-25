@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""VESPO gamma weights: TRL parity without rollout_rs, and a rollout_rs rejected token leaves the
-sequence weight (verl response_mask *= keep) instead of moving the kept tokens' gradients."""
+"""VESPO gamma: TRL parity w/o rollout_rs; rejected token leaves seq weight, not kept grads."""
 import math
 
 import pytest

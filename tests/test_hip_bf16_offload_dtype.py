@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""HIP branch of initialize_unsloth_gradient_checkpointing must ask a probe, not hardcode bf16 (RDNA 1/2 lack native
-bf16 and die in LLVM, unslothai/unsloth issue 7922); inert until unslothai/unsloth 7682 since is_bf16_supported is
-True for HIP before arch checks; CPU runs stub device_count to 0."""
+"""HIP must probe, not hardcode bf16 (RDNA 1/2 lack bf16, unslothai/unsloth issue 7922); inert until
+unslothai/unsloth 7682 since is_bf16_supported is True for HIP; CPU stubs device_count=0."""
 import ast
 import inspect
 

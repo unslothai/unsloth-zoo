@@ -192,8 +192,7 @@ def _write_index(directory, shards):
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_a_partial_fp8_snapshot_does_not_satisfy_the_fallback(monkeypatch, tmp_path, error):
-    """`check_local_model_exists` passes on the first `.safetensors`, so an interrupted download passes; the merge then
-    rebuilds the index from present shards and reports success with missing layers."""
+    """Partial download passes the local check; merge reports success with missing layers."""
     monkeypatch.chdir(tmp_path)
     directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     os.remove(os.path.join(directory, "model.safetensors"))
@@ -312,9 +311,8 @@ def test_shards_from_different_sets_do_not_complete_each_other(tmp_path):
 
 
 def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
-    """A partial set beside a whole one is still incomplete: with no index the merge reads every top-level
-    `.safetensors`, and mismatched shapes raise the 'Bad in-place call' that the stale-shard filter exists to
-    prevent."""
+    """Partial set beside a whole one is incomplete: no index means every top-level .safetensors is
+    read; mismatched shapes hit 'Bad in-place call', which the stale-shard filter prevents."""
     directory = str(tmp_path)
     for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
                   "backup-00001-of-00002.safetensors"):
@@ -324,8 +322,7 @@ def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_an_unnumbered_stale_copy_is_ambiguous_too(monkeypatch, tmp_path, error):
-    """Unnumbered stale copies are ambiguous too: `model.safetensors` beside a stale `backup.safetensors` is read in
-    full and the index keeps whichever file was visited last."""
+    """Stale unnumbered copies are ambiguous: the index keeps whichever file was visited last."""
     monkeypatch.chdir(tmp_path)
     directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     _shard(directory, "backup.safetensors")
@@ -344,8 +341,7 @@ def _write_index_named(directory, names):
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_an_index_the_merge_will_not_honour_settles_nothing(monkeypatch, tmp_path, error):
-    """An index the merge will not honour settles nothing: `consolidated.safetensors` is dropped beside a partial shard,
-    and the empty index intersection keeps that shard."""
+    """An unhonoured index settles nothing; the empty intersection keeps the partial shard."""
     monkeypatch.chdir(tmp_path)
     directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     os.remove(os.path.join(directory, "model.safetensors"))
@@ -552,8 +548,7 @@ def test_sibling_lookup_stays_silent_for_a_genuinely_absent_sibling(monkeypatch,
 def test_the_sibling_lookup_keeps_asking_the_hub_after_an_unreadable_local_config(
     monkeypatch, tmp_path,
 ):
-    """An unreadable local config.json says nothing about the Hub: skip that candidate and keep asking the Hub, or FP8
-    would be dequantized while a full-precision sibling sits on the Hub."""
+    """Unreadable local config says nothing: keep asking the Hub for a full-precision sibling."""
     monkeypatch.chdir(tmp_path)
     # `unsloth/GLM-Air-FP8` strips to `unsloth/GLM-Air`, which also exists locally, broken.
     local_sibling = os.path.join("unsloth", "GLM-Air")

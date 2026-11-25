@@ -28,8 +28,7 @@ from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
 
 
 class _FakeLinear4bit(torch.nn.Module):
-    """Fake Linear4bit as left by a load that dropped quant_state; both feature counts are always set, since leaving
-    them off fires the guard via an unreachable default."""
+    """Fake Linear4bit with quant_state dropped; set both feature counts, else the guard fires."""
 
     def __init__(self, weight, bias = None, out_features = 5120, in_features = 5120):
         super().__init__()
@@ -48,8 +47,7 @@ def _packed_weight(n_bytes = 8192):
 
 
 def _real_bitsandbytes():
-    """Real bitsandbytes or skip: importorskip is not enough, as zoo installs `stubs/bitsandbytes_stub.py` under that
-    name, with no-op attributes the patch cannot patch."""
+    """importorskip is not enough: zoo's stub bitsandbytes has unpatchable no-op attributes."""
     bitsandbytes = pytest.importorskip("bitsandbytes")
     from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
     if not real_bitsandbytes_available():
@@ -63,8 +61,7 @@ def _patched_forward():
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     forward = bitsandbytes.nn.modules.Linear4bit.forward
     forward = getattr(forward, "__wrapped__", forward)
-    # patch_function can decline by returning False, which this patch discards; without this assert a test would
-    # silently exercise upstream bitsandbytes and pass.
+    # patch_function returning False is discarded; the assert stops tests passing on upstream.
     assert forward.__module__ == "unsloth_zoo.temporary_patches.bitsandbytes"
     return forward
 

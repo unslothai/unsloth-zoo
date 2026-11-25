@@ -168,8 +168,7 @@ def _run_every_case(fn):
 
 
 def test_the_old_bound_method_exhausts_a_realistic_recompile_budget():
-    # Regression for the fix: the low limit stands in for the real one, since the old form's cache grows with the
-    # product of the axes; hundreds of norms exhaust any fixed budget.
+    # Low limit stands in for the real one: the old cache grows with the product of the axes.
     torch._dynamo.reset()
     with torch._dynamo.config.patch(**_limit_patch(8)):
         compiled = {}
@@ -197,8 +196,7 @@ def test_the_kernels_survive_the_same_budget():
 
 
 def test_a_parameter_view_is_not_itself_a_parameter():
-    # Width guard is dropped because Dynamo forces a static shape for type(t) is torch.nn.Parameter even with
-    # dynamic=True; a plain Tensor view takes dynamic shapes.
+    # Width guard dropped: Parameters are forced static even with dynamic=True; views are not.
     from unsloth_zoo.temporary_patches.common import unwrap_norm_weight
 
     weight = torch.nn.Parameter(torch.randn(64))
@@ -222,8 +220,7 @@ def test_flatten_round_trips_every_rank():
 
 
 def test_the_kernels_fall_back_to_eager_instead_of_aborting():
-    """Cache exhaustion must latch to eager, not abort: patch_function wraps compiled kernels with fullgraph = True in
-    _fall_back_to_eager_on_recompile_limit; a bare decorator skips it."""
+    """Latch to eager, not abort: patch_function's wrapper does it; a bare decorator skips it."""
     from unsloth_zoo.temporary_patches.gemma4_float32 import (
         _gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,
     )
@@ -242,8 +239,7 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
             f"under fullgraph raises instead of falling back to eager"
         )
 
-    # Marker checks hold in any config; exhaustion cannot run when UNSLOTH_COMPILE_DISABLE binds _raw_torch_compile to
-    # noop at import (not rebindable in process; see
+    # Markers hold in any config; with UNSLOTH_COMPILE_DISABLE exhaustion cannot run in-process (see
     # tests/test_generated_fullgraph_fallback.py::_run_in_fresh_interpreter).
     from unsloth_zoo.temporary_patches import common
     if common.UNSLOTH_COMPILE_DISABLE:

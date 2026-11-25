@@ -330,8 +330,7 @@ def test_correction_flag_without_vllm_drops_the_sampling_logps(monkeypatch):
 
 
 def test_accumulated_loss_reports_the_clipped_ratio(monkeypatch):
-    # r and its ESS are the loss ratio coef_1 (verl SAFETY_BOUND-clamped), but |log r| and the k1/k3 metrics use raw new
-    # - rollout, so gaps past the [-20, 20] loss clamp are not under-reported.
+    # ESS uses clamped coef_1; |log r| and k1/k3 use raw new - rollout, so gaps aren't hidden.
     values = torch.tensor([1.5, 0.5, 1.0, 2.0, 1.0, 0.25, 1.1, 7.0, 9.0, 3.0, 0.1, 4.0, 2.5, 1.25, 0.75])
 
     def coef_of(mask):
@@ -414,8 +413,7 @@ def _capture_entropy_weights(monkeypatch):
             return (entropies.to(torch.float32) * weights).sum()
 
     monkeypatch.setattr(rr, "UnslothGRPOEntropyBonus", _Bonus)
-    # Pins trl_version to 1.10.0: the expected weights are TRL >= 1.10's; TRL < 1.10 takes a legacy dapo branch that
-    # needs num_items_in_batch, which this fake trainer does not pass.
+    # Pins trl_version 1.10.0: older TRL needs num_items_in_batch; this fake trainer lacks it.
     weights_fn = rr.grpo_entropy_bonus_weights
     monkeypatch.setattr(
         rr, "grpo_entropy_bonus_weights",

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests that the MoE top_k combine is reproducible (CUDA index_add_ atomics made bf16 nondeterministic), equals the
-index_add_ sum in float64, and casts after the reduction."""
+"""MoE top_k combine is reproducible (CUDA atomics), equals a float64 sum, and casts after."""
 
 import pytest
 import torch
@@ -128,8 +127,7 @@ def test_combine_casts_to_out_dtype_after_the_sum_not_before():
 
 
 def test_combine_rejects_a_non_permutation():
-    """The slot-count guard must raise ValueError, not a bare assert: python -O strips asserts and a short
-    sorted_indices would silently read wrong rows; reverting to assert fails the test."""
+    """ValueError, not assert: python -O strips asserts; short sorted_indices reads wrong rows."""
     num_tokens, top_k, hidden, num_experts = 32, 4, 8, 7
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sorted_indices, permuted = _make_case(
@@ -142,8 +140,7 @@ def test_combine_rejects_a_non_permutation():
 
 
 def test_combine_gradient_matches_the_index_add_form():
-    """The combine is in every MoE training backward, so forward agreement is not enough: with the same upstream
-    gradient, grads must match the index_add_ form exactly in every dtype."""
+    """Forward match is not enough: grads must equal index_add_ exactly in every dtype."""
     num_tokens, top_k, hidden, num_experts = 512, 4, 64, 16
     device = "cuda" if torch.cuda.is_available() else "cpu"
     for dtype in (torch.float64, torch.float32, torch.bfloat16):

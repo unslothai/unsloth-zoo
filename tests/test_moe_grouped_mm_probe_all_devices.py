@@ -55,8 +55,7 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOMOGENEOUS", False, raising = False)
         monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
-        # A warm-up on the spoofed host selects grouped_mm; restoring _SELECTED_MOE_BACKEND on teardown stops later
-        # tests inheriting that backend for absent cards.
+        # Warm-up selects grouped_mm; teardown restores _SELECTED_MOE_BACKEND for absent cards.
         monkeypatch.setattr(moe_utils, "_SELECTED_MOE_BACKEND", None, raising = False)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
                      "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
@@ -83,8 +82,7 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "ones", ones)
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
-        # The view probe builds real tensors on the card, which on a GPU host would run on the real device and log extra
-        # _grouped_mm calls; answer from failing instead (view-probe tests override it)
+        # Answer from failing: real probe tensors on a GPU host log extra _grouped_mm calls.
         monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
         return probed
     return make
@@ -661,8 +659,7 @@ def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypa
 
 
 def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
-    # One CUDA plus one XPU card: each backend counts 1 device, yet the XPU is foreign to the CUDA home and its first
-    # traced query would hit the compiler-disabled resolver.
+    # Device counts match; a foreign XPU's first traced query would hit the disabled resolver.
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     seen = spoof(1, models = ["H100"])
     real_xpu = getattr(torch, "xpu", None)

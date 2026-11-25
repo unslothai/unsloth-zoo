@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression: a mixed Qwen3 prompt batch keeps one visual row per input row; runs in a subprocess because the
-tests/mlx_simulation shim sibling modules install over mlx.core and mlx_vlm persists for the session."""
+"""Mixed Qwen3 batches keep one visual row per input row; shims leak, so run in a subprocess."""
 
 import subprocess
 import sys
@@ -138,8 +137,7 @@ def test_qwen3_mixed_prompt_batch_survives_a_three_row_unequal_batch():
 
 
 def test_import_regressions_fail_instead_of_reporting_a_skip(tmp_path):
-    """Only an absent optional dependency may skip the isolated run; a blanket except Exception around the imports would
-    turn an import-time break into a passing skip."""
+    """Only a missing optional dep may skip; a broad except would mask import breaks as skips."""
     import os
 
     shim = tmp_path / "shim"

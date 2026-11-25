@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A plain transformers bf16 / fp32 Gemma 3 built after an fp16 (forced float32) Unsloth load must keep its dtype.
-
-The forced float32 patches live on the shared transformers classes and nothing reruns them for a model loaded
-without Unsloth, so the final RMSNorm used to emit fp16 into the bf16 / fp32 lm_head (inference and generate crashed)."""
+"""Plain transformers bf16/fp32 Gemma 3 keeps its dtype after an fp16 forced-float32 Unsloth load:
+patches live on shared classes and nothing reruns them for non-Unsloth loads, so the final
+RMSNorm must not emit fp16 into lm_head (inference and generate crashed)."""
 
 import json
 import os

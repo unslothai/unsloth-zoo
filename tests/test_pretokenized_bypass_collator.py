@@ -27,11 +27,7 @@ from unsloth_zoo.dataset_utils import train_on_responses_only
 
 @pytest.fixture(scope = "module", autouse = True)
 def _hand_back_a_clean_dynamo():
-    """A few hundred cases here leave torch._dynamo's code cache where they found
-    it plus their own. `test_rmsnorm_recompile_guards` asserts on a realistic
-    recompile budget, and in a full-suite run that accumulation pushed three of
-    its cases over; they pass again with this reset, and in isolation either way.
-    """
+    """Dynamo reset: cache from earlier tests pushed test_rmsnorm_recompile_guards over its budget."""
     yield
     try:
         import torch
@@ -267,7 +263,6 @@ def test_a_raw_text_only_eval_split_is_allowed_through():
     row = eval_split[0]
     unmasked = [i for i, l in enumerate(row["labels"]) if l != -100]
     assert unmasked, "eval labels are all -100"
-    # Only the answer is trained on; the question and both markers stay masked.
     assert [row["input_ids"][i] for i in unmasked] == [ord("a"), ord("0")]
     assert row["labels"][row["input_ids"].index(ASSISTANT_ID)] == -100
 
@@ -973,9 +968,8 @@ def test_an_ambiguous_column_of_media_lists_is_refused(column):
 
 
 def test_an_ambiguous_image_column_is_never_decoded_by_the_scan(monkeypatch):
-    """`media` is an ambiguous name, but its dtype is `PIL.Image.Image`, so no
-    string in it can name a file. Scanning it anyway decoded every image (~9ms
-    and ~3MB of pixels a row) only to reach the refusal the schema already gave."""
+    """`media` has dtype PIL.Image.Image, so no string in it can name a file; the scan must not
+    decode it."""
     import io
     import datasets.features.image as image_feature
     from PIL import Image as PILImage
@@ -1545,8 +1539,7 @@ def test_a_nested_generic_alias_holding_provenance_still_passes():
 
 
 class ProcessorWithoutImages:
-    """A processor with no .pad and no modality half: the multimodal bypass skips it and only the .pad repair fires; a
-    feature_extractor (audio half) would mark it multimodal."""
+    """No .pad and no modality half: only the .pad repair fires, not the multimodal bypass."""
     def __init__(self):
         self.tokenizer = StubTokenizer()
 
@@ -1635,8 +1628,7 @@ def test_a_bare_image_column_of_paths_is_refused():
 
 
 def test_a_token_classification_collator_keeps_its_padding_settings():
-    """Padding fields of every pad-delegating collator must survive the repair; DataCollatorForTokenClassification is
-    not a DataCollatorWithPadding subclass, so an isinstance check missed it."""
+    """Every pad-delegating collator keeps its padding fields; an isinstance check missed one."""
     from transformers import DataCollatorForTokenClassification
 
     collator = DataCollatorForTokenClassification(
@@ -1657,8 +1649,7 @@ def test_a_token_classification_collator_keeps_its_padding_settings():
 
 
 def test_a_raw_eval_split_whose_full_scan_fails_is_refused():
-    """A failed full-column scan (a transform needing a column select_columns dropped) leaves only 16 rows checked;
-    refuse, as a later None would crash _maybe_tokenize_dataset."""
+    """A failed full-column scan: refuse, since a later None crashes _maybe_tokenize_dataset."""
     def _needs_both(batch):
         return {"text": [t + str(w) for t, w in zip(batch["text"], batch["weight"])]}
 
@@ -1727,8 +1718,7 @@ def test_remove_unused_columns_false_keeps_the_users_columns():
 
 
 def test_a_bypassed_self_packing_collator_is_refused_under_packing():
-    """Under packing a processor-holding self-packing collator must be refused: the bypass is not packing-gated,
-    replacing it loses position_ids, and keeping it may rebuild labels over the mask."""
+    """Refuse a self-packing processor collator under packing: replacing it loses position_ids."""
     collator = SelfPackingCollator(StubProcessor())   # a processor, so bypassed
     trainer = StubTrainer(collator, _text_rows())
     trainer.args.packing = True
@@ -1805,8 +1795,7 @@ def test_the_packing_refusal_does_not_map_the_eval_split_either():
 
 
 def test_a_type_tagged_struct_column_is_still_scanned():
-    """A struct of all-string fields looks plain by schema and is marked proven, so `_row_is_plain_text` skipped it and
-    never read the `type` tag, dropping the image."""
+    """All-string structs look plain by schema; _row_is_plain_text must read the type tag."""
     rows = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
         "part": [{"type": "text", "content": "hello"},
@@ -2360,11 +2349,9 @@ def test_a_later_multimodal_split_still_reaches_the_vision_collator():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     collator = out.data_collator
 
-    # A text batch still goes the text way.
     text_batch = collator([{"input_ids": list(ROW), "labels": list(ROW)}])
     assert "mine" not in text_batch
 
-    # A batch carrying images goes back to the collator that can handle them.
     assert collator([{"input_ids": list(ROW), "images": [object()]}]) == {"mine": True}
     assert collator.media is mine, "the displaced collator was thrown away"
 
@@ -2419,10 +2406,7 @@ def test_a_data_uri_outside_the_sampled_rows_is_still_media(kind):
 
 
 def test_a_repaired_padding_collator_is_not_kept_as_the_media_fallback():
-    """The `_processor_backed` repair replaces a collator whose tokenizer is a
-    processor with no `.pad`. That object is broken for EVERY batch, not just
-    text, so keeping it as the fallback routed a later media batch straight back
-    into the `processor.pad` AttributeError the repair exists to remove."""
+    """A processor-backed collator is broken for every batch, so it cannot serve as the media fallback."""
     class _NoPad:
         pad_token_id = 0
         def __call__(self, *a, **k): raise AssertionError("should not be called")
@@ -3017,8 +3001,7 @@ def test_a_configured_text_field_is_stripped_under_its_own_name():
 
 
 def test_a_mixed_case_text_field_is_stripped_too():
-    """The strip tests `key.lower()` against companion names, so a mixed-case `dataset_text_field` like `Body` matched
-    nothing and stayed in the text batch; Hub datasets do ship capitalised text columns."""
+    """Strip lowercases keys, so a mixed-case dataset_text_field like Body matched nothing."""
     rows = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
         "attention_mask": [[1] * len(ROW)] * 2,
@@ -3073,8 +3056,7 @@ def test_a_tensorizable_text_column_still_reaches_the_text_collator():
 
 
 def test_a_repeated_masking_call_keeps_the_dispatcher():
-    """A repeated `train_on_responses_only` call missed the dispatcher, whose attributes forward to the text half, and
-    replaced it with a bare text collator, losing the media fallback."""
+    """Repeated train_on_responses_only must keep the dispatcher: a bare collator loses media."""
     rows = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
         "attention_mask": [[1] * len(ROW)] * 2,

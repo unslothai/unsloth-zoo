@@ -29,9 +29,8 @@ import pytest
 
 from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
 
-# find_spec on mlx alone does not show real MLX once a sibling installed the torch shim, which registers mlx in
-# sys.modules and sys.meta_path; requires_real_mlx tests then run against a shim where mx.argpartition is a _Noop,
-# depending on collection order.
+# find_spec on mlx cannot show real MLX once a sibling installed the torch shim (sys.modules,
+# sys.meta_path); requires_real_mlx tests then hit a _Noop mx.argpartition, depending on order.
 _HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None and not mlx_is_simulated()
 if not _HAS_REAL_MLX:
     simulate_mlx_on_torch()
@@ -52,10 +51,8 @@ requires_metal = pytest.mark.skipif(
 )
 requires_real_mlx = pytest.mark.skipif(not _HAS_REAL_MLX, reason="needs real MLX")
 
-# Snapshot the REAL mlx/mlx_lm modules now, before sibling test files install the
-# mlx_simulation torch-stub into sys.modules, so the code under test
-# resolves the real stack regardless of order. The explicit import pulls in
-# mlx_lm.models.gated_delta (the kernel path from-imports it at call time).
+# Snapshot real mlx/mlx_lm before sibling tests install the mlx_simulation torch stub; the explicit
+# import loads mlx_lm.models.gated_delta, which the kernel path from-imports at call time.
 if _HAS_REAL_MLX:
     import mlx_lm.models.gated_delta  # noqa: F401
 
@@ -472,8 +469,7 @@ def test_vlm_patch_rebinds_language_holding_a_stale_copy(fake_mlx_lm, monkeypatc
 
 @requires_metal
 def test_kernel_dispatch_guards_partial_threadgroup_rows():
-    """Dv not divisible by the threadgroup row count must fall back to the ops VJP: the backward kernel's shared-memory
-    pre-reduction reads uninitialized slots in a partial trailing threadgroup."""
+    """Dv % threadgroup rows != 0 needs the ops VJP: partial threadgroups read uninit slots."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     q = mx.zeros((1, 8, 2, 32))
@@ -486,9 +482,8 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
 
 @pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
 def test_kernel_support_declines_off_metal_without_touching_the_layout_search():
-    """Off Metal the predicate must answer False, not raise; the layout search reads dtype.size, which only a real
-    mx.Dtype has, so it must run after the device guard or torch-shim training calls raise AttributeError instead of
-    falling back to the ops VJP."""
+    """Off Metal the predicate returns False, not raise: the layout search reads dtype.size (real
+    mx.Dtype only), so run it after the device guard or shim training hits AttributeError."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     q = mx.zeros((1, 8, 2, 64))
@@ -689,8 +684,7 @@ def test_patch_gated_delta_survives_an_mlx_lm_without_the_module(monkeypatch):
 
 @requires_real_mlx
 def test_checkpointed_layer_detaches_integer_arguments():
-    """A layer that embeds the token ids it was handed derives a gather index, and mx.checkpoint makes every argument a
-    primal MLX wants a gradient for, so integer arguments must be detached."""
+    """Integer args must be detached: mx.checkpoint makes every argument a gradient primal."""
     from unsloth_zoo.mlx.utils import _patch_layer_class_for_gc, _unpatch_layer_class_gc
 
     class _Layer(nn.Module):
@@ -829,9 +823,8 @@ def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, mo
     assert seen["bound"] == -5.0
 
 
-# mlx-vlm 0.7.1 gave the cache ownership of recurrent state: gated_delta_update grew cache, cache_index and state_steps,
-# and qwen3_5 / glm5_next pass cache= on every call, cached or not; these tests pin the wrapper's half without an
-# installed mlx-vlm.
+# mlx-vlm 0.7.1 gave recurrent-state cache ownership to gated_delta_update, and qwen3_5/glm5_next
+# pass cache= on every call; tests pin the wrapper's half without an installed mlx-vlm.
 def _cache_aware_upstream(seen):
     def upstream(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
                  use_kernel=True, lower_bound=None, state_steps=None,
@@ -887,8 +880,7 @@ def install_vlm_patch(request, monkeypatch, fake_mlx_lm):
 def test_cache_owned_calls_delegate_with_their_keywords_intact(
     install_vlm_patch, monkeypatch,
 ):
-    """A cache owns the recurrent state and retained history, so such calls are never training however wide the window
-    is open; forward keywords verbatim and keep upstream's variable return arity."""
+    """Cache-owned calls are never training: keywords verbatim, upstream's variable arity."""
     seen = []
     patched = install_vlm_patch(_cache_aware_upstream(seen))
 
@@ -965,9 +957,8 @@ def test_pre_0_6_9_upstream_is_never_handed_a_keyword_it_lacks(monkeypatch):
 
 @requires_real_mlx
 def test_patched_wrappers_accept_every_keyword_the_installed_mlx_vlm_declares():
-    """Upstream adds keywords faster than this patch is revised (0.6.9 added lower_bound, 0.7.1 three more), and each
-    reached training as a TypeError; fail here, where the training branch decides whether it can honour the new
-    keyword."""
+    """Upstream adds keywords faster than this patch is revised (0.6.9 added lower_bound, 0.7.1
+    three more); each reached training as a TypeError, so fail here."""
     pytest.importorskip("mlx_vlm")
     import inspect
 
@@ -981,8 +972,7 @@ def test_patched_wrappers_accept_every_keyword_the_installed_mlx_vlm_declares():
         except ImportError:
             continue
         checked.append(name)
-        # A sibling test may already have patched this module in-process, and the wrapper's **kwargs hides every
-        # upstream keyword, so the upstream signature is read from the saved original.
+        # Sibling may patch it; **kwargs hides keywords; read _unsloth_gated_delta_original.
         upstream = getattr(module, "_unsloth_gated_delta_original",
                            module.gated_delta_update)
         optional = {
@@ -1035,9 +1025,8 @@ def test_disabling_a_fusion_targets_only_fused_modules(disable, flag, extra):
 
 
 def _has_glm5_next() -> bool:
-    """Whether mlx_vlm ships glm5_next, without raising: find_spec on a submodule imports the parent and raises if
-    mlx_vlm is missing or broken (e.g. torch/mlx-vlm version skew); at module level that fails collection of the
-    whole file. Only the catch-all finder of the shim hid this."""
+    """find_spec on a submodule imports mlx_vlm and raises if missing or broken (torch/mlx-vlm
+    skew), failing collection at module level; only the shim's catch-all finder hid it."""
     try:
         return importlib.util.find_spec("mlx_vlm.models.glm5_next") is not None
     except Exception:

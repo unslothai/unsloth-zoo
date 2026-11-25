@@ -76,9 +76,8 @@ LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
 
 def _requirement_lists() -> dict[str, list[str]]:
-    """Returns {where: [raw requirement, ...]} for the base list and every extra; tomllib is 3.11+ but requires-python
-    is >=3.9, so older interpreters skip rather than fail to collect and red the python-version-collect lane. Same
-    shape as _find_config in tests/test_wheel_top_level_packages.py."""
+    """Returns {where: [raw requirement, ...]} for the base list and every extra; tomllib is 3.11+
+    but requires-python is >=3.9, so older interpreters skip rather than fail to collect."""
     if sys.version_info < (3, 11):
         pytest.skip("tomllib needs Python 3.11+")
     import tomllib
@@ -153,8 +152,7 @@ def test_each_platform_caps_transformers_at_the_tested_ceiling() -> None:
     for where, reqs in _transformers_lists().items():
         for platform, environment in (("off darwin", LINUX_X86), ("on darwin + arm64", DARWIN_ARM)):
             spec = _live(reqs, environment)[0].specifier
-            # Check admission too, not just the ceiling number: a second upper bound, or an exclusion of the tested
-            # release, can shut it out while the ceiling still reads right.
+            # Admission too: a second bound or exclusion can shut out the tested release.
             assert TESTED_CEILING in spec, (
                 f"{where} declares {spec} {platform}, which does not admit the "
                 f"{TESTED_CEILING} the matrix was run against."
@@ -204,8 +202,7 @@ def test_the_torch_ceiling_admits_what_the_matrix_ran() -> None:
             f"pyproject.toml bounds torch as {req.specifier}, which excludes the "
             f"{TESTED_TORCH} the matrix was run against."
         )
-        # Compare the exact bound, not just admission: widening <2.15.0 to <2.16.0 still admits the tested 2.14.0, so an
-        # admission-only check would let untested torch 2.15.x ship.
+        # Compare the exact bound: a widened bound still admits the tested torch version.
         assert _ceiling_bound(req.specifier) == _ceiling_bound(SpecifierSet(TORCH_BOUND)), (
             f"pyproject.toml bounds torch as {req.specifier}, not the {TORCH_BOUND} this "
             f"file declares. Moving the bound means running the matrix on the newly "
@@ -315,9 +312,7 @@ def _sentinel_resolver_source() -> str:
     return textwrap.dedent(match.group(1))
 
 
-# Resolver needs tomllib (CPython 3.11+); CI pins 3.12, but these tests run on any pytest interpreter, and on 3.10 the
-# subprocess dies with ModuleNotFoundError: _RESOLVER_NEEDS holds the minimum; a negative control that fails on its
-# message has stopped testing.
+# Resolver needs tomllib (3.11+); _RESOLVER_NEEDS holds that minimum, since 3.10 would fail.
 _RESOLVER_NEEDS = (3, 11)
 
 
@@ -448,8 +443,7 @@ def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
 
 
 def test_this_file_runs_in_an_executing_ci_step():
-    """Must run in an executing CI step (collect-only proves just imports); the inline gate checks only general <=
-    CEILING, so a lowered ceiling passes it but fails here."""
+    """Must run in an executing CI step; the inline gate passes a lowered ceiling."""
     import re
     from pathlib import Path
 
@@ -470,8 +464,7 @@ def test_this_file_runs_in_an_executing_ci_step():
 
 
 def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
-    """Negative control for _ceiling: upper bounds intersect so the tightest wins; reporting 5.17 for <=5.17.0,<5.16.0
-    (which excludes the tested release) is wrong, and nothing else in this file catches it."""
+    """Negative control: _ceiling reports the tightest of intersecting upper bounds."""
     assert _ceiling(SpecifierSet("<=5.17.0")) == Version("5.17.0")
     assert _ceiling(SpecifierSet(">=4.51.3,<=5.17.0")) == Version("5.17.0")
     assert _ceiling(SpecifierSet("<=5.17.0,<5.16.0")) == Version("5.16.0")

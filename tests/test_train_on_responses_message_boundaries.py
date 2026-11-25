@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only must end response spans at message boundaries, not the next user marker, which trained tool
-results, role headers and the next packed sample's BOS and system prompt; fixtures give the turn terminator a non-EOS
-id; CPU-only, stub tokenizers."""
+"""train_on_responses_only must end response spans at message boundaries, not the next user marker,
+so tool results, role headers and the next packed sample stay masked; non-EOS turn terminators."""
 
 import pytest
 

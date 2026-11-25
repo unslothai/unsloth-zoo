@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests unsloth_zoo.fast_grad_params (per-step clip and zero_grad over a cached parameter tuple); training tests
-require bitwise-equal losses, grad norms and weights with UNSLOTH_FAST_GRAD_PARAMS=0 vs on, plus FAST_GRAD_CALLS
-engagement."""
+"""Tests unsloth_zoo.fast_grad_params (per-step clip and zero_grad over a cached parameter tuple);
+training runs must match UNSLOTH_FAST_GRAD_PARAMS=0 bitwise, with FAST_GRAD_CALLS engaged."""
 import contextlib
 import functools
 import json
@@ -485,8 +484,7 @@ def test_forward_does_not_invalidate():
 
 
 def test_train_call_rebuilds(tmp_path):
-    """A direct _parameters edit (no registration hook) between train() calls is picked up by the Trainer.train bump
-    alone; prepare_model's bump is disabled in this test."""
+    """Unhooked _parameters edit between train() calls: only the Trainer.train bump catches it."""
     from accelerate import Accelerator
     import unittest.mock as mock
     model = _llama()
@@ -650,8 +648,7 @@ json.dump({"flag_base": flag_base, "flag_peft": F._is_flagged(model), "losses": 
 
 
 def test_unsloth_fast_language_model_path(tmp_path):
-    """FastLanguageModel.from_pretrained and get_peft_model flag the model via zoo's loader wrapper; the Trainer step
-    with fast clip/zero_grad must equal UNSLOTH_FAST_GRAD_PARAMS=0."""
+    """FastLanguageModel, get_peft_model: Trainer steps must equal UNSLOTH_FAST_GRAD_PARAMS=0."""
     if DEV != "cuda":
         pytest.skip("Unsloth needs CUDA")
     pytest.importorskip("unsloth")

@@ -358,8 +358,7 @@ _PartlyUsedMLP.__name__ = _PartlyUsedMLP.__qualname__ = "FooPartlyUsedMLP"
 
 
 def test_an_unused_parameter_keeps_the_tile_frame_route(in_unsloth_block):
-    # The op would return zeros for a parameter the forward never uses (Adam's moments and weight decay still move
-    # it); the install probe keeps such a module on the per-tile route (None gradient).
+    # The op would return zeros for an unused parameter; the probe keeps the module per-tile.
     torch.manual_seed(0)
     mlp = _PartlyUsedMLP()
     R.install_module(mlp, "rows:8")
@@ -418,8 +417,7 @@ def test_the_install_probe_leaves_buffers_alone(in_unsloth_block):
 
 
 def test_functional_call_keeps_the_tile_frame_route(in_unsloth_block):
-    # The op reads the live module's weights at run time, after functional_call has restored them, so a replaced
-    # frozen projection would be ignored.
+    # The op reads live weights after functional_call restores them; replacements are ignored.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -448,8 +446,7 @@ _ScaledMLP.__name__ = _ScaledMLP.__qualname__ = "FooScaledMLP"
 
 @pytest.mark.parametrize("kind", ["frozen_parameter", "all_parameters", "buffer_only"])
 def test_functional_call_substitutions_keep_the_tile_frame_route(in_unsloth_block, kind):
-    # A replacement nn.Parameter or buffer would make the op run the live module after functional_call has restored
-    # it (wrong output), or fail to find the module (RuntimeError).
+    # Replacing a parameter or buffer breaks the op: wrong output or RuntimeError.
     torch.manual_seed(0)
     mlp = _ScaledMLP() if kind == "buffer_only" else _LoraMLP()
     R.install_module(mlp, "rows:8")

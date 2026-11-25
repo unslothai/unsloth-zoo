@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD=1 runs the output head in fp32 on both GRPO sides: trainer logits stay fp32 under bf16
-autocast and unchanged when off; load_vllm passes hf_overrides head_dtype=float32 only where vLLM honours it
-(LogitsProcessor._apply_head, vLLM >= 0.26.0) and refuses otherwise."""
+"""UNSLOTH_VLLM_FP32_LM_HEAD=1: fp32 head; head_dtype only on vLLM >= 0.26.0, else load_vllm refuses."""
 
 import ast
 import os

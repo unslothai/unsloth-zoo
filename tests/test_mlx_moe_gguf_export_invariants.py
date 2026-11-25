@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Invariants of the MoE GGUF staging pass: what it does to a directory it cannot help, that it answers twice alike, and
-that what it wrote is the model's own checkpoint, not merely something sanitize() accepts; synthetic fixtures in
-tests/mlx_simulation/ need no mlx or Apple hardware."""
+"""MoE GGUF staging pass invariants: unhelpable directories are handled, repeat calls agree, and
+output is the model's own checkpoint, not merely what sanitize() accepts; no mlx needed."""
 
 import copy
 import hashlib
@@ -263,8 +262,7 @@ def test_the_recovered_checkpoint_is_the_one_the_model_was_saved_from(
 
 
 def test_a_helper_called_from_inside_a_comprehension_is_still_read():
-    """The vocabulary walk must not depend on the interpreter: before PEP 709 (3.12) a comprehension has its own code
-    object, hiding helpers it calls from the enclosing co_names."""
+    """Walk must not depend on interpreter: pre-3.12 comprehensions hide helpers from co_names."""
     import unsloth_zoo.mlx.utils as mutils
 
     class Model:
@@ -306,9 +304,8 @@ def test_experts_come_back_in_the_order_the_sanitizer_stacked_them(tmp_path):
 
 
 def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
-    """mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py splits experts.gate_up_proj and offsets a norm in place in sanitize();
-    an uncopied merge-proof floor shared marker objects with the compared set, so no merge was ever proved and the
-    export kept the MLX spelling llama.cpp cannot map."""
+    """qwen3_5_moe sanitize() splits experts.gate_up_proj and offsets a norm in place; the uncopied
+    floor's markers hid the merge proof, so export kept MLX spelling llama.cpp cannot map."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -352,9 +349,8 @@ def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
 def test_a_layout_the_vlm_pass_already_inverted_is_not_inverted_again(
     tmp_path, monkeypatch, shape
 ):
-    """VLM and MoE passes both claim depthwise_conv1d.weight (_vlm_gguf_tensor_candidates transposes (0, 2, 1); (2, 1)
-    is in _MOE_TENSOR_LAYOUTS); an adjacent-axis move is its own inverse, so a second pass ships it transposed off
-    the HF layout llama.cpp reads, with an equal shape."""
+    """VLM and MoE passes both claim depthwise_conv1d.weight; an adjacent-axis move is its own
+    inverse, so a second pass ships it transposed off the HF layout with an equal shape."""
     import json
 
     import unsloth_zoo.mlx.utils as mutils

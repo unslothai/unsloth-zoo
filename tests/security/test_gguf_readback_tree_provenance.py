@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins GGUF read-back provenance: the probe child must not take the working directory as a search path, and the parent
-accepts a reported gguf tree only from a root Unsloth itself chose; a planted CWD gguf would reach the training
-process holding the token."""
+"""Pins GGUF provenance: the probe child must not search the working directory; the parent trusts a
+gguf tree only under a root Unsloth chose, since a planted CWD gguf would reach the token."""
 
 from __future__ import annotations
 
@@ -57,8 +56,7 @@ def llama_cpp():
 
 
 def _ran(planted_dir):
-    """Whether a PROBE_PAYLOAD-planted package ran: checks the EXECUTED marker in the package's own directory, where the
-    payload can reach; any other path could never fail."""
+    """Checks EXECUTED in the package's own dir, the only place the payload can reach."""
     return (Path(planted_dir) / "gguf" / "EXECUTED").exists()
 
 
@@ -370,8 +368,7 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
         stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
     )
     actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
-    # Platforms differ on the winning side (POSIX resolves the link for sys.path[0], Windows keeps the link's
-    # directory); the test pins agreement, not a platform.
+    # POSIX resolves the link, Windows keeps its dir: the test pins agreement, not a platform.
     assert actual.startswith((str(resolved_gguf), str(linkdir))), actual
 
     probe_env = dict(env)

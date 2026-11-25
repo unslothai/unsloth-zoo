@@ -108,8 +108,7 @@ def _data(seed, rows = 6, cols = 9, scale = 0.2, dtype = torch.float64):
 
 
 def test_overflowed_is_ratio_on_rejected_token_is_not_nan():
-    # Repro: token_mask with no clip and log ratios [0, 100] in float32; exp(100) overflows to inf, and a rejected token
-    # turned that into inf * 0 = nan in the loss and gradient.
+    # Repro: float32 log ratio 100 gives exp(100) = inf; a rejected token made inf * 0 = nan.
     new = torch.zeros(1, 2, dtype = torch.float32, requires_grad = True)
     old = torch.zeros(1, 2, dtype = torch.float32)
     sampling = torch.tensor([[0.0, -100.0]])

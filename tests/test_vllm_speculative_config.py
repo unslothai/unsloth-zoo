@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm(speculative_config = ...) / UNSLOTH_VLLM_SPECULATIVE_CONFIG: any vLLM speculative method, resolved before
-the memory estimate (a draft model's weights come out of the KV cache budget), then through the same LoRA lookahead
-fitting, memory retry and padded-vocab guard as suffix decoding. load_vllm needs a GPU, so wiring is checked on the AST."""
+"""speculative_config / UNSLOTH_VLLM_SPECULATIVE_CONFIG takes any vLLM method, resolved before the
+memory estimate (draft weights reduce KV budget); wiring AST-checked as load_vllm needs GPU."""
 
 import ast
 import json
@@ -443,8 +442,7 @@ def test_real_vllm_methods_if_installed():
 
 
 def test_draft_weights_shrink_the_capacity_estimate(monkeypatch):
-    # The draft is counted inside the estimate, so max_num_batched_tokens (which the context-length fit reads) and the
-    # KV budget both shrink with it, instead of only the KV budget being lowered afterwards.
+    # Counting the draft up front shrinks max_num_batched_tokens and KV budget, not KV alone.
     import types
     import unsloth_zoo.vllm_utils as vu
     monkeypatch.setattr(vu, "get_mem_info", lambda: (80 * 1024**3, 80 * 1024**3))

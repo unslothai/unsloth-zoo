@@ -29,17 +29,10 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def test_the_float32_grpo_path_can_build_its_autocast_context():
-    """`grpo_accumulated_loss` takes `nullcontext()` whenever the trainer has no autocast
-    dtype, which is exactly what `UNSLOTH_FORCE_FLOAT32=1` sets. The name was never bound,
-    so that branch raised `NameError` instead of running unautocast.
-
-    Asserted against the FUNCTION SOURCE in a bare namespace, because that is the shape the
-    production path has: this function is copied into the generated `UnslothGRPOTrainer`
-    cache without unsloth_zoo's module imports, as the comment beside the PrefixGrouper
-    import in its body says. A module-level import satisfies `import unsloth_zoo` and still
-    leaves the generated trainer raising, so checking the module would pass while the path
-    users actually run stayed broken.
-    """
+    """nullcontext is unbound in grpo_accumulated_loss on the UNSLOTH_FORCE_FLOAT32=1 path
+    (NameError); the function is copied into the generated trainer without module imports, so
+    test its source in a bare namespace, since a module-level import would pass while the trainer
+    still raises."""
     import inspect
 
     import unsloth_zoo.rl_replacements as rl
@@ -49,8 +42,7 @@ def test_the_float32_grpo_path_can_build_its_autocast_context():
     exec(compile(source, "<generated-trainer>", "exec"), namespace)
     rebuilt = namespace["grpo_accumulated_loss"]
 
-    # A name bound by an import in the body is local; one that relies on the module is a global, which the generated
-    # trainer does not carry, so bind it in the body.
+    # Module globals are not in the generated trainer, so import nullcontext inside the body.
     assert "nullcontext" in rebuilt.__code__.co_varnames, (
         "nullcontext resolves as a global, so the generated UnslothGRPOTrainer raises "
         "NameError on the UNSLOTH_FORCE_FLOAT32 path; bind it inside the function body"

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Inductor codegen refusal (torch 2.12 CantSplit on torch.chunk ragged tail under dynamic shapes; 2.9 to 2.11 answer
-correctly) must fall back to eager in _fall_back_to_eager_on_recompile_limit, since a simplifier gap should cost
-speed, not kill a GRPO run"""
+"""Torch 2.12 CantSplit codegen refusal (torch.chunk ragged tail, dynamic shapes; 2.9-2.11 correct)
+must fall back to eager in _fall_back_to_eager_on_recompile_limit, not kill GRPO."""
 
 from __future__ import annotations
 
@@ -26,8 +25,7 @@ def _clear_latches():
 
 
 def _inductor_backend_fn(gm, example_inputs):
-    """BackendCompilerFailed stores backend_fn's __name__ as backend_name; torch passes OutputGraph.compiler_fn, named
-    inductor (verified on torch 2.9.1 by raising a bare RuntimeError from compile_fx)."""
+    """backend_name comes from the backend's __name__, which torch sets to inductor."""
     return gm
 _inductor_backend_fn.__name__ = "inductor"
 
@@ -245,8 +243,7 @@ def test_outside_a_checkpoint_a_later_refusal_still_falls_back(monkeypatch):
 
 
 def test_a_refusal_in_a_later_step_falls_back(monkeypatch):
-    """compiled_ok must reset per step: held per wrapper it stays true forever, so a refusal in a later step would
-    re-raise and defeat the fallback for long GRPO runs."""
+    """compiled_ok must reset per step, or a later refusal re-raises and defeats the fallback."""
     calls = {"n": 0}
 
     def compiled(x):
@@ -616,14 +613,12 @@ def test_the_error_builder_produces_an_inductor_identity_on_a_2_6_shaped_torch(
 
 
 # ---- what the SECOND review round found -----------------------------------
-# The post-call _note_compiled_ok probe runs on the success path, so runs that never fall back still pay its cost; one
-# marker latch closes both that cost and a correctness hole.
+# The post-call _note_compiled_ok probe runs on every success; a marker latch skips it.
 
 
 def test_a_successful_call_does_not_reprobe_once_the_marker_has_latched(
         monkeypatch):
-    """Test the cheap _PACKED_COMPILED_IN_CHECKPOINT marker before the frame walk: otherwise the walk is paid on every
-    successful compiled call, even after the marker latched."""
+    """Test _PACKED_COMPILED_IN_CHECKPOINT before walking frames, or every call pays the walk."""
     probes = {"n": 0}
 
     def _counting_probe(**_):
@@ -724,8 +719,7 @@ def test_a_spent_walk_budget_does_not_invent_checkpoint_history(monkeypatch):
 
 
 def test_releasing_borrowed_budget_keeps_compiled_pack_history(monkeypatch):
-    """_restore_recompile_limits runs mid-step, so it must not clear _COMPILED_OK_LABELS; only
-    apply_pending_eager_fallbacks, the real step boundary, may clear that history."""
+    """Restore must keep _COMPILED_OK_LABELS; only apply_pending_eager_fallbacks clears it."""
     patch_utils._COMPILED_OK_LABELS.add("test-packed-earlier")
     patch_utils._restore_recompile_limits()
     assert "test-packed-earlier" in patch_utils._COMPILED_OK_LABELS, (
@@ -737,8 +731,7 @@ def test_releasing_borrowed_budget_keeps_compiled_pack_history(monkeypatch):
         "the step boundary must still reset the history"
 
 def test_generation_does_not_pay_the_success_probe(monkeypatch):
-    """Inference mode saves nothing for backward, so it skips the frame walk; test inference mode rather than
-    is_grad_enabled(), since checkpointed Function.forward runs with grad off."""
+    """Test inference mode, not is_grad_enabled(): checkpointed forward runs with grad off."""
     monkeypatch.setattr(patch_utils, "_saved_tensor_hook_accessor",
                         lambda: None)
     walks = {"n": 0}

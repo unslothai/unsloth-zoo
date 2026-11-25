@@ -30,9 +30,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-# importorskip is not enough: most test_mlx_*.py files leave the torch-backed tests/mlx_simulation stub in sys.modules,
-# so mlx.core may be the stub; these tests need real mlx >= 0.32.1 semantics, such as a mx.random.state sentinel
-# refusing item assignment.
+# importorskip is not enough: most test_mlx_*.py files leave the tests/mlx_simulation stub in
+# sys.modules; these need real mlx >= 0.32.1, where mx.random.state refuses item assignment.
 if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip("mlx.core is the tests/mlx_simulation stub, not real MLX",
                 allow_module_level = True)
@@ -181,8 +180,7 @@ def test_restore_reinterprets_signed_words(words):
     (2**32, 0), (0, 2**32), (2**62, 1), (-(2**31) - 1, 0), (0, -(2**40)),
 ])
 def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
-    """Declining beats masking: (2**32, 0) masks to (0, 0), a plausible wrong key that makes a diverging compile
-    fallback look rewound; declining is loud and callers already handle it."""
+    """Declining beats masking: (2**32, 0) masks to (0, 0), a plausible wrong key."""
     _restore_mlx_rng_key((0, 0))
     before = _mlx_rng_key()
 
@@ -203,8 +201,7 @@ def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
     ((1, 2, 3), False),
 ])
 def test_warnings_as_errors_does_not_turn_declining_into_raising(state, expect_words):
-    """With PYTHONWARNINGS=error the RuntimeWarning must not become an exception, since callers read the key before
-    their try and would abort training or preprocessing."""
+    """With PYTHONWARNINGS=error, declining must not raise; callers read it before their try."""
     dtype = mx.int64 if len(state) == 2 else mx.uint32
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
@@ -418,8 +415,7 @@ def test_a_runtime_compile_failure_trains_eagerly_on_the_pre_trace_state(tmp_pat
 
 
 def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
-    """The DDP retry needs a distributed group no unit test can raise, so it is pinned on the AST, not substring counts:
-    harmless refactors pass, misplaced restores fail."""
+    """The DDP retry needs a group no unit test can raise, so restores are pinned on the AST."""
     import ast
     import inspect
     import textwrap
@@ -471,8 +467,7 @@ def test_every_compile_fallback_rewinds_the_rng_before_retrying_eagerly():
 
 
 def test_an_unsupported_key_is_reported_once_not_once_per_step():
-    """Trainer captures run per batch: the message embeds the offending word so the warnings registry cannot dedupe it,
-    and stderr has no registry, so dedup is manual."""
+    """Dedup is manual: the word in the message defeats the registry; stderr has no registry."""
     seen = []
     with warnings.catch_warnings(record = True) as caught:
         warnings.simplefilter("always")

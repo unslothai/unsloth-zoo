@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Covers rl_environments.py: the create_locked_down_function allowlist is the only barrier to __import__;
-_reject_dunder_access misses attributes spelled as bare identifiers, such as match keywords; launch_openenv must bind
-loopback and never adopt a foreign /health server."""
+"""Covers rl_environments.py: the allowlist alone bars __import__; _reject_dunder_access misses
+bare-identifier match keywords; launch_openenv binds loopback, never adopts foreign /health."""
 
 import contextlib
 import http.server

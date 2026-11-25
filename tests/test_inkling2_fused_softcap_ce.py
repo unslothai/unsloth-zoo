@@ -273,10 +273,9 @@ class _disabled:
 
 
 def test_merged_then_disabled_peft_head_takes_the_exact_path(monkeypatch):
-    """PEFT unmerges a merged head inside its forward when the adapters are disabled; the fused kernel would read the
-    merged weight (the adapter's loss) and leave the head merged, so the loss calls the head's own forward
-    (lm_head_needs_module_forward). Merged and enabled runs base_layer alone on the merged weight, which the kernel
-    reads, so it stays fused."""
+    """PEFT unmerges a merged head in its forward when adapters are disabled; the fused kernel would
+    read the merged weight and leave it merged, so the loss calls the head's own forward
+    (lm_head_needs_module_forward); merged and enabled stays fused."""
     cls = _make_class("MergedHeadToyForCausalLM", _Softcap)
     assert forward_install.install_for_class(cls)
     torch.manual_seed(0)

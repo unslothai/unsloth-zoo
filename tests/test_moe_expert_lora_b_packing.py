@@ -61,8 +61,7 @@ def _vllm_lora_b(weight_B, num_experts):
 
 @pytest.mark.parametrize("num_experts, rank", [(4, 6), (6, 6), (8, 4), (256, 8)])
 def test_rank_major_is_bitwise_peft(num_experts, rank):
-    """Default rank-major reading must match PEFT bit for bit; if a PEFT release changes its packing this fails, so the
-    default follows PEFT rather than inverting it."""
+    """Default must match PEFT bit for bit; this fails if a PEFT release changes its packing."""
     _, weight_B = _factors(num_experts, rank, 16, 12)
     ours = unflatten_moe_lora_b(
         weight_B, num_experts, rank, weight_B.shape[0],
@@ -271,8 +270,7 @@ def test_separated_forward_matches_stock_peft_forward():
             experts = module
     experts.forward = types.MethodType(moe_utils.forward_native_grouped_mm, experts)
 
-    # Calls the wrapper chain, not the sparse block, so the comparison does not depend on transformers resolving an
-    # experts implementation for an unloaded config.
+    # Calls the wrapper chain, not the sparse block: no experts implementation has to resolve.
     torch.manual_seed(2)
     tokens = 16
     x = torch.randn(tokens, hidden, device = device, dtype = torch.float32)
@@ -286,9 +284,8 @@ def test_separated_forward_matches_stock_peft_forward():
         with torch.no_grad():
             return wrapper(x, top_k_index, top_k_weights)
 
-    # Reference arm runs first: skipping when PEFT's forward cannot run cannot hide a separated-path regression; under
-    # pytest transformers can resolve an uncallable experts implementation for a config never loaded from a checkpoint;
-    # standalone check: scripts/verify_lora_b_packing_fix.py.
+    # Reference first: a skip when PEFT cannot run cannot hide a separated-path regression; pytest
+    # resolves uncallable experts for unloaded configs (scripts/verify_lora_b_packing_fix.py).
     ParamWrapper.forward = stock_forward
     try:
         reference = run()
@@ -327,8 +324,7 @@ def _stub_wrapper(num_experts, rank, dim_in, dim_out):
 
 
 def test_a_misspelled_layout_raises_instead_of_dropping_the_adapter(monkeypatch):
-    """_extract_lora_from_wrapper turns every exception into no LoRA, so a typo in UNSLOTH_MOE_LORA_B_LAYOUT would train
-    the base model silently; the typed error must escape that fallback."""
+    """Typo in UNSLOTH_MOE_LORA_B_LAYOUT must escape the no-LoRA fallback, not train silently."""
     from unsloth_zoo.temporary_patches.moe_utils import (
         MoELoRABLayoutError,
         _extract_lora_from_wrapper,
@@ -371,9 +367,8 @@ def test_the_saving_utils_fallback_agrees_with_the_real_helpers(layout):
 
 
 def test_the_saving_utils_fallback_rejects_a_misspelled_layout(monkeypatch):
-    """Fallback resolves UNSLOTH_MOE_LORA_B_LAYOUT like moe_lora_b_layout and must reject the same typos; defaulting to
-    rank_major on a typo would merge a legacy adapter with the wrong reading and bake the scramble into the
-    checkpoint."""
+    """Fallback must reject the same UNSLOTH_MOE_LORA_B_LAYOUT typos: a rank_major default would
+    merge legacy adapters wrongly and bake the scramble into the checkpoint."""
     from unsloth_zoo.saving_utils import _fallback_layout
 
     monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising = False)
@@ -431,8 +426,7 @@ def test_the_grouped_mm_spelling_equals_the_unflatten_spelling(layout, monkeypat
 
 
 def test_the_grouped_mm_second_weight_is_materialised_once(monkeypatch):
-    """Count allocating copies, not just the final allocation: a gather-then-permute path is contiguous and right-sized
-    yet allocates the whole tensor twice on every expert layer."""
+    """Count every copy, not just the result: gather-then-permute copies the tensor twice."""
     monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
     E, r, out, in_dim = 4, 3, 7, 5
     weight_B = torch.randn(out, E * r)
@@ -446,8 +440,7 @@ def test_the_grouped_mm_second_weight_is_materialised_once(monkeypatch):
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
-            # Only lora_B-sized copies count: lora_A's copy and the arange().t().reshape() index tensor are excluded;
-            # the shapes make E*r*in differ from E*r*out.
+            # Count lora_B-sized copies only; lora_A and index tensors differ in size.
             name = str(func)
             if any(op in name for op in ("index_select", "clone", "contiguous", "copy_")):
                 if isinstance(result, torch.Tensor) and result.numel() == E * r * out:
@@ -468,9 +461,8 @@ def test_the_grouped_mm_second_weight_is_materialised_once(monkeypatch):
 
 @pytest.mark.parametrize("num_experts, rank, out", [(4, 3, 7), (2, 2, 5), (1, 5, 4), (6, 1, 3)])
 def test_the_column_reorder_matches_index_select_in_both_directions(num_experts, rank, out):
-    """Backward is hand-written because index_select saves its index tensor, which
-    torch.utils.checkpoint(use_reentrant=False) counts; a wrong backward would be silent, so it is pinned against
-    index_select."""
+    """Hand-written backward: index_select saves an index tensor that use_reentrant=False checkpoint
+    counts; a wrong backward is silent, so it is pinned against index_select."""
     from unsloth_zoo.temporary_patches.moe_utils import _ExpertMajorColumns
 
     torch.manual_seed(0)
@@ -586,8 +578,7 @@ def test_every_merge_helper_lets_a_layout_error_escape(monkeypatch):
 
 
 def test_an_invalid_layout_is_refused_at_import_not_at_first_use():
-    """Read and validated once at import so a typo fails before training; Dynamo guards os.environ.get only if the key
-    is set at trace time, so a per-call read is never re-evaluated in a captured graph."""
+    """Read once at import so typos fail early; per-call reads go stale in compiled graphs."""
     import subprocess
     import sys
 
@@ -626,9 +617,8 @@ def test_a_valid_override_set_before_import_survives_compilation():
 
 
 def test_the_layout_set_after_import_reaches_the_first_compiled_call():
-    """import unsloth runs before the app sets the variable, so an import-time value is stale; gating the refresh on not
-    torch.compiler.is_compiling() let a compiled-first run read the stale default and misread legacy packing;
-    subprocess needed so the import sees it unset."""
+    """UNSLOTH_MOE_LORA_B_LAYOUT is set after import, so refresh at call time even under compile;
+    gating on not is_compiling() let a compiled-first run misread legacy packing."""
     import subprocess
     import sys
 

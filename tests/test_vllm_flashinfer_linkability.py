@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FlashInfer must LINK, not just compile: -lcuda needs the driver stub libcuda.so, not runtime libcuda.so.1, so nvcc
-and ninja present still fail late on Kaggle (RuntimeError: Ninja build failed); VLLM_USE_FLASHINFER_SAMPLER=0 does
-not avoid it."""
+"""Must link: -lcuda needs stub libcuda.so, not .so.1; VLLM_USE_FLASHINFER_SAMPLER=0 does not avoid it."""
 
 import contextlib
 import os
@@ -39,8 +37,7 @@ def _stub(tmp_path, name = "libcuda.so"):
 
 @contextlib.contextmanager
 def _linux_with_no_ambient_cuda():
-    """Pins sys.platform to linux and neutralises the nvcc-inferred CUDA root and linker default dirs; on macOS or
-    Windows _can_link_libcuda returns early, so unpinned tests answer a different question."""
+    """Pins sys.platform to linux; clears nvcc-inferred CUDA root and linker default dirs."""
     with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
          mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
          mock.patch.object(vllm_utils, "_linker_default_dirs", lambda: ()):
@@ -121,8 +118,7 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
 
 
 def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
-    """A libcuda.so in ld's built-in SEARCH_DIRs counts even with no -L: the NVIDIA installer puts it in
-    /usr/lib/x86_64-linux-gnu on Debian/Ubuntu, so False would disable FlashInfer."""
+    """libcuda.so in ld SEARCH_DIRs counts with no -L; NVIDIA installs it in /usr/lib/x86_64-linux-gnu."""
     default = tmp_path / "usr-lib"
     default.mkdir()
     _stub(default)
@@ -139,8 +135,7 @@ def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
 
 
 def test_the_cuda_root_inferred_from_nvcc_counts(tmp_path):
-    """With CUDA_HOME and CUDA_PATH unset, get_cuda_path() infers the root from nvcc, so a toolkit at /opt/cuda or in a
-    conda prefix must count, not just /usr/local/cuda."""
+    """Unsets CUDA_HOME and CUDA_PATH; /opt/cuda or a conda prefix toolkit must still be found via nvcc."""
     root = tmp_path / "opt-cuda"
     stubs = root / "lib64" / "stubs"
     stubs.mkdir(parents = True)
@@ -217,8 +212,7 @@ def test_multiarch_dirs_are_empty_off_linux():
 
 
 def test_the_fallback_includes_the_multiarch_dir_when_ld_cannot_be_consulted():
-    """Without ld --verbose (no binutils, or lld with no SEARCH_DIR, llvm/llvm-project#101661) the fallback must include
-    the multiarch dir, else _can_link_libcuda() wrongly answers False."""
+    """See llvm/llvm-project#101661; the no ld --verbose fallback must include the multiarch dir."""
     vllm_utils._linker_default_dirs.cache_clear()
     try:
         with mock.patch.object(subprocess, "run",

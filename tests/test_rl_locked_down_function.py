@@ -39,8 +39,7 @@ BLOCKED = [
     # pickle_by_enum_name(member, proto) returns (getattr, ...): the real getattr then walks __self__ to builtins.__import__.
     ("enum.pickle_by_enum_name", 'def matmul(A, B):\n    import enum, re\n    g = enum.pickle_by_enum_name(re.IGNORECASE, 2)[0]\n    return g(g(g, "__self__"), "__import__")("os").getpid()\n', AttributeError),
     ("from enum import pickle_by_enum_name", 'def matmul(A, B):\n    from enum import pickle_by_enum_name\n    return pickle_by_enum_name\n', ImportError),
-    # Formatter.get_field resolves a dotted string and returns the object, recovering the real __import__; str.format
-    # walks attributes too but only returns text, so only this one matters.
+    # get_field resolves dotted names to objects (real __import__); str.format returns text.
     ("string.Formatter", 'def matmul(A, B):\n    import string\n    q = string.Formatter()\n    return q.get_field("0.get_field.__globals__[__builtins__][__import__]", (q,), {})[0]\n', ImportError),
 ]
 
@@ -261,8 +260,7 @@ def test_functools_reduce_still_works():
 
 
 def test_frame_traversal_is_denied():
-    # A running generator reaches gi_frame.f_back.f_back.f_builtins, the trusted caller's real builtins; no module or
-    # underscore name is involved, so it needs its own rule.
+    # gi_frame.f_back chains reach the trusted caller's builtins; no name rule catches it.
     source = (
         "def matmul(A, B):\n"
         "    holder = []\n"

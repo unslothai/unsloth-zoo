@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD=1 must reach the recompute projector too, else new logps (recompute) and old/ref logps
-(plain) differ by 16-bit head rounding on identical weights."""
+"""UNSLOTH_VLLM_FP32_LM_HEAD=1 must reach recompute, else logps differ by 16-bit head rounding."""
 
 import inspect
 import math

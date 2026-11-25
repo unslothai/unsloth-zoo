@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GPU-free tests for the vLLM >= 0.25.0 LoRA mapper fix: stacked maps collapse fused projections (IndexError in GRPO
-fast_inference); the worker drops stacked maps but keeps renames via get_unstacked_mapper (0.25.0 to 0.28.x),
-get_rename_mapper (0.29.0+), or clears the field."""
+"""GPU-free tests: vLLM >= 0.25.0 stacked maps break fused projections (GRPO IndexError); renames
+via get_unstacked_mapper (0.25.0-0.28.x) or get_rename_mapper (0.29.0+), else clear the field."""
 
 import dataclasses
 import types
@@ -72,8 +71,7 @@ class _FakePEFTHelper:
 
 
 def _make_recording_lora_model_cls(record, *, new_signature):
-    """Fake _lora_model_cls whose loaders record kwargs; new_signature toggles the model_vocab_size parameter of newer
-    vLLM to cover _load_adapter's signature branch."""
+    """Fake _lora_model_cls recording kwargs; new_signature adds model_vocab_size (newer vLLM)."""
     if new_signature:
         def _loader(lora_model_id, peft_helper, dtype, weights_mapper,
                     tensors=None, lora_dir=None, device=None,

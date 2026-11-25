@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 training patches (temporary_patches/deepseek_v41.py), CPU only, against every implementation on
-the path: the community transformers port and Unsloth's native module (tests/_dsv41_impl.py)."""
+"""CPU tests of DeepSeek-V4.1 training patches against the transformers port and native module."""
 
 import os
 import sys
@@ -121,8 +120,7 @@ def test_gradient_checkpointing_replays_group_state(impl):
 
 
 def test_checkpointed_layers_keep_the_compile_stance(impl, monkeypatch):
-    # Layers keep the caller's stance, not force_eager: a helper also used outside must compile
-    # alike.
+    # Layers keep caller's compile stance, not force_eager, so shared helpers compile alike.
     _patches()
     from torch._dynamo import eval_frame
     modeling = impl.modeling

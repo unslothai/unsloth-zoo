@@ -105,8 +105,7 @@ def test_per_chunk_head_grad_does_not_overflow_fp16(monkeypatch, device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_per_chunk_bf16_hidden_grad_with_fp16_head_does_not_overflow(monkeypatch, device):
-    # Enough rows for the per chunk backward: row 0's hidden grad (about -72000) fits bf16 but not an fp16 GEMM output,
-    # which gave -inf before the cast to the hidden dtype.
+    # Row 0's hidden grad (about -72000) fits bf16 but overflows an fp16 GEMM output to -inf.
     monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024 * 1024)
     vocab, hidden_size, n_rows = 129, 2048, 259
     weight = torch.full((vocab, hidden_size), 600.0, device = device)

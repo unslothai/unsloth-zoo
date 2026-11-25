@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Deepcopied tiled MLP decides RNG preservation from its own dropout state; deepcopy keeps the closure over the
-original module, so an eval original with a training copy broke recompute masks; CPU only."""
+"""Deepcopied tiled MLP decides RNG preservation from its dropout state, not the original's."""
 import copy
 
 import pytest

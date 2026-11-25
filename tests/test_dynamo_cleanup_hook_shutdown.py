@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CleanupHook weakref callbacks must not raise at interpreter shutdown, after torch._dynamo.utils globals are set to
-None ('NoneType' object has no attribute 'pop')."""
+"""CleanupHook callbacks must not raise at shutdown, once torch._dynamo.utils globals are None."""
 import pytest
 
 dynamo_utils = pytest.importorskip("torch._dynamo.utils")

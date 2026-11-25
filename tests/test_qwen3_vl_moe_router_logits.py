@@ -82,8 +82,7 @@ def _run_and_check(model, top_level_router_logits = True):
     torch.testing.assert_close(out.aux_loss, expected_aux)
 
 
-# hidden_size > num_experts crashed one_hot ("Class values must be smaller than num_classes"), as on the
-# real 30B / 235B configs (2048 / 4096 hidden, 128 experts); hidden_size < num_experts gave a shape error.
+# hidden_size above num_experts crashed one_hot (as in 30B/235B); below it, a shape error.
 @pytest.mark.parametrize("hidden_size", [64, 8])
 def test_patched_block_returns_gate_router_logits(hidden_size):
     saved = _saved_forwards()
@@ -97,8 +96,7 @@ def test_patched_block_returns_gate_router_logits(hidden_size):
 
 
 def test_router_logits_survive_stripped_output_capture_decorator():
-    # The Unsloth compiler rewrites Qwen3VLMoeModel / Qwen3VLMoeForConditionalGeneration and strips
-    # @check_model_inputs. On 4.57.x Qwen3VLMoeModel.forward then drops the language model's router_logits.
+    # Compiler strips @check_model_inputs; on 4.57.x Qwen3VLMoeModel drops router_logits.
     saved = _saved_forwards()
     try:
         for cls in (Q.Qwen3VLMoeModel, Q.Qwen3VLMoeForConditionalGeneration):

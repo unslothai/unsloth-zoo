@@ -39,14 +39,12 @@ def apply_top_k_top_p_pytorch(
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
-        # Apply top-k.
         top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
         top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
         top_k_mask = logits_sort < top_k_mask
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
     if p is not None:
-        # Apply top-p.
         probs_sort = logits_sort.softmax(dim=-1)
         probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
@@ -54,7 +52,6 @@ def apply_top_k_top_p_pytorch(
         top_p_mask[:, -1] = False
         logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
-    # Re-sort the probabilities.
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
 
 
@@ -67,7 +64,6 @@ def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     # topk.values has shape [batch_size, max_top_k]; converts top k to a 0-based index in [0, max_top_k).
     k_index = k.sub_(1).unsqueeze(1)
     top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
-    # Handle non-topk rows.
     top_k_mask.masked_fill_(no_top_k_mask.unsqueeze(1), -float("inf"))
     return logits.masked_fill_(logits < top_k_mask, -float("inf"))
 
@@ -88,14 +84,12 @@ def apply_top_k_top_p_v0_11_2(
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
-        # Apply top-k.
         top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
         top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
         top_k_mask = logits_sort < top_k_mask
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
     if p is not None:
-        # Apply top-p.
         probs_sort = logits_sort.softmax(dim=-1)
         probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
@@ -103,7 +97,6 @@ def apply_top_k_top_p_v0_11_2(
         top_p_mask[:, -1] = False
         logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
-    # Re-sort the probabilities.
     logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
     return logits
 

@@ -106,8 +106,7 @@ def test_round_trip_with_the_setter(path):
 # Bracket components, from the parallel review of PR #1108.
 
 def test_bracket_components_resolve_like_eval():
-    """peft_utils rewrites .0. to [0] and one call site keeps brackets; a bare getattr cannot index, so name[0] must
-    resolve or gradient checkpointing breaks for models calling self.blocks[0] directly."""
+    """peft_utils rewrites .0. to [0]; name[0] must resolve or gradient checkpointing breaks."""
     import torch
     from unsloth_zoo.empty_model import _get_module_attribute
 
@@ -145,8 +144,7 @@ def test_bracket_components_stay_a_name_and_index_walk():
 
 
 def test_a_unicode_named_submodule_resolves():
-    """Python identifiers may be non-ASCII and PyTorch accepts them; an ASCII-only pattern for the name in name[0] would
-    fall through to getattr on the whole 层[0] string and fail."""
+    """Non-ASCII names like 层[0] must resolve; an ASCII-only pattern falls through to getattr."""
     import torch
 
     class Block(torch.nn.Module):

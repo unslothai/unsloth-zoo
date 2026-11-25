@@ -119,8 +119,7 @@ def test_source_or_new_layout_checkout_also_resolves(mod, monkeypatch, tmp_path)
 
 
 def test_env_pin_resolver_takes_precedence_over_bundle(mod, monkeypatch, tmp_path):
-    # _download_convert_hf_to_gguf tries _resolve_local_convert_script first and falls back to the bundle only when it
-    # returns None; an env pin wins, so the bundle is unreached.
+    # Local resolver runs first; the bundle is a fallback, so an env pin leaves it unreached.
     scripts_dir = _make_bundle(tmp_path / "pinned", conversion=False)
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(scripts_dir))
 

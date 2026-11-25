@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""GRPO text path: prompt tokens that share the pad id stay in the prompt.
-
-With ``tokenizer.pad_token = "<|im_end|>"`` (Qwen-style chat templates end every turn in it), the
-id rule counted each turn end as left padding, so ``left_pack_padding`` moved it out of the prompt
-and the policy forward never saw it. Padding now comes from TRL's attention mask when the two
-disagree. Composes with the completion EOS that shares the pad id (grpo_pad_is_eos_rows): the policy
-sees TRL's prompt plus TRL's completion and the loss mask is TRL's completion_mask.
-CPU only: a tiny causal model whose hidden state depends on every token it attends to.
-"""
+"""GRPO text path: prompt tokens sharing the pad id (Qwen <|im_end|>) stay in prompt, since the id
+rule let left_pack_padding drop them; padding comes from TRL's attention mask on disagreement;
+policy sees TRL prompt+completion, loss mask is TRL's completion_mask; composes with EOS sharing
+pad id."""
 
 import os
 import inspect

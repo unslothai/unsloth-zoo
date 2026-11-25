@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grouped MoE readiness verdicts and NF4 pointer tables reused across expert-state changes (transformers < 5
-ModuleList, gpt-oss NF4); bitwise equal to UNSLOTH_MOE_FAST_READY=0; verdicts match full checks after changes; steady
-state is one lean re-read per block per step."""
+"""MoE readiness verdicts and NF4 pointer tables survive expert-state changes (transformers < 5
+ModuleList, gpt-oss NF4); verdicts match full checks; bitwise equal to UNSLOTH_MOE_FAST_READY=0."""
 import contextlib
 import os
 import sys

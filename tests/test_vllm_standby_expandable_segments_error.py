@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins vLLM load-failure classification in standby mode: expandable-segments config clashes and memory profiling races
-are not OOMs (loose 'alloc', 'memory' and 'free memory' substring checks caught them); real OOMs still are; load_vllm
-wiring is checked."""
+"""Standby load-failure classification: expandable-segments clashes and profiling races are not OOMs
+(loose 'alloc'/'memory'/'free memory' substring checks misfired); real OOMs still are."""
 
 from __future__ import annotations
 
@@ -195,8 +194,7 @@ def test_profiling_race_and_kv_cache_oom_classify_differently():
 
 
 def test_free_memory_marker_still_covers_the_real_startup_shortfall():
-    # Dropping the 'free memory' marker would silently lose the real startup shortfall; its text never says 'out of
-    # memory' (vllm/v1/worker/utils.py request_memory).
+    # Dropping 'free memory' loses the startup shortfall; its text never says 'out of memory'.
     shortfall = (
         "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
         "utilization (0.9, 71.24 GiB). Decrease GPU memory utilization or reduce GPU memory "

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""train_on_responses_only sizes its auto worker count via unsloth_zoo.dataset_num_proc (CPU affinity, cgroup limits),
-not min(cpu_count + 4, 64) capped by host RAM, which forked up to 64 workers onto two pinned cores; CPU-pure and
-offline."""
+"""train_on_responses_only sizes workers via dataset_num_proc (CPU affinity, cgroup limits), not
+min(cpu_count + 4, 64) capped by host RAM, which forked up to 64 workers onto two pinned cores"""
 
 from __future__ import annotations
 

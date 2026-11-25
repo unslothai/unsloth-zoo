@@ -71,9 +71,8 @@ def test_knobs_scale_with_the_machine(ram_gb, cpus, limit, size, perfile, files,
 
 
 def test_a_big_host_lands_on_xet_cores_own_high_performance_numbers():
-    """Scales buffer sizing to the with_high_performance() numbers by machine size without setting
-    HF_XET_HIGH_PERFORMANCE, keeping the bound on small hosts; concurrent files are not followed, since the preset
-    100 x 2 GB per-file buffer is 200 GB against its 64 GB limit."""
+    """Sizes buffers like with_high_performance(), without setting HF_XET_HIGH_PERFORMANCE; its 100
+    x 2 GB buffers are 200 GB, over its 64 GB limit, so concurrent files are not followed."""
     env = tuning.xet_env_overrides(_profile(2048, cpus = 192))
     preset = {  # xet_runtime/src/config/xet_config.rs, with_high_performance()
         "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT": str(64 * GB),
@@ -86,8 +85,7 @@ def test_a_big_host_lands_on_xet_cores_own_high_performance_numbers():
 
 
 def test_the_budget_never_promises_more_than_the_disk_can_take():
-    """The budget is also capped by free disk space, not just host RAM: buffering 64 GB of a download that fails on
-    ENOSPC helps nobody, and free space is the only signal we have."""
+    """Budget is also capped by free disk: buffering a download that hits ENOSPC helps nobody."""
     roomy = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 8000))
     tight = tuning.xet_env_overrides(_profile(2048, cpus = 192, free_disk_gb = 40))
     assert int(roomy["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 64 * GB
@@ -196,8 +194,7 @@ def test_apply_never_overwrites_a_user_setting():
 
 
 def test_a_user_set_high_performance_flag_is_left_alone():
-    """A user-set HF_XET_HIGH_PERFORMANCE (or HF_XET_HP) is left alone, since enabling it is deliberate; clearing it on
-    import once cost a large throughput loss, and setdefault applies."""
+    """A user-set HF_XET_HIGH_PERFORMANCE (or HF_XET_HP) is kept; clearing it cost throughput."""
     for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP"):
         env = {var: "1"}
         written = tuning.apply_xet_env(env, profile = _profile(16))
@@ -342,8 +339,7 @@ def test_a_hybrid_cgroup_v2_line_below_the_first_is_still_found(monkeypatch, tmp
 
 
 def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
-    """A fractional cgroup CPU quota must bind (Kubernetes cpu 500m reads as cpu.max 50000 100000, i.e. 0.5); requiring
-    >= 1 fell back to host cores, sizing streams for the node."""
+    """Fractional quotas (cpu.max 50000/100000 = 0.5) must bind, not fall back to host cores."""
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: 0.5)
     profile = tuning.system_profile()
     assert profile.cpu_count == 1
@@ -354,8 +350,7 @@ def test_fractional_cgroup_cpu_quota_binds(monkeypatch):
 
 
 def test_fail_fast_timeouts_are_opt_out():
-    """Fail-fast Xet timeouts belong only in the supervised download child: xet-core reads its config once per process,
-    so they would also hit uploads and direct hub downloads."""
+    """Fail-fast timeouts stay in the supervised child: xet-core reads config once per process."""
     supervised = tuning.xet_env_overrides(_profile(16))
     global_env = tuning.xet_env_overrides(_profile(16), fail_fast = False)
 
@@ -398,8 +393,7 @@ DEVICES = [
 
 @pytest.mark.parametrize("name, ram_gb, cpus, disk_gb", DEVICES, ids = [d[0] for d in DEVICES])
 def test_every_device_stays_within_its_own_means(name, ram_gb, cpus, disk_gb):
-    """One sizing rule applies to every device: generosity on big hosts is only defensible if the same arithmetic stays
-    conservative on small ones, where OOMs and stalls go unnoticed."""
+    """One rule for all: big-host generosity needs small hosts to stay conservative."""
     env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
     limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
     size = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
@@ -419,8 +413,7 @@ def test_every_device_stays_within_its_own_means(name, ram_gb, cpus, disk_gb):
 
 
 def test_the_smallest_devices_get_the_smallest_numbers():
-    """Small devices (2 GB VM, fractional-core pod) get two files, four streams and a buffer capped at a sixth of RAM,
-    since xet-core's default would take a 2 GB machine whole."""
+    """Small devices: 2 files, 4 streams, a RAM/6 buffer; stock xet-core would swamp them."""
     for name, ram_gb, cpus, disk_gb in DEVICES[:2]:
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus, disk_gb))
         assert int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"]) == 1 * GB, name
@@ -482,8 +475,7 @@ def test_we_only_set_variables_xet_core_reads(tmp_path):
 
 
 def test_the_prefetch_floor_never_undercuts_xet_cores_own(tmp_path):
-    """The prefetch floor never undercuts xet-core's default unless the whole budget is below 1 GB; sizing below the
-    default for no reason only makes downloads slower."""
+    """Prefetch floor never undercuts xet-core's default unless the budget is under 1 GB."""
     for ram_gb, cpus in ((8, 4), (16, 8), (32, 16), (64, 32), (2048, 192)):
         env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
         prefetch = int(env["HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER"])
@@ -512,8 +504,7 @@ def test_no_module_sets_a_variable_xet_core_does_not_read():
 
 @pytest.mark.parametrize("ram_gb, cpus", [(8, 8), (12.7, 2), (16, 4), (32, 16), (64, 32), (2048, 192)])
 def test_a_machine_that_can_hold_xet_cores_own_buffer_gets_it(ram_gb, cpus):
-    """Sizing exists to cap machines that need it; giving a machine less buffer than it would get by default is just a
-    slower download, not a cap (the small-device regression)."""
+    """Sizing caps only machines that need it; a buffer below stock default is just slower."""
     env = tuning.xet_env_overrides(_profile(ram_gb, cpus))
     size = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE"])
     limit = int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"])
@@ -525,8 +516,7 @@ def test_a_machine_that_can_hold_xet_cores_own_buffer_gets_it(ram_gb, cpus):
 
 
 def test_a_small_container_with_many_cores_still_fits_a_third_of_its_ram():
-    """Small containers with many cores must still fit their RAM budget: cores alone setting the file count put 973 MB
-    in flight on a 2 GB box, so the proportional promise must win."""
+    """Cores alone setting file count put 973 MB in flight on a 2 GB box; RAM budget must win."""
     for cpus in (2, 8, 64):
         env = tuning.xet_env_overrides(_profile(2, cpus))
         worst = (
@@ -643,8 +633,7 @@ def test_installed_xet_core_honours_the_fixed_alias_after_sizing():
 
 
 def test_the_flag_is_read_the_way_xet_core_reads_it():
-    """xet-core reads HF_XET_HP only when HF_XET_HIGH_PERFORMANCE is unset (configuration_utils.rs
-    get_high_performance_flag), so an explicit 0 masks it; standing down over it leaves stock constants."""
+    """HF_XET_HP is read only when HF_XET_HIGH_PERFORMANCE is unset, so an explicit 0 masks it."""
     masked = {"HF_XET_HIGH_PERFORMANCE": "0", "HF_XET_HP": "1"}
     tuning.apply_xet_env(masked, profile = _profile(16))
     assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" in masked, "sizing stood down for nothing"

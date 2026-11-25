@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""model_type from a downloaded config.json is interpolated into imports and cache names, so get_transformers_model_type
-is the single choke point every caller passes through; tests are CPU-only and network-free."""
+"""Untrusted model_type reaches imports and cache names only via get_transformers_model_type."""
 
 import re
 

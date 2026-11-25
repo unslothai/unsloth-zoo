@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The automatic Hub cache fallback must not sit under a directory another account can rename entries in:
-a group-writable, non-sticky scratch dir owned by someone else lets any group member move our private
-folder away and plant theirs. Foreign ownership is faked by patching Path.stat, since a real one needs
-root."""
+"""The automatic Hub cache fallback must not sit in a group-writable, non-sticky dir owned by
+another account, where any group member could move our private folder away and plant theirs;
+foreign ownership is faked by patching Path.stat since a real one needs root."""
 
 import os
 import pathlib

@@ -96,8 +96,7 @@ def raised():
         capture_output = True, text = True, timeout = 900, cwd = str(root), env = env,
     )
     if "<<<WARMFAIL>>>" in proc.stdout:
-        # A failure, not a skip: the parent just imported the module, so a child that cannot is a real init regression;
-        # a skip would read as green CI and leave both handlers unexercised.
+        # Fail, not skip: a skip would read as green CI and leave both handlers unexercised.
         pytest.fail("the child could not import what this process already did: "
                     + proc.stdout.split("<<<WARMFAIL>>>", 1)[1][:400])
     if "<<<RESULTS>>>" not in proc.stdout:
@@ -127,7 +126,6 @@ def test_a_mismatched_torchvision_is_caught_on_the_runtimeerror_arm(raised):
     assert got["type"] == "RuntimeError", got
     assert "reinstall torchvision" in got["message"]
     assert PIP in got["message"]
-    # Not the bare error the user used to see.
     assert "does not exist" not in got["message"]
 
 
@@ -148,8 +146,7 @@ def test_an_unrelated_import_error_still_falls_through(raised):
 
 
 def test_a_missing_symbol_is_not_called_an_incomplete_install(raised):
-    """A cannot-import-name for read_video from torchvision.io.video has the same substring while the module is present,
-    so an incomplete-install message would be false and reinstalling would not fix it."""
+    """A missing symbol (module present) shares the substring; reinstalling would not fix it."""
     got = raised["video_symbol"]
     assert "install is incomplete" not in (got["message"] or "")
     assert got["type"] == "Exception", got

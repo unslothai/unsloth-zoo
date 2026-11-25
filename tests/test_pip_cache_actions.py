@@ -50,8 +50,7 @@ def test_workflows_exist():
 
 
 def test_no_builtin_setup_python_pip_cache():
-    """Checks every step in the repo, including composite actions: a composite may run setup-python whose post-step
-    writes a PR-scoped cache, and the save guard only matches actions/cache spellings."""
+    """setup-python post-step in composites writes PR-scoped caches the save guard misses."""
     offenders = [
         f"{where}: {step.get('name') or step.get('uses')}"
         for where, step in _cache_writer_steps()
@@ -171,8 +170,7 @@ _CACHE_WRITERS = ("actions/cache@", "actions/cache/save@")
 
 
 def _uses(step):
-    """Casefolds uses since GitHub resolves owner/repo case-insensitively, so Actions/Cache/Save@v6 must match; the ref
-    after @ is not matched on and local paths are compared raw."""
+    """Casefolds uses (GitHub owner/repo is case-insensitive); @ref is ignored, paths stay raw."""
     return str(step.get("uses", "")).casefold()
 
 
@@ -234,9 +232,8 @@ _LEAF_MAIN = re.compile(
 
 
 def _restricted_to_main(expr):
-    """Whether expr can only be true on the default branch: OR restricts only if every branch does, AND if any does;
-    top-level-only splitting accepted an always() && (...) expression that runs on every PR; negations are refused
-    outright, since a negated main equality is its inverse."""
+    """Whether expr only runs on main: OR needs every branch restricted, AND any one; top-level
+    splitting let always() && (...) pass; negations are refused as they invert main."""
     return _requires(expr, _LEAF_MAIN)
 
 

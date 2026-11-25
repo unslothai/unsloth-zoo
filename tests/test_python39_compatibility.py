@@ -40,8 +40,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "unsloth_zoo"
 
-# Eagerly imported by unsloth_zoo/__init__.py, so they must work on the floor though the rest of mlx/ is lazy; paths are
-# package-relative since mlx/cce/__init__.py shares a basename.
+# Eagerly imported, so must work on the floor; package-relative paths avoid a basename clash.
 MLX_IMPORT_TIME = {"mlx/__init__.py", "mlx/runtime.py"}
 
 
@@ -275,8 +274,7 @@ def _is_floor_version_check(node):
 
 
 def test_vendored_fla_stays_gated_below_310():
-    """Excluding _vendored/fla is only sound while the guard bails out below Python 3.10; checked structurally, since a
-    commented-out or dead check would still satisfy a text search."""
+    """Excluding _vendored/fla is sound only while its guard bails below 3.10; checked by AST."""
     path = PACKAGE_ROOT / "temporary_patches" / "fla_vendor.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     guard = next((n for n in ast.walk(tree)

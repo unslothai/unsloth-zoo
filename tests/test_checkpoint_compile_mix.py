@@ -77,8 +77,7 @@ def dynamo_limits():
     saved = {n: getattr(dynamo.config, n) for n in names
              if hasattr(dynamo.config, n)}
     n_wrappers = len(U._EAGER_FALLBACK_WRAPPERS)
-    # These tests leave a bump outstanding on purpose: left behind, a later fallback restores this test's limit of 2
-    # over the process default, or finds the allowance spent and takes every live borrower eager.
+    # Leftover bumps skew later fallbacks: wrong limit, or allowance spent and all go eager.
     saved_states = [(_w, dict(_w._unsloth_fallback_state))
                     for _w in (_r() for _r in U._EAGER_FALLBACK_WRAPPERS)
                     if _w is not None]

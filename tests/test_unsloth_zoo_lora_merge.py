@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tier 0 LoRA merge tests for saving_utils.py (_active_merge_device, _merge_lora, 5 MoE expert merges) against a numpy
-reference; run on Linux CUDA/XPU without an MLX shim."""
+"""Tier 0 LoRA merge tests for saving_utils.py against numpy; run on CUDA/XPU, no MLX shim."""
 
 from __future__ import annotations
 
@@ -48,9 +47,8 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
     return LoraStats(module=None, lora_A=lora_A, lora_B=lora_B, alpha=alpha)
 
 
-# PEFT packs fused MoE LoRA differently: lora_A is expert-slowest (rows e*rank:(e+1)*rank), lora_B expert-fastest
-# (columns e::num_experts); written out, not imported from moe_utils, because an expectation calling the merge's own
-# helper could never fail.
+# PEFT packs lora_A expert-slowest (rows e*rank:(e+1)*rank) and lora_B expert-fastest (columns
+# e::num_experts); expectation written out, not from moe_utils, so the test can fail.
 
 def _peft_expert_lora_b(lora_B: torch.Tensor, expert_idx: int, num_experts: int) -> torch.Tensor:
     """Expert `expert_idx`'s `(out, rank)` block of a fused `lora_B`, as PEFT packs it."""
@@ -58,8 +56,7 @@ def _peft_expert_lora_b(lora_B: torch.Tensor, expert_idx: int, num_experts: int)
 
 
 def _expert_slowest_lora_b(lora_B: torch.Tensor, expert_idx: int, rank_per: int) -> torch.Tensor:
-    """Pre-fix reading of lora_B as one contiguous rank-wide column block per expert; it never raises and barely moves
-    the delta norm, kept so a test can assert the merge does not produce it."""
+    """Pre-fix lora_B read, contiguous per-expert blocks; silent, kept so a test catches it."""
     return lora_B[:, expert_idx * rank_per:(expert_idx + 1) * rank_per]
 
 

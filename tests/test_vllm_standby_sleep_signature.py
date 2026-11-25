@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Standby's patched CuMemAllocator.sleep must take both call shapes: vLLM <= 0.33 calls sleep(offload_tags) and
-vLLM >= 0.34 (CuMemBackend.suspend) calls sleep(offload_tags, discardable). On 0.34 AllocationData also carries
-is_asleep, which vLLM's own discard/_trim/free paths read, so the patch must keep it in sync."""
+"""vLLM <= 0.33: sleep(offload_tags); >= 0.34: sleep(offload_tags, discardable), also sync is_asleep."""
 
 import dataclasses
 import sys
