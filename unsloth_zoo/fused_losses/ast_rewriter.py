@@ -674,7 +674,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             or cap.logits_bias_src is not None):
         template = textwrap.dedent(f"""
             if labels is not None:
-                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):
+                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not (_fuses_model(self) and _can_fuse_loss(self.loss_function)):
                     {logits} = {logits_rhs}
                     {loss} = self.loss_function({lf_args}{lf_extra}{kwargs_unpack})
                 else:
@@ -742,7 +742,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     custom_loss = "" if cap.legacy_body else " or not _can_fuse_loss(self.loss_function)"
     template = (
         "if labels is not None:\n"
-        f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{custom_loss}{zero_scale}:\n"
+        f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _fuses_model(self){custom_loss}{zero_scale}:\n"
         f"{ind(unfused, 8)}\n"
         f"    else:\n{ind(fused, 8)}\n"
         f"else:\n{ind([f'{logits} = {logits_rhs}', *softcap, f'{loss} = None'], 4)}"

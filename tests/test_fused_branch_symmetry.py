@@ -30,6 +30,7 @@ from unsloth_zoo.fused_losses.ast_rewriter import (  # noqa: E402
     rewrite_forward_source_spliced,
 )
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy  # noqa: E402
+from unsloth_zoo.fused_losses.forward_install import _fuses_model  # noqa: E402
 from test_fused_num_items_fallback import MAMBA_5_16_1, T5_ENC_DEC, XGLM_KWARGLESS  # noqa: E402
 
 VOCAB, HIDDEN = 11, 8
@@ -79,7 +80,7 @@ def _run(source, return_logits, **kwargs):
     labels = torch.randint(0, VOCAB, (2, 6))
     labels[0, :3] = -100
     ns = {
-        "torch": torch, "os": os, "CrossEntropyLoss": torch.nn.CrossEntropyLoss, "EMPTY_LOGITS": None,
+        "torch": torch, "os": os, "CrossEntropyLoss": torch.nn.CrossEntropyLoss, "EMPTY_LOGITS": None, "_fuses_model": _fuses_model,
         "unsloth_fused_lm_head_loss": _fused_stub,
         "unsloth_count_aware_cross_entropy": unsloth_count_aware_cross_entropy,
     }
@@ -145,7 +146,7 @@ def test_injected_count_only_reaches_a_loss_function_when_present():
         return logits.sum() * 0
 
     from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_loss_count_kwargs
-    ns = {"torch": torch, "os": os, "EMPTY_LOGITS": None, "unsloth_fused_lm_head_loss": _fused_stub,
+    ns = {"torch": torch, "os": os, "EMPTY_LOGITS": None, "_fuses_model": _fuses_model, "unsloth_fused_lm_head_loss": _fused_stub,
           "unsloth_loss_count_kwargs": unsloth_loss_count_kwargs}
     exec(new, ns)
     old = os.environ.get("UNSLOTH_RETURN_LOGITS")

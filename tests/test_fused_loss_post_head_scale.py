@@ -19,7 +19,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 
@@ -176,6 +176,7 @@ def _install_rewritten(cls):
         "os": os,
         "torch": torch,
         "_can_fuse_loss": _can_fuse_loss,
+        "_fuses_model": _fuses_model,
         "unsloth_fused_lm_head_loss": unsloth_fused_lm_head_loss,
         "EMPTY_LOGITS": EMPTY_LOGITS,
     }

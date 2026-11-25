@@ -940,6 +940,26 @@ def _calling_model_spans_devices(max_depth = 8):
     return spans
 
 
+def _mask_built_for_plain_model(max_depth = 8):
+    """A plain transformers model (unmarked) builds this mask: give it transformers' own mask."""
+    from unsloth_zoo.model_marker import is_unsloth_model, model_marker_required
+    if not model_marker_required() or _is_tracing_masks():
+        return False
+    try:
+        from transformers import PreTrainedModel
+    except Exception:
+        return False
+    frame = sys._getframe(1)
+    for _ in range(max_depth):
+        frame = frame.f_back
+        if frame is None:
+            return False
+        module = frame.f_locals.get("self", None)
+        if isinstance(module, nn.Module):
+            return isinstance(module, PreTrainedModel) and not is_unsloth_model(module)
+    return False
+
+
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
@@ -1160,6 +1180,8 @@ def patch_transformers_masks():
                         kwargs[embeds_name] = kwargs.pop(other)
             for name in drop:
                 kwargs.pop(name, None)
+            if _mask_built_for_plain_model():
+                return original(*args, **kwargs)
             input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
             if (
                 prepared_mask_shortcut
