@@ -513,8 +513,7 @@ def patch_qwen3_vl_moe():
             logits_to_keep=0,
             **kwargs,
         ):
-            # transformers 5.24 passes the cache as `cache=`, which lands in **kwargs here: fold it in and hand it on
-            # under the callee's own name, or stock sees both names and warns on every call.
+            # Fold 5.24's `cache=` from **kwargs, else stock sees both names and warns every call.
             _cache = kwargs.pop("cache", None)
             if past_key_values is None:
                 past_key_values = _cache
@@ -574,7 +573,6 @@ def patch_qwen3_vl_moe():
                 **{_output_cache_field: output_cache(outputs)},
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
-                # transformers 5.24 dropped rope_deltas from this output class.
                 **({"rope_deltas": getattr(outputs, "rope_deltas", None)} if _output_has_rope_deltas else {}),
             )
 

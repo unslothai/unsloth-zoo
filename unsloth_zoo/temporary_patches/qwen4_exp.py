@@ -482,7 +482,6 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
     from unsloth_zoo.temporary_patches.qwen4_exp import (
         _qwen4_exp_sparse_attention, _reference_attention_forward, QWEN4_EXP_SPARSE_STATS,
     )
-    # transformers 5.24 passes the cache as `cache=`; past_key_values is the name up to 5.23.
     cache = kwargs.pop("cache", None)
     if past_key_values is None:
         past_key_values = cache
@@ -546,8 +545,7 @@ def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values,
 
 
 def _is_transformers_indexer_forward(function):
-    """By code file: the compiled copy keeps transformers' ``__module__``. transformers 5.24 wraps these forwards
-    in ``deprecate_kwarg``, whose code lives in utils/deprecation.py: read the wrapped function's file."""
+    """By code file: the compiled copy keeps transformers' ``__module__``; read through 5.24's ``deprecate_kwarg`` wrapper."""
     import inspect
     try:
         function = inspect.unwrap(function)

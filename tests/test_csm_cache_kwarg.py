@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers 5.24 generate hands the CSM depth decoder its cache as `cache=` (renamed from past_key_values): the
-patched depth decoder forwards must read it there, or codebook positions restart at 0 every step; and the
-CsmOutputWithPast cache fields (depth_decoder_cache on 5.24) must keep their values."""
+"""Patched CSM depth decoder must read 5.24's `cache=` (else positions restart at 0) and keep output cache fields."""
 
 import json
 import os

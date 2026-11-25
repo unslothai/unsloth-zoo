@@ -3256,8 +3256,7 @@ def create_standalone_class(
     # the undecorated function instead of off the class attribute.
     real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
     old_source = inspect.getsource(real_forward)
-    # transformers 5.24: patch_function's cache adapter shows `cache` but the source it wraps says past_key_values.
-    # Emit the replacement's own names, then re-apply the adapter to the generated class.
+    # 5.24: the adapter shows `cache` but wraps past_key_values source; emit its names, re-apply the adapter.
     cache_adapter, _adapted = None, f.forward
     for _ in range(10):  # under a checkpoint / functools.wraps wrapper too
         cache_adapter = getattr(_adapted, "_unsloth_cache_kwarg_adapter", None)
@@ -3404,7 +3403,6 @@ def create_standalone_class(
     if cache_adapter is not None:
         signature_source = getattr(_adapted, "__wrapped__", real_forward)
     parameters = inspect.signature(signature_source).parameters
-    # The emitted definition is the stock one (renamed replacement) or the replacement's own: bind its cache name.
     cache_value = {}
     if cache_adapter is not None and patched_forward_info:
         cache_value = {cache_adapter[0]: cache_adapter[1]}

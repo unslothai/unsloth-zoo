@@ -63,7 +63,6 @@ def _indexer_base(cls, model_type, skip_forward, skip_installer):
 
 
 def _source_has(function, needles):
-    # Needles use the pre-5.24 cache spelling; _skip._source maps 5.24's `cache` onto it.
     source = _skip._source(function)
     return bool(source) and all(n in source for n in needles)
 
@@ -236,7 +235,6 @@ def patch_minimax_m3_sparse_flex():
         unsloth_minimax_m3_indexer_forward = unsloth_minimax_m3_indexer_forward,
     )
 
-    # `cache`: transformers 5.24+ decoder layers pass the cache as cache=; past_key_values before.
     def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, cache = None, **kwargs):
         return unsloth_minimax_m3_sparse_attention_forward(
             self, hidden_states, position_embeddings, attention_mask,
@@ -425,7 +423,6 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
         **{f"unsloth_{family}_sparse_attention_forward": attention_forward},
         unsloth_dsa_indexer_forward = unsloth_dsa_indexer_forward,
     )
-    # `cache`: transformers 5.24+ passes the cache as cache= (decoder layer -> attention -> indexer); past_key_values before.
     if family == "deepseek_v32":
         def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, position_ids = None, cache = None, **kwargs):
             return unsloth_deepseek_v32_sparse_attention_forward(

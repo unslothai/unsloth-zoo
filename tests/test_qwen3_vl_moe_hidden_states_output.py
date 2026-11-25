@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Qwen3-VL-MoE GRPO hidden-states forward builds an output the running transformers accepts.
-
-transformers 5.24 renamed past_key_values to cache and dropped rope_deltas from
-Qwen3VLMoeCausalLMOutputWithPast; passing rope_deltas there raised TypeError on every
-UNSLOTH_RETURN_HIDDEN_STATES=1 step.
-"""
+"""Qwen3-VL-MoE hidden-states output must not pass rope_deltas (dropped in 5.24, raised TypeError)."""
 
 import dataclasses
 import inspect
@@ -70,7 +65,6 @@ def test_hidden_states_output_is_constructible(monkeypatch):
     cache = object()
     rope_deltas = torch.zeros(1, 1)
     fake = _Self(_ModelOutput(hidden, cache, rope_deltas))
-    # The cache under the keyword the running transformers' generate uses (`cache` from 5.24).
     stock = getattr(cls.forward, "__wrapped__", cls.forward)
     call_name = "cache" if "cache" in inspect.signature(stock).parameters else "past_key_values"
     out = cls.forward(
@@ -83,6 +77,5 @@ def test_hidden_states_output_is_constructible(monkeypatch):
     assert out.get(cache_field) is cache
     if "rope_deltas" in fields:
         assert out.rope_deltas is rope_deltas
-    # The cache reached the inner model once, under the name it takes.
     assert sum(k in fake.seen for k in ("cache", "past_key_values")) == 1, fake.seen
     assert fake.seen.get(cache_field) is cache

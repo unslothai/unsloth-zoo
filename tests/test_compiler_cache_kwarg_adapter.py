@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A zoo replacement adapted to transformers 5.24's `cache` keyword must keep the cache in the compiler's
-standalone class too: the emitted forward is written from the replacement (past_key_values), so the adapter has
-to be re-applied there or a `cache=` call loses the cache in **kwargs."""
+"""The compiler's standalone class must re-apply the 5.24 `cache` adapter or `cache=` is lost in **kwargs."""
 
 import importlib.util
 import sys

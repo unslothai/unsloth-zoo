@@ -86,8 +86,7 @@ def _is_transformers_function(function, model_type):
     return f"/transformers/models/{model_type}/" in filename
 
 
-# transformers 5.24 renamed the cache argument past_key_values to cache (and hands `kwargs=kwargs` to cache.update);
-# the needles below are written in the earlier spelling.
+# Needles below use the pre-5.24 spelling (past_key_values, no `kwargs=kwargs` in cache.update).
 _CACHE_WORD = re.compile(r"\bcache\b")
 
 
@@ -138,13 +137,11 @@ def _dsa_indexer_forward(self, model_type, hidden_states, q_resid, position_embe
         return torch.arange(key_len, device=hidden_states.device, dtype=torch.int32).expand(
             batch_size, seq_len, key_len
         )
-    # Positional: the sixth argument is the cache under either name (past_key_values, cache from 5.24).
     return _REFERENCE[f"{model_type}.indexer"](
         self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values,
     )
 
 
-# `cache` is what transformers 5.24+ attention passes (cache=cache); past_key_values is the earlier name.
 def deepseek_v32_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask,
                                  position_ids=None, past_key_values=None, cache=None):
     # Copied into the compiler cache: only torch, self, the arguments and the lazy import.

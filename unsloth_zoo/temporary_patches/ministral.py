@@ -100,8 +100,7 @@ def patch_MinistralAttention():
     _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     if _renamed_cache_param(target_cls.forward, _full_forward) is not None:
-        # transformers 5.24 passes the cache as `cache=`; the copied stock signature hides the rename from
-        # patch_function, so map it onto past_key_values here or decode runs without the cache.
+        # The copied stock signature hides 5.24's `cache` from patch_function: map it here or decode loses the cache.
         _full_forward = adapt_cache_kwarg(_full_forward, "past_key_values")
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
@@ -130,7 +129,6 @@ def patch_MinistralModel_forward():
         return raise_error("MinistralModel", e)
 
     original_forward = MinistralModel.forward
-    # Pass the cache on under the stock name (`cache` from transformers 5.24) so no deprecation warning fires.
     _cache_kwarg = cache_kwarg_name(original_forward)
 
     def patched_forward(

@@ -155,8 +155,7 @@ def _patch_deepseek_v3_causal_lm_forward():
             logits_to_keep=0,
             **kwargs,
         ):
-            # transformers 5.24 passes the cache as `cache=`, which lands in **kwargs here: fold it in and hand it on
-            # under the callee's own name, or stock sees both names and warns on every call.
+            # Fold 5.24's `cache=` from **kwargs, else stock sees both names and warns every call.
             _cache = kwargs.pop("cache", None)
             if past_key_values is None:
                 past_key_values = _cache

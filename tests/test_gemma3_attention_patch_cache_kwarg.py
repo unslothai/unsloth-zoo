@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers 5.24 renamed the attention cache argument to `cache`; the Gemma3Attention patch must still install
-(it silently fell back to stock attention) and must still fill the KV cache, on every transformers version."""
+"""Gemma3Attention patch must install (not silently fall back) and fill the KV cache under 5.24's `cache`."""
 
 import json
 import os

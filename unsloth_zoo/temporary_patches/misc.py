@@ -205,7 +205,6 @@ TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
 
 def _cache_as_past_key_values(kwargs):
-    """transformers 5.24+ passes the cache as `cache=`; the full CSM forwards below declare past_key_values."""
     if "cache" in kwargs:
         cache = kwargs.pop("cache")
         if cache is not None or kwargs.get("past_key_values") is None:
@@ -222,7 +221,6 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         return raise_error("CsmDepthDecoderForCausalLM.forward", e)
 
     target_cls = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM
-    # The depth decoder model's cache keyword: `cache` from transformers 5.24.
     _model_cache_kwarg = cache_kwarg_name(transformers.models.csm.modeling_csm.CsmDepthDecoderModel.forward)
 
     def forward(
@@ -349,7 +347,6 @@ def patch_CsmDepthDecoderModel_forward():
         return  # transformers 4.x: positions come from generate's cache_position
     if getattr(target_cls.forward, "_unsloth_device_positions", False):
         return
-    # Cache keywords / output field: `cache` from transformers 5.24 (past_key_values before).
     _layer_cache_kwarg = cache_kwarg_name(modeling_csm.CsmDecoderLayer.forward)
     import transformers.masking_utils as _masking_utils
     _mask_cache_kwarg = cache_kwarg_name(getattr(
@@ -373,7 +370,6 @@ def patch_CsmDepthDecoderModel_forward():
     ):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
-        # transformers 5.24+ callers pass the cache as cache= (this signature mirrors stock's).
         cache = kwargs.pop("cache", None)
         if past_key_values is None:
             past_key_values = cache
@@ -437,7 +433,6 @@ def patch_CsmForConditionalGeneration_forward():
         return raise_error("CsmForConditionalGeneration.forward", e)
 
     target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
-    # The backbone's cache keyword: `cache` from transformers 5.24.
     _backbone_cache_kwarg = cache_kwarg_name(transformers.models.csm.modeling_csm.CsmBackboneModel.forward)
 
     def forward(
@@ -959,8 +954,7 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
     parameters = signature.parameters
     if "past_key_values" in kwargs and "cache" in parameters:
-        # transformers 5.24 renamed the factories' past_key_values to cache; the old name is a deprecated
-        # alias (5.24.1 lists it keyword-only, while `cache` stays required).
+        # 5.24 factories: `cache` required, past_key_values a keyword-only deprecated alias.
         kwargs = dict(kwargs)
         kwargs.setdefault("cache", kwargs.pop("past_key_values"))
     try:
@@ -2944,7 +2938,6 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
             message += " `use_cache=False`,"
             changed = True
         if not getattr(self, "_can_checkpoint_with_cache", False):
-            # `cache` is transformers 5.24's name for past_key_values.
             for name in ("past_key_values", "cache", "layer_past"):
                 if kwargs.get(name) is not None:
                     kwargs[name] = None

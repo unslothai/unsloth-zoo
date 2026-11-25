@@ -50,7 +50,6 @@ class _ChainKV:
     def add_positions(self, positions):
         self.positions = positions if self.positions is None else torch.cat([self.positions, positions], dim = 1)
 
-    # transformers 5.24 attention passes `kwargs=kwargs` too.
     def update(self, key_states, value_states, layer_idx, cache_kwargs = None, **kwargs):
         if layer_idx in self.keys:
             self.keys[layer_idx] = torch.cat([self.keys[layer_idx], key_states], dim = -2)
@@ -140,7 +139,6 @@ def _call_kwargs(layer):
 
 
 def _cache_kwarg(layer):
-    """The decoder layer's cache keyword: `cache` from transformers 5.24, past_key_values before."""
     try:
         params = inspect.signature(layer.forward).parameters
     except (TypeError, ValueError):

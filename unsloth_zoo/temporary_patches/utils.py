@@ -88,8 +88,7 @@ pass
 # Fastpath: output classes sometimes drop args.
 global PROCESS_RETURN_ALLOWED_TYPES
 PROCESS_RETURN_ALLOWED_TYPES = {}
-# transformers 5.24 renamed the KV cache argument / output field `past_key_values` (SSM mixers:
-# `cache_params`) to `cache`; the old names stay deprecated aliases until 5.40.
+# transformers 5.24 renamed past_key_values / cache_params to `cache`; old names are aliases until 5.40.
 _OLD_CACHE_NAMES = ("past_key_values", "cache_params")
 _OUTPUT_CACHE_FIELD = {}
 
@@ -2649,7 +2648,6 @@ def patch_function(
             new_func = eager_under_zero3(_eager_func, new_func)
     pass
 
-    # transformers 5.24: stock takes `cache` where the replacement declares past_key_values / cache_params.
     _old_cache_name = _renamed_cache_param(original_func, new_func)
     if _old_cache_name is not None:
         new_func = adapt_cache_kwarg(new_func, _old_cache_name)
@@ -2715,7 +2713,6 @@ def patch_function_past_key_values(
             continue
         # Check if either is provided
         for key in ("past_key_value", "past_key_values",):
-            # transformers 5.24 renamed past_key_values to cache; patch_function adapts the keyword.
             if key in new_keys and (key in old_keys or (
                 key == "past_key_values" and "cache" in old_keys and "cache" not in new_keys
             )):

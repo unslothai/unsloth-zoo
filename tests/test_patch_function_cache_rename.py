@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers 5.24 renamed the KV cache argument `past_key_values` (SSM mixers: `cache_params`) to `cache`.
-
-A replacement written against `past_key_values` must still install over a stock forward that declares
-`cache`, and must receive the cache that 5.24 callers pass as `cache=` instead of losing it in **kwargs.
-"""
+"""past_key_values replacements must install over a 5.24 `cache` forward and receive `cache=`."""
 
 import inspect
 
@@ -29,7 +25,6 @@ from unsloth_zoo.temporary_patches import utils as U
 
 def _stock_class():
     class Attention:
-        # transformers 5.24 GptOssAttention.forward
         def forward(self, hidden_states, position_embeddings, attention_mask, cache = None, **kwargs):
             raise AssertionError("stock forward must have been replaced")
 

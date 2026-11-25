@@ -182,8 +182,7 @@ def test_disabling_a_requested_cache_still_warns(monkeypatch):
 
 @pytest.mark.parametrize("cache_name", ["past_key_values", "cache", "layer_past"])
 def test_a_cache_under_any_name_is_dropped_while_checkpointing(cache_name):
-    # transformers 5.24 renamed past_key_values to cache: stock nulls `cache`, so must the keyword-input path,
-    # or the recompute would write the cache a second time.
+    # Stock nulls `cache` (5.24); else the recompute writes the cache twice.
     seen = {}
 
     class _CachedLayer(GradientCheckpointingLayer):

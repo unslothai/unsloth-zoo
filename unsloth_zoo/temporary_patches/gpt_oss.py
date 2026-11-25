@@ -4027,15 +4027,13 @@ def patch_GptOssModel():
         if _tf_major < 5:
             return {"config", "input_embeds", "attention_mask",
                     "cache_position", "past_key_values", "position_ids"}
-        # 5.24 renamed the factories' past_key_values to cache.
         return {"config", "inputs_embeds", "attention_mask",
                 "cache" if transformers_version >= Version("5.24.0") else "past_key_values", "position_ids"}
     _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
     _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
     _mask_params = _ccm_params | _cswc_params
 
-    # transformers 5.24 factories take the cache as `cache` (past_key_values is a deprecated alias that the
-    # kwargs filter below would drop, building decode masks as if there were no cache).
+    # 5.24 factories take `cache`; the filter below drops past_key_values, building masks with no cache.
     _mask_cache_kwarg = "cache" if "cache" in _mask_params else "past_key_values"
 
     def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):
@@ -4057,7 +4055,6 @@ def patch_GptOssModel():
         flex_attention_with_sink_decoding,
     )
 
-    # Cache keyword of the stock layer / attention forwards: `cache` from transformers 5.24.
     _modeling = transformers.models.gpt_oss.modeling_gpt_oss
     _layer_cache_kwarg = cache_kwarg_name(_modeling.GptOssDecoderLayer.forward)
     _attn_cache_kwarg = cache_kwarg_name(_modeling.GptOssAttention.forward)
@@ -4896,7 +4893,6 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             return
 
         _original_causal_lm_forward = GptOssForCausalLM.forward
-        # transformers 5.24 takes the cache as `cache`; pass it on under the name each callee declares.
         _causal_cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
         _model_cache_kwarg = cache_kwarg_name(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel.forward)
 
@@ -4984,7 +4980,6 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         _old_cache_name = _renamed_cache_param(_original_causal_lm_forward, _patched_causal_lm_forward)
         if _old_cache_name is not None:
-            # Stock 5.24 generate passes cache=, which **kwargs would otherwise swallow.
             _patched_causal_lm_forward = adapt_cache_kwarg(_patched_causal_lm_forward, _old_cache_name)
         GptOssForCausalLM.forward = _patched_causal_lm_forward
         GptOssForCausalLM._unsloth_grpo_patched = True

@@ -625,7 +625,6 @@ def patch_chunked_causal_lm_loss(model):
     # outer method, and a bound original would run the source model's weights.
     original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
     inner_name = getattr(model, "base_model_prefix", "model")
-    # transformers 5.24 renamed past_key_values to cache: pass it on under the stock forward's own name.
     try:
         params = inspect.signature(original_forward).parameters
     except (TypeError, ValueError):
@@ -637,7 +636,6 @@ def patch_chunked_causal_lm_loss(model):
     def forward(self, input_ids = None, attention_mask = None, position_ids = None,
                 past_key_values = None, inputs_embeds = None, labels = None, use_cache = None,
                 logits_to_keep = 0, **kwargs):
-        # 5.24 generate passes the cache as `cache=`, which lands in **kwargs here.
         cache = kwargs.pop("cache", None)
         if past_key_values is None:
             past_key_values = cache

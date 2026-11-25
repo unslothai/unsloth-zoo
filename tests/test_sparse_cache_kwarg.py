@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers 5.24 renamed past_key_values to cache (decoder layers pass `cache=cache` to the attention, the DSA
-attention passes it to the indexer by name). The sparse skip / flex / GLM-5.3-Flash patches must still install on
-5.24 and their forwards must use the cache they are handed: cached decode equals the uncached forward."""
+"""Sparse skip / flex / GLM-5.3-Flash patches install on 5.24 and use the `cache=` they are handed."""
 
 import importlib.util
 import os
@@ -39,7 +37,7 @@ def _env(monkeypatch):
     for name in list(os.environ):
         if name.startswith("UNSLOTH_SPARSE_"):
             monkeypatch.delenv(name, raising = False)
-    # No dynamo.config.patch(disable=True) here: it leaks into the compiled mask builders later tests rely on.
+    # No dynamo.config.patch(disable=True): it leaks into later tests' compiled mask builders.
     yield
 
 
@@ -106,12 +104,10 @@ def test_sparse_patches_install_and_decode_with_the_cache(family):
         for p in model.parameters():
             if not torch.isfinite(p).all():
                 p.normal_(0, 0.02)
-    # Prefill within the indexer budget (exact skip), then decode past it (scored / chunked indexer).
     ids = torch.randint(3, 97, (2, 14), generator = torch.Generator().manual_seed(1))
     patched = _cached_decode(model, ids, prefill = 6)
     if family == "glm_moe_dsa":
-        # Shared-indexer layers make upstream's own cached decode differ from its uncached forward: compare with
-        # upstream's cached decode (the forwards the patches saved).
+        # Shared-indexer layers: upstream cached decode differs from uncached, so compare cached vs cached.
         attn, indexer = getattr(modeling, attn_name), getattr(modeling, indexer_name)
         saved = attn.forward, indexer.forward
         attn.forward, indexer.forward = attn._unsloth_upstream_forward, indexer._unsloth_original_forward
@@ -126,7 +122,6 @@ def test_sparse_patches_install_and_decode_with_the_cache(family):
 
 
 def _cached_decode(model, ids, prefill):
-    """Last-position outputs of a prefill of `prefill` tokens, then one cached step per remaining token."""
     with torch.no_grad():
         out = model(input_ids = ids[:, :prefill], use_cache = True)
         cache = out.past_key_values

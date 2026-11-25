@@ -317,8 +317,7 @@ def _resolve_for_arity(func, expected_name = None):
 # bitsandbytes.py patches the top-level bitsandbytes.nn.Linear4bit alias and its .forward; nn.modules.Linear4bit.forward is covered elsewhere.
 
 def _constructible_with(cls, field_names, req):
-    """cls(req=...) works: a declared field, or transformers 5.24's past_key_values -> cache init alias
-    (fails again once upstream drops that alias)."""
+    """cls(req=...) works: a declared field or the 5.24 past_key_values -> cache alias."""
     if req in field_names:
         return True
     if req != "past_key_values" or "cache" not in field_names:
@@ -1672,7 +1671,6 @@ def test_qwen3_vl_moe_causal_lm_output_with_past_kwargs():
         )
     sig = inspect.signature(cls)
     field_names = list(sig.parameters.keys())
-    # rope_deltas is passed only when the class declares it (transformers 5.24 dropped it).
     optional = ("rope_deltas",)
     for req in ("loss", "logits", "past_key_values", "hidden_states",
                 "attentions", "rope_deltas"):

@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Family attention / decoder patches keep the KV cache across transformers' past_key_values -> cache rename.
-
-transformers 5.24 passes the cache as `cache=`. A replacement declaring `past_key_values` received it in
-**kwargs and ran with no cache, so a cached decode step attended to the new token only. Each case
-applies the real patch to a tiny random model and checks that the patch is live and that one cached
-decode step matches the full forward.
-"""
+"""Family patches keep the KV cache under 5.24's `cache=` (past_key_values replacements lost it in **kwargs)."""
 
 from __future__ import annotations
 
@@ -140,7 +134,6 @@ print('RESULT ' + json.dumps(res))
 """
 
 _CASES = {
-    # case: (model module that must exist, extra env)
     "gemma3_generic": ("gemma3", {"UNSLOTH_MODEL_NAME": "unsloth/gemma3-test", "UNSLOTH_FORCE_FLOAT32": "0"}),
     "gemma3_float32": ("gemma3", {"UNSLOTH_MODEL_NAME": "unsloth/gemma3-test", "UNSLOTH_FORCE_FLOAT32": "1"}),
     "ministral": ("ministral", {"UNSLOTH_MODEL_NAME": "unsloth/ministral-test"}),
@@ -172,7 +165,6 @@ def test_patched_forward_is_live_and_keeps_the_kv_cache(case):
     )
     res = json.loads(lines[-1][len("RESULT "):])
     assert all(res["live"].values()), res
-    # Forced-float32 paths cast to fp16 around the projections; the rest are float32 end to end.
     tolerance = 5e-2 if "float32" in case else 1e-4
     assert res["decode_err"] < tolerance * max(1.0, res["scale"]), res
     assert res["both_set_warnings"] == 0, res

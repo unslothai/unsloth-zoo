@@ -82,8 +82,7 @@ def _assert_params_superset(
 ):
     """Asserts every name in required is a parameter of func; upstream may add params but must not drop one zoo forwards by name."""
     got = _param_names(func)
-    # transformers 5.24 renamed past_key_values to cache: patch_function adapts the keyword and
-    # @deprecate_kwarg renames it on calls, so a stock `cache` still serves zoo's past_key_values.
+    # 5.24 `cache` is adapted by patch_function and @deprecate_kwarg, so it serves past_key_values.
     missing = [
         name for name in required
         if name not in got and not (name == "past_key_values" and "cache" in got)
@@ -1007,7 +1006,6 @@ def test_DeepseekV3ForCausalLM_forward_signature():
         )
     except ImportError:
         pytest.skip("transformers.models.deepseek_v3 not installed")
-    # transformers 5.24 renamed past_key_values to cache; the patch passes the stock forward's own name.
     _params = inspect.signature(DeepseekV3ForCausalLM.forward).parameters
     _cache_name = "cache" if "cache" in _params else "past_key_values"
     _assert_params_superset(
