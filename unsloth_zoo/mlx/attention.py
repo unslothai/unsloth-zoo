@@ -52,11 +52,15 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     return scores > copy + padding
 
 
-# Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.3);
+# Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.5);
 # elsewhere mlx builds the scores anyway, so a copy would add cost rather than replace it.
 _FUSED_FULL_HEAD_DIMS = frozenset((64, 72, 80, 96, 128))
 _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
+# mlx's sdpa_split serves 33 to 128 stacked query rows at these head dims (the vector kernels hold 32).
+_SPLIT_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 192, 256))
 _SPLIT_MIN_QUERIES = 1024
+# On NAX, half-precision head_dim 256 also fuses from this many queries once batch x heads fills the machine.
+_HALF_D256_MIN_QUERIES, _HALF_D256_MIN_HEADS = 512, 8
 _D512_MIN_QUERY_BLOCKS = 1024
 # mlx also fuses square causal head_dim 256 prefill this long; on NAX the split covers it.
 _SQUARE_D256_MIN_QUERIES = 2048
@@ -92,22 +96,27 @@ def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
     causal = isinstance(mask, str) and mask == "causal"
     if causal and L > S:
         return False
-    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
+    nax = (causal or isinstance(mask, mx.array)) and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
     if head_dim == value_dim == 256:
-        if split and (causal or isinstance(mask, mx.array)):
+        if nax and (L >= _SPLIT_MIN_QUERIES or dtype in (mx.bfloat16, mx.float16) and L >= _HALF_D256_MIN_QUERIES
+                    and B * HQ >= _HALF_D256_MIN_HEADS):
             return True
         return dtype != mx.float32 and causal and L >= _SQUARE_D256_MIN_QUERIES and L == S
     if head_dim == value_dim == 512:
-        return split and causal and B * HQ * -(-L // 32) >= _D512_MIN_QUERY_BLOCKS
+        return nax and L >= _SPLIT_MIN_QUERIES and B * HQ * -(-L // 32) >= _D512_MIN_QUERY_BLOCKS
     return ((head_dim == value_dim and head_dim in _FUSED_FULL_HEAD_DIMS)
             or (head_dim, value_dim) == (96, 64))
 
 
-def _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask):
-    L, S = queries.shape[-2], q_keys[0].shape[-2]
-    gqa = queries.shape[-3] // q_keys[0].shape[-3]
-    if L > S or L * gqa > 32:
+def _vector_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
+    L, S, HKV = queries.shape[-2], q_keys[0].shape[-2], q_keys[0].shape[-3]
+    gqa = queries.shape[-3] // HKV
+    if L > S:
         return False
+    if L * gqa > 32:
+        return (L * gqa <= 128 and head_dim == value_dim and head_dim in _SPLIT_VECTOR_HEAD_DIMS and S >= 128
+                and not isinstance(mask, mx.array)
+                and (HKV > 1 or _stock_runs_nax() and (_tf32_enabled() or dtype != mx.float32)))
     if head_dim == value_dim == 512:
         # 0 also lifts the other defaults.
         min_keys = mlx_setting("MLX_SDPA_D512_MIN_KL", 1024)
@@ -117,9 +126,18 @@ def _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask):
             or (head_dim, value_dim) in ((192, 128), (96, 64)))
 
 
+def _mask_reaches_fused_heads(mask, shape):
+    # mlx broadcasts a mask against [B, HQ, L, S] from the right; runtimes that align it to their own scores read a
+    # 3-D mask's leading axis as the batch, so only an unambiguous one keeps its meaning on the fused kernel.
+    lead = mask.shape[:-2]
+    return (len(lead) == 1 and lead[0] == 1) or (len(lead) == 2 and lead[0] in (1, shape[0]) and lead[1] in (1, shape[1]))
+
+
 def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     """Whether mlx will really fuse this call."""
     dtype = _result_dtype(queries, q_keys, q_values)
+    if isinstance(mask, mx.array) and mask.ndim > 2 and not _mask_reaches_fused_heads(mask, queries.shape):
+        return False
     if isinstance(mask, mx.array) and mx.issubdtype(mask.dtype, mx.floating):
         # The fused kernel rejects such a mask; the runtime widens the scores instead.
         if mx.result_type(mask.dtype, dtype) != dtype:
@@ -128,7 +146,7 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     value_dim = q_values[1].shape[-1] * group_size
     if queries.shape[-2] > 8:
         return _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask)
-    return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
+    return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask)
 
 
 # mlx builds full `[B, HQ, L, S]` scores for these causal calls; below the floors that is small and faster.

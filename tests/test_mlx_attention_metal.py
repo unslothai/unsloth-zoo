@@ -178,12 +178,17 @@ def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_s
 
 @pytest.mark.parametrize("case,expected", [
     ({}, True),
-    ({"L": 1023}, False),
+    ({"L": 1023}, True),   # half precision from 512 queries once batch x heads reaches 8
+    ({"L": 511}, False),
+    ({"L": 1023, "HQ": 4}, False),
+    ({"L": 1023, "HQ": 4, "B": 2}, True),   # batch x heads
+    ({"L": 1023, "dtype": mx.float32}, False),
+    ({"L": 1023, "mask": None}, False),
     ({"S": 1023}, False),   # more queries than keys
     ({"mask": None}, False),
     ({"mask": "bool"}, True),
     ({"mask": "additive"}, True),
-    ({"mask": "bool", "L": 1023}, False),
+    ({"mask": "bool", "L": 1023}, True),
     ({"Dv": 128}, False),
     ({"nax": False}, False),
     ({"nax": False, "L": 2048, "S": 2048}, True),
@@ -207,8 +212,8 @@ def test_wide_head_prefill_is_fused_where_mlx_fuses_it(monkeypatch, case, expect
          "tf32": 1, **case}
     c.setdefault("Dv", c["D"])
     monkeypatch.setattr(nax, "nax_available", lambda: c["nax"])
-    cache = _cache(1, 2, c["S"], c["D"], 8, dtype=c["dtype"], Dv=c["Dv"])
-    queries = _queries(1, 8, c["L"], c["D"], dtype=c.get("qdtype", c["dtype"]))
+    cache = _cache(c.get("B", 1), 2, c["S"], c["D"], 8, dtype=c["dtype"], Dv=c["Dv"])
+    queries = _queries(c.get("B", 1), c.get("HQ", 8), c["L"], c["D"], dtype=c.get("qdtype", c["dtype"]))
     mask = {"bool": mx.ones((c["L"], c["S"]), mx.bool_),
             "additive": mx.zeros((c["L"], c["S"]), c["dtype"])}.get(c["mask"], c["mask"])
     with mx.config.scoped_update(MLX_ENABLE_TF32 = c["tf32"]):
@@ -223,7 +228,7 @@ def test_head_dim_256_prefill_on_nax_is_the_dequantized_kernel(monkeypatch):
     B, HQ, HKV, S, D, bits = 1, 16, 4, 1280, 256, 8
     cache = _cache(B, HKV, S, D, bits)
     wrapped = quantized_sdpa_over(unfused)
-    for L, on_nax, fused in ((1023, True, False), (1024, True, True), (1024, False, False)):
+    for L, on_nax, fused in ((511, True, False), (512, True, True), (1024, False, False)):
         monkeypatch.setattr(nax, "nax_available", lambda: on_nax)
         queries = _queries(B, HQ, L, D)
         call = dict(scale=D ** -0.5, mask="causal", group_size=GS, bits=bits)
@@ -241,7 +246,7 @@ def test_head_dim_256_prefill_on_nax_is_the_dequantized_kernel(monkeypatch):
 @pytest.mark.parametrize("D,Dv,HQ,L,S,mask,min_keys,expected", [
     (512, 512, 32, 1024, 1024, "causal", None, True),
     (512, 512, 16, 1024, 1024, "causal", None, False),
-    (512, 512, 32, 1024, 1024, "bool", None, False),
+    (512, 512, 32, 1024, 1024, "bool", None, True),
     (512, 512, 32, 1024, 1023, "causal", None, False),
     (512, 512, 64, 1000, 1024, "causal", None, False),
     (512, 512, 30, 1089, 1089, "causal", None, True),   # query blocks round up
@@ -277,13 +282,31 @@ def test_head_dim_512_and_96_64_are_fused_where_mlx_has_a_kernel(monkeypatch, D,
     (96, 64, 8, 8, 16, 512, None), (96, 64, 8, 8, 1, 512, None),
     (96, 64, 8, 8, 32, 16, "causal"), (128, 128, 8, 8, 32, 16, "causal"),
     (128, 128, 8, 8, 8, 4, None),
+    (256, 256, 8, 2, 512, 512, "causal"), (256, 256, 8, 2, 768, 768, "bool"), (256, 256, 4, 2, 768, 768, "causal"),
+    (256, 256, 8, 2, 511, 511, "causal"), (512, 512, 32, 4, 1024, 1024, "bool"),
+    # Split vector rows: 33 to 128 rows of a GQA group, two KV heads (or one on NAX), 128 keys or more, no array mask.
+    (128, 128, 32, 2, 4, 512, None), (128, 128, 32, 2, 8, 512, None), (192, 192, 32, 2, 4, 512, None),
+    (128, 128, 32, 1, 4, 512, None),
+    (128, 128, 32, 2, 4, 100, None), (128, 128, 32, 2, 4, 512, "bool"), (128, 128, 64, 2, 8, 512, None),
 ])
 def test_fused_kernel_exists_matches_what_the_installed_mlx_fuses(monkeypatch, D, Dv, HQ, HKV, L, S,
                                                                   mask):
-    """The default call is bit-identical to `force_fused=True` exactly when mlx fuses."""
     monkeypatch.delenv("UNSLOTH_MLX_NAX", raising=False)
-    q_keys, q_values = _cache(1, HKV, S, D, 8, group_size=32, Dv=Dv)
-    queries = _queries(1, HQ, L, D)
+    _assert_fuses_as_mlx_does(D, Dv, HQ, HKV, L, S, mask)
+
+
+@pytest.mark.parametrize("tf32", [0, 1])
+@pytest.mark.parametrize("HKV", [1, 2])
+def test_float32_split_rows_follow_tf32(monkeypatch, tf32, HKV):
+    monkeypatch.delenv("UNSLOTH_MLX_NAX", raising=False)
+    with mx.config.scoped_update(MLX_ENABLE_TF32=tf32):
+        _assert_fuses_as_mlx_does(128, 128, 32, HKV, 4, 512, None, mx.float32)
+
+
+def _assert_fuses_as_mlx_does(D, Dv, HQ, HKV, L, S, mask, dtype=mx.bfloat16):
+    """The default call is bit-identical to `force_fused=True` exactly when mlx fuses."""
+    q_keys, q_values = _cache(1, HKV, S, D, 8, group_size=32, Dv=Dv, dtype=dtype)
+    queries = _queries(1, HQ, L, D, dtype)
     keys, values = (mx.dequantize(*q, group_size=32, bits=8).astype(queries.dtype)
                     for q in (q_keys, q_values))
     mask = mx.random.uniform(shape=(L, S)) > 0.1 if mask == "bool" else mask
@@ -331,6 +354,34 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
             assert mx.array_equal(actual, expected).item(), L
         else:
             assert _divergence(expected, actual) < MAX_DIVERGENCE, L
+
+
+@pytest.mark.parametrize("lead,fused", [((), True), ((1,), True), ((2,), False), ((2, 1), True), ((1, 32), True),
+                                        ((2, 8), False), ((1, 1, 1), False)])
+def test_fused_kernel_refuses_masks_it_would_broadcast_over_other_axes(lead, fused):
+    """mlx reads a mask from the right against [B, HQ, L, S]; a runtime aligning it to its own scores reads a 3-D
+    mask's leading axis as the batch."""
+    B, HQ, L, S = 2, 32, 16, 512
+    mask = mx.ones((*lead, L, S), mx.bool_)
+    assert fused_kernel_exists(_queries(B, HQ, L, 128), *_cache(B, 8, S, 128, 8, group_size=32), 32, mask) is fused
+
+
+def test_a_batched_mask_on_a_fusible_wide_head_call_stays_on_the_runtime(monkeypatch):
+    """mlx-vlm reads a `[B, L, S]` mask per batch row; mlx's fused kernel would read its leading axis as heads."""
+    from unsloth_zoo.mlx import nax
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    unfused = _runtime("mlx_vlm")
+    B, HQ, HKV, L, D = 2, 16, 2, 1024, 512
+    cache = _cache(B, HKV, L, D, 8, group_size=32)
+    queries = _queries(B, HQ, L, D)
+    keep = mx.arange(L)[:, None] >= mx.arange(L)[None]
+    mask = mx.stack([keep, keep & (mx.arange(L)[None] % 5 != 1)])
+    assert fused_kernel_exists(queries, *cache, 32, mask[:, None]) is True   # unambiguous, the same call fuses
+    call = dict(scale=D ** -0.5, mask=mask, group_size=32, bits=8)
+    expected = unfused(mx.array(queries), *cache, **call)
+    actual = quantized_sdpa_over(unfused)(mx.array(queries), *cache, **call)
+    assert mx.array_equal(actual, expected).item()
 
 
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
