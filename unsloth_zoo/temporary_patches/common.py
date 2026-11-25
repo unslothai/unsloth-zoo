@@ -298,7 +298,6 @@ def get_torch_compile_options(
         "coordinate_descent_tuning" : coordinate_descent_tuning or UNSLOTH_COMPILE_MAXIMUM,
         "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
         "compile_threads"           : determine_compile_threads(), # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
-        "group_fusion"              : group_fusion, # [DEPRECATED]
         "disable_progress"          : not logging,
         "verbose_progress"          : logging,
 

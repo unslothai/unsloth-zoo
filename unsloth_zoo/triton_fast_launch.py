@@ -184,15 +184,20 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
         compiled = _full(kernel, grid, args, constexprs, options)
         if torch.cuda.is_current_stream_capturing():
             return compiled  # check syncs to host: defer to an eager call
-        refs = [t.clone() for t in outs]
+        try:
+            refs = [t.clone() for t in outs]
+        except torch.cuda.OutOfMemoryError:
+            return compiled  # outs already hold the full launch's result; check on a later call
         for t in outs:  # flip bits so an unwritten element cannot match
             _poison(t)
         try:
             _run(entry, grid, device, args)
             ok = all(map(_same_bits, outs, refs))
-        except Exception:
+        except Exception as exc:
             for t, r in zip(outs, refs):
                 t.copy_(r)
+            if isinstance(exc, torch.cuda.OutOfMemoryError):
+                return compiled  # transient: neither a verdict nor a reason to disable fast launch
             _ENABLED = False
             _PLANS.clear()
             return compiled
@@ -205,6 +210,8 @@ def launch(kernel, grid, args, constexprs, device, outs, **options):
         return _full(kernel, grid, args, constexprs, options)
     try:
         _run(entry, grid, device, args)
+    except torch.cuda.OutOfMemoryError:
+        return _full(kernel, grid, args, constexprs, options)  # transient: keep fast launch on
     except Exception:
         # Incompatible launcher signature (raises before launching): disable globally.
         _ENABLED = False
