@@ -584,7 +584,7 @@ def _tiled_forward(self, *args, **kwargs):
     state = self.__dict__.get("_unsloth_tiling")
     if state is None or kwargs or len(args) != 1 or not torch.is_tensor(args[0]) or args[0].dim() < 2:
         return inner(*args, **kwargs)
-    if _expert_parallel(self):  # tiled before expert parallel sharded it: one untiled call on every rank
+    if _expert_parallel(self):  # tiles would mismatch across ranks' all_to_all
         return inner(*args)
     x = args[0]
     lead = x.shape[:-1]
@@ -1268,12 +1268,11 @@ def _tensor_parallel(module):
     return False
 
 
-_EP_ATTR = "_unsloth_ep"  # unsloth models/ep_native.py tags every expert parallel parameter with its gather layout
+_EP_ATTR = "_unsloth_ep"  # set by unsloth models/ep_native.py
 
 
 def _expert_parallel(module):
-    """True when `module` holds expert parallel experts: each experts call runs all_to_all over the ep group, and
-    the ranks' row counts differ, so tiles (one experts call each) would not line up across ranks."""
+    """Ranks' row counts differ, so per-tile all_to_all calls would not line up."""
     return any(getattr(p, _EP_ATTR, None) is not None for p in module.parameters())
 
 
@@ -1353,8 +1352,7 @@ def install(model, mode = DEFAULT_MODE, modules = None, *, force = None, verbose
         # "_unsloth_tiling" too: a wrapper installed after tiling (accelerate) hides the tiled forward from is_tiled.
         if id(module) not in keep and (is_tiled(module) or "_unsloth_tiling" in module.__dict__):
             if _expert_parallel(module) and not is_tiled(module):
-                # Expert parallel wrapped the tiled forward after tiling: detaching would drop the forward it adopted
-                # from the chain; the tiled forward stays and passes through untiled.
+                # EP wrapped the tiled forward; detaching would drop it from the chain.
                 continue
             _detach(module)
     previous = model.__dict__.get("_unsloth_tiling_report")

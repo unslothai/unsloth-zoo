@@ -13,13 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Tiled MLP x expert parallel (gloo CPU, 2 ranks).
-
-Under unsloth's expert parallel every experts call runs collectives over the ep group, and each rank holds its own
-rows. Tiling such a block gives each rank its own number of experts calls (8 tiles vs 4 here), so the collectives
-stop lining up: a gloo error / hang, or a RecursionError when the trainer revalidates tiling under the EP wrapper.
-The block must run untiled whatever the order (tiling at load before EP, revalidate after EP, tiling after EP),
-while a dense module beside it stays tiled."""
+"""Tiled MLP x expert parallel (gloo CPU, 2 ranks): ranks tile differently (8 vs 4), so EP collectives would
+mismatch (gloo hang / RecursionError). EP blocks must run untiled in any order; dense modules stay tiled."""
 
 import datetime
 import multiprocessing
@@ -32,7 +27,7 @@ import torch
 
 H = 16
 ROWS = (14, 10)  # rows:3 gives 8 tiles on rank 0 and 4 on rank 1
-EP_ATTR = "_unsloth_ep"  # what unsloth models/ep_native.py tags each expert parallel parameter with
+EP_ATTR = "_unsloth_ep"
 
 
 class DenseMLP(torch.nn.Module):
@@ -78,7 +73,7 @@ class Net(torch.nn.Module):
 
 
 def _apply_ep(net):
-    # What apply_expert_parallel does to a block, for tiling: tag the local expert parameters, wrap block.forward.
+    # Mimics apply_expert_parallel: tag expert params, wrap block.forward.
     for p in net.moe.parameters():
         setattr(p, EP_ATTR, ("ep layout",))
     inner = net.moe.forward
@@ -134,7 +129,7 @@ def _worker(rank, world, tmp, order):
     )
     try:
         res = _case(rank, order)
-    except BaseException as exc:  # a rank must report, not vanish
+    except BaseException as exc:
         res = {"error": f"{type(exc).__name__}: {exc}"[:500]}
     torch.save(res, os.path.join(tmp, f"result_{rank}.pt"))
     try:
@@ -166,8 +161,8 @@ def test_expert_parallel_block_runs_untiled_on_every_rank(order):
     assert all(r is not None and "error" not in r for r in results), results
     assert all(r["zoo"] == tr.__file__ for r in results), (results, tr.__file__)
     for rank, r in enumerate(results):
-        assert r["moe_calls"] == 1, (rank, r)  # one experts call, so both ranks run the same collectives
-        assert r["dense_calls"] > 2, (rank, r)  # the dense module beside it is still tiled (tiles + recompute)
+        assert r["moe_calls"] == 1, (rank, r)
+        assert r["dense_calls"] > 2, (rank, r)  # dense stays tiled
         assert "dense" in r["tiled"], (rank, r)
         if order != "tile_then_ep":  # tiled at load, before expert parallel existed: the report predates it
             assert "moe" not in r["tiled"], (rank, r)
