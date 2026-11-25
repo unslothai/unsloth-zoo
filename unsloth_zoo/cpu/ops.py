@@ -614,11 +614,14 @@ def _plain_head_weight(head):
 @functools.lru_cache(maxsize = None)
 def _forward_takes_index_logits_to_keep(cls):
     """True when cls.forward slices with transformers' `slice(-k, None) if isinstance(logits_to_keep, int) else
-    logits_to_keep`, i.e. it also takes a tensor of positions."""
+    logits_to_keep`, or (newer transformers, after 5.18) hands it to `slice_logits_to_keep`, which indexes with a
+    1D tensor the same way; i.e. it also takes a tensor of positions."""
     try:
         source = inspect.getsource(cls.forward)
     except (OSError, TypeError):
         return False
+    if "slice_logits_to_keep(hidden_states, logits_to_keep)" in source:
+        return True
     return "isinstance(logits_to_keep, int)" in source and "slice(-logits_to_keep, None)" in source
 
 
