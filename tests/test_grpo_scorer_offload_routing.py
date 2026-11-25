@@ -29,7 +29,7 @@ _ENVS = ("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_VLLM_FP32_LM_HEAD", "UNSLOTH_
          "UNSLOTH_GRPO_KEPT_SET_RECOMPUTE")
 
 _CASES = {
-    "default": ({"UNSLOTH_VLLM_FP32_LM_HEAD": "0"}, {}),
+    "default": ({}, {}),
     "fp32_head": ({"UNSLOTH_VLLM_FP32_LM_HEAD": "1"}, {}),
     "truncated_support": ({}, {"support_top_k": 20}),
     # The kept-set scorer's kill switch restores the old one, which keeps every chunk's logits.
@@ -41,6 +41,8 @@ _CASES = {
 def _set_env(monkeypatch, env):
     for name in _ENVS:
         monkeypatch.delenv(name, raising = False)
+    # Unset is on for CUDA hosts: pin it off so each case names the head precision it tests.
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "0")
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
@@ -70,10 +72,12 @@ def test_fp32_head_keeps_the_fused_scorer_where_it_is_float32_out(monkeypatch):
     assert not rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
     monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
     assert not rr.grpo_scorer_keeps_logits()
+    # A CPU head gets 16-bit fused logits: the fp32 head takes the old scorer there.
+    assert rr.grpo_scorer_keeps_logits(lm_head = torch.zeros(4, 2))
 
 
 def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
-    _set_env(monkeypatch, {"UNSLOTH_VLLM_FP32_LM_HEAD": "0"})
+    _set_env(monkeypatch, {})
     assert not rr.grpo_scorer_keeps_logits()
     assert rr.grpo_scorer_keeps_logits({"support_top_k": 20})
     assert rr.grpo_scorer_keeps_logits({"support_top_p": 0.9})

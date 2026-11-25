@@ -103,16 +103,22 @@ def test_recompute_fp32_head_gradients_match_plain():
         assert (a - b).abs().max().item() <= 2e-2 * b.abs().max().item()
 
 
-def test_recompute_off_is_bit_identical_to_default():
+def test_recompute_default_is_bit_identical_to_the_def_time_flag():
+    import inspect
     states, weight, index, _ = _inputs(2)
     recompute = _standalone()
+    flag = inspect.signature(recompute).parameters["fp32_lm_head"].default
     with torch.autocast(device_type = "cpu", dtype = torch.bfloat16):
         a = recompute(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9)
-        b = recompute(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9, fp32_lm_head = False)
+        b = recompute(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9, fp32_lm_head = flag)
     assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("value, expected", [(None, "False False"), ("0", "False False"), ("1", "True True")])
+# Unset is on for CUDA (not ROCm) with aten::mm.dtype, matching vLLM's default fp32 rollout head.
+_AUTO = str(torch.version.hip is None and torch.cuda.is_available() and hasattr(torch.ops.aten.mm, "dtype"))
+
+
+@pytest.mark.parametrize("value, expected", [(None, f"{_AUTO} {_AUTO}"), ("0", "False False"), ("1", "True True")])
 def test_env_sets_both_defaults(value, expected):
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_VLLM_FP32_LM_HEAD"}
     if value is not None:

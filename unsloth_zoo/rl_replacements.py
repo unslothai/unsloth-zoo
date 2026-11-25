@@ -653,14 +653,16 @@ def grpo_fp32_lm_head_default():
     )
 
 
-def grpo_scorer_keeps_logits(support_kwargs = None, **extra_kwargs):
-    """True when GRPO falls back to the old chunked scorer, which keeps every chunk's logits for backward."""
+def grpo_scorer_keeps_logits(support_kwargs = None, lm_head = None, **extra_kwargs):
+    """True when GRPO falls back to the old chunked scorer, which keeps every chunk's logits for backward. An fp32
+    head stays on the fused scorers where their logits are float32-out (CUDA; lm_head pins the device when given)."""
     support = dict(support_kwargs or {}, **extra_kwargs)
     fp32_head = support.get("fp32_lm_head", grpo_fp32_lm_head_default())
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    fused_fp32 = _chunked_logprob._FUSED_FP32_LOGITS if lm_head is None else _chunked_logprob.fused_fp32_logits_ok(lm_head)
     return bool(
         (not _chunked_logprob._FUSED_LINEAR)
-        or (fp32_head and not _chunked_logprob._FUSED_FP32_LOGITS)
+        or (fp32_head and not fused_fp32)
         or support.get("support_top_k", 0)
         or support.get("support_top_p", 1.0) != 1.0
         or support.get("support_min_p", 0.0)
@@ -1101,7 +1103,7 @@ def grpo_chunked_hidden_states_logprobs(
             logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
             max_rows_per_chunk = max_rows_per_chunk, lm_head_bias = lm_head_bias, **kwargs,
         )
-    if grpo_scorer_keeps_logits(extra_kwargs):
+    if grpo_scorer_keeps_logits(extra_kwargs, lm_head = lm_head):
         kwargs = dict(extra_kwargs)
         if max_rows_per_chunk is not None:
             kwargs["max_rows_per_chunk"] = max_rows_per_chunk
@@ -3458,7 +3460,7 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and (lm_head is None or not lm_head.requires_grad or GRPO_FUSED_TRAINABLE_HEAD)
         and (entropy_bonus_on or GRPO_FUSED_WITHOUT_ENTROPY or (lm_head is not None and lm_head.requires_grad))
         and os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
-        and not grpo_scorer_keeps_logits(support_kwargs)
+        and not grpo_scorer_keeps_logits(support_kwargs, lm_head = lm_head)
     )
 pass
 RL_REPLACEMENTS["grpo_fused_route_ok"] = grpo_fused_route_ok
@@ -4913,7 +4915,7 @@ def grpo_accumulated_loss(
             _plain = os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
             _kept_set_keeps = bool(_support_kwargs) and os.environ.get("UNSLOTH_GRPO_KEPT_SET_RECOMPUTE", "1") == "0"
             if not ((index.shape[1] <= 1024 and batch_size <= 8) or batch_size == 1) \
-                    and (_kept_set_keeps or (_plain and _keeps_logits())):
+                    and (_kept_set_keeps or (_plain and _keeps_logits(lm_head = lm_head))):
                 return Unsloth_Offloaded_Log_Softmax.apply(
                     hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,
