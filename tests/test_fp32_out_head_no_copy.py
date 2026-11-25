@@ -89,12 +89,10 @@ def test_non_fused_scorer_copies_the_head_where_fp32_out_is_missing():
     torch.testing.assert_close(out.double(), _reference(hidden, weight, index), atol = 1e-4, rtol = 0)
 
 
-@pytest.mark.parametrize("trainable_head", [False, True])
-def test_kept_set_scorer_uses_fp32_out_without_a_head_copy(monkeypatch, trainable_head):
+def test_kept_set_scorer_uses_fp32_out_without_a_head_copy(monkeypatch):
     calls = _cpu_stand_in(monkeypatch)
     hidden, weight, index = _inputs(2)
     hidden = hidden.requires_grad_(True)
-    weight = weight.requires_grad_(trainable_head)
     with _CountHeadCopies(weight.shape) as mode:
         out = rr.grpo_kept_set_logprobs(
             hidden, weight, index, 3, 0.0, 0.0, 0.0, 1.0, support_top_k = 40, fp32_lm_head = True,
@@ -102,10 +100,22 @@ def test_kept_set_scorer_uses_fp32_out_without_a_head_copy(monkeypatch, trainabl
         out[torch.isfinite(out)].sum().backward()
     assert mode.copies == 0 and calls and set(calls) == {torch.bfloat16}
     assert out.dtype == torch.float32
-    # Gradients come back in the 16-bit dtypes, from 16-bit GEMMs (no fp32 head in backward either).
+    # The hidden-state gradient comes back in its 16-bit dtype, from 16-bit GEMMs (no fp32 head in backward either).
     assert hidden.grad.dtype == torch.bfloat16 and torch.isfinite(hidden.grad.float()).all()
-    if trainable_head:
-        assert weight.grad.dtype == torch.bfloat16
+
+
+def test_trainable_and_fp32_heads_keep_their_previous_paths():
+    # A trainable head keeps the fp32 copy (its gradient accumulates over chunks in float32), and a float32 head
+    # never takes the fused shortcut (autocast would round it) nor the unset default.
+    weight = torch.zeros(300, 32, dtype = torch.bfloat16)
+    assert not cl.fp32_out_linear_ok(weight.requires_grad_(True))
+    fp32_head = torch.zeros(300, 32)
+    assert not cl.fused_fp32_logits_ok(fp32_head)
+    assert not cl.fp32_lm_head_auto_ok(fp32_head)
+    if torch.cuda.is_available():
+        assert not cl.fused_fp32_logits_ok(fp32_head.cuda())
+        assert not cl.fp32_lm_head_auto_ok(fp32_head.cuda())
+        assert cl.fp32_lm_head_auto_ok(fp32_head.cuda().bfloat16())
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available() and cl._MM_OUT_DTYPE), reason = "needs CUDA and aten::mm.dtype")
@@ -155,30 +165,33 @@ def _old_half_logit_grad(grad, dtype):
 @pytest.mark.skipif(not (torch.cuda.is_available() and cl._MM_OUT_DTYPE), reason = "needs CUDA and aten::mm.dtype")
 @pytest.mark.parametrize("rescale", [True, False])
 def test_fp16_small_logit_gradients_survive(monkeypatch, rescale):
-    # GRPO weights each token by about 1 / tokens, so most logit gradients sit below float16's smallest subnormal.
-    # Without the rescale (the plain cast, rescale=False) they flush to zero; the test must catch that.
+    # A wide vocabulary under a small upstream weight (GRPO's 1 / tokens) puts each non-target logit gradient below
+    # float16's subnormal step while their sum on the hidden state stays representable. The plain cast
+    # (rescale=False) flushes them; the test must catch that against the float32-copy path.
     if not rescale:
         monkeypatch.setattr(cl, "half_logit_grad", _old_half_logit_grad)
-    hidden, weight, index = _inputs(5, torch.float16, "cuda")
-    upstream = torch.full(index.shape, 1e-6, device = "cuda")
+    gen = torch.Generator().manual_seed(5)
+    # Large weights and small hidden states (logits ~ N(0, 2.3)) keep the hidden-state gradient in float16's normal
+    # range while upstream * p sits far below its subnormal step.
+    weight = (torch.randn(30000, 32, generator = gen) * 40).to("cuda", torch.float16)
+    hidden = (torch.randn(2, 9, 32, generator = gen) * 0.01).to("cuda", torch.float16)
+    index = torch.randint(0, 30000, (2, 9), generator = gen).cuda()
+    upstream = torch.full(index.shape, 1e-5, device = "cuda")
     grads = {}
-    for name, fp32_out in (("fp32_out", True), ("copy", False)):
-        if not fp32_out:
+    for name in ("fp32_out", "copy"):
+        if name == "copy":
             monkeypatch.setattr(cl, "fp32_out_linear_ok", lambda w: False)
-        for scorer, kw in (("plain", dict(fused_linear = False)), ("kept_set", dict(support_top_k = 299))):
+        for scorer, kw in (("plain", dict(fused_linear = False)), ("kept_set", dict(support_top_k = 29999))):
             h = hidden.clone().requires_grad_(True)
-            w = weight.clone().requires_grad_(True)
             fn = rr.grpo_kept_set_logprobs if scorer == "kept_set" else rr.chunked_hidden_states_selective_log_softmax
-            out = fn(h, w, index, 3, 0.0, 0.0, 0.0, 1.0, fp32_lm_head = True, **kw)
+            out = fn(h, weight, index, 3, 0.0, 0.0, 0.0, 1.0, fp32_lm_head = True, **kw)
             (out * upstream).sum().backward()
-            grads[(name, scorer)] = (h.grad.float(), w.grad.float())
-    rel = lambda a, b: ((a - b).norm() / b.norm()).item()
+            grads[(name, scorer)] = h.grad.float()
     for scorer in ("plain", "kept_set"):
         new, ref = grads[("fp32_out", scorer)], grads[("copy", scorer)]
-        errors = [rel(new[1], ref[1])]
-        if ref[0].norm() > 0:
-            errors.append(rel(new[0], ref[0]))
+        assert ref.norm() > 0
+        err = ((new - ref).norm() / ref.norm()).item()
         if rescale:
-            assert max(errors) < 2e-2, (scorer, errors)
+            assert err < 2e-2, (scorer, err)
         else:
-            assert max(errors) > 0.1, (scorer, errors)
+            assert err > 0.1, (scorer, err)

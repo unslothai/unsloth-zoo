@@ -86,15 +86,25 @@ _FUSED_FP32_LOGITS = (
 
 
 def fused_fp32_logits_ok(weight):
-    """True when the fused kernels project this head with float32-out logits (CUDA only)."""
-    return _FUSED_FP32_LOGITS and torch.is_tensor(weight) and weight.is_cuda
+    """True when the fused kernels project this 16-bit CUDA head with float32-out logits. A float32 head is excluded:
+    under autocast the fused kernels round its weights to the autocast dtype, which an fp32 lm_head must not do."""
+    return (
+        _FUSED_FP32_LOGITS and torch.is_tensor(weight) and weight.is_cuda
+        and weight.dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def fp32_lm_head_auto_ok(weight):
+    """The unset default's scope: a 16-bit CUDA head (an fp32 head keeps its previous scorer unless =1)."""
+    return torch.is_tensor(weight) and weight.is_cuda and weight.dtype in (torch.float16, torch.bfloat16)
 
 
 def fp32_out_linear_ok(weight):
-    """True when `fp32_out_linear` can project through this head without a float32 copy of it."""
+    """True when `fp32_out_linear` can project through this head without a float32 copy of it. A trainable head keeps
+    the copy: its gradient then accumulates over the chunks in float32 and is rounded once."""
     return (
         _MM_OUT_DTYPE and torch.is_tensor(weight) and weight.is_cuda
-        and weight.dtype in (torch.float16, torch.bfloat16)
+        and weight.dtype in (torch.float16, torch.bfloat16) and not weight.requires_grad
     )
 
 

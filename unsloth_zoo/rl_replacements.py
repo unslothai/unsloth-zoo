@@ -237,7 +237,7 @@ def chunked_hidden_states_selective_log_softmax(
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
-    fp32_lm_head = fp32_lm_head or (fp32_lm_head_cuda and lm_head.is_cuda)
+    fp32_lm_head = fp32_lm_head or (fp32_lm_head_cuda and _chunked_logprob.fp32_lm_head_auto_ok(lm_head))
     # The fused kernel's logits are already float32-out wherever _FUSED_FP32_LOGITS holds, so an fp32 head keeps it.
     if (fused_linear and _chunked_logprob._FUSED_LINEAR
             and (not fp32_lm_head or _chunked_logprob.fused_fp32_logits_ok(lm_head))
@@ -397,7 +397,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # All Unsloth Zoo code licensed under AGPL3
     # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
-    fp32_lm_head = fp32_lm_head or (fp32_lm_head_cuda and lm_head is not None and lm_head.is_cuda)
+    fp32_lm_head = fp32_lm_head or (fp32_lm_head_cuda and _chunked_logprob.fp32_lm_head_auto_ok(lm_head))
     # hidden_states None is the import-time build call below: it only sets up the recompute function.
     if (hidden_states is not None and fused_linear and _chunked_logprob._FUSED_LINEAR
             and (not fp32_lm_head or _chunked_logprob.fused_fp32_logits_ok(lm_head))):
@@ -647,15 +647,16 @@ RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_
 
 def grpo_fp32_lm_head_default(lm_head = None):
     """The scorers' fp32 lm_head default for this head, read now: UNSLOTH_VLLM_FP32_LM_HEAD=1 on, =0 off, unset on
-    for a CUDA head (not ROCm) with fp32 fused logits (torch >= 2.8, aten::mm.dtype)."""
+    for a 16-bit CUDA head (not ROCm) with fp32 fused logits (torch >= 2.8, aten::mm.dtype)."""
     value = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip()
     if value.lower() in ("1", "true", "on", "yes"):
         return True
+    from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     return bool(
         value == "" and torch.version.hip is None and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
-        and (lm_head is None or (torch.is_tensor(lm_head) and lm_head.is_cuda))
+        and (lm_head is None or _chunked_logprob.fp32_lm_head_auto_ok(lm_head))
     )
 
 
@@ -3875,10 +3876,11 @@ def grpo_accumulated_loss(
             zero3_partitioned_training as _zero3_training,
             _devices_without_native_bf16 as _no_native_bf16,
         )
+        from unsloth_zoo.fused_losses import chunked_logprob as _chunked_lp
         _projector_params = _inspect.signature(_projector).parameters
         _fp32_lm_head = _projector_params["fp32_lm_head"].default is True or (
             "fp32_lm_head_cuda" in _projector_params and _projector_params["fp32_lm_head_cuda"].default is True
-            and lm_head.is_cuda
+            and _chunked_lp.fp32_lm_head_auto_ok(lm_head)
         )
         try:
             import torch._functorch.config as _functorch_config
@@ -3886,12 +3888,11 @@ def grpo_accumulated_loss(
             _backward_autocast_off = getattr(_functorch_config, "backward_pass_autocast", None) == "off"
         except Exception:
             _backward_autocast_off = False
-        # Only a scorer without a float32-out path takes a head copy: the fused kernels (_FUSED_FP32_LOGITS) and a
-        # 16-bit CUDA head (fp32_out_linear) project the head as it is, so a copy would make them fp32 GEMMs.
-        from unsloth_zoo.fused_losses import chunked_logprob as _chunked_lp
+        # Only a head without a float32-out path is pre-cast: the fused kernels (fused_fp32_logits_ok) and a frozen
+        # 16-bit CUDA head (fp32_out_linear) project it as it is, and a copy would make them fp32 GEMMs. Scorers that
+        # still need a copy (a trainable head off the fused route) cast it themselves.
         _fp32_copy = _fp32_lm_head and not (
-            _chunked_lp.fp32_out_linear_ok(lm_head)
-            and (_chunked_lp._FUSED_FP32_LOGITS or os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1")
+            _chunked_lp.fused_fp32_logits_ok(lm_head) or _chunked_lp.fp32_out_linear_ok(lm_head)
         )
         _fp32_precast = _fp32_copy and (
             os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1"
