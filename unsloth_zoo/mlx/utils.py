@@ -15335,8 +15335,7 @@ def _fuse_scaled_quantized(linear, delta, dequantize):
         weight = (effective_weight + delta).astype(mx.bfloat16)
     else:
         ws2 = scale_name == "weight_scale_2"
-        # Decoded weight before pre_quant_scale; the global scale only grows where it would pass NVFP4's 6 * 448
-        # (a zero scale of an all-zero expert included), so an in-range merge keeps the stored scale bit-exact.
+        # Grow the global scale only where the merge passes NVFP4's 6 * 448 (or it is 0); else keep it bit-exact.
         target = base_weight * (scale if ws2 else 1 / scale) + (delta / pre if pre is not None else delta)
         need = mx.abs(target).max(axis=-1, keepdims=True) / _NVFP4_MAX
         need = need.max() if scale.size == 1 else need.max(axis=-2, keepdims=True) if scale.shape[-2] == 1 else need
