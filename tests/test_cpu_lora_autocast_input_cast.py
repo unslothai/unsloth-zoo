@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU backend, PEFT LoRA Linear under bf16 / fp16 autocast: the input is no longer cast to the fp32 adapter dtype
-(autocast casts it straight back for lora_A), with the same loss and gradients bit for bit. Outside autocast, with
-LoRA dropout, or with a LoRA variant (DoRA) PEFT's cast stays."""
+"""CPU autocast: no fp32 LoRA input copy, same bits; PEFT's cast stays wherever it is not a round trip."""
 
 from __future__ import annotations
 
@@ -44,7 +42,6 @@ class _Net(torch.nn.Module):
 
 
 class _InputUpcasts(TorchDispatchMode):
-    """Counts fp32 copies of bf16 / fp16 activations with `rows` rows (the LoRA input casts)."""
 
     def __init__(self, rows):
         super().__init__()
@@ -90,7 +87,6 @@ def _step(model, x, amp_dtype):
 
 @pytest.fixture
 def stock_cast():
-    """PEFT's own cast for the reference arm, then the patch for the arm under test."""
     original = LoraLinear._cast_input_dtype
     stock = getattr(original, "__wrapped__", original)
     yield stock
@@ -132,8 +128,7 @@ def test_cast_kept_where_autocast_would_not_undo_it(case, stock_cast):
     with _InputUpcasts(32) as casts:
         loss, grads = _step(model, x, amp)
     if case == "autocast_other_dtype":
-        # The bf16 input into the first layer keeps its cast; under fp16 autocast the second layer's input is fp16
-        # (the base layer ran in fp16), which autocast does round-trip exactly, so only that one is skipped.
+        # The second layer's input is already fp16 (its base layer ran under fp16 autocast), so only it skips.
         assert ref_casts.count == 3 and casts.count == 1
     else:
         assert casts.count == ref_casts.count >= 2

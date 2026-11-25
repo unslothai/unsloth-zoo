@@ -442,10 +442,8 @@ def _lora_input_cast_is_undone(layer, x, dtype):
 
 
 def patch_peft_lora_autocast_input():
-    """PEFT's LoRA Linear casts its input to the adapter dtype (fp32) before lora_A, and under CPU bf16 / fp16
-    autocast lora_A casts it straight back: two activation-sized copies per LoRA module in the forward and two more
-    in the backward, for the same bits (the round trip is exact). Skip the cast exactly when autocast would undo it.
-    Idempotent; returns True when installed."""
+    """PEFT upcasts each LoRA input to the fp32 adapter dtype and CPU autocast casts it straight back (exact round
+    trip): two activation copies per module in forward, one in backward, and lora_A saves its own copy. Skip it there."""
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
     except Exception:
