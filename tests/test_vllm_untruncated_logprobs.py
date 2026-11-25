@@ -105,7 +105,12 @@ def _fake_v2(monkeypatch):
             self.logprobs_mode = mode
             self.sampling_states = SamplingStates(temp)
 
-        def __call__(self, logits):
+        def get_logprobs_dims(self, idx_mapping_np):
+            return None if self.no_logprobs else (0, 0)
+
+        no_logprobs = False
+
+        def __call__(self, logits, input_batch = None):
             processed = logits.clone()
             self.sampling_states.apply_temperature(processed)
             self.sampling_states.apply_min_p(processed)
@@ -164,10 +169,34 @@ def test_v2_returns_scaled_untruncated_logprobs(monkeypatch, on):
     ns = _load()
     ns["set_vllm_untruncated_logprobs"](on)
     logits = _logits()
-    out = Sampler("processed_logprobs", torch.full((4,), 1.3))(logits.clone())
+    out = Sampler("processed_logprobs", torch.full((4,), 1.3))(logits.clone(), SimpleNamespace(idx_mapping_np = None))
     ref = logits / 1.3 if on else _min_p_mask(logits / 1.3, 0.1)
     sampled = _min_p_mask(logits / 1.3, 0.1).argmax(-1)
     torch.testing.assert_close(out, torch.log_softmax(ref, -1).gather(1, sampled[:, None]))
+
+
+def test_v2_batches_without_logprobs_skip_the_capture(monkeypatch):
+    Sampler = _fake_v2(monkeypatch)
+    ns = _load()
+    ns["set_vllm_untruncated_logprobs"](True)
+    sampler = Sampler("processed_logprobs", torch.full((4,), 1.3))
+    sampler.no_logprobs = True
+    copies = []
+    original = torch.Tensor.clone
+    monkeypatch.setattr(torch.Tensor, "clone", lambda self, *a, **k: copies.append(1) or original(self, *a, **k))
+    sampler(_logits(), SimpleNamespace(idx_mapping_np = None))
+    assert len(copies) == 1  # the stand-in's own copy only
+    assert ns["UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS"]["calls"] == 0
+
+
+def test_v1_token_specific_logprobs_are_left_alone(monkeypatch):
+    Sampler = _fake_v1(monkeypatch)
+    ns = _load()
+    ns["set_vllm_untruncated_logprobs"](True)
+    logits = _logits()
+    md = SimpleNamespace(temperature = torch.full((4,), 0.7), max_num_logprobs = 0, logprob_token_ids = {0: [1]})
+    truncated = torch.log_softmax(_min_p_mask(logits / 0.7, 0.1), -1)
+    torch.testing.assert_close(Sampler("processed_logprobs").sample(logits.clone(), md)[1], truncated)
 
 
 def test_kill_switch_and_unknown_vllm(monkeypatch):

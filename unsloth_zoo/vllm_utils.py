@@ -1603,8 +1603,9 @@ def patch_vllm_untruncated_logprobs():
             mode = str(kwargs.get("logprobs_mode_override") or self.logprobs_mode)
             if not (
                 state["on"] and mode in ("processed_logprobs", "processed_logits")
-                and (getattr(sampling_metadata, "max_num_logprobs", None) is not None
-                     or getattr(sampling_metadata, "logprob_token_ids", None))
+                and getattr(sampling_metadata, "max_num_logprobs", None) is not None
+                # Token-specific logprobs (generative scoring) are gathered elsewhere on some versions.
+                and not getattr(sampling_metadata, "logprob_token_ids", None)
             ):
                 return original_sample(self, logits, sampling_metadata, *args, **kwargs)
             capture.update(on = True, scaled = None)
@@ -1643,9 +1644,22 @@ def patch_vllm_untruncated_logprobs():
                 capture["scaled"] = logits.clone()
             return original_min_p(self, logits, *args, **kwargs)
 
+        def wants_logprobs(sampler, input_batch):
+            idx = getattr(input_batch, "idx_mapping_np", None)
+            try:
+                if hasattr(sampler, "get_logprobs_dims"):
+                    return sampler.get_logprobs_dims(idx) is not None
+                from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+                return sampler.sampling_states.max_num_logprobs(idx) != NO_LOGPROBS
+            except Exception:
+                return True
+
         @functools.wraps(original_call)
         def __call__(self, *args, **kwargs):
-            if not (state["on"] and str(getattr(self, "logprobs_mode", "")) in ("processed_logprobs", "processed_logits")):
+            if not (
+                state["on"] and str(getattr(self, "logprobs_mode", "")) in ("processed_logprobs", "processed_logits")
+                and wants_logprobs(self, args[1] if len(args) > 1 else kwargs.get("input_batch"))
+            ):
                 return original_call(self, *args, **kwargs)
             capture.update(on = True, scaled = None)
             try:
