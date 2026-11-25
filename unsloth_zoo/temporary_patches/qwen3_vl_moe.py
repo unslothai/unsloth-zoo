@@ -495,6 +495,7 @@ def patch_qwen3_vl_moe():
 
         _cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
         _output_cache_field = "cache" if "cache" in getattr(Qwen3VLMoeCausalLMOutputWithPast, "__dataclass_fields__", {}) else "past_key_values"
+        _output_has_rope_deltas = "rope_deltas" in getattr(Qwen3VLMoeCausalLMOutputWithPast, "__dataclass_fields__", {})
 
         def _patched_causal_lm_forward(
             self,
@@ -573,7 +574,8 @@ def patch_qwen3_vl_moe():
                 **{_output_cache_field: output_cache(outputs)},
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
-                rope_deltas=outputs.rope_deltas,
+                # transformers 5.24 dropped rope_deltas from this output class.
+                **({"rope_deltas": getattr(outputs, "rope_deltas", None)} if _output_has_rope_deltas else {}),
             )
 
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect this is
