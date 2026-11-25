@@ -71,6 +71,87 @@ def _pop_gpu_loader_kwargs(kwargs):
         kwargs.pop("rope_scaling")
 
 
+# fp32 weights + fp32 grads + AdamW's two fp32 states, per parameter.
+_FP32_MASTER_BYTES_PER_PARAM = 16
+
+
+def _multi_process():
+    """True under a launcher with several training processes (torchrun, accelerate, Intel MPI, Open MPI, MVAPICH) or
+    an initialized process group of several ranks."""
+    from .runtime import _local_world_size
+    if _local_world_size() > 1:
+        return True
+    for name in ("WORLD_SIZE", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE"):
+        try:
+            if int(os.environ.get(name, "")) > 1:
+                return True
+        except ValueError:
+            pass
+    try:
+        import torch.distributed as dist
+        return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    except Exception:
+        return False
+
+
+def _fp32_master_fit(model_name, token, revision, trust_remote_code, resize_vocab = None, /, **kwargs):
+    """(bytes, free RAM, fits) for float32 full finetuning: weights, grads and AdamW states take at most half of the
+    free RAM; activations are sized separately (gradient checkpointing auto-off). ``kwargs`` are the model load's: an
+    explicit config object decides, else the checkpoint's config with the load's overrides (as AutoModel reads it,
+    ``vocab_size`` included). ``resize_vocab`` is a pending resize, counted when larger. Positional-only, so no load
+    kwarg can collide with them. None when the parameter count or the free RAM is unknown."""
+    try:
+        from transformers import AutoConfig, PretrainedConfig
+        config = kwargs.pop("config", None)
+        if not isinstance(config, PretrainedConfig):
+            config, _ = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                                   trust_remote_code = trust_remote_code, return_unused_kwargs = True,
+                                                   **kwargs)
+    except Exception:
+        return None
+    vocab_size = resize_vocab
+    if resize_vocab is not None:
+        loaded = getattr(getattr(config, "get_text_config", lambda: config)(), "vocab_size", None)
+        if isinstance(loaded, int) and not isinstance(loaded, bool):
+            vocab_size = max(loaded, resize_vocab)
+    count = _dense_parameter_count(config, vocab_size = vocab_size)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    needed = count * _FP32_MASTER_BYTES_PER_PARAM
+    return needed, available, needed * 2 <= available
+
+
+def _print_full_finetuning_precision(dtype, choice, fit = None):
+    """One line on full finetuning precision. bfloat16 weights take AdamW's bfloat16 update directly, so updates below
+    a weight's bfloat16 spacing round away (SmolLM2-135M, lr 2e-5, 4 steps: 3.9% of the weights changed, against
+    99.99% with float32 master weights)."""
+    gb = lambda value: f"{value / 1024 ** 3:.1f} GB"  # noqa: E731
+    if choice == "fits":
+        _print(f"full finetuning keeps float32 master weights and computes in bfloat16 autocast: float32 weights, grads "
+               f"and AdamW states ({gb(fit[0])}) fit in RAM ({gb(fit[1])} free), and bfloat16 weights round away "
+               "small updates. float32_mixed_precision = False (or dtype = torch.bfloat16) keeps bfloat16 weights.")
+    elif choice == "forced":
+        if dtype == torch.float32 and cpu_bf16_supported():
+            _print("float32_mixed_precision = True: full finetuning keeps float32 weights and optimizer states, "
+                   "computing in bfloat16 autocast.")
+    elif dtype == torch.bfloat16:
+        if choice in ("too_big", "distributed"):
+            if choice == "distributed":
+                reason = "several training processes each read their own free RAM and could pick different dtypes"
+            elif fit is not None:
+                reason = f"float32 weights, grads and AdamW states ({gb(fit[0])}) do not fit in RAM ({gb(fit[1])} free)"
+            else:
+                reason = "the float32 training state could not be sized"
+            _print(f"bfloat16 full finetuning: {reason}, so weights stay bfloat16 and updates below a weight's "
+                   "bfloat16 spacing can be rounded away at small learning rates. float32_mixed_precision = True "
+                   "forces float32 master weights.")
+        else:
+            _print("bfloat16 full finetuning (your dtype / float32_mixed_precision): halves memory, but updates below "
+                   "a weight's bfloat16 spacing can be rounded away at small learning rates. float32_mixed_precision "
+                   "= True keeps float32 master weights.")
+
+
 def _dtype_kwarg():
     # from_pretrained took `torch_dtype` before transformers 4.56; older ones drop `dtype` silently.
     from transformers import __version__
@@ -85,22 +166,31 @@ def _print(message):
     print(f"Unsloth (CPU): {message}")
 
 
-def _dense_parameter_count(config):
-    """Parameters of a dense decoder from its config (embeddings, attention, gated MLP), None when unknown or MoE."""
-    text = getattr(config, "get_text_config", lambda: config)()
-    get = lambda name: getattr(text, name, None)  # noqa: E731
-    if any(get(name) for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_intermediate_size")):
+def _dense_parameter_count(config, vocab_size = None):
+    """Parameters of a dense decoder from its config (embeddings, attention, gated MLP), None when unknown, MoE, or a
+    per-layer layout (list widths, per-layer embeddings) the formula does not cover. ``vocab_size`` overrides the
+    config's (a pending resize)."""
+    try:
+        text = getattr(config, "get_text_config", lambda: config)()
+        get = lambda name: getattr(text, name, None)  # noqa: E731
+        if any(get(name) for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_intermediate_size",
+                                      "vocab_size_per_layer_input", "hidden_size_per_layer_input")):
+            return None
+        hidden, layers = get("hidden_size"), get("num_hidden_layers")
+        vocab = vocab_size if vocab_size is not None else get("vocab_size")
+        heads = get("num_attention_heads") or 1
+        head_dim = get("head_dim") or (hidden // heads if isinstance(hidden, int) and isinstance(heads, int) else None)
+        kv_heads = get("num_key_value_heads") or heads
+        intermediate = get("intermediate_size") or (4 * hidden if isinstance(hidden, int) else None)
+        if not all(isinstance(value, int) and not isinstance(value, bool)
+                   for value in (hidden, layers, vocab, heads, head_dim, kv_heads, intermediate)):
+            return None
+        kv = kv_heads * head_dim
+        per_layer = hidden * heads * head_dim * 2 + 2 * hidden * kv + 3 * hidden * intermediate
+        embeddings = vocab * hidden * (1 if getattr(config, "tie_word_embeddings", True) else 2)
+        return embeddings + layers * per_layer
+    except Exception:
         return None
-    hidden, layers, vocab = get("hidden_size"), get("num_hidden_layers"), get("vocab_size")
-    if not (isinstance(hidden, int) and isinstance(layers, int) and isinstance(vocab, int)):
-        return None
-    heads = get("num_attention_heads") or 1
-    head_dim = get("head_dim") or hidden // heads
-    kv = (get("num_key_value_heads") or heads) * head_dim
-    intermediate = get("intermediate_size") or 4 * hidden
-    per_layer = hidden * heads * head_dim * 2 + 2 * hidden * kv + 3 * hidden * intermediate
-    embeddings = vocab * hidden * (1 if getattr(config, "tie_word_embeddings", True) else 2)
-    return embeddings + layers * per_layer
 
 
 def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **kwargs):
@@ -698,6 +788,9 @@ class FastCPUModel:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
         # A quantization config the caller built is a choice of quantization: never swapped for 16-bit weights.
         user_quantization = kwargs.get("quantization_config", None) is not None
+        # Full finetuning on a native-bf16 CPU: True keeps float32 master weights, False bfloat16 weights; unset (and no
+        # dtype) picks float32 when its training state fits in RAM.
+        float32_mixed_precision = kwargs.get("float32_mixed_precision", None)
         # Before anything downloads: a refused GPU-only feature fails fast.
         _pop_gpu_loader_kwargs(kwargs)
         # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
@@ -712,9 +805,13 @@ class FastCPUModel:
         torch_dtype = kwargs.pop("torch_dtype", None)
         if dtype is None and torch_dtype is not None:
             dtype = torch_dtype
+        user_dtype = dtype is not None
+        master_fp32 = bool(full_finetuning) and float32_mixed_precision is True
+        master_choice = "forced" if master_fp32 else "user"
         # "auto" keeps the checkpoint's own dtype (fp16 checkpoints still move off fp16 after loading).
-        auto_dtype = isinstance(dtype, str) and dtype == "auto"
-        dtype = _resolve_dtype(None if auto_dtype else dtype)
+        auto_dtype = isinstance(dtype, str) and dtype == "auto" and not master_fp32
+        # Forced float32 master weights load as float32 straight from the checkpoint, whatever dtype was asked for.
+        dtype = torch.float32 if master_fp32 else _resolve_dtype(None if auto_dtype else dtype)
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
         use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
@@ -765,6 +862,20 @@ class FastCPUModel:
             if adapter_name is not None and adapter_name != model_name:
                 on_model_resolved(adapter_name)
             on_model_resolved(model_name)
+        resize_model_vocab = kwargs.pop("resize_model_vocab", None)
+        master_fit = None
+        if full_finetuning and float32_mixed_precision is None and not user_dtype and dtype == torch.bfloat16:
+            # No dtype and no float32_mixed_precision from the caller: float32 master weights when they fit, sized on
+            # the checkpoint that loads (after the redirect above), its overrides and a pending vocabulary resize.
+            # One process only: ranks reading different free RAM would pick different dtypes.
+            if _multi_process():
+                master_choice = "distributed"
+            else:
+                master_fit = _fp32_master_fit(model_name, token, revision, trust_remote_code, resize_model_vocab,
+                                              **kwargs)
+                master_choice = "too_big"
+                if master_fit is not None and master_fit[2]:
+                    master_fp32, master_choice, dtype = True, "fits", torch.float32
 
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
@@ -777,7 +888,6 @@ class FastCPUModel:
                 # As the GPU loaders: lm_head, MoE routers, Mamba and vision / audio towers stay 16-bit.
                 llm_int8_skip_modules = list(SKIP_QUANTIZATION_MODULES),
             )
-        resize_model_vocab = kwargs.pop("resize_model_vocab", None)
 
         if quantization_config is not None:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
@@ -832,6 +942,8 @@ class FastCPUModel:
             if dtype == torch.float16 and not use_4bit:
                 dtype = _resolve_dtype(torch.float16)
                 model = model.to(dtype)
+        if full_finetuning:
+            _print_full_finetuning_precision(dtype, master_choice, master_fit)
         max_seq_length = _clamp_to_learned_positions(model, max_seq_length)
         tokenizer_kwargs = dict(
             token = token, revision = revision, trust_remote_code = trust_remote_code,
