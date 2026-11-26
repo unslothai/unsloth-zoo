@@ -894,26 +894,32 @@ def patch_vllm_untiled_moe_experts():
 pass
 
 
-# model_type -> (vLLM module, vLLM class, transformers module, stacked HF experts class)
-_STACKED_MOE_LORA_MODELS = {
-    "qwen3_moe":   ("qwen3_moe",   "Qwen3MoeForCausalLM",   "qwen3_moe.modeling_qwen3_moe",     "Qwen3MoeExperts"),
-    "deepseek_v2": ("deepseek_v2", "DeepseekV2ForCausalLM", "deepseek_v2.modeling_deepseek_v2", "DeepseekV2Experts"),
-    "deepseek_v3": ("deepseek_v2", "DeepseekV3ForCausalLM", "deepseek_v3.modeling_deepseek_v3", "DeepseekV3Experts"),
-}
+def _stacked_moe_lora_class(model_type):
+    """vLLM class to mark as 3D MoE LoRA, or None. Only transformers >= 5 stacks the experts into 3D tensors."""
+    if model_type == "qwen3_moe":
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts  # noqa: F401
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+        return Qwen3MoeForCausalLM
+    if model_type == "deepseek_v2":
+        from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2Experts  # noqa: F401
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
+        return DeepseekV2ForCausalLM
+    if model_type == "deepseek_v3":
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Experts  # noqa: F401
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV3ForCausalLM
+        return DeepseekV3ForCausalLM
+    return None
+pass
 
 
 def patch_vllm_stacked_moe_lora(config):
     """Set is_3d_moe_weight so vLLM serves the stacked expert adapter; its 2D wrapper cannot (vllm-project/vllm#41754)."""
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
-    if model_type not in _STACKED_MOE_LORA_MODELS: return False
-    vllm_module, vllm_class, hf_module, hf_experts = _STACKED_MOE_LORA_MODELS[model_type]
+    if model_type not in ("qwen3_moe", "deepseek_v2", "deepseek_v3"): return False
     try:
-        import importlib
         from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
-        cls = getattr(importlib.import_module(f"vllm.model_executor.models.{vllm_module}"), vllm_class)
-        # Only transformers >= 5 stacks the experts into 3D tensors.
-        getattr(importlib.import_module(f"transformers.models.{hf_module}"), hf_experts)
+        cls = _stacked_moe_lora_class(model_type)
     except Exception as e:
         logger.info(f"Unsloth: not marking {model_type} as a 3D MoE LoRA model in vLLM: {e}")
         return False
