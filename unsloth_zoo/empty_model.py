@@ -1295,6 +1295,24 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.router.scale",
             "model.layers.{kk}.router.per_expert_scale",
 
+            # DeepSeek-V2 / V3 multi-head latent attention and MoE (vLLM fused_qkv_a_proj / gate_up_proj split back)
+            "model.layers.{kk}.self_attn.q_a_proj",
+            "model.layers.{kk}.self_attn.q_b_proj",
+            "model.layers.{kk}.self_attn.kv_a_proj_with_mqa",
+            "model.layers.{kk}.self_attn.kv_b_proj",
+            "model.layers.{kk}.mlp.gate.e_score_correction_bias",
+            "model.layers.{kk}.mlp.shared_experts.gate_proj",
+            "model.layers.{kk}.mlp.shared_experts.up_proj",
+            "model.layers.{kk}.mlp.shared_experts.down_proj",
+            "model.language_model.layers.{kk}.self_attn.q_a_proj",
+            "model.language_model.layers.{kk}.self_attn.q_b_proj",
+            "model.language_model.layers.{kk}.self_attn.kv_a_proj_with_mqa",
+            "model.language_model.layers.{kk}.self_attn.kv_b_proj",
+            "model.language_model.layers.{kk}.mlp.gate.e_score_correction_bias",
+            "model.language_model.layers.{kk}.mlp.shared_experts.gate_proj",
+            "model.language_model.layers.{kk}.mlp.shared_experts.up_proj",
+            "model.language_model.layers.{kk}.mlp.shared_experts.down_proj",
+
             # MuseGlimmer attention output gate (vLLM self_attn.output_gate_proj)
             "model.language_model.layers.{kk}.self_attn.gate_proj",
 
@@ -1366,6 +1384,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.ffn_norm",
             "model.layers.{kk}.self_attn.q_layernorm",
             "model.layers.{kk}.self_attn.k_layernorm",
+
+            # DeepSeek-V2 / V3 MLA
+            "model.layers.{kk}.self_attn.q_a_layernorm",
+            "model.layers.{kk}.self_attn.kv_a_layernorm",
+            "model.language_model.layers.{kk}.self_attn.q_a_layernorm",
+            "model.language_model.layers.{kk}.self_attn.kv_a_layernorm",
 
             # Gemma4 per-layer input norm
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
@@ -2075,6 +2099,10 @@ def extract_moe_layers(
         gate_weight = getattr(getattr(gate, "base_layer", gate), "weight", None)
         if gate_weight is not None:
             store(f"{prefix}.gate.weight", gate_weight.data)
+        # DeepSeek-V3 noaux_tc router bias (an HF buffer, a float32 vLLM parameter)
+        bias = getattr(gate, "e_score_correction_bias", None)
+        if bias is not None:
+            store(f"{prefix}.gate.e_score_correction_bias", bias.data)
 
     shared_expert_gate = getattr(moe_block, "shared_expert_gate", None)
     if shared_expert_gate is not None:
@@ -2098,6 +2126,19 @@ def extract_moe_layers(
         get_state_dict(f"{prefix}.shared_expert.gate_proj", 0, state_dict, shared_expert.gate_up_proj)
         get_state_dict(f"{prefix}.shared_expert.up_proj",   1, state_dict, shared_expert.gate_up_proj)
         get_state_dict(f"{prefix}.shared_expert.down_proj", 0, state_dict, shared_expert.down_proj, slice_weights = False)
+
+    # DeepSeek-V2 / V3: shared_experts (plural) is a gated MLP with a fused gate_up_proj
+    shared_experts = getattr(moe_block, "shared_experts", None)
+    if shared_experts is not None and hasattr(shared_experts, "gate_up_proj"):
+        get_state_dict(f"{prefix}.shared_experts.gate_proj", 0, state_dict, shared_experts.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_experts.up_proj",   1, state_dict, shared_experts.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_experts.down_proj", 0, state_dict, shared_experts.down_proj, slice_weights = False)
+    elif getattr(moe_block, "is_fused_shared_expert_enabled", False):
+        raise NotImplementedError(
+            f"Unsloth: vLLM fused {prefix}'s shared experts into the routed experts (ROCm AITER), so "
+            "fast_inference cannot share them with training; "
+            "set fast_inference = False."
+        )
 
     experts = getattr(moe_block, "experts", None)
     if experts is None: return
