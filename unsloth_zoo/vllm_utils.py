@@ -73,6 +73,13 @@ from .hf_utils import (
     set_dtype_in_config,
 )
 from .patching_utils import patch_model_and_tokenizer
+from .vllm_deepseek_v41 import (
+    is_deepseek_v41_config,
+    deepseek_v41_fast_inference_refusal,
+    deepseek_v41_engine_args,
+    get_deepseek_v41_vllm_state_dict,
+    convert_deepseek_v41_vllm_to_huggingface,
+)
 from unsloth_zoo.temporary_patches.common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
@@ -1818,6 +1825,8 @@ pass
 
 
 def _get_multimodal_engine_args(config, is_vision_model):
+    if is_deepseek_v41_config(config):
+        return deepseek_v41_engine_args(config, is_vision_model)
     # Audio = 0: profiling the Gemma-4 audio tower aborts with Unsloth's compiled audio modules.
     # Other audio models (Gemma3n, Qwen2-Audio) keep vLLM's default audio quota.
     limits = {"image": 1, "video": 0}
@@ -1973,6 +1982,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     pass
 
     assert(config is not None)
+
+    if is_deepseek_v41_config(config):
+        # Native-name views of vLLM's DeepSeek-V4.1 text model (unsloth_zoo/vllm_deepseek_v41.py)
+        quant_state_dict = get_deepseek_v41_vllm_state_dict(vllm_internals, config)
+        return (quant_state_dict if return_state_dict else None), quant_state_dict
 
     # Read model_type before reassigning config below
     model_type = getattr(config, "model_type", "causal_lm")
@@ -2826,6 +2840,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         return getattr(value, "data", value)
 
     dtype = _shared_weight_dtype(quant_state_dict, dtype)
+    if is_deepseek_v41_config(config):
+        return convert_deepseek_v41_vllm_to_huggingface(quant_state_dict, config, dtype)
     config = _native_config_for_vllm_rebuild(config)
     set_dtype_in_config(config, dtype)
     for subconfig_name in ("text_config", "vision_config", "audio_config"):
@@ -6111,6 +6127,13 @@ def load_vllm(
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
+    dsv41_refusal = deepseek_v41_fast_inference_refusal(config, load_in_4bit = use_bitsandbytes)
+    if dsv41_refusal is not None and training:
+        raise NotImplementedError(
+            f"Unsloth: fast_inference = True cannot share DeepSeek-V4.1 with vLLM: {dsv41_refusal}. "
+            "Load a 16-bit (BF16) copy with load_in_4bit = False, or set fast_inference = False."
+        )
+
     fp8_moe = fp8_moe_checkpoint_scheme(config)
     if fp8_moe is not None:
         shareable, reason = fp8_moe
@@ -6709,7 +6732,8 @@ def load_vllm(
             if major_version >= 10:
                 _text_config = getattr(config, "text_config", config)
                 _head_dim = _config_get(_text_config, "head_dim")
-                if _head_dim is not None and _head_dim >= 256:
+                # DeepSeek-V4.1's sparse MLA backends pick their own block size (128) and refuse 32.
+                if _head_dim is not None and _head_dim >= 256 and not is_deepseek_v41_config(config):
                     engine_args["block_size"] = 32
                     logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
         pass
@@ -8023,6 +8047,17 @@ def _check_lora_is_servable(model, keys, source, peft_config):
     rollouts from the base weights while the trainer updates the adapter.
     """
     # All Unsloth Zoo code licensed under LGPLv3
+    if keys and is_deepseek_v41_config(getattr(model, "config", None)):
+        verdict = getattr(model, "_unsloth_merged_rollout_state", None)
+        raise NotImplementedError(
+            "Unsloth: fast_inference=True serves a DeepSeek-V4.1 LoRA only through the merged-weight rollout, "
+            "which folds the adapter into the weights vLLM shares with training. vLLM's own LoRA cannot take "
+            "this adapter (vLLM names the layers wq_a / wkv / wo_a / ffn.experts, the training model "
+            "q_a_proj / kv_proj / o_a_proj / mlp.experts), and the fold is not used here because "
+            f"{getattr(verdict, 'reason', None) or 'UNSLOTH_VLLM_MERGED_ROLLOUT is off'}.\n"
+            "Unset UNSLOTH_VLLM_MERGED_ROLLOUT (or set it to 1) with a 16-bit model and plain LoRA, "
+            "or use fast_inference=False."
+        )
     expert_keys = [k for k in keys if _is_moe_expert_lora_key(k)]
     # Per-expert 2D and stacked keys need opposite vLLM wrappers.
     per_expert_keys = [k for k in expert_keys if _is_moe_per_expert_lora_key(k)]
@@ -8677,7 +8712,9 @@ def _prepare_merged_rollout_locked(model):
         quiet = automatic
     else:
         targets, reason = _merged_rollout_targets(model)
-    if reason is None and automatic and any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
+    # DeepSeek-V4.1 has no vLLM LoRA fallback (see _check_lora_is_servable), so the default folds its experts too.
+    if reason is None and automatic and not is_deepseek_v41_config(getattr(model, "config", None)) \
+        and any(_merged_rollout_is_param_wrapper(module) for _, module, _ in targets):
         reason = "the automatic default does not fold MoE expert LoRA (set UNSLOTH_VLLM_MERGED_ROLLOUT=1 to force it)"
     if reason is None:
         if _merged_rollout_use_exact(targets):
