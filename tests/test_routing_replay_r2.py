@@ -281,3 +281,25 @@ def test_no_pad_id_and_no_mask_still_replays(r2):
     model(input_ids = ids)
     assert torch.equal(routes.ids(), old)
     assert rr.routing_replay_stats()["r2_replayed_tokens"] == ids.numel()
+
+
+@pytest.mark.parametrize("env", ["UNSLOTH_GRPO_ROUTING_REPLAY", "UNSLOTH_GRPO_ROUTING_REPLAY_R2"])
+def test_looped_model_refuses_routing_replay(monkeypatch, env):
+    # Inkling-2 style loop: every pass reuses the same layers and routers, so per-layer routes collide.
+    monkeypatch.delenv("UNSLOTH_GRPO_ROUTING_REPLAY", raising = False)
+    monkeypatch.delenv("UNSLOTH_GRPO_ROUTING_REPLAY_R2", raising = False)
+    monkeypatch.setenv(env, "1")
+    rr.reset_routing_replay()
+    plain = _model()
+    assert rr.install_routing_replay(plain, None, SimpleNamespace(pad_token_id = PAD)) == NUM_LAYERS
+    looped = _model()
+    looped.config.loop_num_passes = 3
+    with pytest.warns(UserWarning, match = "looped model"):
+        assert rr.install_routing_replay(looped, None, SimpleNamespace(pad_token_id = PAD)) == 0
+    assert all(not layer.mlp.gate._forward_hooks for layer in looped.model.layers)
+    if env == "UNSLOTH_GRPO_ROUTING_REPLAY":
+        monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
+        with pytest.warns(UserWarning, match = "looped model"):
+            assert rr.routing_replay_engine_args(looped.config) == {}
+        assert rr.routing_replay_engine_args(plain.config) != {}
+    rr.reset_routing_replay()

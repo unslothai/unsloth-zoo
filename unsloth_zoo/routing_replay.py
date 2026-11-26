@@ -222,6 +222,24 @@ def _config_is_hybrid_attention(config):
     return False
 
 
+def _loop_passes(config):
+    """Passes over the same decoder layers (Inkling-2 style looped models), 1 when not looped."""
+    for sub in (config, getattr(config, "text_config", None)):
+        value = getattr(sub, "loop_num_passes", None) if sub is not None else None
+        if isinstance(value, int) and value > 1:
+            return value
+    return 1
+
+
+def _warn_looped(passes):
+    warnings.warn(
+        f"Unsloth: MoE routing replay is off for this looped model (loop_num_passes = {passes}): it keys "
+        "routes by layer, and every pass reuses the same layers and routers, so the passes' routes would "
+        "overwrite each other.",
+        stacklevel = 3,
+    )
+
+
 def _vllm_at_least(major, minor):
     try:
         from importlib.metadata import version
@@ -235,6 +253,9 @@ def _vllm_at_least(major, minor):
 def routing_replay_engine_args(config):
     """Extra vLLM engine args, empty unless requested, supported and the model is MoE."""
     if not routing_replay_requested() or not _config_is_moe(config):
+        return {}
+    if _loop_passes(config) > 1:
+        _warn_looped(_loop_passes(config))
         return {}
     if not vllm_supports_routed_experts():
         warnings.warn(
@@ -1409,6 +1430,10 @@ def install_routing_replay(model, llm = None, tokenizer = None):
     """Hook every router of `model` and the decoder's forward. Returns the number of routers."""
     if not (routing_replay_requested() or old_policy_replay_requested()) \
             or getattr(model, "_unsloth_routing_replay_installed", False):
+        return 0
+    passes = max(_loop_passes(getattr(m, "config", None)) for m in (model, getattr(model, "get_base_model", lambda: None)()))
+    if passes > 1:
+        _warn_looped(passes)
         return 0
     if llm is not None:
         wrap_vllm_generate(llm)
