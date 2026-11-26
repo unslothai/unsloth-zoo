@@ -573,7 +573,8 @@ _TRITON_GROUPED_MM_AUTO_ROWS = {
 # ROCm, keyed by the gcnArch capability torch reports. There torch._grouped_mm is a per-expert mm loop, and on gfx1151
 # ROCm 7.13 / 7.14 it fails the training-shaped probe, so the LoRA GEMMs ran as about 3.8k per-expert mm per step.
 # gfx1151 (Strix Halo) LoRA GEMMs on Triton, Qwen3-30B-A3B layer shape (E 128, top-8), r16, bf16: 1.26x step speed on
-# Linux, 1.76x on Windows. Base-sized classes are not timed there yet and stay on torch; other ROCm archs keep the loop.
+# Linux. Windows (triton-windows) timed 1.76x on one box and 0.94x on another, so auto keeps it on the loop there.
+# Base-sized classes are not timed yet and stay on torch; other ROCm archs keep the loop. =1 forces Triton anywhere.
 _TRITON_GROUPED_MM_AUTO_ROWS_ROCM = {
     (11, 5): {"lora": -1, "many": 0, "few": 0, "dw": 0, "dw_few": 0},
 }
@@ -631,7 +632,11 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = F
         # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
         limit = -1 if rocm or cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     else:
-        limit = (_TRITON_GROUPED_MM_AUTO_ROWS_ROCM if rocm else _TRITON_GROUPED_MM_AUTO_ROWS).get(cap, {}).get(kind, 0)
+        if rocm:
+            table = {} if sys.platform == "win32" else _TRITON_GROUPED_MM_AUTO_ROWS_ROCM
+        else:
+            table = _TRITON_GROUPED_MM_AUTO_ROWS
+        limit = table.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
         try:
             limit = int(override)

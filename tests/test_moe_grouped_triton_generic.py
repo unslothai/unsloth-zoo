@@ -757,17 +757,19 @@ def test_lora_pad_checks_both_gemms(monkeypatch):
     assert MU._lora_rank_pad_needed(x, A, B)
 
 
+@pytest.mark.parametrize("platform", ["linux", "win32"])
 @pytest.mark.parametrize("cap", [(11, 5), (9, 4), (11, 0), (12, 0)])
 @pytest.mark.parametrize("kind", ["lora", "many", "few", "dw", "dw_few"])
-def test_gate_table_rocm(monkeypatch, cap, kind):
-    """ROCm: auto routes only gfx1151 (11, 5) LoRA GEMMs to Triton (base-sized GEMMs stay on torch); forcing it on works on any
-    arch, and UNSLOTH_MOE_GROUPED_TRITON=0 / UNSLOTH_DISABLE_MOE_TRITON=1 keep every GEMM on torch._grouped_mm."""
+def test_gate_table_rocm(monkeypatch, platform, cap, kind):
+    """ROCm: auto routes only gfx1151 (11, 5) LoRA GEMMs on Linux to Triton (base-sized GEMMs and Windows stay on torch);
+    forcing it on works on any arch and OS, and UNSLOTH_MOE_GROUPED_TRITON=0 / UNSLOTH_DISABLE_MOE_TRITON=1 keep every
+    GEMM on torch._grouped_mm."""
     if MG.triton is None or MU._GROUPED_MM_TRITON_OP is None:
         pytest.skip("gate is off without Triton / custom_op")
     monkeypatch.setattr(MU, "is_rocm_torch", lambda *a, **k: True)
+    monkeypatch.setattr(MU.sys, "platform", platform)
     _mock_cap(cap)
-    auto = MU._TRITON_GROUPED_MM_AUTO_ROWS_ROCM.get(cap, {}).get(kind, 0)
-    assert auto == (-1 if cap == (11, 5) and kind == "lora" else 0)
+    auto = -1 if cap == (11, 5) and kind == "lora" and platform == "linux" else 0
     assert MU._triton_grouped_mm_max_rows(0, kind) == auto
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
     assert MU._triton_grouped_mm_max_rows(0, kind) == -1
