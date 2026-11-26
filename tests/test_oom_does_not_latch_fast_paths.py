@@ -208,3 +208,32 @@ def test_matmul_ogs_self_check_oom_is_not_cached(monkeypatch):
     assert "cpu" not in tkc._DEVICE_OK
     assert tkc.matmul_ogs_available("cpu") is True
     assert check.ok == 1
+
+
+def _checkpoint_errors():
+    from torch.utils import checkpoint
+
+    errors = [lambda: checkpoint.CheckpointError("torch.utils.checkpoint: recomputed tensors differ")]
+    if hasattr(checkpoint, "_StopRecomputationError"):
+        errors.append(lambda: checkpoint._StopRecomputationError())
+    return errors
+
+
+@pytest.mark.parametrize("make_error", _checkpoint_errors())
+def test_recompute_checkpoint_control_flow_is_reraised_not_latched(monkeypatch, make_error):
+    # Checkpoint control flow raised through the compiled kernel must reach checkpoint, and must not turn the compiled
+    # recompute off for the rest of the process.
+    function, kernels = _recompute_standalone(monkeypatch, make_error)
+    gen = torch.Generator().manual_seed(4)
+    head = torch.randn(11, 4, generator = gen, dtype = torch.float64)
+    states = torch.randn(1, 5, 4, generator = gen, dtype = torch.float64)
+    index = torch.randint(0, 11, (1, 5), generator = gen)
+    expected = type(make_error())
+    with pytest.raises(expected):
+        function(states, head, index, 2, fused_linear = False)
+    assert getattr(function, "_use_compiled", True), "checkpoint control flow latched the compiled recompute off"
+    forward = kernels[0]
+    ok_before = forward.ok
+    reference = torch.log_softmax(states @ head.t(), -1).gather(-1, index.unsqueeze(-1)).squeeze(-1)
+    torch.testing.assert_close(function(states, head, index, 2, fused_linear = False).double(), reference)
+    assert forward.ok > ok_before, "the next call did not take the compiled kernel"
