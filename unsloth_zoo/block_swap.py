@@ -844,6 +844,7 @@ class _Block:
             if c is not None:
                 # Compressed bytes over the bus, decoded into the slot on the card's decode stream.
                 self.decoders[d].fetch(c, self.host_buf[d], bufs[d], stream, event)
+                _set_fence(self, bufs[d], event)
         self.copy_open = self.t_copy is not None
         for p, v in zip(self.params, views):
             p.data = v
@@ -888,16 +889,12 @@ def _wait_fence(block, buf, stream):
         stream.wait_event(ev)
 
 
-def _leave_fence(block, slot):
-    """A compressed block gives its slot back: its decode may still be writing it (decoded on a codec stream)."""
+def _set_fence(block, buf, event):
+    """A decode into slot buffer `buf` was just submitted (it completes at `event`, on a codec stream): the next
+    fetch into that buffer waits for it, whichever block holds the slot by then."""
     fences = getattr(block, "fences", None)
-    if fences is None or slot is None or not getattr(block, "codec", None):
-        return
-    bufs = slot[0]
-    for d, c in block.codec.items():
-        ev = block.events.get(d) if c is not None else None
-        if ev is not None and d in bufs:
-            fences[bufs[d].data_ptr()] = ev
+    if fences is not None:
+        fences[buf.data_ptr()] = event
 
 
 def _to_device(obj, device):
@@ -1165,8 +1162,8 @@ class BlockSwap:
             if self._compress:
                 self._build_decoders()
             # A slot can be reused while the last decode into it is still running (an interrupted step steals or
-            # resets a prefetched block): a released compressed block leaves its decode's event on the slot, and
-            # the next fetch into that slot waits for it, whichever codec stream did the decode.
+            # resets a prefetched block): each decode submitted into a slot leaves its event there, and the next
+            # fetch into that slot waits for it, whichever block or codec stream it came from.
             fences = {}
             for b in self.blocks:
                 b.fences = fences
@@ -1484,7 +1481,6 @@ class BlockSwap:
     def _release(self, block):
         freed = block.evict()
         if freed is not None:
-            _leave_fence(block, freed)
             self.free[block.sig].append(freed)
 
     def _keep(self, block):

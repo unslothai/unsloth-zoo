@@ -486,6 +486,9 @@ class DiskTier:
             if c is not None:
                 # Stored encoded (lossless): the encoded bytes go over the bus and decode into the slot on the card.
                 block.decoders[d].fetch(c, stage[:c.nbytes], bufs[d], stream, event)
+                fences = getattr(block, "fences", None)
+                if fences is not None:
+                    fences[bufs[d].data_ptr()] = event
         done = torch.cuda.Event()
         done.record(block.streams[next(iter(block.events))])
         self.slot_done[block.stage] = done

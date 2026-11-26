@@ -354,3 +354,33 @@ def test_host_codec_keeps_the_disk_decoders_on_disk_blocks(monkeypatch):
     got, _ = _train(layers, sw)
     _equal(ref, got)
     sw.remove()
+
+
+@_codec_gpu
+def test_slot_fences_only_ever_hold_submitted_decodes(monkeypatch):
+    """Cancelled disk reads (two interrupted steps in a row) never replace a slot's fence with an event no decode
+    was recorded on: the fence is set when a decode is submitted, never on release."""
+    base = _stack()
+    ref, _ = _train(copy.deepcopy(base), _NoSwap())
+    submitted = []
+    real = _cmod.DeviceDecoder.fetch
+
+    def fetch(self, codec, blob, out_u8, copy_stream, done):
+        submitted.append(done)
+        return real(self, codec, blob, out_u8, copy_stream, done)
+
+    monkeypatch.setattr(_cmod.DeviceDecoder, "fetch", fetch)
+    layers = copy.deepcopy(base)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    sw = BlockSwap(layers, 9, prefetch_depth = 2, placement = "tail")
+    fences = sw.blocks[0].fences
+    for stop in (5, 3):
+        with torch.no_grad():
+            h = torch.randn(4, 32, 256, device = "cuda", dtype = torch.bfloat16)
+            for layer in layers[:stop]:
+                h = layer(h)
+        sw.reset()
+        assert fences and all(any(ev is s for s in submitted) for ev in fences.values())
+    got, _ = _train(layers, sw)
+    _equal(ref, got)
+    sw.remove()
