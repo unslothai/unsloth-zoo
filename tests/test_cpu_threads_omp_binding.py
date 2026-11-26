@@ -126,3 +126,31 @@ def test_omp_places_cover_the_process_mask():
     if not places:
         pytest.skip("no OpenMP runtime answered omp_get_num_places")
     assert places == mask
+
+
+def test_torch_omp_runtime_prefers_torch_own_copy():
+    torch = pytest.importorskip("torch")
+    tdir = os.path.dirname(os.path.realpath(torch.__file__))
+    other = "/site-packages/sentencepiece.libs/libgomp-a34b3233.so.1"
+    own_x86 = os.path.join(tdir, "lib", "libgomp.so.1")
+    own_arm = tdir + ".libs/libgomp-947d5fa1.so.1.0.0"
+    system = "/usr/lib/x86_64-linux-gnu/libgomp.so.1"
+    pick = runtime._torch_omp_runtime
+    assert pick([other]) == other  # the only runtime loaded is the one torch runs on
+    assert pick(sorted([other, own_x86])) == own_x86
+    assert pick(sorted([other, own_arm])) == own_arm
+    assert pick(sorted([other, system])) == system  # conda / distro torch: the system soname
+    assert pick(sorted([own_x86, own_arm])) is None  # ambiguous: fall back to where the pool's threads run
+    assert pick(["/a.libs/libgomp-1.so.1", "/b.libs/libgomp-2.so.1"]) is None
+
+
+def test_ambiguous_runtime_falls_back_to_thread_masks(monkeypatch):
+    for name in _ENV:
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setenv("OMP_PROC_BIND", "close")
+    monkeypatch.setattr(runtime, "_omp_place_cpus", lambda: set())
+    masks = {0: {4}, 11: {4}, 12: {5}}
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(masks[pid]), raising = False)
+    real_listdir = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda p: ["11", "12"] if p == "/proc/self/task" else real_listdir(p))
+    assert runtime._process_affinity() == {4, 5}
