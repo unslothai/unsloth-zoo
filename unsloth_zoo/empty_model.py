@@ -46,6 +46,7 @@ from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
+from .vllm_qwen4_exp import is_qwen4_exp_config, qwen4_exp_empty_config_attrs
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
 _CLAMP_BOUND_SUFFIXES = (".input_min", ".input_max", ".output_min", ".output_max")
@@ -327,6 +328,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         "linear_value_head_dim": 1,
         "linear_conv_kernel_dim": 1,
     })
+    if is_qwen4_exp_config(causal_config):
+        _set_config_attrs(new_config, qwen4_exp_empty_config_attrs(new_config))
 
     # Set attention module head_dim
     head_dim = _global_config_value(
@@ -705,6 +708,9 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "num_attention_heads": 1,
     })
 
+    if is_qwen4_exp_config(config):
+        _set_config_attrs(new_config.text_config, qwen4_exp_empty_config_attrs(new_config.text_config))
+
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
@@ -884,12 +890,14 @@ def set_additional_modules(new_model, quant_state_dict, config):
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     # LFM2 calls its final norm embedding_norm, Nemotron-H norm_f
-    norm_name = next(x for x in ("norm", "embedding_norm", "norm_f") if hasattr(language_model, x))
+    # Qwen4Exp has no final norm (its hyper_connection_mixer is set below with the other non-layered keys)
+    norm_name = next((x for x in ("norm", "embedding_norm", "norm_f") if hasattr(language_model, x)), None)
     norm_key = f"{language_model_prefix}.{norm_name}.weight"
-    norm = quant_state_dict[norm_key]
-    norm = _unwrap_tensor(norm)
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    getattr(language_model, norm_name).weight = norm
+    if norm_name is not None or not is_qwen4_exp_config(config):
+        norm = quant_state_dict[norm_key]
+        norm = _unwrap_tensor(norm)
+        norm = torch.nn.Parameter(norm, requires_grad = False)
+        getattr(language_model, norm_name).weight = norm
 
     # LM Head. For some models (e.g. Mistral3ForConditionalGeneration)
     # tie_word_embeddings can differ between config and text_config; prefer
@@ -1577,6 +1585,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_model.post_layernorm",
         }
     }
+
+    # Qwen3.8-Flash-Next (qwen4_exp): hyper-connections, PLE, QSA indexer
+    from .vllm_qwen4_exp import qwen4_exp_layer_templates
+    for key, value in qwen4_exp_layer_templates().items():
+        layer_templates[key] |= value
 
     # Convert sets to sorted lists for deterministic order
     return {key: sorted(list(value)) for key, value in layer_templates.items() if key!='non_layered_components' or return_non_layered}
