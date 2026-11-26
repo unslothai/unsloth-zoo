@@ -1089,7 +1089,9 @@ def _fake_gpu(monkeypatch, capability, hip = None, cuda = True, arch = "gfx1100"
     )
 
 
-@pytest.mark.parametrize("capability, min_seq", [((7, 5), 8192), ((8, 0), 8192), ((8, 9), 16384)])
+@pytest.mark.parametrize(
+    "capability, min_seq", [((7, 5), 8192), ((8, 0), 8192), ((8, 9), 16384), ((12, 0), 8192)],
+)
 def test_auto_min_seq_on_measured_gpus(monkeypatch, capability, min_seq):
     _fake_gpu(monkeypatch, capability)
     assert SA.save_attention_auto_min_seq() == min_seq
@@ -1110,7 +1112,7 @@ def test_auto_min_seq_on_measured_gpus(monkeypatch, capability, min_seq):
         ((8, 0), "6.4", True, "1"),
         ((8, 0), None, False, None),
         ((10, 0), None, True, None),
-        ((12, 0), None, True, None),
+        ((12, 0), None, True, "0"),
     ],
 )
 def test_auto_min_seq_is_off(monkeypatch, capability, hip, cuda, setting):
