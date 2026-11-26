@@ -25,6 +25,9 @@ def _log_prob_route(monkeypatch):
     monkeypatch.delenv("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", raising = False)
 
 
+_IS_LOG_RATIO_BOUND = 20.0
+
+
 def _trl_loss(new, old, sampling, adv, mask, loss_type, level, is_mode, ga = 1, max_len = 16, num_items = None,
               clip_min = None, clip_max = 3.0, beta = 0.0, ref = None, spg = 4):
     """TRL 1.18 _compute_loss (+ the IS ratio _generate_and_score_completions builds), float64, written out."""
@@ -42,7 +45,9 @@ def _trl_loss(new, old, sampling, adv, mask, loss_type, level, is_mode, ga = 1, 
         diff = torch.nan_to_num((old - sampling) * mask, nan = 0.0)
         if is_mode.startswith("sequence"):
             diff = diff.sum(-1, keepdim = True)
-        ratio = torch.exp(diff)
+        # grpo_compute_loss bounds the IS log ratio to +-20 like verl's SAFETY_BOUND (#2818); TRL does not. Only the lower
+        # bound changes a result here (d = +20 / +88): above +20 the clip_max = 3 truncation or mask already decides.
+        ratio = torch.exp(torch.clamp(diff, min = -_IS_LOG_RATIO_BOUND, max = _IS_LOG_RATIO_BOUND))
         if is_mode.endswith("truncate"):
             ratio = torch.clamp(ratio, min = clip_min, max = clip_max)
         else:
