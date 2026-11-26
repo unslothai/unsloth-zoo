@@ -255,14 +255,15 @@ class _FakeWithLoRA(torch.nn.Module):
         self.base_layer = base_layer
 
 
-def _fake_vllm_mla_lora(separate_wrappers):
+def _fake_vllm_mla_lora(separate_wrappers, q_lora_rank = True):
     """vLLM's MLA layer under enable_lora: 0.11.2 gives attn.X and attn.mla_attn.X separate wrappers (the adapter
     lands in attn.X's, the forward calls mla_attn.X's); 0.34 wraps once and both names hold it."""
     root = torch.nn.Module()
     attn = torch.nn.Module()
     attn.kv_b_proj = _FakeWithLoRA(_linear(torch.zeros(4, 4)))
     attn.mla_attn = torch.nn.Module()
-    for proj in ("fused_qkv_a_proj", "q_b_proj", "o_proj"):
+    projs = ("fused_qkv_a_proj", "q_b_proj", "o_proj") if q_lora_rank else ("kv_a_proj_with_mqa", "q_proj", "o_proj")
+    for proj in projs:
         base = _linear(torch.zeros(4, 4))
         setattr(attn, proj, _FakeWithLoRA(base))
         setattr(attn.mla_attn, proj, _FakeWithLoRA(base) if separate_wrappers else getattr(attn, proj))
@@ -305,3 +306,17 @@ def test_vllm_lora_model_unwraps_cuda_graph_wrapper(monkeypatch):
     assert vllm_utils._vllm_mla_unread_lora_projections(vllm_utils._get_vllm_lora_model(None, runner))
     plain = types.SimpleNamespace(model = inner)
     assert vllm_utils._get_vllm_lora_model(None, plain) is inner
+
+
+def test_mla_unfused_kv_a_lora_refused_when_q_lora_rank_is_none(monkeypatch):
+    # q_lora_rank = None (DeepSeek-V2-Lite): vLLM keeps kv_a_proj_with_mqa and q_proj as their own modules.
+    from unsloth_zoo import vllm_utils
+    monkeypatch.delenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", raising = False)
+    vllm_model = _fake_vllm_mla_lora(True, q_lora_rank = False)
+    monkeypatch.setattr(vllm_utils, "_get_vllm_lora_model", lambda model, *a: vllm_model)
+    monkeypatch.setattr(vllm_utils, "_unmatched_lora_keys", lambda model, keys: [])
+    assert vllm_utils._vllm_mla_unread_lora_projections(vllm_model) == {"kv_a_proj_with_mqa", "q_proj", "o_proj"}
+    for proj in ("kv_a_proj_with_mqa", "q_proj"):
+        keys = [f"base_model.model.model.layers.0.self_attn.{proj}.lora_A.weight"]
+        with pytest.raises(NotImplementedError, match = proj):
+            vllm_utils._check_lora_is_servable(object(), keys, "the training model", {"r": 8})

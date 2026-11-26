@@ -7777,10 +7777,11 @@ def _check_lora_is_servable(model, keys, source, peft_config):
         )
     mla_proj_keys = [k for k in keys if _MLA_PROJ_LORA_KEY.search(k)]
     unread = _vllm_mla_unread_lora_projections(_get_vllm_lora_model(model)) if mla_proj_keys else set()
-    unread_keys = [
-        k for k in mla_proj_keys
-        if _MLA_VLLM_PROJ.get(_MLA_PROJ_LORA_KEY.search(k).group(1), _MLA_PROJ_LORA_KEY.search(k).group(1)) in unread
-    ]
+    def _unread(key):
+        # kv_a_proj_with_mqa is its own module when q_lora_rank is None, else inside fused_qkv_a_proj
+        proj = _MLA_PROJ_LORA_KEY.search(key).group(1)
+        return proj in unread or _MLA_VLLM_PROJ.get(proj) in unread
+    unread_keys = [k for k in mla_proj_keys if _unread(k)]
     if unread_keys:
         raise NotImplementedError(
             f"Unsloth: fast_inference=True cannot serve a LoRA on the MLA attention projections {sorted(unread)} with "
