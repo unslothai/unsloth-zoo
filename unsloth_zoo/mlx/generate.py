@@ -296,10 +296,12 @@ class GenerationRequest:
     ``drafts=False`` keeps a row of a speculative batch off the draft: its tokens are the
     target's own, as a reply decoded without speculation draws them. Other batches ignore it.
 
-    ``prompt_progress`` (a non-speculative vision ``BatchStream`` row only) is called with
-    ``(processed, total, cached)`` once each chunk of the row's prompt batch has run: ``processed``
-    and ``total`` over the batch's columns past the ``cached`` prefix the row resumed from. Nothing is reported where something other than unsloth-zoo
-    overrides mlx-vlm's ``PromptProcessingBatch``.
+    ``prompt_progress`` is called with ``(processed, total, cached)`` as the row's prompt is
+    prefilled: ``processed`` and ``total`` over the columns past the ``cached`` prefix the row
+    resumed from. Chunks run as a row joins (a speculative row, an image text row) are reported
+    from ``add``. A vision model prefilling unchunked reports nothing, as do vision batches where
+    something other than unsloth-zoo overrides mlx-vlm's ``PromptProcessingBatch``. The callback
+    cannot change the ``BatchStream`` reporting to it.
     """
 
     prompt: str | None = None
@@ -447,12 +449,11 @@ def _validate_text_requests(
             )
         if isinstance(request.image, os.PathLike):
             validated[index] = replace(validated[index], image=os.fspath(request.image))
-        for name in ("prompt_cache_state", "prompt_progress"):
-            if getattr(request, name) is not None:
-                raise ValueError(
-                    f"requests[{index}] carries a {name}, which only a vision "
-                    "BatchStream row takes."
-                )
+        if request.prompt_cache_state is not None:
+            raise ValueError(
+                f"requests[{index}] carries a prompt_cache_state, which only a vision "
+                "BatchStream row takes."
+            )
     _validate_text_defaults(defaults)
     return validated
 
@@ -2018,6 +2019,7 @@ def image_prompt_embeddings(model, tokenizer, prompt: str, images, *, add_specia
 
 def prefill_image_prompt(
     model, tokenizer, prompt: str, images, cache, *, prefill_step_size: int = 2048, add_special_tokens = None,
+    progress = None,
 ) -> list[int]:
     """Prefill ``cache`` with all but the last token of an image prompt and return its token ids: mlx-lm's
     ``BatchGenerator`` takes ids only, so the row joins as ``insert([ids[-1:]], caches=[cache], all_tokens=[ids[:-1]])``."""
@@ -2034,7 +2036,30 @@ def prefill_image_prompt(
             end = min(start + prefill_step_size, len(ids) - 1)
             model(mx.array(ids[start:end])[None], cache=cache, input_embeddings=embeddings[None, start:end])
             mx.eval([entry.state for entry in cache])
+            if progress is not None:
+                progress(end, len(ids), 0)
     return ids
+
+
+class _PromptProgress:
+    """A row's ``prompt_progress``, told each count once; one that raises is dropped with a warning."""
+
+    def __init__(self, callback):
+        self.callback, self.told = callback, None
+
+    @classmethod
+    def of(cls, request):
+        return None if request.prompt_progress is None else cls(request.prompt_progress)
+
+    def __call__(self, processed, total, cached) -> bool:
+        if self.callback is not None and processed != self.told:
+            self.told = processed
+            try:
+                self.callback(processed, total, cached)
+            except Exception as exc:
+                self.callback = None
+                warnings.warn(f"A prompt_progress callback raised {exc!r}; its row reports no more progress.")
+        return self.callback is not None
 
 
 class _TextBatchSession:
@@ -2064,6 +2089,7 @@ class _TextBatchSession:
         self._pending: dict[int, _PendingResult] = {}
         self._row_of: dict[int, int] = {}
         self._uid_of: dict[int, int] = {}
+        self._progress: dict[int, tuple[_PromptProgress, int, int]] = {}
         self._next_row = 0
         self.usable = True
 
@@ -2071,15 +2097,16 @@ class _TextBatchSession:
     def rows_in_flight(self) -> int:
         return len(self._pending)
 
-    def add(self, request: GenerationRequest, prefilled_prompt = None) -> int:
+    def add(self, request: GenerationRequest, prefilled_prompt = None, progress = None) -> int:
         adapter = self.adapter
         defaults = adapter.defaults
+        progress = progress or _PromptProgress.of(request)
         if prefilled_prompt is not None:
             prompt, prefilled, cache = prefilled_prompt
         elif request.image is None:
             prompt, prefilled, cache = _encode_prompt(adapter.tokenizer, request), [], None
         else:
-            prompt, prefilled, cache = self._prefill_image_row(request)
+            prompt, prefilled, cache = self._prefill_image_row(request, progress)
         params = request.sampling or defaults.sampling
         if defaults.logits_warp is not None and request.logits_processors:
             raise ValueError("A row with logits processors cannot take logits_warp: the order would be ambiguous.")
@@ -2137,9 +2164,13 @@ class _TextBatchSession:
         self._pending[uid] = state
         self._row_of[uid] = row
         self._uid_of[row] = uid
+        if progress is not None:
+            # mlx-lm counts only the inserted ids: past a prefix this row heard prefilled, or else one cached for it.
+            heard = progress.told is not None
+            self._progress[uid] = (progress, len(prefilled) if heard else 0, 0 if heard else len(prefilled))
         return row
 
-    def _prefill_image_row(self, request: GenerationRequest) -> tuple[list[int], list[int], list]:
+    def _prefill_image_row(self, request: GenerationRequest, progress = None) -> tuple[list[int], list[int], list]:
         """``(last token, prompt before it, cache holding that prompt)`` for an image row."""
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -2159,7 +2190,7 @@ class _TextBatchSession:
         ids = prefill_image_prompt(
             self.adapter.model, self.adapter.tokenizer, request.prompt, [image], cache,
             prefill_step_size=getattr(self.generator, "prefill_step_size", None) or 2048,
-            add_special_tokens=False,
+            add_special_tokens=False, progress=progress,
         )
         return ids[-1:], ids[:-1], cache
 
@@ -2172,7 +2203,7 @@ class _TextBatchSession:
                 counts[key] = counts.get(key, 0) + 1
         return {ids: count for ids, count in counts.items() if (alone or count > 1) and len(ids) >= 2}
 
-    def prefill_prompt(self, ids) -> tuple:
+    def prefill_prompt(self, ids, progress = None) -> tuple:
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -2181,8 +2212,11 @@ class _TextBatchSession:
             fresh = make_prompt_cache(self.adapter.model, self.adapter.defaults.max_kv_size)
             cache = [entry.merge([entry]) for entry in fresh]
             for start in range(0, len(ids) - 1, step):
-                self.adapter.model(mx.array([ids[start:min(start + step, len(ids) - 1)]]), cache=cache)
+                end = min(start + step, len(ids) - 1)
+                self.adapter.model(mx.array([ids[start:end]]), cache=cache)
                 mx.eval([entry.state for entry in cache])
+                if progress is not None:
+                    progress(end, len(ids), 0)
             return list(ids[-1:]), list(ids[:-1]), [entry.extract(0) for entry in cache]
 
     def cancel(self, row: int) -> bool:
@@ -2209,7 +2243,7 @@ class _TextBatchSession:
         if not self._pending:
             return
         try:
-            responses = self.generator.next_generated()
+            responses = self._next_generated()
             if not responses:
                 raise RuntimeError(
                     "mlx-lm ended its event stream before every request "
@@ -2221,6 +2255,23 @@ class _TextBatchSession:
         except BaseException:
             self.usable = False
             raise
+
+    def _next_generated(self) -> list:
+        """``next_generated()``, telling watched rows each prompt chunk mlx-lm ran."""
+        if not self._progress:
+            return self.generator.next_generated()
+        while True:
+            prompting, generated = self.generator.next()
+            for response in prompting:
+                watched = self._progress.get(response.uid)
+                if watched is None:
+                    continue
+                progress, offset, cached = watched
+                processed, total = response.progress
+                if not progress(processed + offset, total + offset, cached) or processed == total:
+                    del self._progress[response.uid]
+            if generated or not prompting:
+                return generated
 
     def _logprob_values(self, responses) -> dict:
         """Each live row's sampled log-prob, copied out of the step's vocabulary rows so they can be freed."""
@@ -2234,11 +2285,13 @@ class _TextBatchSession:
         return {response.uid: picked[row] for row, response in enumerate(live)}
 
     def close(self):
+        self._progress.clear()
         self.generator.close()
 
     def _retire(self, uid: int):
         row = self._row_of.pop(uid, None)
         self._pending.pop(uid, None)
+        self._progress.pop(uid, None)
         if row is not None:
             self._uid_of.pop(row, None)
         if self._draws is not None:
@@ -2310,9 +2363,12 @@ class _TextBatchAdapter:
                     if key not in sharing:
                         session.add(request)
                         continue
+                    progress = None
                     if key not in prefixes:
-                        prefixes[key] = session.prefill_prompt(key)
-                    session.add(request, prefixes[key])
+                        # The row that waits for the prefix hears it prefilled; rows reusing it count it cached.
+                        progress = _PromptProgress.of(request)
+                        prefixes[key] = session.prefill_prompt(key, progress)
+                    session.add(request, prefixes[key], progress)
                     if all(key != upcoming for _, upcoming in itertools.islice(pending, window)):
                         del prefixes[key]
 
@@ -3054,6 +3110,15 @@ def speculative_quantized_rows_unavailable_reason() -> str | None:
     return row_quantized_prompt_cache_unavailable_reason()
 
 
+def speculative_prompt_progress_unavailable_reason() -> str | None:
+    """Why a speculative batch row here reports no ``prompt_progress``: it prefills through mlx-vlm's ``Prefill`` bar."""
+
+    module = _resolve_module_attr(("mlx_vlm.generate.ar", "mlx_vlm.generate"), "generate_step")
+    if getattr(module, "tqdm", None) is None:
+        return f"{_installed_mlx_vlm_version()} prefills without the progress bar unsloth-zoo reports"
+    return None
+
+
 def row_retire_unavailable_reason() -> str | None:
     """Why a batched vision row here cannot hand its own cache back as it leaves the batch."""
 
@@ -3071,6 +3136,27 @@ def _install_row_prefill_batch(batch_module) -> None:
                 "mlx_vlm.generate.PromptProcessingBatch is overridden by something else"
             )
         public.PromptProcessingBatch = _row_prefill_batch_class(base)
+
+
+def _report_row_prefill(progress: dict, batches) -> None:
+    """Tell each watched row of ``batches`` (``RowPrefillBatch``) the chunks run since it was last told."""
+    if not progress:
+        return
+    for batch in {id(batch): batch for batch in batches if batch is not None}.values():
+        done = getattr(batch, "_unsloth_prefilled", 0)
+        columns = getattr(batch, "_unsloth_columns", None)
+        if not done or columns is None or done == batch._unsloth_reported:
+            continue
+        uids = [uid for uid in batch.uids if uid in progress]
+        if not uids:
+            continue
+        batch._unsloth_reported = done
+        import mlx.core as mx
+        # mlx-vlm only queued the chunk.
+        mx.eval([entry.state for entry in batch.prompt_cache])
+        for uid in uids:
+            if not progress[uid](done, columns, batch._unsloth_cached):
+                del progress[uid]
 
 
 def _cache_layout(entries) -> tuple | None:
@@ -3561,6 +3647,14 @@ class _VLMBatchAdapter:
                 )
             ),
         )
+        progress = _PromptProgress.of(request)
+        if progress is not None:
+            events = iter(events)
+            # The prompt runs before the stream's first event.
+            with vlm_prefill_progress(lambda done, total: progress(done, total, 0)):
+                first = next(events, None)
+            events = _after(first, events)
+            del first
         for event in events:
             if previous is None:
                 state.prompt_token_count = int(getattr(event, "prompt_tokens", 0) or 0)
@@ -3673,6 +3767,13 @@ class _VLMBatchAdapter:
             int(requests[index].max_tokens or self.defaults.max_tokens) for index in indices
         ]
         row_processors = self._row_logits_processors([requests[index] for index in indices])
+        progress = [_PromptProgress.of(requests[index]) for index in indices]
+        if any(progress):
+            try:
+                _install_row_prefill_batch(self.batch_module)
+            except BatchRowRefused:
+                # Something else builds the prompt batches, so none counts its chunks.
+                progress = []
         generator = None
         active_error = None
         try:
@@ -3719,6 +3820,7 @@ class _VLMBatchAdapter:
                     generator, uids, indices, row_sampler,
                     prompt_token_count=len(token_ids[0]),
                     prompt_token_counts=None if counts is None else [counts[source] for source in sources],
+                    progress={uid: watch for uid, watch in zip(uids, progress) if watch is not None},
                 )
         except BaseException as exc:
             active_error = exc
@@ -3749,6 +3851,7 @@ class _VLMBatchAdapter:
         row_sampler=None,
         prompt_token_count=0,
         prompt_token_counts=None,
+        progress=None,
     ) -> Iterator[GenerationEvent]:
         """Report the chunk's rows, charging each its own prompt count, or
         ``prompt_token_count`` to every row when none are given."""
@@ -3767,6 +3870,7 @@ class _VLMBatchAdapter:
         }
         row_of = dict(zip(uids, indices))
         live = list(uids)
+        progress, prefilling = progress or {}, ()
         while pending:
             if row_sampler is not None:
                 row_sampler.row_uids = list(live)
@@ -3775,7 +3879,12 @@ class _VLMBatchAdapter:
                     "mlx-vlm ended its event stream before every request "
                     "reported a finish reason."
                 )
+            # Told a step late, as a BatchStream row is, so no step's tokens wait on the chunk it queued.
+            _report_row_prefill(progress, prefilling)
+            prompting = getattr(generator, "_prompt_batch", None) if progress else None
             _, events = generator.next()
+            prefilling = (prompting, getattr(generator, "_prompt_batch", None)) if progress else ()
+            prompting = None
             if not events:
                 if self._admission_stalled(generator):
                     raise self._stall_error()
@@ -3801,6 +3910,8 @@ class _VLMBatchAdapter:
                         live.remove(event.uid)
                     yield from _finished_events(row_of[event.uid], state, tokenizer)
                     del pending[event.uid]
+                    progress.pop(event.uid, None)
+                    prefilling = prefilling if progress else ()
                     continue
                 if finish_reason not in ("stop", "length"):
                     raise RuntimeError(
@@ -3812,6 +3923,16 @@ class _VLMBatchAdapter:
                 state.finish(tokenizer, finish_reason, int(event.token))
                 yield from _finished_events(row_of[event.uid], state, tokenizer)
                 del pending[event.uid]
+                progress.pop(event.uid, None)
+                prefilling = prefilling if progress else ()
+
+
+def _after(first, rest):
+    """``first`` (unless None) then ``rest``, holding ``first`` only until it is taken."""
+    if first is not None:
+        yield first
+    del first
+    yield from rest
 
 
 @contextmanager
@@ -4018,7 +4139,7 @@ class _VLMBatchSession:
         if prefill is not None and callable(retire):
             self._retiring[uid] = retire
         if progress is not None:
-            self._progress[uid] = progress
+            self._progress[uid] = _PromptProgress(progress)
         self.sampler.register(uid, request.sampling or defaults.sampling)
         self._row_signature = _row_signature(
             prompt_kwargs, adapter.padded_prompt_kwargs)
@@ -4168,11 +4289,12 @@ class _VLMBatchSession:
             self._hand_back_rows()
             # The last step's chunks: waiting there held back its tokens; nothing here ends before them.
             self._report_prefill(*self._prefilling)
-            prompting = getattr(self.generator, "_prompt_batch", None)
+            prompting = getattr(self.generator, "_prompt_batch", None) if self._progress else None
             _, events = self._cache_materializer.next()
             # The step may also have built and started a batch from a queued row.
             # Held only to report: a finished prompt batch still owns its pre-merge cache.
             self._prefilling = (prompting, getattr(self.generator, "_prompt_batch", None)) if self._progress else ()
+            prompting = None
             if not events:
                 if self.adapter._admission_stalled(self.generator):
                     raise self.adapter._stall_error()
@@ -4184,27 +4306,7 @@ class _VLMBatchSession:
             raise
 
     def _report_prefill(self, *batches) -> None:
-        if not self._progress:
-            return
-        for batch in {id(batch): batch for batch in batches if batch is not None}.values():
-            done = getattr(batch, "_unsloth_prefilled", 0)
-            columns = getattr(batch, "_unsloth_columns", None)
-            if not done or columns is None or done == batch._unsloth_reported:
-                continue
-            uids = [uid for uid in batch.uids if uid in self._progress]
-            if not uids:
-                continue
-            batch._unsloth_reported = done
-            import mlx.core as mx
-            # mlx-vlm only queued the chunk.
-            mx.eval([entry.state for entry in batch.prompt_cache])
-            for uid in uids:
-                try:
-                    self._progress[uid](done, columns, batch._unsloth_cached)
-                except Exception as exc:
-                    # One row's reporter must not fail the batch; it stops reporting.
-                    self._progress.pop(uid, None)
-                    warnings.warn(f"A prompt_progress callback raised {exc!r}; its row reports no more progress.")
+        _report_row_prefill(self._progress, batches)
 
     def _schedule_prefill(self) -> None:
         """Run the prefill with the fewest prompt tokens left, queued rows included. Batches park
@@ -4421,8 +4523,6 @@ class _SpeculativeBatchSession:
         adapter = self.adapter
         if request.audio is not None:
             raise BatchRowRefused("An audio request decodes on its own and cannot join a batch; generate it with generate_batch or stream_batch.")
-        if request.prompt_progress is not None:
-            raise BatchRowRefused("A speculative batch prefills each row as it joins, so it reports no prompt progress.")
         request = adapter._decode_image(request)
         inputs = adapter._prompt_inputs([request])
         input_ids, mask = inputs["input_ids"], inputs.get("attention_mask")
@@ -4440,8 +4540,10 @@ class _SpeculativeBatchSession:
             prompt_token_count = len(pending.prompt),
             cached_token_count = prefix,
         )
+        progress = _PromptProgress.of(request)
+        heard = _null_context() if progress is None else vlm_prefill_progress(lambda done, total: progress(done, total, prefix))
         # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
-        with self._embedded(len(pending.prompt) - prefix):
+        with self._embedded(len(pending.prompt) - prefix), heard:
             admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults, model=adapter.model))
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         retire = getattr(request.prompt_cache_state, "retire", None)
@@ -4663,7 +4765,7 @@ class BatchStream:
         self._stack = ExitStack()
         self._session = None
         self._is_vlm = is_vlm
-        self._closed = self._stepping = False
+        self._closed = self._stepping = self._reporting = False
         self._owner = (threading.get_ident(), _current_async_task())
         try:
             self._stack.enter_context(generation_mode(model, call = (
@@ -4707,7 +4809,23 @@ class BatchStream:
                 [request], session.adapter.defaults, _serves_text_images(session.adapter.model))
         from .utils import _validate_mlx_image_input
         _validate_mlx_image_input(session.adapter.model, validated.image is not None)
+        if validated.prompt_progress is not None:
+            # Weakly: the session keeps the callback, and a cycle would outlive a dropped stream's lock.
+            validated = replace(validated, prompt_progress = functools.partial(
+                self._report, weakref.ref(self), validated.prompt_progress))
         return session.add(validated)
+
+    @staticmethod
+    def _report(stream, callback, *counts):
+        # Reports run inside add() and step(), which a callback must not reenter.
+        stream = stream()
+        if stream is None:
+            return callback(*counts)
+        stream._reporting = True
+        try:
+            callback(*counts)
+        finally:
+            stream._reporting = False
 
     def cancel(self, row: int) -> bool:
         return self._require_open().cancel(row)
@@ -4740,6 +4858,7 @@ class BatchStream:
         if self._closed:
             return
         self._require_owner()
+        self._require_unreported()
         self._closed = True
         self._session = None
         self._stack.close()
@@ -4777,6 +4896,7 @@ class BatchStream:
         if self._session is None:
             raise RuntimeError("This BatchStream is closed.")
         self._require_owner()
+        self._require_unreported()
         if self._stepping:
             raise RuntimeError("This BatchStream is mid-step; consume its events before changing the batch.")
         if not self._session.usable:
@@ -4786,6 +4906,10 @@ class BatchStream:
                 "Close it and open another."
             )
         return self._session
+
+    def _require_unreported(self) -> None:
+        if self.__dict__.get("_reporting"):
+            raise RuntimeError("A prompt_progress callback cannot change the BatchStream reporting to it.")
 
     def _require_owner(self) -> None:
         current = (threading.get_ident(), _current_async_task())
@@ -4929,8 +5053,6 @@ def _stream_batch(
             "A prompt_cache_state is taken only by a BatchStream row; batched "
             "generation builds its own caches."
         )
-    if any(request.prompt_progress is not None for request in validated):
-        raise ValueError("A prompt_progress is taken only by a BatchStream row.")
     if not validated:
         return
     if is_vlm:
@@ -5041,6 +5163,7 @@ __all__ = [
     "row_logits_processors_unavailable_reason",
     "row_prompt_cache_unavailable_reason",
     "row_quantized_prompt_cache_unavailable_reason",
+    "speculative_prompt_progress_unavailable_reason",
     "stream_batch",
     "stream_unavailable_reason",
     "vlm_batch_adds_special_tokens",

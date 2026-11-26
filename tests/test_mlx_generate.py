@@ -1,6 +1,7 @@
 import concurrent.futures
 import contextlib
 import contextvars
+import gc
 import importlib
 import importlib.util
 import inspect
@@ -9,6 +10,7 @@ import sys
 import threading
 import types
 import warnings
+import weakref
 from dataclasses import make_dataclass
 import pytest
 
@@ -588,18 +590,75 @@ def test_vision_text_engine_is_the_language_model_only_for_verified_types_with_p
         assert (engine.text_engine_model(types.SimpleNamespace(_is_vlm_model=True, language_model=language, config=config)) is not None) == routed
 
 
-def test_prompt_progress_is_taken_only_by_a_vision_stream_row():
-    from unsloth_zoo.mlx.generate import BatchRowRefused, _SpeculativeBatchSession, _stream_batch
+def test_a_text_row_hears_each_prompt_chunk_past_what_it_did_not_hear_prefilled(monkeypatch):
+    from unsloth_zoo.mlx.generate import _PromptProgress
     with pytest.raises(TypeError, match="must be callable"):
         GenerationRequest(prompt="a", prompt_progress=object())
-    request = GenerationRequest(prompt="a", prompt_progress=lambda processed, total: None)
-    with pytest.raises(ValueError, match="carries a prompt_progress"):
-        _validate_text_requests([request], GenerationDefaults())
-    vlm = types.SimpleNamespace(_is_vlm_model=True, language_model=None)
-    with pytest.raises(ValueError, match="prompt_progress is taken only by a BatchStream row"):
-        list(_stream_batch(vlm, object(), [request]))
-    with pytest.raises(BatchRowRefused, match="reports no prompt progress"):
-        _SpeculativeBatchSession.add(types.SimpleNamespace(adapter=None), request)
+
+    class Generator(_OpenBatchGenerator):  # mlx-lm: chunks of 2 over all but the last token, then the split
+        def insert(self, prompts, max_tokens=None, samplers=None, logits_processors=None, caches=None, all_tokens=None):
+            uids = super().insert(prompts, max_tokens, samplers, logits_processors)
+            self.prompts = {**getattr(self, "prompts", {}), **{uid: [0, len(ids)] for uid, ids in zip(uids, prompts)}}
+            return uids
+
+        def next(self):
+            prompting = []
+            for uid, seen in self.prompts.items():
+                if seen[0] < seen[1]:
+                    seen[0] = min(seen[0] + 2, seen[1] - 1) if seen[0] < seen[1] - 1 else seen[1]
+                    prompting.append(types.SimpleNamespace(uid=uid, progress=tuple(seen)))
+            return (prompting, []) if prompting else ([], self.next_generated())
+
+    heard = {}
+    tell = lambda name: lambda *counts: heard.setdefault(name, []).append(counts)
+    stream = _open_stream(monkeypatch, generator_type=Generator, max_tokens=2)
+    with contextlib.closing(stream):
+        session = stream._session
+        stream.add(GenerationRequest(prompt_token_ids=[9] * 6))
+        assert session._next_generated() and session.generator.steps == 1
+        stream.add(GenerationRequest(prompt_token_ids=[9] * 6, prompt_progress=tell("cold")))
+        session.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=tell("cached")), ([9], [1, 2, 3], None))
+        prefilled = _PromptProgress(tell("prefilled"))
+        prefilled(2, 4, 0)
+        session.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=print), ([9], [1, 2, 3], None), prefilled)
+        refused = []
+
+        def reenter(*_):
+            for change in (lambda: stream.add(GenerationRequest(prompt_token_ids=[9])), stream.close):
+                with pytest.raises(RuntimeError) as caught:
+                    change()
+                refused.append(str(caught.value))
+            1 / 0
+        stream.add(GenerationRequest(prompt_token_ids=[9] * 3, prompt_progress=reenter))
+        with pytest.warns(UserWarning, match="ZeroDivisionError"):
+            assert [event.index for event in stream.step()] == [0, 1, 2, 3, 4]
+        assert not session._progress and refused == ["A prompt_progress callback cannot change the BatchStream reporting to it."] * 2
+        while stream.rows_in_flight:
+            stream.step()
+    assert heard == {
+        "cold": [(2, 6, 0), (4, 6, 0), (5, 6, 0), (6, 6, 0)],
+        "cached": [(1, 1, 3)],
+        "prefilled": [(2, 4, 0), (4, 4, 0)],
+    }
+    from unsloth_zoo.mlx.generate import _report_row_prefill
+    batch = types.SimpleNamespace(uids=[3, 5, 7], prompt_cache=[], _unsloth_prefilled=4, _unsloth_columns=9,
+                                  _unsloth_reported=0, _unsloth_cached=2)
+    rows = {uid: _PromptProgress(tell(uid)) for uid in (5, 7)}
+    _report_row_prefill(rows, [batch, batch])
+    _report_row_prefill(rows, [batch])
+    assert heard[5] == heard[7] == [(4, 9, 2)] and 3 not in heard
+    # A row's callback holds its stream weakly, so dropping the stream releases it (and its lock) at once.
+    dropped = _open_stream(monkeypatch, max_tokens=2)
+    dropped.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=print))
+    ref = weakref.ref(dropped)
+    gc.disable()
+    try:
+        del dropped
+        assert ref() is None
+    finally:
+        gc.enable()
+        if ref() is not None:
+            ref().close()
 
 
 def test_a_prefill_bar_tells_the_open_callback_each_chunk(monkeypatch):
@@ -1060,8 +1119,12 @@ def _audio_adapter(events, tokenizer=None, stops=()):
     adapter.stream_calls = []
     adapter.audio_warn_stacklevel = 3
     def stream(*args, **kwargs):
+        from unsloth_zoo.mlx.generate import _open_prefill_scope
         adapter.stream_calls.append((args, kwargs))
-        return iter(events)
+        scope = _open_prefill_scope()  # as mlx-vlm's Prefill bar reports, before the first event
+        if scope is not None:
+            scope[0](3, 5)
+        yield from events
     adapter.stream_module = types.SimpleNamespace(stream_generate=stream)
     return adapter
 
@@ -1093,10 +1156,16 @@ class _CriteriaTokenizer(_CharTokenizer):
     # Nothing generated at all: newer releases emit one event with no token.
     (((None, "length"),), None, ([], "length")),
 ])
-def test_audio_fallback_keeps_the_batched_result_contract(specs, tokenizer, expected):
+def test_audio_fallback_keeps_the_batched_result_contract(monkeypatch, specs, tokenizer, expected):
+    from unsloth_zoo.mlx import generate
+    monkeypatch.setattr(generate, "_install_prefill_bar", lambda: None)
+    heard = []
+    watched = _audio_row(_audio_adapter(_audio_events(*specs), tokenizer), GenerationRequest(
+        prompt="p", audio="a.wav", prompt_progress=lambda *counts: heard.append(counts)))
     result, streamed = _audio_row(
         _audio_adapter(_audio_events(*specs), tokenizer),
         GenerationRequest(prompt="p", audio="a.wav"))
+    assert watched == (result, streamed) and heard == [(3, 5, 0)]
     assert (result.token_ids, result.finish_reason) == expected
     assert streamed == result.text
     # Logprobs must belong to the tokens they sit beside, not to their successors.
@@ -2626,13 +2695,13 @@ def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch, layo
 
         rows_in_flight = property(lambda self: len(self.rows))
 
-        def prefill_prompt(self, ids):
+        def prefill_prompt(self, ids, progress=None):
             prefix = Prefix(ids)
             alive.add(prefix)
             peak[0] = max(peak[0], len(alive))
             return prefix
 
-        def add(self, request, prefix=None):
+        def add(self, request, prefix=None, progress=None):
             added.append((tuple(request.prompt_token_ids), prefix and prefix.ids))
             self.rows.append(prefix)
 

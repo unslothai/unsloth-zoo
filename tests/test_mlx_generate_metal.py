@@ -471,6 +471,51 @@ def test_vlm_prefill_reports_each_chunk_past_the_reused_prefix():
 
 
 @metal_only
+def test_batched_generation_rows_hear_their_prompt_chunks_and_decode_unchanged():
+    from mlx_lm import load as load_text
+    from mlx_vlm import load
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import (
+        BatchStream, GenerationDefaults, GenerationRequest, generate_batch, speculative_prompt_progress_unavailable_reason,
+    )
+    from unsloth_zoo.mlx.speculative import DraftController, SpeculativeDraft
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(60))
+
+    def run(model, tokenizer, prompts, watched, **defaults):
+        heard = {row: [] for row in watched}
+        requests = [GenerationRequest(prompt=prompt, max_tokens=4, prompt_progress=(
+            lambda *counts, row=row: heard[row].append(counts)) if row in watched else None) for row, prompt in enumerate(prompts)]
+        results = generate_batch(model, tokenizer, requests, defaults=GenerationDefaults(max_tokens=4, prefill_step_size=128, **defaults))
+        return [result.token_ids for result in results], heard, results[-1].prompt_token_count
+    # Chunk ends up to the held-back last token; mlx-lm then reports the whole prompt as the row starts decoding.
+    chunks = lambda total, *last: [(n, total, 0) for n in [*range(128, total - 1, 128), total - 1, *last]]
+
+    model, tokenizer = load_text(MODEL)
+    colour, fruit = (tokenizer.apply_chat_template([{"role": "user", "content": f"{rules} Name a {thing}."}],
+                                                    add_generation_prompt=True, tokenize=False) for thing in ("colour", "fruit"))
+    plain, _, total = run(model, tokenizer, [colour, fruit], ())
+    tokens, heard, _ = run(model, tokenizer, [colour, fruit], (1,))
+    assert total > 512 and tokens == plain and heard[1] == chunks(total, total)
+    # Rows sharing a prompt: the first hears it prefilled once; the rest count it cached.
+    plain, _, _ = run(model, tokenizer, [fruit] * 3, (), share_prompt_prefill=True, completion_batch_size=4)
+    tokens, heard, _ = run(model, tokenizer, [fruit] * 3, (0, 2), share_prompt_prefill=True, completion_batch_size=4)
+    assert tokens == plain and heard[0] == chunks(total, total) and heard[2] == [(1, 1, total - 1)]
+
+    model, processor = load(QWEN_VLM_MODEL)
+    model._is_vlm_model = True
+    colour, fruit = (apply_chat_template(processor, model.config, f"{rules} Name a {thing}.", num_images=0) for thing in ("colour", "fruit"))
+    plain, _, total = run(model, processor, [colour, fruit], (), prefill_batch_size=1)
+    tokens, heard, _ = run(model, processor, [colour, fruit], (1,), prefill_batch_size=1)
+    assert tokens == plain and heard[1] == chunks(total)  # the last token runs with the first decode step
+    assert speculative_prompt_progress_unavailable_reason() is None
+    with BatchStream(model, processor, defaults=GenerationDefaults(max_tokens=2, prefill_step_size=128),
+                     speculative=SpeculativeDraft(DraftController(max_depth=0, max_copy=16))) as stream:
+        spoken = []
+        stream.add(GenerationRequest(prompt=fruit, prompt_progress=lambda *counts: spoken.append(counts)))
+        assert spoken == heard[1]
+
+
+@metal_only
 def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     from mlx_vlm import load
     from mlx_vlm.models.cache import make_prompt_cache
