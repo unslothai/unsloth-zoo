@@ -5353,6 +5353,17 @@ def _vllm_cascade_attn_needs_disable(vllm_version, major_version):
     return major_version < 9 and Version(str(vllm_version)) < Version("0.11.1")
 
 
+def _score_centering_k():
+    # UNSLOTH_GRPO_SCORE_CENTERING=k: the GRPO rollouts return the sampler's top-k head.
+    try:
+        from .score_centering import score_centering_top_k
+        return score_centering_top_k()
+    except ValueError:
+        raise
+    except Exception:
+        return 0
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -6054,7 +6065,8 @@ def load_vllm(
 
             max_num_batched_tokens = max_num_batched_tokens,
             max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
-            max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            # Disallow logprobs being returned, except the top-k head score centering records.
+            max_logprobs           = max(int(max_logprobs or 0), _score_centering_k()),
             # Match TRL when reusing this engine for RL, including temperature scaling.
             logprobs_mode          = "processed_logprobs" if training else "raw_logprobs",
             seed                   = random_state, # Default is 0
@@ -6496,6 +6508,9 @@ def load_vllm(
         if engine_args.get("enable_return_routed_experts", False):
             from .routing_replay import wrap_vllm_generate
             wrap_vllm_generate(llm)
+        if _score_centering_k() > 0:
+            from .score_centering import wrap_vllm_generate_topk
+            wrap_vllm_generate_topk(llm, _score_centering_k())
         padded_ids = _padded_vocab_ids(config)
         if padded_ids:
             suppress_vllm_padded_vocab(
