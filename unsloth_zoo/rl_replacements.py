@@ -1797,18 +1797,19 @@ def grpo_compute_loss(
             sampler_logps = old
         else:
             sampler_logps = new.detach()
-        # Unscored vLLM tokens (nan) and masked columns add nothing; clamp keeps expm1 finite.
-        sampler_logps = torch.where(torch.isnan(sampler_logps), new.detach(), sampler_logps)
-        sampler_log_ratio = torch.clamp(new - sampler_logps, min = -20.0, max = 20.0)
+        # Unscored vLLM tokens (nan) and masked columns add no value and no gradient; clamp keeps expm1 finite.
+        sampler_valid = ~torch.isnan(sampler_logps)
         if mask is not None:
-            sampler_log_ratio = torch.where(mask.to(torch.bool), sampler_log_ratio, 0.0)
+            sampler_valid = sampler_valid & mask.to(torch.bool)
+        sampler_logps = torch.where(sampler_valid, sampler_logps, new.detach())
+        sampler_log_ratio = torch.clamp(new - sampler_logps, min = -20.0, max = 20.0)
         if sampler_kl_estimator == "k3":
             # r - 1 - log r with r = p / q: >= 0, gradient (r - 1) * grad log p.
             sampler_kl_i = torch.expm1(sampler_log_ratio) - sampler_log_ratio
         else:
             # k1 = log q - log p: gradient -grad log p on every sampled token.
             sampler_kl_i = -sampler_log_ratio
-        loss_i = loss_i + sampler_kl_coef * sampler_kl_i
+        loss_i = loss_i + sampler_kl_coef * torch.where(sampler_valid, sampler_kl_i, 0.0)
     if rs_keep is not None:
         # Rejected tokens drop out of every loss term, KL included (verl rollout_rs). A select, so
         # an inf or nan there neither reaches the loss nor turns into a nan gradient.
@@ -4205,6 +4206,8 @@ def grpo_accumulated_loss(
             and mm_token_type_ids is None
             and os.environ.get("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "1") != "0"
             and float(getattr(trainer, "beta", 0.0) or 0.0) == 0.0
+            # The sampler KL, like the reference KL, gives zero-advantage rows a gradient.
+            and _sampler_kl_coef == 0.0
             and kwargs.get("loss_type", "grpo") in ("grpo", "bnpo", "dr_grpo", "dapo")
             and not _need_entropy
             and not _rollout_logps_as_old

@@ -148,17 +148,38 @@ def test_sampler_falls_back_to_old_then_policy():
     torch.testing.assert_close(g1, -mask.double() / mask.sum())
 
 
-def test_unscored_sampler_tokens_add_nothing():
+@pytest.mark.parametrize("estimator", ("k1", "k3"))
+def test_unscored_sampler_tokens_add_nothing(estimator):
     new, sampler, adv, mask = _data(1.0)
     holes = sampler.clone()
     holes[3, 2] = float("nan")
-    loss = _zoo(new, holes, torch.zeros_like(adv), mask, "dapo", 1.0, "k3")
+    loss = _zoo(new, holes, torch.zeros_like(adv), mask, "dapo", 1.0, estimator)
     (grad,) = torch.autograd.grad(loss, new)
-    filled = sampler.clone()
-    filled[3, 2] = new.detach()[3, 2]
-    want = _oracle(new.detach().clone().requires_grad_(True), filled, torch.zeros_like(adv), mask, "dapo", 1.0, "k3")
+    keep = mask.clone()
+    keep[3, 2] = 0
+    new64 = new.detach().clone().requires_grad_(True)
+    log_r = new64 - sampler
+    kl = -log_r if estimator == "k1" else torch.exp(log_r) - 1 - log_r
+    want = (kl * keep).sum() / mask.sum()  # dapo: the normaliser still counts the unscored token
+    (want_grad,) = torch.autograd.grad(want, new64)
     torch.testing.assert_close(loss, want, rtol = 1e-12, atol = 1e-12)
+    torch.testing.assert_close(grad, want_grad, rtol = 1e-12, atol = 1e-12)
+    # No value and no gradient there, for k1 too (whose derivative does not vanish at a zero log ratio).
     assert grad[3, 2] == 0 and torch.isfinite(grad).all()
+
+
+def test_zero_advantage_rows_keep_a_sampler_kl_gradient():
+    # Why grpo_accumulated_loss must not drop zero-advantage rows while the sampler KL is on.
+    new, sampler, adv, mask = _data(0.5)
+    adv[1] = 0.0
+    loss = _zoo(new, sampler, adv, mask, "dapo", 0.01, "k1")
+    (grad,) = torch.autograd.grad(loss, new)
+    assert torch.count_nonzero(grad[1]) > 0
+    import inspect
+
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    gate = src[src.index('"UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE"'): src.index("_row_policy_ok = getattr")]
+    assert "_sampler_kl_coef == 0.0" in gate
 
 
 def test_fully_masked_batch_is_zero():
