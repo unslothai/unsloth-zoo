@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Which module serves vLLM's quantization = "bitsandbytes".
-
-vLLM <= 0.27.1 has it in tree. vLLM 0.28 (vllm-project/vllm#43529) moved it to vllm-bnb-plugin, which vLLM loads
-from its `vllm.general_plugins` entry point; registering it here first lets load_vllm patch the class vLLM will use.
-"""
+"""vLLM's bitsandbytes: in tree on vLLM <= 0.27.1, vllm-bnb-plugin from 0.28 (vllm-project/vllm#43529)."""
 
 import importlib
 import importlib.util
@@ -43,8 +39,7 @@ def _import_pair(pair):
 
 
 def _alias_rename_mapper():
-    # vllm-bnb-plugin 0.0.3 calls WeightsMapper.get_rename_mapper; vLLM 0.28.0 still names it get_unstacked_mapper
-    # (what plugin 0.0.2 called), and every Llama / Qwen2 / Qwen3 model there has an hf_to_vllm_mapper.
+    # Plugin 0.0.3 calls get_rename_mapper; vLLM 0.28.0 (where Llama / Qwen have a mapper) names it get_unstacked_mapper.
     WeightsMapper = _import("vllm.model_executor.models.utils").WeightsMapper
     if not hasattr(WeightsMapper, "get_rename_mapper") and hasattr(WeightsMapper, "get_unstacked_mapper"):
         WeightsMapper.get_rename_mapper = WeightsMapper.get_unstacked_mapper
@@ -67,7 +62,7 @@ def resolve():
     if _find_spec("vllm_bnb_plugin") is None:
         return (None, None, None)
     _alias_rename_mapper()
-    # Idempotent; also enables it when VLLM_PLUGINS leaves it out.
+    # Before load_vllm patches its config; idempotent, and loads it even when VLLM_PLUGINS leaves it out.
     _import("vllm_bnb_plugin").register()
     _RESOLVED = (*_import_pair(_PLUGIN), "vllm-bnb-plugin")
     return _RESOLVED
