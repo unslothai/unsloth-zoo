@@ -3583,6 +3583,60 @@ def _vllm_online_fp8_moe_ignore(config):
 pass
 
 
+# Fraction of decoder layers UNSLOTH_FP8_BF16_TAIL=1 keeps 16-bit (humans& NVFP4 RL, LMSYS FP8 RL: last 15%).
+_FP8_BF16_TAIL_DEFAULT_FRAC = 0.15
+
+
+def _fp8_bf16_tail_fraction():
+    """UNSLOTH_FP8_BF16_TAIL: unset / 0 = off, 1 = the last 15% of decoder layers, a float in
+    (0, 1) = that fraction (rounded up to whole layers)."""
+    value = os.environ.get("UNSLOTH_FP8_BF16_TAIL", "0").strip().lower()
+    if value in ("", "0", "0.0", "false", "off", "no"):
+        return 0.0
+    if value in ("1", "true", "on", "yes"):
+        return _FP8_BF16_TAIL_DEFAULT_FRAC
+    try:
+        frac = float(value)
+    except ValueError:
+        frac = -1.0
+    if not 0.0 < frac < 1.0:
+        raise ValueError(
+            f"Unsloth: UNSLOTH_FP8_BF16_TAIL={value!r} must be 0, 1 (the last 15% of decoder layers) "
+            "or a fraction in (0, 1)."
+        )
+    return frac
+pass
+
+
+def _fp8_bf16_tail_layers(config, frac):
+    """Indices of the last ceil(frac * num_hidden_layers) decoder layers."""
+    if frac <= 0:
+        return []
+    text_config = getattr(config, "text_config", None) or config
+    n = _config_get(text_config, "num_hidden_layers")
+    if not isinstance(n, int) or n <= 0:
+        return []
+    k = min(n, math.ceil(frac * n - 1e-9))
+    return list(range(n - k, n))
+pass
+
+
+def _vllm_online_fp8_bf16_tail_ignore(config):
+    """`ignore` entries that keep the last decoder layers and every MoE shared expert 16-bit in
+    vLLM's online FP8 (UNSLOTH_FP8_BF16_TAIL), else []. The trainer binds vLLM's tensors, so the
+    same layers are 16-bit in both the rollout and the training forward."""
+    layers = _fp8_bf16_tail_layers(config, _fp8_bf16_tail_fraction())
+    if not layers:
+        return []
+    joined = "|".join(str(i) for i in layers)
+    # Decoder layers only (model.layers.N / language_model.model.layers.N), never a vision encoder's.
+    ignore = [rf"re:(.*\.)?(model|language_model)\.layers\.({joined})\."]
+    # Qwen2 / 3 MoE shared_expert, DeepSeek / GLM shared_experts; the sigmoid gate is a router already.
+    ignore.append(r"re:.*\.shared_experts?\.")
+    return ignore
+pass
+
+
 # Idempotency flag so the piecewise-compile fix is only installed once per process.
 _UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX_INSTALLED = False
 
@@ -5940,6 +5994,12 @@ def load_vllm(
         if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
             native_fp8 = _get_vllm_online_fp8_quantization(fp8_mode)
             torchao_fp8 = native_fp8 is None
+        elif _fp8_bf16_tail_fraction() > 0:
+            print(
+                "Unsloth: UNSLOTH_FP8_BF16_TAIL is ignored: it only applies when vLLM quantizes a 16-bit "
+                "checkpoint online (load_in_fp8 on vLLM >= 0.12). A pre-quantized FP8 repo the name mapped "
+                "to keeps its own layers; pass use_exact_model_name = True with the 16-bit repo instead."
+            )
 
         if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
             install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
@@ -6131,10 +6191,23 @@ def load_vllm(
         if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
             if native_fp8 is not None:
                 engine_args["quantization"] = native_fp8
-                online_ignore = _vllm_online_fp8_moe_ignore(config)
-                if online_ignore is not None:
+                online_ignore = list(_vllm_online_fp8_moe_ignore(config) or [])
+                tail_ignore = _vllm_online_fp8_bf16_tail_ignore(config)
+                if tail_ignore:
+                    tail = _fp8_bf16_tail_layers(config, _fp8_bf16_tail_fraction())
+                    print(
+                        f"Unsloth: UNSLOTH_FP8_BF16_TAIL keeps decoder layers {tail[0]}-{tail[-1]} and any "
+                        "MoE shared experts in 16-bit for both vLLM and training."
+                    )
+                    online_ignore += tail_ignore
+                if online_ignore:
                     engine_args["quantization_config"] = {"ignore": online_ignore}
             else:
+                if _fp8_bf16_tail_fraction() > 0:
+                    print(
+                        "Unsloth: UNSLOTH_FP8_BF16_TAIL needs vLLM's native online FP8 (vLLM >= 0.24 for "
+                        "row-wise); the torchao fallback quantizes every layer, so it is ignored here."
+                    )
                 from torchao.core.config import config_to_dict
                 torchao_config = _get_torchao_fp8_config(fp8_mode)
                 hf_overrides = {
