@@ -125,6 +125,8 @@ def test_determine_compile_threads_follows_cpu_affinity_not_the_host_total(monke
 
 
 def test_determine_compile_threads_falls_back_to_cpu_count_without_affinity(monkeypatch):
+    import sys
+    monkeypatch.setattr(sys, "platform", "darwin")  # macOS: no sched_getaffinity, and not the Windows early return
     monkeypatch.delattr(os, "sched_getaffinity", raising = False)
     monkeypatch.setattr(os, "cpu_count", lambda: 12)
     assert determine_compile_threads() == 12
