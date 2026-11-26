@@ -16,7 +16,7 @@
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
-small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
+small-batch quantized projections, int8 prefill on the neural accelerators, the pre-norm residual handoff,
 Qwen exact speculative verify blocks, wide-head decode and Gemma 4 verify-block attention, Qwen sparse attention block selection,
 QSA indexer blocks kept across cache trims, dilated depthwise convolutions, and SSD-backed PLE row reads."""
 
@@ -5887,8 +5887,9 @@ class _SmallRowRoute(NamedTuple):
         return kernel(*args, reader = self.reader) if self.reader and not suffix else kernel(*args)
 
 
-_NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
-                                ("QMM_PROBE_KEY", "probe_small_m_qmm"), True)
+# Stock MLX's NAX kernels serve every row count: this route has no kernel and carries the int8 prefill, sorted gather
+# and dense prefill routes.
+_NAX_QMM_ROUTE = _SmallRowRoute(nax, None, "Nax", "NAX", None, None, None, True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
@@ -5897,7 +5898,7 @@ _LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane
 
 
 def _small_row_route():
-    """The small-row kernel this GPU runs, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
+    """The small-row route this GPU's scope takes, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
     if nax.nax_available():
         return _NAX_QMM_ROUTE
     return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
@@ -6405,17 +6406,13 @@ def _int8_prefill_status(projections):
 
 @contextmanager
 def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
-    """Run affine quantized projections on the M5 neural accelerators where measured faster.
+    """Run affine quantized projections on unsloth's kernels where measured faster than stock.
 
-    Quantized linears and tied quantized embedding heads called with the row counts measured
-    faster than stock for their shape on this GPU use a matmul2d kernel that reads the stock
-    packed codes and keeps stock's per-group factorization in fp32; each (shape, quantization,
-    dtype, kernel variant) is checked against stock's fp32 arithmetic at first use. Single rows,
-    training and other quantizations keep the native call. `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
-
-    Where stock MLX has no NAX kernels (the GPUs before M5), 4- and 8-bit projections take the
-    small-row kernels of `matmul` under their own row table and the same first-use check;
-    `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
+    Where stock MLX has no NAX kernels (the GPUs before M5), quantized linears and tied quantized
+    embedding heads take 4- and 8-bit small-row kernels of `matmul` at the row counts measured
+    faster than stock for their shape; each (shape, quantization, dtype, kernel variant) is checked
+    against stock's fp32 arithmetic at first use. Single rows, training and other quantizations
+    keep the native call. `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
     `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 2- to
     8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
@@ -6437,7 +6434,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
             if tracked:
                 model.__dict__["_unsloth_nax_int8_prefill_scope"] = (depth + 1, bool(int8_prefill))
             route = _small_row_route()
-            small_m = (route is not None and os.environ.get(route.switch, "1") != "0"
+            small_m = (route is not None and route.kernel is not None and os.environ.get(route.switch, "1") != "0"
                        and nax.gap_open(route.gap))
             int8_prefill = bool(int8_prefill) and route is _NAX_QMM_ROUTE
             sorted_gather = (route is _NAX_QMM_ROUTE and os.environ.get("UNSLOTH_MLX_NAX_SORTED_GATHER", "1") != "0"
@@ -6759,7 +6756,7 @@ def _dense_qmm_bindings(*cache_key):
 
 
 def _dense_prefill_in_scope(module, x):
-    """The dense result for a NAX-routed linear inside a `dense_prefill_linear` scope, else None."""
+    """The dense result for a small-row-routed linear inside a `dense_prefill_linear` scope, else None."""
     if not module.__dict__.get("_unsloth_dense_qmm_scopes"):
         return None
     bindings = _dense_qmm_bindings(nn.QuantizedLinear.__call__)
@@ -6813,8 +6810,8 @@ def dense_prefill_linear(model, *, _modules = None):
     Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
     densely, bit-identical to the quantized matmul; smaller calls,
     training, and any shape that fails its first-use comparison keep the exact tiled route when eligible,
-    otherwise the native call. A linear the
-    NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
+    otherwise the native call. A linear `nax_quantized_linear` already routes keeps its small-row route and
+    takes this one for the rest.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
 
     Where stock MLX runs no NAX kernels, affine calls this route leaves to stock's plain quantized matmul
@@ -6858,7 +6855,7 @@ def dense_prefill_linear(model, *, _modules = None):
             for module, fused in reversed(changed):
                 module._unsloth_dense_qmm_scopes -= 1
                 if not module._unsloth_dense_qmm_scopes:
-                    if type(module) is fused:   # a NAX-routed linear keeps the NAX scope's class
+                    if type(module) is fused:   # a small-row-routed linear keeps that scope's class
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
                     module.__dict__.pop("_unsloth_tiled_qmm", None)

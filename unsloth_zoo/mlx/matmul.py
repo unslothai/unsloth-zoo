@@ -240,14 +240,18 @@ def simd_qmm(x, w, scales, biases, group_size, bits):
     return _simd_qmm_launch(M, w.shape[0], K, group_size, bits, x.dtype)(inputs = [x, w, scales, biases])[0]
 
 
-# `nax._QMM_ROWS_BY_GPU` format; measured on an M3 Max, used for every generation. Up to 16 rows stock's qmv_mma beats
-# this route; from 17 rows stock leaves qmv_mma.
+# (bits, group size or None, fewest weights, widest N or None, fewest rows, most rows), first match wins; measured on
+# an M3 Max, used for every generation. Up to 16 rows stock's qmv_mma beats this route; from 17 rows stock leaves it.
 _SIMD_QMM_ROWS = ((4, None, 1 << 21, 65536, 17, 24), (8, None, 1 << 21, 4096, 17, 24))
 
 
 def simd_qmm_row_range(N, K, group_size, bits):
     """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
-    return nax._measured_row_range(_SIMD_QMM_ROWS, _SIMD_QMM_MAX_ROWS, N, K, group_size, bits)
+    for entry_bits, entry_group_size, fewest, widest, low, high in _SIMD_QMM_ROWS:
+        if (bits == entry_bits and entry_group_size in (None, group_size) and N * K >= fewest
+                and (widest is None or N <= widest)):
+            return max(low, 2), min(high, _SIMD_QMM_MAX_ROWS)  # one row stays on stock qmv, at the bandwidth roofline
+    return 0, -1
 
 
 def probe_simd_qmm():
