@@ -344,6 +344,7 @@ class RowState:
     remaining: int | None = None
     catch_up: int = 0
     folded_replay: bool = False
+    priming: int = 0
 
 
 @dataclass
@@ -470,6 +471,7 @@ class DraftController:
     _VERIFY_SLOPE = 0.03
     _DRAFT_SLOPE = 0.25
     _CATCH_UP = 0.1
+    _BACKLOG_CATCH_UP = 0.005
     _COPY_PROBE = 4
     _STALL_RATIO = 2.0
     _EXHAUSTIVE_ROWS = 6
@@ -558,7 +560,17 @@ class DraftController:
         hidden = self.hidden_drafting.get(bucket)
         return drafting if hidden is None or hidden.value is None else max(drafting - hidden.value, 0.0)
 
-    def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
+    def _replay_seconds(self, pairs: int, rows: Sequence[RowState], expected: float | None = None) -> float:
+        state = rows[0] if expected is not None and len(rows) == 1 and pairs else None
+        if state is None or not state.priming or state.remaining is None or state.remaining <= self.max_depth + 1:
+            return pairs * self._catch_up_seconds()
+        # A lone row's prompt priming is paid once per reply, so it costs its share over the tokens left; untimed, it replays in chunks.
+        value = self.catch_up_cost.value
+        per_pair = self._plain_step(1) * self._BACKLOG_CATCH_UP if value is None else value
+        return (pairs - state.priming) * self._catch_up_seconds() + state.priming * per_pair * expected / state.remaining
+
+    def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None,
+                      expected: float | None = None) -> float:
         bucket = _bucket(len(rows))
         drafting = sum(self._draft_seconds(row.length) for row in plan.rows if row.source == "draft")
         draft_rows = [state for row, state in zip(plan.rows, rows) if row.source == "draft"]
@@ -566,13 +578,14 @@ class DraftController:
         if not replay:
             drafting += sum(state.catch_up for state in draft_rows) * self._catch_up_seconds()
         verify = self._copy_seconds if all(row.source == "copy" for row in plan.rows) else self._verify_seconds
-        return verify(bucket, width or plan.width) + replay * self._catch_up_seconds() + self._drafting_paid(bucket, drafting)
+        return verify(bucket, width or plan.width) + self._replay_seconds(replay, rows, expected) + self._drafting_paid(bucket, drafting)
 
-    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0) -> float:
+    def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None, optimism: float = 0.0,
+              planning: bool = True) -> float:
         if plan.kind == "plain":
             return len(rows) / self._plain_step(_bucket(len(rows)))
         expected = sum(state.stats.expected(row, optimism) for row, state in zip(plan.rows, rows))
-        return expected / self.round_seconds(plan, rows, width)
+        return expected / self.round_seconds(plan, rows, width, expected if planning else None)
 
     @staticmethod
     def _cap(state: RowState, length: int) -> int:
@@ -615,7 +628,8 @@ class DraftController:
         best_score = tokens / self._copy_seconds(bucket, width) if best.width > 1 else 0.0
         for gain, chosen in scored:
             drafting = sum(option[4] for option in chosen)
-            replay = self._replay_pairs([rows[option[2]] for option in chosen]) * self._catch_up_seconds() if has_replay else 0.0
+            pairs = self._replay_pairs([rows[option[2]] for option in chosen]) if has_replay else 0
+            replay = self._replay_seconds(pairs, rows, tokens + gain) if pairs else 0.0
             if has_replay and not replay:
                 drafting += sum(rows[option[2]].catch_up for option in chosen) * self._catch_up_seconds()
             rate = (tokens + gain) / (verify + replay + self._drafting_paid(bucket, drafting))
@@ -776,6 +790,11 @@ class DraftController:
         if self._probe_left > 0:
             # A probe runs a few rounds: one sample moves a rarely drafted position too little.
             probe = next((p for p in candidates if self._identity(p, bucket) == self._probe), None)
+            if (probe is not None and probe.kind == "round" and len(rows) == 1 and probe.rows[0].source == "draft"
+                    and rows[0].priming and not rows[0].folded_replay):
+                # Its width can now draft a prompt still to prime, which only a probe admitted at that price may pay.
+                best = max(candidates, key = lambda plan: self.score(plan, rows))
+                probe = probe if self._affordable(probe, best, rows) else None
             if probe is not None:
                 self._probe_left -= 1
                 self._reference = max(self.score(plan, rows) for plan in candidates)
@@ -842,7 +861,7 @@ class DraftController:
 
     def _regret(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState]) -> float:
         seconds = self.round_seconds(probe, rows) if probe.kind == "round" else probe.length * self._plain_step(_bucket(len(rows)))
-        return seconds * max(0.0, 1.0 - self.score(probe, rows) / self.score(best, rows))
+        return seconds * max(0.0, 1.0 - self.score(probe, rows, planning = False) / self.score(best, rows))
 
     def _affordable(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState], rounds: int = 1) -> bool:
         return self._regret(probe, best, rows) * rounds <= self._credit
@@ -1612,6 +1631,8 @@ class SpeculativeEngine:
             state.can_draft = row.draft is not None and row.draft.ready
             state.catch_up = getattr(row.draft, "pending_pairs", 0)
             state.folded_replay = state.catch_up <= self.controller.max_depth + 1
+            prefix = getattr(row.draft, "prefix", None)
+            state.priming = 0 if prefix is None else len(prefix.tokens)
             states.append(state)
         return states
 
