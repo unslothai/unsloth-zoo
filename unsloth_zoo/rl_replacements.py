@@ -1556,6 +1556,8 @@ def grpo_compute_loss(
     full_batch_tokens = kwargs.get("full_batch_tokens", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
+    # loss_type="reinforce": per-token score-centering term (arXiv 2609.20807), [B, T] with gradient.
+    score_centering_correction = kwargs.get("score_centering_correction", None)
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -1767,6 +1769,36 @@ def grpo_compute_loss(
             lambda_neg=vespo_lambda_neg,
         )
         loss_i = -phi_seq * advantages * new
+    elif loss_type == "reinforce":
+        # verl compute_policy_loss_reinforce: -sg[w] * A * log pi, no PPO clip. In bypass mode
+        # (rollout logps as pi_old) w is built here from pi_theta / pi_rollout with the configured
+        # vllm_importance_sampling_mode (token / sequence / geometric, *_truncate = TIS, *_mask = IcePop);
+        # otherwise w is the vLLM IS ratio above (pi_old / pi_rollout), or 1 without one.
+        with torch.no_grad():
+            if kwargs.get("rollout_logps_as_old", False) and old is not None:
+                reinforce_log_w = torch.nan_to_num((new.detach() - old) * mask, nan = 0.0)
+                reinforce_log_w = torch.clamp(reinforce_log_w, min = -20.0, max = 20.0)
+                if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
+                    reinforce_log_w = torch.clamp(reinforce_log_w.sum(dim = -1, keepdim = True), min = -20.0, max = 20.0)
+                elif vllm_importance_sampling_mode in ["geometric_mask", "geometric_truncate"]:
+                    reinforce_log_w = reinforce_log_w.sum(dim = -1, keepdim = True) / mask.sum(dim = -1, keepdim = True).clamp(min = 1.0)
+                reinforce_w = torch.exp(reinforce_log_w)
+                if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate", "geometric_truncate"]:
+                    reinforce_w = torch.clamp(reinforce_w, min = vllm_importance_sampling_clip_min, max = vllm_importance_sampling_clip_max)
+                else:
+                    reinforce_low = vllm_importance_sampling_clip_min if vllm_importance_sampling_clip_min is not None else -math.inf
+                    reinforce_high = vllm_importance_sampling_clip_max if vllm_importance_sampling_clip_max is not None else math.inf
+                    reinforce_w = torch.where(
+                        (reinforce_w >= reinforce_low) & (reinforce_w <= reinforce_high), reinforce_w, 0.0,
+                    )
+            elif importance_sampling_ratio is not None:
+                reinforce_w = importance_sampling_ratio
+            else:
+                reinforce_w = torch.ones_like(new)
+        loss_i = -reinforce_w * advantages * new
+        if score_centering_correction is not None:
+            # Added after the IS weight (verl): an IcePop-zeroed token keeps its centering term.
+            loss_i = loss_i + advantages * torch.where(mask.to(torch.bool), score_centering_correction, 0.0)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -1777,8 +1809,8 @@ def grpo_compute_loss(
         loss_i = loss_i * entropy_mask
 
     if use_vllm and sampling_per_token_logps is not None and vllm_importance_sampling_correction:
-        # vespo applies the IS ratio inside get_gamma_weights, so skip it here.
-        if loss_type != "vespo":
+        # vespo applies the IS ratio inside get_gamma_weights, reinforce in its own branch.
+        if loss_type not in ("vespo", "reinforce"):
             loss_i = loss_i * importance_sampling_ratio
         # delta for the metric.
         with torch.no_grad():
@@ -1830,6 +1862,12 @@ def grpo_compute_loss(
         if steps_per_generation:
             normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
         loss = (loss_i * mask).sum() / normalizer
+    elif loss_type == "reinforce":
+        # verl seq-mean-token-sum: token sum per completion, mean over completions. Rows are counted
+        # like grpo / dr_grpo (every row of the micro-batch), so N accumulation steps equal one batch.
+        n_rows = loss_i.size(0) if full_batch_rows is None else full_batch_rows
+        loss = (loss_i * mask).sum() / n_rows
+        loss = loss / current_gradient_accumulation_steps
     elif loss_type == "luspo":
         # loss_i is (B, T) unless sequence level with beta 0, so mask elementwise (TRL >= 1.10).
         loss = (loss_i * mask).sum(-1).mean()
@@ -1876,10 +1914,11 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under AGPL3
     @staticmethod
-    def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None, upstream_scale = None):
+    def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None, upstream_scale = None, _sc_correction = None):
         if extra_kwargs is None:
             extra_kwargs = {}
-        def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
+        def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling, sc_correction = None):
+            sc_kwargs = {} if sc_correction is None else {"score_centering_correction": sc_correction}
             loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, _mask  = grpo_compute_loss(
                 ref_logps,
                 new_logps,
@@ -1890,6 +1929,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 beta,
                 advantages,
                 **extra_kwargs,
+                **sc_kwargs,
             )
 
             # Scale for mixed precision; return loss.detach() or autograd uses 2x VRAM.
@@ -1899,6 +1939,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
 
         device =_new_logps.device
         grad_inputs = torch.empty_like(_new_logps)
+        # Score centering (loss_type="reinforce"): the loss is linear in the correction, so its
+        # gradient is taken here alongside new_logps' and chained to the head log-probs in backward.
+        sc_grad_inputs = None if _sc_correction is None else torch.empty_like(_sc_correction, dtype = torch.float32)
         accumulated_loss              = torch.zeros(1, device = device)[0]
         accumulated_completion_length = torch.zeros(1, device = device)[0]
         accumulated_mean_kl           = torch.zeros(1, device = device)[0]
@@ -1931,13 +1974,41 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
+        def accumulate_chunk_sc(
+            new_logps_j,
+            old_logps_j,
+            ref_logps_j,
+            sampling_per_token_logps_j,
+            input_ids_j,
+            mask_j,
+            advantages_j,
+            scaling,
+            grad_inputs_j,
+            sc_correction_j,
+            sc_grad_inputs_j,
+        ):
+            (chunk_grad_input, chunk_sc_grad), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl, chunk_delta, chunk_flat_is_ratio, chunk_coef_1)) = torch.func.grad_and_value(
+                compute_loss,
+                argnums = (0, 8),
+                has_aux = True,
+            )(new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling, sc_correction_j)
+            accumulated_loss             .add_(unscaled_loss)
+            accumulated_completion_length.add_(chunk_completion_length)
+            accumulated_mean_kl          .add_(chunk_mean_kl)
+            accumulated_delta            .append(chunk_delta)
+            accumulated_flat_is_ratio    .append(chunk_flat_is_ratio)
+            accumulated_coef_1           .append(chunk_coef_1)
+            grad_inputs_j[:] = chunk_grad_input
+            sc_grad_inputs_j[:] = chunk_sc_grad
+        pass
+
         from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
         accumulate_chunk = torch_compile_with_fallback(
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
             options = torch_compile_options,
-        )(accumulate_chunk)
+        )(accumulate_chunk if _sc_correction is None else accumulate_chunk_sc)
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)
@@ -1956,6 +2027,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
         mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
         advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
+        if _sc_correction is not None:
+            sc_correction  = torch.chunk(_sc_correction.detach().to(torch.float32), chunks = n_chunks, dim = 0)
+            sc_grad_chunks = torch.chunk(sc_grad_inputs,     chunks = n_chunks, dim = 0)
 
         # Mixed precision scaling if present.
         scaling = scaler.get_scale() if scaler is not None else 1.0
@@ -1963,8 +2037,14 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         if scaler is not None and not torch.is_tensor(scaling):
             scaling = torch.full((), float(scaling), dtype = torch.float32, device = device)
 
-        for (grad_inputs_j, new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
-            zip(grad_inputs_chunks, new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages):
+        for _chunk_index, (grad_inputs_j, new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
+            enumerate(zip(grad_inputs_chunks, new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages)):
+            if _sc_correction is not None:
+                accumulate_chunk(
+                    new_logps_j, old_logps_j, ref_logps_j, sampling_per_token_logps_j, input_ids_j, mask_j,
+                    advantages_j, scaling, grad_inputs_j, sc_correction[_chunk_index], sc_grad_chunks[_chunk_index],
+                )
+                continue
 
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
 
@@ -1988,6 +2068,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         pass
 
         grad_inputs                  .div_(n_chunks)
+        if sc_grad_inputs is not None:
+            sc_grad_inputs.div_(n_chunks)
         accumulated_loss             .div_(n_chunks)
         accumulated_completion_length.div_(n_chunks)
         accumulated_mean_kl          .div_(n_chunks)
@@ -2000,6 +2082,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_flat_is_ratio = None
         accumulated_coef_1  = torch.cat(accumulated_coef_1, dim=0)
         ctx.save_for_backward(grad_inputs)
+        ctx.sc_grad_inputs = sc_grad_inputs
         ctx.upstream_scale = upstream_scale
         return (
             accumulated_loss,
@@ -2014,9 +2097,12 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio, dcoef_1):
         (grad_input,) = ctx.saved_tensors
+        sc_grad_input = getattr(ctx, "sc_grad_inputs", None)
         if ctx.upstream_scale is not None:
             grad_input = grad_input * (grad_output * ctx.upstream_scale)
-        return (grad_input, None, None, None, None, None, None, None, None, None, None, None, None)
+            if sc_grad_input is not None:
+                sc_grad_input = sc_grad_input * (grad_output * ctx.upstream_scale)
+        return (grad_input, None, None, None, None, None, None, None, None, None, None, None, None, sc_grad_input)
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
@@ -3663,6 +3749,84 @@ pass
 RL_REPLACEMENTS["grpo_rollout_logps_as_old"] = grpo_rollout_logps_as_old
 
 
+def grpo_score_centering_k(trainer, loss_kwargs, rollout_logps_as_old = False, kept_set_scoring = False):
+    """Head size k for this batch's score centering (UNSLOTH_GRPO_SCORE_CENTERING, loss_type="reinforce"),
+    0 when it cannot center the loss's own score: the head is weighted with pi_theta / pi_rollout, which is
+    the sampled token's weight in bypass mode (rollout logps as pi_old) or without an IS weight, but not
+    with the vLLM IS ratio pi_old / pi_rollout once the policy has moved (verl also requires bypass); and
+    kept-set scoring of truncated sampling leaves no full-vocabulary trainer log-probs."""
+    from unsloth_zoo.score_centering import score_centering_top_k
+    k = score_centering_top_k()
+    if not k:
+        return 0
+    reason = None
+    if kept_set_scoring:
+        reason = ("needs full-vocabulary trainer logprobs, but kept-set scoring is on (truncated vLLM sampling)")
+    elif not rollout_logps_as_old and getattr(trainer, "use_vllm", False) \
+            and loss_kwargs.get("vllm_importance_sampling_correction", False):
+        reason = ("with the vLLM importance-sampling correction needs bypass mode "
+                  "(UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1), so the head and the sampled token share one weight")
+    if reason is None:
+        return k
+    if not getattr(trainer, "_unsloth_score_centering_off_warned", False):
+        from unsloth_zoo.log import logger as _zoo_logger
+        _zoo_logger.warning(f"Unsloth: score centering {reason}. Score centering is off for this run.")
+        trainer._unsloth_score_centering_off_warned = True
+    return 0
+pass
+RL_REPLACEMENTS["grpo_score_centering_k"] = grpo_score_centering_k
+
+
+def grpo_score_centering_term(trainer, loss_kwargs, head_list, head_ids, sampler_head_logps, completion_mask,
+                              rollout_logps_as_old = False, training = True):
+    """[B, T] score-centering correction (with gradient to the trainer head log-probs) for
+    grpo_compute_loss's reinforce branch, or None when the heads do not line up with the batch.
+    The head IS rule is the sampled token's: vllm_importance_sampling_mode with its clip bounds
+    when an IS weight is applied (vLLM IS correction or rollout logps as pi_old), else weight 1."""
+    from unsloth_zoo.score_centering import score_centering_correction, score_centering_weight_fn
+    if not head_list:
+        return None
+    train_head = torch.cat(head_list, dim = 0)
+    if train_head.shape[:2] != completion_mask.shape or head_ids.shape != train_head.shape:
+        if not getattr(trainer, "_unsloth_score_centering_shape_warned", False):
+            from unsloth_zoo.log import logger as _zoo_logger
+            _zoo_logger.warning(
+                f"Unsloth: score centering heads {tuple(train_head.shape)} do not match the completion mask "
+                f"{tuple(completion_mask.shape)}; this batch trains without the centering term."
+            )
+            trainer._unsloth_score_centering_shape_warned = True
+        return None
+    # grpo_score_centering_k admits bypass mode (the head shares the sampled token's IS rule) or no IS weight.
+    is_on = rollout_logps_as_old
+    weight_fn = score_centering_weight_fn(
+        loss_kwargs.get("vllm_importance_sampling_mode", None) if is_on else None,
+        loss_kwargs.get("vllm_importance_sampling_clip_min", None),
+        loss_kwargs.get("vllm_importance_sampling_clip_max", None),
+    )
+    sampler_head_logps = sampler_head_logps.to(train_head.device)
+    head_mask = (head_ids >= 0).to(train_head.device) & completion_mask.to(torch.bool).unsqueeze(-1)
+    correction, q_mass, p_mass = score_centering_correction(train_head, sampler_head_logps, weight_fn, head_mask)
+    with torch.no_grad():
+        token_mask = head_mask.any(-1)
+        n_tokens = completion_mask.to(torch.float32).sum().clamp(min = 1.0)
+        n_head = token_mask.to(torch.float32).sum().clamp(min = 1.0)
+        values = torch.stack([
+            token_mask.to(torch.float32).sum() / n_tokens,
+            torch.where(token_mask, correction.detach(), 0.0).sum() / n_head,
+            torch.where(token_mask, q_mass, 0.0).sum() / n_head,
+            torch.where(token_mask, p_mass, 0.0).sum() / n_head,
+        ]).tolist()
+    metrics = getattr(trainer, "_metrics", None)
+    if isinstance(metrics, dict):
+        if "train" in metrics:
+            metrics = metrics["train" if training else "eval"]
+        for name, value in zip(("matched_token_frac", "correction_mean", "sampler_head_mass", "train_head_mass"), values):
+            metrics.setdefault(f"score_centering/{name}", []).append(value)
+    return correction
+pass
+RL_REPLACEMENTS["grpo_score_centering_term"] = grpo_score_centering_term
+
+
 def grpo_rollout_old_fill_unscored(old_logps, new_logps):
     """Tokens the rollout engine could not score (vLLM returns NaN) take the current policy's own
     logprob as pi_old, so their ratio is exactly 1: no correction, as the vLLM importance-sampling
@@ -4040,6 +4204,8 @@ def grpo_accumulated_loss(
         grpo_rollout_logps_as_old,
         grpo_rollout_as_old_ratio_metrics,
         grpo_rollout_old_fill_unscored,
+        grpo_score_centering_term,
+        grpo_score_centering_k,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
@@ -4376,6 +4542,19 @@ def grpo_accumulated_loss(
             else:
                 multiplier = trainer.args.unsloth_logit_chunk_multiplier
 
+        # Score centering (UNSLOTH_GRPO_SCORE_CENTERING=k with loss_type="reinforce"): the vLLM top-k head
+        # of every completion token, looked up by content in TRL's [prompt | completion] layout.
+        _sc_ids = _sc_logps = None
+        _sc_head_list = []
+        if kwargs.get("loss_type", "grpo") == "reinforce" and getattr(trainer, "use_vllm", False):
+            from unsloth_zoo.rl_replacements import grpo_score_centering_k as _sc_enabled_k
+            _sc_k = _sc_enabled_k(trainer, kwargs, _rollout_logps_as_old, bool(_support_kwargs))
+            if _sc_k:
+                from unsloth_zoo.score_centering import lookup_rollout_topk as _sc_lookup
+                _sc_ids, _sc_logps, _sc_matched = _sc_lookup(
+                    input_ids, logits_to_keep, _sc_k, trainer.processing_class.pad_token_id,
+                )
+
         # The text path rebuilds completion_mask from token ids, which would undo TRL's
         # mask_truncated_completions row zeroing; keep TRL's rows and reapply them before the loss.
         kept_completion_rows = None
@@ -4465,6 +4644,10 @@ def grpo_accumulated_loss(
                 sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
             else:
                 sampling_per_token_logps = None
+            if _sc_ids is not None:
+                from unsloth_zoo.score_centering import align_topk_with_mask as _sc_align
+                _sc_ids = _sc_align(_sc_ids, completion_mask, -1)
+                _sc_logps = _sc_align(_sc_logps, completion_mask, float("-inf"))
             completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
             attention_mask =  input_ids != trainer.processing_class.pad_token_id
             if prompt_real_mask is not None:
@@ -4599,7 +4782,7 @@ def grpo_accumulated_loss(
             ) and (trainer.accelerator.scaler is None or trainer.accelerator.scaler.get_scale() < 128.0),
         )
         # The fused op needs pi_old before scoring and weights by scored-row counts: use the log-prob op.
-        _fused_route = _fused_route and not _old_from_new and _row_keep is None
+        _fused_route = _fused_route and not _old_from_new and _row_keep is None and _sc_ids is None
         _fused_W = logits_to_keep + max_left_pad if pixel_values is None else logits_to_keep
         _fused_pad = []
         _fused_pack = _fused_pg = None
@@ -4821,6 +5004,9 @@ def grpo_accumulated_loss(
         # result, and it fixes the padded path's left-pad RoPE error. Loss/gradients flow through it. Self-
         # verified against the per-row forward (shape/RoPE-aware, re-checked as T grows); falls back if a
         # backend ignores packed_seq_lengths. lm_head runs on completion positions only.
+        if _sc_ids is not None:
+            # Score centering gathers its head log-probs in the padded loop below.
+            _pg_skip_pack = True
         new_logprobs = None
         _pack_result = None
         _pack_use = False
@@ -5350,6 +5536,14 @@ def grpo_accumulated_loss(
             # Hidden states -> lm_head matmul path; raw logits -> skip matmul and
             # skip scale/softcap (model forward already applied them).
             chunks = input_ids_chunk.shape[0] * multiplier
+            if _sc_ids is not None:
+                from unsloth_zoo.score_centering import grpo_topk_head_logprobs as _sc_head_logprobs
+                _sc_row = sum(_x.shape[0] for _x in _sc_head_list)
+                _sc_head_list.append(_sc_head_logprobs(
+                    new_hidden_states_chunk, lm_head, _sc_ids[_sc_row : _sc_row + completion_ids.shape[0]], chunks,
+                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                    lm_head_bias = lm_head_bias,
+                ))
             if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
                 _fp32_bind(_need_entropy)
                 if _fused_route:
@@ -5552,6 +5746,12 @@ def grpo_accumulated_loss(
                     torch.cuda.empty_cache()
                 new_logprobs, new_entropies = _score_deferred(_fused_items, _entropy_bonus_on)
             _fused_items = _fused_ent_w = None
+        _sc_correction = None
+        if _sc_ids is not None and not _fused_done:
+            _sc_correction = grpo_score_centering_term(
+                trainer, kwargs, _sc_head_list, _sc_ids, _sc_logps, completion_mask, _rollout_logps_as_old, _training,
+            )
+        _sc_head_list = None
         if not _fused_done:
             with autocaster:
                 loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
@@ -5568,6 +5768,8 @@ def grpo_accumulated_loss(
                     1,
                     kwargs,
                     upstream_scale,
+                    # Only with score centering: the 13-argument call stays as it was.
+                    *(() if _sc_correction is None else (_sc_correction,)),
                 )
         _rollout_stats_args = None
         _rollout_stats_kwargs = {}
