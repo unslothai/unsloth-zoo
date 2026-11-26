@@ -183,7 +183,7 @@ def get_deepseek_v41_vllm_state_dict(vllm_internals, config):
     weights, and any vLLM language-model tensor this mapping does not cover (an unshared tensor would silently
     diverge between rollouts and training)."""
     # All Unsloth Zoo code licensed under LGPLv3
-    from .empty_model import vllm_moe_expert_descriptor
+    from unsloth_zoo.empty_model import vllm_moe_expert_descriptor
 
     text_config = _text_config(config)
     language_model, text_model, lm_head = _vllm_text_model(vllm_internals)
@@ -320,7 +320,7 @@ pass
 def _native_model_class_and_config(config):
     """Unsloth's native DeepSeek-V4.1 CausalLM (or transformers' own, when it ships one) and the config in its
     class: vLLM registers its own DeepseekV41Config with AutoConfig, which the native model does not accept."""
-    from .temporary_patches.deepseek_v41 import _modeling
+    from unsloth_zoo.temporary_patches.deepseek_v41 import _modeling
     modeling = _modeling()
     model_class = getattr(modeling, "DeepseekV41ForCausalLM", None) if modeling is not None else None
     if model_class is None:
