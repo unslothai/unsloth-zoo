@@ -1551,6 +1551,9 @@ def grpo_compute_loss(
     full_batch_tokens = kwargs.get("full_batch_tokens", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
+    # StableReinforce (Tinker): coef * KL(sampler || policy) on the sampled tokens, k1 or k3. 0 is off.
+    sampler_kl_coef = kwargs.get("sampler_kl_coef", 0.0)
+    sampler_kl_estimator = kwargs.get("sampler_kl_estimator", "k1")
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -1785,6 +1788,27 @@ def grpo_compute_loss(
         flat_is_ratio = torch.tensor([]).detach()
     if beta != 0.0:
         loss_i = loss_i + beta * kl_i
+    if sampler_kl_coef != 0.0:
+        # The sampler is vLLM when its logprobs came, else pi_old (rollout logps as old land there), else the
+        # policy itself (on-policy). Not IS-weighted: the tokens are already drawn from the sampler.
+        if sampling_per_token_logps is not None:
+            sampler_logps = sampling_per_token_logps
+        elif old is not None:
+            sampler_logps = old
+        else:
+            sampler_logps = new.detach()
+        # Unscored vLLM tokens (nan) and masked columns add nothing; clamp keeps expm1 finite.
+        sampler_logps = torch.where(torch.isnan(sampler_logps), new.detach(), sampler_logps)
+        sampler_log_ratio = torch.clamp(new - sampler_logps, min = -20.0, max = 20.0)
+        if mask is not None:
+            sampler_log_ratio = torch.where(mask.to(torch.bool), sampler_log_ratio, 0.0)
+        if sampler_kl_estimator == "k3":
+            # r - 1 - log r with r = p / q: >= 0, gradient (r - 1) * grad log p.
+            sampler_kl_i = torch.expm1(sampler_log_ratio) - sampler_log_ratio
+        else:
+            # k1 = log q - log p: gradient -grad log p on every sampled token.
+            sampler_kl_i = -sampler_log_ratio
+        loss_i = loss_i + sampler_kl_coef * sampler_kl_i
     if rs_keep is not None:
         # Rejected tokens drop out of every loss term, KL included (verl rollout_rs). A select, so
         # an inf or nan there neither reaches the loss nor turns into a nan gradient.
@@ -1855,6 +1879,10 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+# Capability flags read by unsloth: the StableReinforce sampler KL, and (B, T) advantages realigned to the
+# left-packed loss window in grpo_accumulated_loss.
+GRPO_SAMPLER_KL = True
+GRPO_TOKEN_ADVANTAGES = True
 # Same eager fallback as other fullgraph regions: a bare decorator leaves cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
@@ -3487,6 +3515,7 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
     """True when grpo_compute_loss's per-token loss is a closed form of each token's own log-prob, so the GRPO loss can
     take fused_linear_grpo_loss: every token's gradient is known in the forward. Off for GSPO (sequence-level ratio),
     VESPO, the off-policy and top-entropy-quantile masks (all read every token's log-prob or entropy first), rollout_rs,
+    the StableReinforce sampler KL (a term the fused op does not carry),
     rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), a gathered ZeRO-3
     head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, a frozen head without an entropy
     bonus unless UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY=1 (nothing to save there), and float16 compute without a
@@ -3503,6 +3532,7 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and kwargs.get("off_policy_mask_threshold", None) is None
         and kwargs.get("entropy_mask", None) is None
         and kwargs.get("rollout_rs", None) is None
+        and not kwargs.get("sampler_kl_coef", 0.0)
         and not entropy_mask_on
         and not rollout_logps_as_old
         and not support_kwargs
@@ -3755,11 +3785,24 @@ def grpo_accumulated_loss(
     _old_from_new = bool(kwargs.pop("old_logps_from_new", False)) and old_logps is None and not _rollout_logps_as_old
     _store_old = bool(kwargs.pop("store_old_logps", False)) and _old_from_new
     _row_keep = None
+    # StableReinforce sampler KL: an explicit kwarg wins, else the Unsloth config field. 0 is off.
+    _sampler_kl_coef = kwargs.get("sampler_kl_coef", None)
+    if _sampler_kl_coef is None:
+        _sampler_kl_coef = getattr(trainer.args, "unsloth_sampler_kl_coef", 0.0)
+    _sampler_kl_coef = float(_sampler_kl_coef or 0.0)
+    _sampler_kl_estimator = kwargs.get("sampler_kl_estimator", None) or getattr(trainer.args, "unsloth_sampler_kl_estimator", None) or "k1"
+    if _sampler_kl_estimator not in ("k1", "k3"):
+        raise ValueError(f"Unsloth: sampler_kl_estimator must be 'k1' or 'k3', not {_sampler_kl_estimator!r}.")
+    if not (0.0 <= _sampler_kl_coef < float("inf")):
+        raise ValueError(f"Unsloth: sampler_kl_coef must be a finite float >= 0, not {_sampler_kl_coef!r}.")
+    kwargs["sampler_kl_coef"] = _sampler_kl_coef
+    kwargs["sampler_kl_estimator"] = _sampler_kl_estimator
     # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
     _sampling_logps_used = (
         (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False))
         or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
         or _rollout_logps_as_old
+        or _sampler_kl_coef != 0.0
     )
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if _sampling_logps_used else None
     temperature = kwargs.get("temperature", 1.0)
@@ -4126,6 +4169,11 @@ def grpo_accumulated_loss(
                 sampling_per_token_logps = align_logprobs_with_mask(sampling_per_token_logps, completion_mask)
             else:
                 sampling_per_token_logps = None
+            # Per-token advantages (on-policy distillation) arrive in the completion layout like vLLM's
+            # logprobs: move them onto the left-packed loss window too. (B, 1) stays a row broadcast.
+            if torch.is_tensor(advantages) and advantages.dim() == 2 and advantages.shape[1] > 1 \
+                    and advantages.shape != completion_mask.shape:
+                advantages = align_logprobs_with_mask(advantages, completion_mask)
             completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
             attention_mask =  input_ids != trainer.processing_class.pad_token_id
             if prompt_real_mask is not None:
