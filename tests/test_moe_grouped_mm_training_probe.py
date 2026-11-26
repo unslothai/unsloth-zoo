@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The grouped_mm probe runs what training runs. A torch._grouped_mm that serves one fp16 expert but refuses several
-bf16 experts (Windows CUDA wheels on sm90 / sm100: "grouped mm is not supported on your system") must not select
-grouped_mm; a real call refusing after the probe passed falls back once; an OOM never latches. CPU only: the card is a
-CPU device and torch._grouped_mm a per-expert reference."""
+"""A grouped_mm that serves one fp16 expert but refuses bf16 multi-expert (Windows wheels) must not be selected; a
+later refusal falls back once; an OOM never latches. CPU only."""
 
 import pytest
 import torch
@@ -30,7 +28,6 @@ CPU = torch.device("cpu")
 
 
 def _reference_grouped_mm(x, w, offs = None):
-    """torch._grouped_mm on per-expert matmuls (autograd tracked)."""
     ends = offs.tolist()
     rows = [x[s:e] @ w[g] for g, (s, e) in enumerate(zip([0] + ends[:-1], ends))]
     return torch.cat(rows) if rows else x.new_empty((0, w.shape[-1]))
@@ -48,7 +45,6 @@ def _windows_grouped_mm(calls):
 
 @pytest.fixture
 def fresh(monkeypatch):
-    """Cold probe state with the CPU standing in for the home card."""
     for name, value in (
         ("_TORCH_GROUPED_MM_AVAILABLE", True), ("_TORCH_GROUPED_MM_SUPPORTED", None),
         ("_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None), ("_GROUPED_MM_HOME", None), ("_GROUPED_MM_HOMOGENEOUS", False),
@@ -71,7 +67,6 @@ def fresh(monkeypatch):
 
 
 class _Experts(nn.Module):
-    """Frozen bf16 [E, 2I, H] / [E, H, I] stacks (the HF layout) with LoRA on both projections via the stash."""
 
     def __init__(self, E = 4, H = 32, I = 16, rank = 4):
         super().__init__()
@@ -89,13 +84,12 @@ def _batch(T = 24, H = 32, E = 4, k = 2):
     gen = torch.Generator().manual_seed(1)
     x = torch.randn(T, H, generator = gen).bfloat16()
     logits = torch.randn(T, E, generator = gen)
-    logits[:, 1] = -1e4   # expert 1 gets no tokens, as in a real skewed batch
+    logits[:, 1] = -1e4
     top_v, top_i = torch.topk(logits, k, dim = -1)
     return x, top_i, torch.softmax(top_v, dim = -1).bfloat16()
 
 
 def _train_step(monkeypatch, forward):
-    """One LoRA step's loss and grads through forward(module, x, top_k_index, top_k_weights)."""
     module = _Experts()
     monkeypatch.setattr(mu, "take_moe_lora_stash", lambda m, name: module.lora.get(name))
     x, top_i, top_w = _batch()
@@ -112,13 +106,11 @@ def _selected_forward(module, x, top_i, top_w):
 
 
 def test_windows_refusal_selects_the_fallback_and_trains_like_native(fresh, capsys):
-    # The flip: before, the single fp16 expert passed, grouped_mm was selected and the first bf16 call raised.
     calls = []
     fresh.setattr(torch, "_grouped_mm", _windows_grouped_mm(calls), raising = False)
     loss, grads = _train_step(fresh, _selected_forward)
     assert mu.select_moe_backend() == "native_torch"
     assert mu._check_torch_grouped_mm_supported() is False
-    # Probe calls only: the single fp16 expert, then the bf16 4-expert training call it refused.
     assert calls == [(torch.float16, 1), (torch.bfloat16, 4)]
     out = capsys.readouterr().out
     assert REFUSAL in out and "MoE backend 'native_torch'" in out and "UNSLOTH_MOE_GROUPED_MM_PROBE=0" in out
@@ -131,7 +123,6 @@ def test_windows_refusal_selects_the_fallback_and_trains_like_native(fresh, caps
 
 
 def test_explicit_grouped_mm_runs_on_the_triton_stand_in(fresh, capsys):
-    # UNSLOTH_MOE_BACKEND=grouped_mm is honoured: the Triton grouped GEMM stands in for torch._grouped_mm.
     calls = []
     fresh.setattr(torch, "_grouped_mm", _windows_grouped_mm(calls), raising = False)
     fresh.setenv("UNSLOTH_MOE_BACKEND", "grouped_mm")
@@ -141,7 +132,6 @@ def test_explicit_grouped_mm_runs_on_the_triton_stand_in(fresh, capsys):
     assert "Unsloth's Triton grouped GEMM kernels" in capsys.readouterr().out
     fresh.setattr(mu, "_SELECTED_MOE_BACKEND", "grouped_mm")
     del calls[:]
-    # No Triton on a CPU: every grouped GEMM takes the per-expert loop, never the refusing op.
     loss, grads = _train_step(fresh, mu.forward_native_grouped_mm)
     assert calls == []
     native_loss, native_grads = _train_step(fresh, mu.forward_native_moe_loop)
@@ -163,7 +153,6 @@ def test_stand_in_opt_out_keeps_the_backend_chain(fresh, explicit):
     fresh.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
     if explicit:
         fresh.setenv("UNSLOTH_MOE_BACKEND", "grouped_mm")
-    # Real availability check (not patched): the env opt-out answers before anything touches a GPU.
     assert mu._select_moe_backend() == "native_torch"
     assert mu._GROUPED_MM_TRITON_STANDIN is False
 
@@ -185,7 +174,6 @@ def test_stand_in_forces_triton_for_every_kind(fresh):
         pytest.skip("needs triton and the grouped_mm_triton op")
     fresh.setattr(mu, "is_rocm_torch", lambda torch_module: False)
     for kind in ("lora", "many", "few", "dw", "dw_few"):
-        # sm100 has no auto row table: Triton stays off unless it stands in.
         assert mu._triton_grouped_mm_policy(0, kind, None, None, None) == 0
         assert mu._triton_grouped_mm_policy(0, kind, None, None, None, True) == -1
         assert mu._triton_grouped_mm_policy(0, kind, "0", None, None, True) == 0
@@ -199,7 +187,7 @@ def test_a_correct_grouped_mm_still_selects_grouped_mm(fresh, capsys):
     fresh.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
     cpu_rng = torch.get_rng_state()
     assert mu._select_moe_backend() == "grouped_mm"
-    assert torch.equal(cpu_rng, torch.get_rng_state())   # the probe never advances the global RNG
+    assert torch.equal(cpu_rng, torch.get_rng_state())
     assert calls[:2] == [(torch.float16, 1), (torch.bfloat16, 4)]
     assert mu._GROUPED_MM_TRAINING_PROBE_FAILURE is None and mu._GROUPED_MM_TRITON_STANDIN is False
     assert "cannot run MoE training" not in capsys.readouterr().out
@@ -224,7 +212,7 @@ def test_the_probe_checks_forward_and_both_grads(fresh, defect):
             if defect == "dx":
                 dx = dx * 2
             if defect == "empty_dw":
-                dw[1] = 1   # garbage left in the expert with no tokens
+                dw[1] = 1
             return dx, dw, None
     def grouped_mm(x, w, offs = None):
         return _reference_grouped_mm(x, w, offs) if offs.numel() == 1 else Wrong.apply(x, w, offs)
@@ -260,7 +248,6 @@ def test_probe_dtype_is_the_training_compute_dtype(monkeypatch):
 
 
 def _supported_then(fresh, behaviour):
-    """A probe that passed (grouped_mm selected), then real calls that behave as given."""
     calls = []
     def grouped_mm(x, w, offs = None):
         calls.append(x.dtype)
@@ -284,7 +271,7 @@ def test_a_real_call_refusal_falls_back_once_for_the_process(fresh, capsys):
     assert mu._TORCH_GROUPED_MM_SUPPORTED is False and mu._GROUPED_MM_RUNTIME_REFUSALS == [1]
     assert REFUSAL in capsys.readouterr().out
     mu._grouped_mm_with_backward_fix(x, w, offs)
-    assert calls == [torch.bfloat16]   # latched: the op is not called again
+    assert calls == [torch.bfloat16]
     assert mu._GROUPED_MM_RUNTIME_REFUSALS == [1]
 
 
@@ -300,7 +287,7 @@ def test_a_runtime_oom_propagates_and_never_latches(fresh):
     assert mu._TORCH_GROUPED_MM_SUPPORTED is True and mu._GROUPED_MM_RUNTIME_REFUSALS == [0]
     state["oom"] = False
     mu._grouped_mm_with_backward_fix(x, w, offs)
-    assert calls == [torch.bfloat16, torch.bfloat16]   # the next call tries grouped_mm again
+    assert calls == [torch.bfloat16, torch.bfloat16]
 
 
 def test_other_runtime_errors_still_raise(fresh):

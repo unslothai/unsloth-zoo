@@ -397,7 +397,6 @@ def _grouped_mm_eager(inputs, weight, offsets):
     return _manual_grouped_mm(inputs, weight, offsets)
 
 
-# torch refusing grouped_mm on this platform / arch / dtype (Windows CUDA wheels, torch 2.8 off sm90, ROCm builds).
 _GROUPED_MM_REFUSALS = ("not supported on your system", "is only supported on cuda devices", "not supported on rocm")
 
 
@@ -413,8 +412,7 @@ def _grouped_mm_refusal(exc):
 
 
 def _latch_grouped_mm_refused(device, reason):
-    """A real call refused what the probe passed: grouped_mm is off for this GPU model for the rest of the process,
-    the Triton grouped GEMM stands in where it runs, and one line says so."""
+    """A real call refused what the probe passed: latch grouped_mm off for this GPU model."""
     global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     kind = _grouped_mm_foreign_kind(device)
     if kind is None:
@@ -427,7 +425,6 @@ def _latch_grouped_mm_refused(device, reason):
     _use_grouped_mm_triton_standin(device, reason)
 
 
-# Real calls torch refused after the probe passed (each latches once; test / engagement counter).
 _GROUPED_MM_RUNTIME_REFUSALS = [0]
 
 
@@ -572,7 +569,6 @@ _TRITON_GROUPED_MM_AUTO_ROWS = {
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
-# Set when torch._grouped_mm refuses training here and the grouped_mm backend runs on the Triton grouped GEMM instead.
 _GROUPED_MM_TRITON_STANDIN = False
 
 
@@ -608,7 +604,7 @@ def _triton_grouped_mm_lora_rank_scaled():
 def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = False):
     mode = (mode or "auto").strip().lower()
     if standin and mode == "auto":
-        mode = "1"   # torch._grouped_mm refuses training here: Triton takes every call it can, as with =1
+        mode = "1"
     if mode in ("0", "false", "off") or disabled == "1":
         return 0
     if is_rocm_torch(torch) or _GROUPED_MM_TRITON_OP is None or index is None:
@@ -2192,16 +2188,12 @@ def _grouped_mm_runs_on(device):
     return _GROUPED_MM_LAST_REFUSAL[0] is None
 
 
-# Routing of one tiny training step: uneven token counts and an expert that got none.
 _GROUPED_MM_PROBE_COUNTS = (8, 0, 5, 19)
-# Why the home card's training-shaped call failed where its single fp16 expert passed (the op exists, refuses training).
 _GROUPED_MM_TRAINING_PROBE_FAILURE = None
-# The last _grouped_mm_runs_on's training-call failure, read by the home probe.
 _GROUPED_MM_LAST_REFUSAL = [None]
 
 
 def _grouped_mm_probe_dtype(device):
-    """The dtype MoE training computes in on device (moe_compute_dtype): fp16 on CUDA below sm80, else bf16."""
     if device.type == "cuda" and not is_rocm_torch(torch):
         try:
             if torch.cuda.get_device_capability(device)[0] < 8: return torch.float16
@@ -2211,24 +2203,21 @@ def _grouped_mm_probe_dtype(device):
 
 
 def _grouped_mm_on_device(device):
-    # torch picks the grouped_mm kernel from the current device's properties, not the operands'.
+    # torch picks the kernel from the current device, not the operands'.
     backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
     context = getattr(backend, "device", None)
     return context(device) if context is not None else contextlib.nullcontext()
 
 
 def _grouped_mm_trains_on(device):
-    """One training-shaped torch._grouped_mm in the compute dtype: 4 experts, uneven counts with an empty one, forward
-    plus dX and dW through autograd, each against per-expert matmuls. A single fp16 expert is not what training runs:
-    Windows CUDA wheels serve it, yet raise "grouped mm is not supported on your system" for bf16 on sm90 / sm100.
-    Small integer operands keep every product and sum exact, so any wrong element fails. None when it runs, else why
-    not; an OOM is no verdict (None). UNSLOTH_MOE_GROUPED_MM_PROBE=0 skips this call."""
+    """Training-shaped fwd + dX + dW vs per-expert matmuls; None when it runs, else why not. Windows CUDA wheels serve
+    one fp16 expert but refuse bf16 multi-expert. Integer operands make the comparison exact. OOM is no verdict."""
     if os.environ.get("UNSLOTH_MOE_GROUPED_MM_PROBE", "1") == "0": return None
     dtype = _grouped_mm_probe_dtype(device)
     counts = _GROUPED_MM_PROBE_COUNTS
     try:
         with _grouped_mm_on_device(device), torch.inference_mode(False), torch.enable_grad():
-            # A CPU generator: the process-wide RNG a seeded run relies on never advances.
+            # CPU generator: the global RNG stays untouched.
             gen = torch.Generator(device = "cpu").manual_seed(0)
             E, M, K, N = len(counts), sum(counts), 32, 48
             x, w, dy = (torch.randint(-2, 3, shape, generator = gen).double() for shape in ((M, K), (E, K, N), (M, N)))
@@ -2523,8 +2512,6 @@ def _check_sonic_moe_available():
 
 
 def _grouped_mm_triton_standin_available(device):
-    """zoo's Triton grouped GEMM can replace torch._grouped_mm on device: CUDA sm80+ (Triton MMA), not ROCm, its self-check
-    passes, and neither UNSLOTH_MOE_GROUPED_TRITON=0 nor UNSLOTH_DISABLE_MOE_TRITON=1 is set."""
     if os.environ.get("UNSLOTH_MOE_GROUPED_TRITON", "auto").strip().lower() in ("0", "false", "off"): return False
     if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1": return False
     if _GROUPED_MM_TRITON_OP is None or is_rocm_torch(torch) or getattr(device, "type", None) != "cuda": return False
@@ -2533,7 +2520,7 @@ def _grouped_mm_triton_standin_available(device):
         from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
         return bool(mg.triton_grouped_available(device))
     except Exception:
-        return False   # an OOM in the self-check included: the backend chain below is still correct
+        return False
 
 
 _GROUPED_MM_FALLBACK_LOGGED = set()
@@ -2551,8 +2538,6 @@ def _log_grouped_mm_fallback(reason, fallback):
 
 
 def _use_grouped_mm_triton_standin(device, reason):
-    """Run the grouped_mm backend on the Triton grouped GEMM (UNSLOTH_MOE_GROUPED_TRITON=1) because torch._grouped_mm
-    refuses training on device; calls Triton cannot take use the per-expert loop. False when Triton cannot stand in."""
     global _GROUPED_MM_TRITON_STANDIN
     if device is None or not _grouped_mm_triton_standin_available(device):
         _log_grouped_mm_fallback(reason, "the per-expert loop for grouped_mm calls")
@@ -2563,9 +2548,7 @@ def _use_grouped_mm_triton_standin(device, reason):
 
 
 def _select_grouped_mm_on_triton(explicit):
-    """torch._grouped_mm failed the probe: grouped_mm on Triton when the user asked for grouped_mm, or when torch has a
-    working single-expert op that refuses training's call (the Windows bf16 case). Other failures (no op, torch 2.8 off
-    sm90) keep the auto chain they always had."""
+    """Auto takes the Triton stand-in only when the single-expert op works; older failures keep the old chain."""
     reason = _GROUPED_MM_TRAINING_PROBE_FAILURE
     if not explicit and reason is None:
         return False
@@ -5843,7 +5826,6 @@ def forward_native_grouped_mm(
     # This Unsloth Zoo code section is licensed under AGPL3
 
     # Runtime safety check (defense in depth); packed NVFP4 / MXFP8 stacks fall back to a per-group loop instead.
-    # On the Triton stand-in every grouped GEMM takes Triton or the per-expert loop, never torch._grouped_mm.
     if not _check_torch_grouped_mm_supported() and not _GROUPED_MM_TRITON_STANDIN \
             and not _moe_uses_new_packed_expert_weights(self):
         # Compute Capability is CUDA-only; on XPU it would mask this message.

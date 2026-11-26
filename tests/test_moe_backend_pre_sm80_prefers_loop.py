@@ -37,7 +37,6 @@ def _patch(module, monkeypatch, platform, capability, grouped_mm, env):
     on_gpu = platform in ("cuda", "hip")
     monkeypatch.setattr(module, "_check_torch_grouped_mm_supported", lambda *a, **k: grouped_mm)
     monkeypatch.setattr(module, "_check_grouped_gemm_available", lambda: on_gpu)
-    # The Triton stand-in for a refusing torch._grouped_mm has its own tests (test_moe_grouped_mm_training_probe.py).
     monkeypatch.setattr(module, "_grouped_mm_triton_standin_available", lambda device: False, raising = False)
     monkeypatch.setattr(torch.version, "hip", "6.3" if platform == "hip" else None)
 
