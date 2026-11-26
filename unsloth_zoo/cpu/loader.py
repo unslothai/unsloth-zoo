@@ -702,6 +702,32 @@ def _cpu_compile_unavailable():
 _CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
 
 
+def _parallel_kernel_builds():
+    """Windows: build the C++ kernels of a compile in parallel. torch sets ``compile_threads = 1`` on win32 (its Triton
+    worker process pool), so Inductor runs one MSVC build at a time; a cold Qwen3 layer compile is about 27 builds
+    (45 s first step on a 4 vCPU runner, 21 s with 4). CPU kernels build on Inductor's in-process thread pool, not that
+    process pool, which stays off (TORCH_WARM_POOL=0: the CPU backend never compiles Triton). A user's
+    TORCHINDUCTOR_COMPILE_THREADS, a compile_threads already raised, or UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=1 is kept.
+    Returns the thread count set, or None when unchanged."""
+    if sys.platform != "win32" or "TORCHINDUCTOR_COMPILE_THREADS" in os.environ:
+        return None
+    if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1":
+        return None
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return None
+    if getattr(inductor_config, "compile_threads", 1) not in (None, 1):
+        return None
+    count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    threads = min(32, count)
+    if threads <= 1:
+        return None
+    os.environ.setdefault("TORCH_WARM_POOL", "0")
+    inductor_config.compile_threads = threads
+    return threads
+
+
 def compile_cpu_layers(model, explicit = False):
     """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
     if getattr(model, "_unsloth_cpu_compiled", False):
@@ -713,6 +739,7 @@ def compile_cpu_layers(model, explicit = False):
         else:
             _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
         return 0
+    _parallel_kernel_builds()
     count = _compile_layers(model)
     model._unsloth_cpu_compiled = True
     _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
