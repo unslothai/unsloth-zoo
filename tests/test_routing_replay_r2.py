@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Old-policy routing replay (R2, UNSLOTH_GRPO_ROUTING_REPLAY_R2): the pi_old forward's experts are
-replayed in the later forwards with grad (num_iterations > 1). CPU only, no vLLM."""
+"""Old-policy routing replay (R2, UNSLOTH_GRPO_ROUTING_REPLAY_R2): after a rollout, the first forward
+of a row (pi_old's) records its experts and later forwards (num_iterations > 1) replay them. CPU only."""
 
 from types import SimpleNamespace
 
@@ -87,6 +87,12 @@ def _install(model):
     return _Routes(model)  # after install: sees the replayed ids
 
 
+def _rollout(model):
+    # HF generation: the decoder gets a KV cache, which starts a new rollout for R2.
+    with torch.no_grad():
+        model.generate(input_ids = torch.tensor([[3, 4]]), max_new_tokens = 2, do_sample = False, pad_token_id = PAD)
+
+
 def _policy_update(model, seed = 3):
     # Stands in for an optimizer step between iterations: enough to move the natural routing.
     generator = torch.Generator().manual_seed(seed)
@@ -110,6 +116,7 @@ def _agreement(a, b, mask):
 def test_second_pass_replays_the_old_forward_experts(r2, old_mode):
     model = _model()
     routes = _install(model)
+    _rollout(model)
     input_ids, mask = _batch()
     with (torch.no_grad() if old_mode == "no_grad" else torch.inference_mode()):
         model(input_ids = input_ids, attention_mask = mask)
@@ -123,6 +130,45 @@ def test_second_pass_replays_the_old_forward_experts(r2, old_mode):
     assert _agreement(routes.ids(), old, mask) == 1.0
     assert rr.routing_replay_stats()["r2_replayed_tokens"] == int(mask.sum())
     assert model.model.layers[0].mlp.gate.weight.grad.abs().sum() > 0
+
+
+def test_pi_old_taken_from_the_first_policy_forward_is_replayed(r2):
+    # pi_old from the first forward with grad (no separate no-grad forward): iteration 2 replays it.
+    model = _model()
+    model.train()
+    routes = _install(model)
+    _rollout(model)
+    input_ids, mask = _batch()
+    model(input_ids = input_ids, attention_mask = mask).logits.float().pow(2).mean().backward()
+    old = routes.ids()
+    _policy_update(model)
+    model(input_ids = input_ids, attention_mask = mask).logits.float().pow(2).mean().backward()
+    assert _agreement(routes.ids(), old, mask) == 1.0
+    stats = rr.routing_replay_stats()
+    assert stats["r2_recorded"] == 2 and stats["r2_replayed_tokens"] == int(mask.sum())
+
+
+def test_no_rollout_seen_keeps_natural_routing(r2):
+    # Without a rollout boundary R2 cannot tell pi_old's forward apart: it records nothing.
+    model = _model()
+    routes = _install(model)
+    input_ids, mask = _batch()
+    with torch.no_grad():
+        model(input_ids = input_ids, attention_mask = mask)
+    first = routes.ids()
+    _policy_update(model)
+    model(input_ids = input_ids, attention_mask = mask)
+    assert _agreement(routes.ids(), first, mask) < 0.9
+    assert rr.routing_replay_stats()["r2_recorded"] == 0
+
+
+def test_vllm_generate_starts_a_rollout(r2):
+    model = _model()
+    llm = SimpleNamespace(generate = lambda *a, **k: [])
+    assert rr.install_routing_replay(model, llm, SimpleNamespace(pad_token_id = PAD)) == NUM_LAYERS
+    assert rr._STATE.r2_rollout == 0
+    llm.generate(["x"])
+    assert rr._STATE.r2_rollout == 1
 
 
 def test_without_r2_the_second_pass_routes_differently(monkeypatch):
@@ -142,6 +188,7 @@ def test_without_r2_the_second_pass_routes_differently(monkeypatch):
 def test_reordered_and_repadded_minibatch_finds_its_old_routes(r2):
     model = _model()
     routes = _install(model)
+    _rollout(model)
     input_ids, mask = _batch()
     with torch.no_grad():
         model(input_ids = input_ids, attention_mask = mask)
@@ -155,15 +202,18 @@ def test_reordered_and_repadded_minibatch_finds_its_old_routes(r2):
     assert torch.equal(routes.ids().reshape(1, 8, NUM_LAYERS, TOP_K)[0, :6], old[0, 2:])
 
 
-def test_a_new_forward_without_grad_refreshes_the_old_routes(r2):
-    # The next rollout's pi_old forward scores the updated policy: it must not replay stale routes.
+def test_the_next_rollout_refreshes_the_old_routes(r2):
+    # The next rollout's pi_old forward scores the updated policy: it must not replay stale routes,
+    # even for a row identical to one of the previous rollout.
     model = _model()
     routes = _install(model)
+    _rollout(model)
     input_ids, mask = _batch()
     with torch.no_grad():
         model(input_ids = input_ids, attention_mask = mask)
     first = routes.ids()
     _policy_update(model)
+    _rollout(model)
     with torch.no_grad():
         model(input_ids = input_ids, attention_mask = mask)
     second = routes.ids()
@@ -180,6 +230,7 @@ def test_checkpoint_recompute_replays_r2_routes(r2, use_reentrant):
         rr.reset_routing_replay()
         m = _model()
         _install(m)
+        _rollout(m)
         with torch.no_grad():
             m(input_ids = input_ids, attention_mask = mask)
         _policy_update(m)
@@ -201,6 +252,7 @@ def test_r2_store_is_bounded(r2, monkeypatch):
     monkeypatch.setattr(rr, "_MAX_R2_ROWS", 3)
     model = _model()
     _install(model)
+    _rollout(model)
     with torch.no_grad():
         for start in range(5):
             ids = torch.tensor([[start + 1, start + 2, start + 3]])

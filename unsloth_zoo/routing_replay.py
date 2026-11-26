@@ -34,10 +34,12 @@ trainer forward uses those values. The gradient still goes through the trainer's
 the forced ids (straight-through), so a trainable router and the hidden states feeding a frozen
 one keep their gradient. Older vLLM returns ids only and the weights are recomputed as before.
 
-Old-policy replay (R2, UNSLOTH_GRPO_ROUTING_REPLAY_R2=1, no vLLM needed): every forward without
-grad (the pi_old logprob forward TRL runs when num_iterations > 1 or steps_per_generation >
-gradient_accumulation_steps) records the experts each row was routed to, and later forwards with
-grad replay them for rows R3 has no rollout routes for.
+Old-policy replay (R2, UNSLOTH_GRPO_ROUTING_REPLAY_R2=1, no vLLM needed): after each rollout (a
+vLLM `generate` call, or a forward with a KV cache, i.e. HF generation), the first trainer forward of
+a row records the experts it was routed to. That forward is the one pi_old comes from (TRL's
+no-grad old logprob forward, or the first policy forward when pi_old is taken from it), so the later
+forwards of that row (num_iterations > 1, later minibatches) replay them. Rows R3 has rollout routes
+for keep those.
 """
 
 __all__ = [
@@ -313,6 +315,9 @@ class _ReplayState:
         self.r2_unpadded = OrderedDict()
         self.r2_capture = None
         self.r2_meta = None
+        # Rollouts seen: R2 records nothing before the first, and each one starts a fresh table.
+        self.r2_rollout = 0
+        self.r2_generating = False
         self.num_layers = None
         self.moe_layers = ()
 
@@ -574,6 +579,7 @@ def wrap_vllm_generate(llm):
 
     @functools.wraps(generate)
     def generate_with_routing_record(*args, **kwargs):
+        _r2_new_rollout()
         outputs = generate(*args, **kwargs)
         try:
             outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
@@ -615,6 +621,13 @@ def _fit_layers(rows, width, fill):
     return None
 
 
+def _r2_new_rollout():
+    if _STATE.r2_on:
+        _STATE.r2_exact.clear()
+        _STATE.r2_unpadded.clear()
+        _STATE.r2_rollout += 1
+
+
 def _r2_lookup(key, exact):
     if not _STATE.r2_on:
         return None
@@ -622,10 +635,10 @@ def _r2_lookup(key, exact):
     return None if rows is None else torch.from_numpy(rows)
 
 
-def _build_replay(input_ids, position_ids, attention_mask = None):
+def _build_replay(input_ids, position_ids, attention_mask = None, use_r2 = False, r2_new = None):
+    """Replay rows for this forward. r2_new: a list that receives the (row, start, end) segments
+    neither R3 nor R2 has routes for, for R2 to record."""
     _STATE.current_weights = None
-    # R2 replays only into forwards with grad: a forward without grad records the policy's routes.
-    use_r2 = _STATE.r2_on and torch.is_grad_enabled() and bool(_STATE.r2_exact or _STATE.r2_unpadded)
     if not _STATE.generations and not use_r2:
         return None
     pad = _STATE.pad_token_id
@@ -654,6 +667,8 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
                     # An attended pad id is a real token (pad == eos): dropping it would match
                     # another history, so a miss keeps the natural routing.
                     unmatched += len(cols)
+                    if r2_new is not None:
+                        r2_new.append((row, start, end))
                     continue
         elif pad is not None and pad in tokens:
             # Packed segments hold only attended tokens: try the whole history first.
@@ -670,6 +685,8 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
             if routed is None and use_r2:
                 routed = _r2_lookup(_make_key(tokens, pad), exact = False)
                 from_r2 = routed is not None
+        if routed is None and r2_new is not None:
+            r2_new.append((row, start, end))
         if routed is None or routed.shape[0] != len(cols):
             unmatched += len(cols)
             continue
@@ -706,7 +723,7 @@ def _r2_store_forward():
     _STATE.r2_capture = _STATE.r2_meta = None
     if not capture or meta is None or _STATE.num_layers is None:
         return
-    ids, position_ids, attention_mask = meta
+    ids, position_ids, attention_mask, segments = meta
     rows, T = ids.shape
     k = next(iter(capture.values())).shape[-1]
     full = torch.full((rows * T, _STATE.num_layers, k), -1, dtype = torch.int16)
@@ -720,7 +737,7 @@ def _r2_store_forward():
     if torch.is_tensor(attention_mask) and tuple(attention_mask.shape) == (rows, T):
         mask_list = attention_mask.detach().to("cpu").bool().tolist()
     stored = 0
-    for row, start, end in _segments(ids, position_ids):
+    for row, start, end in segments:
         if mask_list is not None:
             cols = [start + i for i in range(end - start) if mask_list[row][start + i]]
         else:
@@ -729,13 +746,11 @@ def _r2_store_forward():
             continue
         tokens = [ids_list[row][c] for c in cols]
         exact = tuple(tokens)
-        _STATE.r2_exact.pop(exact, None)
-        _STATE.r2_exact[exact] = full[[c + row * T for c in cols]]
+        # The first forward of a row after the rollout is pi_old's: later ones never overwrite it.
+        _STATE.r2_exact.setdefault(exact, full[[c + row * T for c in cols]])
         if pad is not None:
             kept = [c for c, t in zip(cols, tokens) if t != pad]
-            key = _make_key(tokens, pad)
-            _STATE.r2_unpadded.pop(key, None)
-            _STATE.r2_unpadded[key] = full[[c + row * T for c in kept]]
+            _STATE.r2_unpadded.setdefault(_make_key(tokens, pad), full[[c + row * T for c in kept]])
         stored += 1
     for table in (_STATE.r2_exact, _STATE.r2_unpadded):
         while len(table) > _MAX_R2_ROWS:
@@ -782,22 +797,27 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = (), moe_layers = 
                     "match their forward. Run backward more often (fewer chunks per backward)."
                 )
     _STATE.r2_capture = _STATE.r2_meta = None
+    use_r2 = False
+    if _STATE.r2_on:
+        # Generation hands the decoder a KV cache; scoring forwards build none before the call.
+        generating = kwargs.get("past_key_values", None) is not None
+        if generating and not _STATE.r2_generating:
+            _r2_new_rollout()
+        _STATE.r2_generating = generating
+        use_r2 = not generating and _STATE.r2_rollout > 0
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
         _STATE.current_weights = None
         return None
-    if _STATE.r2_on and not torch.is_grad_enabled():
-        # A forward without grad (pi_old, or a reference without its own adapter) scores with the
-        # policy as it is now: R2 records the routes it uses for the forwards with grad after it.
-        _STATE.r2_capture = {}
-        _STATE.r2_meta = (
-            input_ids.detach().to("cpu"), kwargs.get("position_ids", None), kwargs.get("attention_mask", None),
-        )
+    r2_new = [] if use_r2 else None
+    position_ids, attention_mask = kwargs.get("position_ids", None), kwargs.get("attention_mask", None)
     # Left set after the forward on purpose: the gradient checkpointing recompute in
     # backward must see the same routing as the forward it replays.
-    _STATE.current = _build_replay(
-        input_ids, kwargs.get("position_ids", None), kwargs.get("attention_mask", None),
-    )
+    _STATE.current = _build_replay(input_ids, position_ids, attention_mask, use_r2 = use_r2, r2_new = r2_new)
+    if r2_new:
+        # R2: rows seen for the first time since the rollout record the routes this forward uses.
+        _STATE.r2_capture = {}
+        _STATE.r2_meta = (input_ids.detach().to("cpu"), position_ids, attention_mask, r2_new)
     return None
 
 
