@@ -430,6 +430,42 @@ def test_abort_restores_decoder_gradients_written_by_the_loss_part():
     assert _grads(model) == {}
 
 
+def test_abort_on_a_live_kv_cache():
+    """use_cache without checkpointing hands the layers a cache the recompute would update twice."""
+    model = _model()
+    model.get_base_model().gradient_checkpointing_disable()
+    model.config.use_cache = True
+    batches, items = _batches(2)
+
+    def fn(b):
+        out = model(**b, num_items_in_batch = items, use_cache = True)
+        out.loss.backward()
+        return out.loss.detach()
+
+    why = _abort_case(model, batches, items, [lambda b = b: fn(b) for b in batches])
+    assert "live KV cache" in why
+    assert _grads(model) == {}
+
+
+def test_out_of_memory_in_the_decoder_backward_is_an_abort():
+    """The recompute runs out of memory after the loss parts wrote the head gradient: every gradient put back."""
+    model = _model(train_head = True)
+    batches, items = _batches(2)
+    layer = _layers(model)[1]
+
+    def oom(mod, args, out):
+        if torch.is_grad_enabled():
+            raise torch.OutOfMemoryError("simulated")
+
+    h = layer.register_forward_hook(oom)
+    try:
+        why = _abort_case(model, batches, items)
+    finally:
+        h.remove()
+    assert "out of memory" in why
+    assert _grads(model) == {}
+
+
 def test_distributed_is_refused(monkeypatch):
     model = _model()
     batches, items = _batches(2)

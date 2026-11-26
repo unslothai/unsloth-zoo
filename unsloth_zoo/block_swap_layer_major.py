@@ -326,7 +326,12 @@ class _Window:
             # directly (a loss on the embedding output) would consume it first.
             h.register_hook(functools.partial(self._input_grad, m))
         x = h.detach()
-        args2, kwargs2 = _with_hidden(args, _uncached(layer, dict(kwargs)), where, x)
+        kwargs = _uncached(layer, dict(kwargs))
+        if not getattr(layer, "_can_checkpoint_with_cache", False) and any(
+                kwargs.get(k) is not None for k in _CACHE_KWARGS):
+            # A live KV cache (use_cache without checkpointing): the recompute would update it a second time.
+            self._abort("a decoder layer call with a live KV cache")
+        args2, kwargs2 = _with_hidden(args, kwargs, where, x)
         self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(self.device))
         if m == 0 and self.swapper is not None:
             self.swapper.hold(l)
@@ -568,7 +573,16 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
         if w.error is not None and not isinstance(w.error, torch.OutOfMemoryError):
             raise w.error
         return None, w.abort_reason
-    w.backward(orig_calls)
+    try:
+        w.backward(orig_calls)
+    except torch.OutOfMemoryError:
+        # The recompute builds a graph the no-grad forward did not: it can run out where the forward fit.
+        w.saved = w.outs = w.h0 = None
+        for p, g in outside:
+            p.grad = g
+        _STATS["aborts"] += 1
+        _STATS["last_abort"] = "out of memory in the decoder backward"
+        return None, _STATS["last_abort"]
     _STATS["windows"] += 1
     _STATS["micro_batches"] += n
     return w.results, None
