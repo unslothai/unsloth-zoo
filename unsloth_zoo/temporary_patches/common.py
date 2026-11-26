@@ -132,7 +132,9 @@ def apply_inductor_correctness_workarounds():
     if _mix_order_reduction_is_buggy():
         try:
             import torch._inductor.config as inductor_config
-            inductor_config.triton.mix_order_reduction = False
+            from unsloth_zoo.torch_config import set_torch_config
+            # torch >= 2.12 config is per thread; checkpoint recompute compiles on autograd's thread.
+            set_torch_config(inductor_config, "triton.mix_order_reduction", False)
             active.append("mix_order_reduction")
         except Exception as error:
             if UNSLOTH_ENABLE_LOGGING:
@@ -197,7 +199,9 @@ def determine_compile_threads():
     # unconditionally at import (vllm/env_override.py), which would drop every vLLM user to
     # a single compile worker.
     if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1": return 1
-    cpu_count = os.cpu_count()
+    # Affinity, as Inductor counts: a taskset / cpuset limited process must not get the host total.
+    try:    cpu_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError): cpu_count = os.cpu_count() or 1
     return min(32, max(4, cpu_count))
 pass
 

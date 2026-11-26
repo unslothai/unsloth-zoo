@@ -460,7 +460,7 @@ def _index_fwd(q, kv, idx, sink, scale, has_sink):
             out.stride(0), out.stride(1), out.stride(2),
             lse.stride(0), lse.stride(1),
             scale,
-        ), q.device, d, False, BLOCK_H = _BLOCK_H, HAS_SINK = has_sink, _dtype = q.dtype)
+        ), q.device, d, False, BLOCK_H = _BLOCK_H, HAS_SINK = has_sink, _dtype = q.dtype, enable_fp_fusion = True)
     SPARSE_MQA_STATS["fwd"] += 1
     return out, lse
 
@@ -498,7 +498,7 @@ def _index_bwd(q, kv, idx, grad_out, lse, delta, scale):
                 lse.stride(0), lse.stride(1),
                 dkv.stride(0), dkv.stride(1),
                 scale,
-            ), q.device, d, True, BLOCK_H = _BLOCK_H, _dtype = q.dtype)
+            ), q.device, d, True, BLOCK_H = _BLOCK_H, _dtype = q.dtype, enable_fp_fusion = True)
     SPARSE_MQA_STATS["bwd"] += 1
     return dq, dkv.to(kv.dtype).contiguous()
 
@@ -600,7 +600,7 @@ def _wfwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
         q.stride(0), q.stride(1), q.stride(2), wkv.stride(0), wkv.stride(1),
         lse.stride(0), lse.stride(1),
         scale,
-    ), q.device, d, q.dtype, HAS_PRIOR = has_prior, HAS_SINK = has_sink)
+    ), q.device, d, q.dtype, HAS_PRIOR = has_prior, HAS_SINK = has_sink, enable_fp_fusion = True)
     SPARSE_MQA_STATS["window_fwd"] += 1
     return out, lse
 
@@ -630,9 +630,10 @@ def _wbwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
     args = (s, h, int(window), q.stride(0), q.stride(1), q.stride(2), wkv.stride(0), wkv.stride(1),
             lse.stride(0), lse.stride(1), scale)
     _launch_window(_window_bwd_dq, "dq", lambda bt, bn: (triton.cdiv(s, bt), triton.cdiv(h, _BLOCK_H), b),
-                   (q, wkv, grad_out, lse, delta, dq_c, dq) + args, q.device, d, q.dtype, HAS_DQ_IN = has_prior)
+                   (q, wkv, grad_out, lse, delta, dq_c, dq) + args, q.device, d, q.dtype, HAS_DQ_IN = has_prior,
+                   enable_fp_fusion = True)
     _launch_window(_window_bwd_dkv, "dkv", lambda bt, bn: (triton.cdiv(s, bn), b),
-                   (q, wkv, grad_out, lse, delta, dwkv) + args, q.device, d, q.dtype)
+                   (q, wkv, grad_out, lse, delta, dwkv) + args, q.device, d, q.dtype, enable_fp_fusion = True)
     SPARSE_MQA_STATS["window_bwd"] += 1
     return dq, dwkv, dckv.contiguous()
 

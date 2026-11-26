@@ -445,6 +445,8 @@ def matmul_ogs_available(device = None) -> bool:
         try:
             with torch.no_grad(), torch.autocast(device.type, enabled = False), on_cuda:
                 ok = bool(_self_check(device))
+        except torch.OutOfMemoryError:
+            return False  # transient: not served this call, probed again on the next one
         except Exception:
             ok = False
         _DEVICE_OK[key] = ok
