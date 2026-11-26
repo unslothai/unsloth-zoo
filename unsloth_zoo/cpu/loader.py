@@ -21,6 +21,7 @@ import gc
 import functools
 import os
 import re
+import sys
 import types
 import warnings
 import weakref
@@ -1234,16 +1235,43 @@ def _set_inference_mode(model, inference):
             break
 
 
-def _frozen_bf16_for(model, training):
-    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
-    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+def _frozen_bf16_mode(model):
     inner, mode = model, None
     for _ in range(4):
         mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
         inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
         if inner is None:
             break
-    if mode == "training" and isinstance(model, torch.nn.Module):
+    return mode
+
+
+# A rollout's fp32 copy of the frozen weights may use at most this share of the RAM still available.
+_FP32_ROLLOUT_RAM_SHARE = 0.5
+
+
+def _slow_bf16_upcast():
+    """Apple Silicon: upcasting the bf16-stored projections on every decoded token made a Qwen3-0.6B GRPO step 1.6x
+    slower (M1). On x86 without native bf16 (AVX2) it cost about 2%, not worth the fp32 copy's RAM."""
+    import platform
+    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
+
+
+def _fp32_rollout_fits(model):
+    """True on Apple Silicon when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits in RAM."""
+    if not _slow_bf16_upcast():
+        return False
+    extra = 2 * sum(m.weight.numel() for m in model.modules()
+                    if isinstance(m, Bf16StoredLinear) and m.weight.dtype == torch.bfloat16 and not m.weight.requires_grad)
+    if extra == 0:
+        return False
+    available = available_ram()
+    return available is not None and extra <= _FP32_ROLLOUT_RAM_SHARE * available
+
+
+def _frozen_bf16_for(model, training):
+    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
+    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    if _frozen_bf16_mode(model) == "training" and isinstance(model, torch.nn.Module):
         set_bf16_stored_dtype(model, torch.bfloat16 if training else torch.float32)
 
 
@@ -1256,16 +1284,29 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        restore = False
         if isinstance(self, torch.nn.Module) and not self.training:
             # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
             _frozen_bf16_for(self, training = False)
-        set_stance = getattr(torch.compiler, "set_stance", None)
-        modules = self.modules() if isinstance(self, torch.nn.Module) else ()
-        if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
-            # Layers compiled for training would recompile per layer against the KV cache, up to the limit.
-            with set_stance("force_eager"):
-                return generate(self, *args, **kwargs)
-        return generate(self, *args, **kwargs)
+        elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self):
+            # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
+            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon, then store bf16.
+            # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
+            # tensors, and the next training forward could not save them for backward.
+            with torch.inference_mode(False):
+                restore = set_bf16_stored_dtype(self, torch.float32) > 0
+        try:
+            set_stance = getattr(torch.compiler, "set_stance", None)
+            modules = self.modules() if isinstance(self, torch.nn.Module) else ()
+            if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
+                # Layers compiled for training would recompile per layer against the KV cache, up to the limit.
+                with set_stance("force_eager"):
+                    return generate(self, *args, **kwargs)
+            return generate(self, *args, **kwargs)
+        finally:
+            if restore:
+                with torch.inference_mode(False):
+                    set_bf16_stored_dtype(self, torch.bfloat16)
     wrapper._unsloth_cpu = True
     return wrapper
 
