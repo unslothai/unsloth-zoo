@@ -19,6 +19,7 @@ __all__ = ["FastCPUModel"]
 import contextlib
 import gc
 import functools
+import itertools
 import os
 import re
 import sys
@@ -982,16 +983,19 @@ class FastCPUModel:
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
         )
+        frozen_fp32 = False
         if frozen_bf16 and frozen_env not in ("1", "true", "yes", "on", "training"):
             fp32_fit = _fp32_weights_fit(model_name, token, revision, trust_remote_code,
                                          **probe_kwargs, **({"config": kwargs["config"]} if "config" in kwargs else {}))
             if fp32_fit is not None:
-                frozen_bf16 = False
+                # Still loaded in bf16, then upcast one tensor at a time: a float32 load of a bf16 checkpoint peaked at
+                # 4.7 GB RSS on Qwen3-0.6B, against 1.9 GB for the bf16 load.
+                frozen_bf16, frozen_fp32 = False, True
                 _print(f"frozen weights kept in float32: they fit in RAM ({fp32_fit[0] / 1024 ** 3:.2f} GB of "
                        f"{fp32_fit[1] / 1024 ** 3:.0f} GB free), and bfloat16 storage would upcast them on every "
                        "call on this CPU. UNSLOTH_CPU_FROZEN_BF16=training keeps bfloat16 storage.")
         load_kwargs = dict(
-            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
+            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 or frozen_fp32 else dtype)},
             device_map = "cpu",
             token = token,
             revision = revision,
@@ -1052,6 +1056,10 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
+        if frozen_fp32:
+            for tensor in itertools.chain(model.parameters(), model.buffers()):
+                if tensor.dtype == torch.bfloat16:
+                    tensor.data = tensor.data.float()
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
             # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
