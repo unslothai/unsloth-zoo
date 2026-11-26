@@ -85,6 +85,14 @@ def test_quarter_of_free_ram_is_the_bound():
         loader.available_ram = original
 
 
+def test_several_training_processes_keep_bf16_storage(monkeypatch):
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(loader, "available_ram", lambda: 1 << 50)
+    assert loader._fp32_weights_fit("x", None, None, False, config = _config()) is not None
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    assert loader._fp32_weights_fit("x", None, None, False, config = _config()) is None
+
+
 def test_float32_and_bf16_stored_give_the_same_loss_and_lora_grads(monkeypatch, checkpoint):
     """The two storages hold the same bf16 values; from the same adapter weights the float32 path trains identically
     (bit for bit). Only the fresh adapter's init differs: PEFT draws it in the base weight's dtype, so bf16 storage

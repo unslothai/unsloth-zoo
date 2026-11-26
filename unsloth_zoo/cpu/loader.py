@@ -222,7 +222,10 @@ def _fp32_weights_fit(model_name, token, revision, trust_remote_code, **kwargs):
     """(bytes, free RAM) when the whole model in float32 takes at most a quarter of the free RAM, else None (also when
     either is unknown). Then the frozen projections are kept in float32 instead of bfloat16: a bfloat16-stored weight
     is upcast on every forward, backward and decoded token, which was 30-34% of a Qwen3-0.6B GRPO step (aten::copy_)
-    on 2-core AVX-512 runners without native bf16; float32 storage costs 2 more bytes per frozen weight."""
+    on 2-core AVX-512 runners without native bf16; float32 storage costs 2 more bytes per frozen weight. None under
+    several training processes: each would read the same free RAM for its own copy."""
+    if _multi_process():
+        return None
     try:
         from transformers import AutoConfig
         config = kwargs.get("config")
