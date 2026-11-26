@@ -422,10 +422,13 @@ def _latch_grouped_mm_refused(device, reason):
         _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = False
         _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = False
     _GROUPED_MM_RUNTIME_REFUSALS[0] += 1
+    # grouped_mm stays selected: later forwards run on Triton or the per-expert loop instead of raising.
+    _GROUPED_MM_RUNTIME_LATCHED[0] = True
     _use_grouped_mm_triton_standin(device, reason)
 
 
 _GROUPED_MM_RUNTIME_REFUSALS = [0]
+_GROUPED_MM_RUNTIME_LATCHED = [False]
 
 
 def _grouped_mm_native(inputs, weight, offsets):
@@ -2220,8 +2223,10 @@ def _grouped_mm_trains_on(device):
             # CPU generator: the global RNG stays untouched.
             gen = torch.Generator(device = "cpu").manual_seed(0)
             E, M, K, N = len(counts), sum(counts), 32, 48
-            x, w, dy = (torch.randint(-2, 3, shape, generator = gen).double() for shape in ((M, K), (E, K, N), (M, N)))
-            ends = torch.tensor(counts).cumsum(0).tolist()
+            # device = "cpu": a torch.set_default_device("cuda") app must not move the reference off the generator.
+            x, w, dy = (torch.randint(-2, 3, shape, generator = gen, device = "cpu").double()
+                        for shape in ((M, K), (E, K, N), (M, N)))
+            ends = torch.tensor(counts, device = "cpu").cumsum(0).tolist()
             x_d = x.to(device = device, dtype = dtype).requires_grad_()
             w_d = w.to(device = device, dtype = dtype).requires_grad_()
             offs = torch.tensor(ends, device = device, dtype = torch.int32)
@@ -5830,7 +5835,7 @@ def forward_native_grouped_mm(
 
     # Runtime safety check (defense in depth); packed NVFP4 / MXFP8 stacks fall back to a per-group loop instead.
     if not _check_torch_grouped_mm_supported() and not _GROUPED_MM_TRITON_STANDIN \
-            and not _moe_uses_new_packed_expert_weights(self):
+            and not _GROUPED_MM_RUNTIME_LATCHED[0] and not _moe_uses_new_packed_expert_weights(self):
         # Compute Capability is CUDA-only; on XPU it would mask this message.
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())

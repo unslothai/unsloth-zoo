@@ -58,6 +58,7 @@ def fresh(monkeypatch):
     monkeypatch.setattr(mu, "_GROUPED_MM_FALLBACK_LOGGED", set(), raising = False)
     monkeypatch.setattr(mu, "_GROUPED_MM_RUNTIME_REFUSALS", [0], raising = False)
     monkeypatch.setattr(mu, "_GROUPED_MM_LAST_REFUSAL", [None], raising = False)
+    monkeypatch.setattr(mu, "_GROUPED_MM_RUNTIME_LATCHED", [False], raising = False)
     monkeypatch.setattr(mu, "_grouped_mm_probe_device", lambda: CPU)
     monkeypatch.setattr(mu, "_check_grouped_gemm_available", lambda: False)
     for var in ("UNSLOTH_MOE_BACKEND", "UNSLOTH_MOE_GROUPED_TRITON", "UNSLOTH_DISABLE_MOE_TRITON",
@@ -307,3 +308,28 @@ def test_the_fallback_line_prints_once_across_the_compiled_cache_copy(fresh, cap
     mu._log_grouped_mm_fallback("bfloat16, 4 experts: refused", "MoE backend 'native_torch'")
     copy._log_grouped_mm_fallback("bfloat16, 4 experts: refused", "MoE backend 'native_torch'")
     assert capsys.readouterr().out.count("cannot run MoE training") == 1
+
+
+def test_a_runtime_refusal_without_triton_keeps_training_on_the_loop(fresh):
+    # Triton cannot stand in (UNSLOTH_MOE_GROUPED_TRITON=0 here): grouped_mm stays selected and every later forward
+    # takes the per-expert loop instead of raising at forward_native_grouped_mm's safety check.
+    fresh.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
+    calls = []
+    def refuse(x, w, offs = None):
+        calls.append(x.dtype)
+        raise RuntimeError(REFUSAL)
+    fresh.setattr(mu, "_TORCH_GROUPED_MM_SUPPORTED", True)
+    fresh.setattr(mu, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", True)
+    fresh.setattr(mu, "_SELECTED_MOE_BACKEND", "grouped_mm")
+    fresh.setattr(torch, "_grouped_mm", refuse, raising = False)
+    losses = [_train_step(fresh, mu.forward_native_grouped_mm)[0] for _ in range(2)]
+    assert mu._GROUPED_MM_RUNTIME_REFUSALS == [1] and len(calls) == 1
+    assert mu._GROUPED_MM_TRITON_STANDIN is False
+    native_loss, _ = _train_step(fresh, mu.forward_native_moe_loop)
+    assert losses[0] == losses[1] == pytest.approx(native_loss, rel = 2e-2)
+
+
+def test_the_probe_ignores_the_default_device(fresh):
+    fresh.setattr(torch, "_grouped_mm", lambda x, w, offs = None: _reference_grouped_mm(x, w, offs), raising = False)
+    with torch.device("meta"):
+        assert mu._grouped_mm_trains_on(CPU) is None
