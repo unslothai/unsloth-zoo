@@ -4556,6 +4556,14 @@ def grpo_accumulated_loss(
                 chunked_hidden_states_selective_log_softmax, **_support_kwargs,
             )
             chunked_selective_log_softmax = partial(chunked_selective_log_softmax, **_support_kwargs)
+        # Unsloth's DPO / GRPO context parallel: every peer holds the same gathered hidden states, so each scores its
+        # share of the rows and gathers the rest (identity outside a CP scope or without unsloth.context_parallel).
+        import sys as _sys
+        _cp_local_rows = getattr(_sys.modules.get("unsloth.context_parallel", None), "cp_local_row_scorer", None)
+        if _cp_local_rows is not None:
+            chunked_hidden_states_selective_log_softmax = _cp_local_rows(chunked_hidden_states_selective_log_softmax)
+            if _need_entropy:
+                _entropy_log_softmax = _cp_local_rows(_entropy_log_softmax)
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
         dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
