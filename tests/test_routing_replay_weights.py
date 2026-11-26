@@ -16,6 +16,7 @@
 
 """Routing replay of the rollout's fp32 routing weights (UNSLOTH_GRPO_ROUTING_REPLAY_WEIGHTS). CPU only."""
 
+import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -433,6 +434,54 @@ def test_vllm_patch_refuses_an_unknown_capture_layout(monkeypatch):
     del capturer_module._get_routed_experts_shape  # vLLM < 0.28
     assert not rr._patch_vllm_routed_weights()
     assert rr._VLLM_WEIGHTS_PACKED is False
+
+
+def _reworded_select(top_k = 2):
+    # The same contract as vLLM's _select_experts, worded so no "self.capture_fn(topk_ids)" text appears.
+    def _select_experts(self, hidden_states, router_logits, topk_indices_dtype = None, **kwargs):
+        weights, ids = router_logits.softmax(-1).topk(top_k, -1)
+        weights = weights / weights.sum(-1, keepdim = True)
+        capture = self.capture_fn
+        if capture is not None:
+            capture(
+                ids,
+            )
+        return weights, ids + 100
+
+    return _select_experts
+
+
+def test_vllm_patch_survives_a_reworded_select(monkeypatch):
+    monkeypatch.setattr(rr, "_VLLM_WEIGHTS_PACKED", False)
+    monkeypatch.setattr(rr, "_PACKED_TOP_K", None)
+    capturer_module, BaseRouter = _fake_vllm(monkeypatch)
+    monkeypatch.setattr(BaseRouter, "_select_experts", _reworded_select())
+    original_select = BaseRouter._select_experts
+    assert "self.capture_fn(topk_ids)" not in inspect.getsource(original_select)
+    assert rr._patch_vllm_routed_weights()
+    capturer = capturer_module.RoutedExpertsCapturer(max_tokens = 5)
+    router = BaseRouter()
+    router.capture_fn = lambda ids: capturer.capture(0, ids)
+    logits = torch.randn(4, 8)
+    weights, ids = router._select_experts(None, logits)
+    want_weights, want_ids = original_select(BaseRouter(), None, logits)
+    assert torch.equal(weights, want_weights) and torch.equal(ids, want_ids)
+    got_ids, got_weights = rr._unpack_routed_weights(capturer.device_buffer[:4, 0], 2)
+    assert torch.equal(got_ids, want_ids - 100) and torch.equal(got_weights, want_weights)
+
+
+def test_vllm_patch_refuses_a_select_that_does_not_capture(monkeypatch):
+    # Capture moved out of _select_experts: swapping capture_fn there would capture twice, so stay ids only.
+    monkeypatch.setattr(rr, "_VLLM_WEIGHTS_PACKED", False)
+    capturer_module, BaseRouter = _fake_vllm(monkeypatch)
+
+    def _select_experts(self, hidden_states, router_logits, topk_indices_dtype = None, **kwargs):
+        return router_logits.softmax(-1).topk(2, -1)
+
+    monkeypatch.setattr(BaseRouter, "_select_experts", _select_experts)
+    assert not rr._patch_vllm_routed_weights()
+    assert rr._VLLM_WEIGHTS_PACKED is False
+    assert BaseRouter._select_experts is _select_experts
 
 
 def test_engine_args_warn_when_weights_cannot_be_returned(replay, monkeypatch):

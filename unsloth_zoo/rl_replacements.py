@@ -491,6 +491,10 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                 try:
                     return kernel(*args)
                 except Exception as error:
+                    # Checkpoint control flow (the non-reentrant early stop, a forward / recompute mismatch) is not
+                    # a compile failure: re-raise it, never latch the compiled path off for the rest of the process.
+                    if type(error).__name__ in ("_StopRecomputationError", "CheckpointError"):
+                        raise
                     # An OOM (bare or while compiling) is transient: eager for this call only, after the except.
                     if not (
                         isinstance(error, torch.OutOfMemoryError)
@@ -2634,7 +2638,9 @@ pass
 
 
 def _grpo_truncated_support_auto_platform():
-    return getattr(torch.version, "hip", None) is None and torch.cuda.is_available()
+    # is_rocm_torch: ROCm SDK wheels leave torch.version.hip unset.
+    from unsloth_zoo.rocm_build import is_rocm_torch
+    return not is_rocm_torch(torch) and torch.cuda.is_available()
 pass
 
 
