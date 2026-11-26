@@ -23,19 +23,22 @@ all micro-batches of one optimizer step through a layer while it is on the card 
 * forward: each micro-batch's own training step runs in a worker thread; the threads take turns (one runs at a time,
   in a fixed order), so every micro-batch passes decoder layer l before any passes layer l + 1. A layer runs without
   gradients there, and its input is kept, as gradient checkpointing keeps it.
-* the loss part (final norm, head, loss, the trainer's own scaling and backward) runs per micro-batch, in order, on
-  a leaf that stands for the last layer's output.
+* every layer output the model sees is a leaf; the loss part (final norm, head, loss, the trainer's own scaling and
+  backward) runs per micro-batch, in order, and leaves its gradient on the last one (a loss on an intermediate
+  hidden state on that one).
 * backward: the layers are recomputed and backpropagated last to first, every micro-batch per layer, from the kept
   inputs and the gradients the loss part left on the leaves.
 
 Each micro-batch keeps its own shapes, kernels and loss normalisation, and every weight gradient accumulates
 micro-batch 0 first, as plain accumulation does, so losses and gradients are bitwise those of standard gradient
-accumulation with per-layer checkpointing. The price is memory: every micro-batch's layer inputs are held at once
-(gradient checkpointing holds one micro-batch's), see `boundary_bytes`.
+accumulation with per-layer checkpointing. Dropout masks are replayed in the recompute (drawn in layer-major order,
+so with dropout they differ from standard accumulation's). The price is memory: every micro-batch's layer inputs are
+held at once (gradient checkpointing holds one micro-batch's), see `boundary_bytes`.
 
-Anything outside the protocol (a layer called out of order or twice, hidden states changed between layers, a layer
-input other than the hidden states that needs gradients, a checkpoint around the layer call) aborts the window before
-any decoder-layer gradient exists; gradients the loss part already wrote are put back, and the caller runs the step
+Anything outside the protocol (a layer called out of order or twice, hidden states changed or written in place between
+layers, a layer input other than the hidden states that needs gradients, a checkpoint around the layer call, forward
+hooks or wrappers added to a layer during the window, saved-tensor hooks) aborts the window before any decoder-layer
+gradient exists; gradients the loss part already wrote are put back, and the caller runs the step
 the standard way. UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
 """
 
@@ -136,6 +139,23 @@ def _autocast(state):
     return stack
 
 
+def _rng_state(device):
+    """CPU and device generator states before a layer call: its recompute must draw the same dropout masks."""
+    cuda = device is not None and device.type == "cuda"
+    return torch.get_rng_state(), (torch.cuda.get_rng_state(device) if cuda else None), device
+
+
+@contextmanager
+def _replay_rng(state):
+    cpu, dev_state, device = state
+    devices = [device] if dev_state is not None else []
+    with torch.random.fork_rng(devices = devices, enabled = True):
+        torch.set_rng_state(cpu)
+        if dev_state is not None:
+            torch.cuda.set_rng_state(dev_state, device)
+        yield
+
+
 @contextmanager
 def _checkpointing_off(layer):
     """The window is the checkpoint: the layer's own checkpoint wrapper must pass the call straight through."""
@@ -223,14 +243,26 @@ class _Window:
         self.alive = [True] * n
         self.next_layer = [0] * n
         self.last_out = [None] * n
+        self.last_version = [None] * n
         self.h0 = [None] * n
         self.saved = [[None] * n for _ in range(self.L)]
-        self.leaves = [None] * n
+        # Every layer's output as the model sees it: a leaf, so a loss on intermediate hidden states (and the
+        # loss part on the last one) leaves its gradient there for the backward.
+        self.outs = [[None] * n for _ in range(self.L)]
         self.results = [None] * n
         self.error = None
         self.abort_reason = None
         self.held = set()
-        self.calls = {}
+        self.signatures = [self._call_signature(l) for l in range(self.L)]
+
+    def _call_signature(self, l):
+        """Forward hooks and instance-level forwards in layer l (and the global hooks): what a per-call output
+        recorder changes."""
+        from torch.nn.modules import module as nn_module
+        sig = [len(getattr(nn_module, "_global_forward_hooks", ())), len(getattr(nn_module, "_global_forward_pre_hooks", ()))]
+        for mod in self.layers[l].modules():
+            sig += (len(mod._forward_hooks), len(mod._forward_pre_hooks), id(mod.__dict__.get("forward")))
+        return tuple(sig)
 
     # ---- turn taking: exactly one worker runs at a time, in micro-batch order ----
     def _wait_turn(self, m):
@@ -273,7 +305,7 @@ class _Window:
         h, where = _hidden(args, kwargs)
         if h is None:
             self._abort("a decoder layer call without a hidden_states tensor")
-        if l > 0 and h is not self.last_out[m]:
+        if l > 0 and (h is not self.last_out[m] or h._version != self.last_version[m]):
             self._abort("the hidden states changed between two decoder layers")
         if where == 0:
             others = (args[1:], kwargs)
@@ -281,11 +313,15 @@ class _Window:
             others = (args, {k: v for k, v in kwargs.items() if k != where})
         if _needs_grad(others):
             self._abort("a decoder layer input other than the hidden states needs gradients")
+        if self._call_signature(l) != self.signatures[l]:
+            # Per-call output recorders (transformers' output_hidden_states / output_attentions capture wrappers,
+            # hooks) would collect every interleaved micro-batch's outputs.
+            self._abort("a decoder layer's forward or hooks changed during the window (output recorders)")
         if l == 0 and h.requires_grad:
             self.h0[m] = h
         x = h.detach()
         args2, kwargs2 = _with_hidden(args, _uncached(layer, dict(kwargs)), where, x)
-        self.saved[l][m] = (args2, kwargs2, where, _autocast_state())
+        self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(self.device))
         if m == 0 and self.swapper is not None:
             self.swapper.hold(l)
             self.held.add(l)
@@ -299,13 +335,12 @@ class _Window:
             self.swapper.unhold(l)
         _STATS["layer_calls"] += 1
         self.next_layer[m] = l + 1
-        if l == self.L - 1:
-            leaf = out_h.detach().requires_grad_(True)
-            self.leaves[m] = leaf
-            out = rebuild(leaf)
-            self.last_out[m] = leaf
-        else:
-            self.last_out[m] = out_h
+        # The output tensor itself becomes the leaf (it has no graph): anything that kept a reference to it inside
+        # the call (transformers' hidden-state capture) then holds the leaf, and a loss on it reaches the layers.
+        leaf = out_h.requires_grad_(True) if out_h is not x and out_h.is_leaf else out_h.detach().requires_grad_(True)
+        self.outs[l][m] = leaf
+        out = rebuild(leaf)
+        self.last_out[m], self.last_version[m] = leaf, leaf._version
         # Let the other micro-batches through this layer; after the last layer the loss parts run in order.
         self._pass_turn(m)
         self._wait_turn(m)
@@ -320,12 +355,24 @@ class _Window:
                     stack.enter_context(torch.cuda.device(self.device))
                     if self.stream is not None:
                         stack.enter_context(torch.cuda.stream(self.stream))
+                # Grad mode and autocast are thread-local: the caller's apply to its micro-batches.
+                stack.enter_context(torch.set_grad_enabled(self.caller_grad))
+                stack.enter_context(_autocast(self.caller_autocast))
                 self.results[m] = fn()
             if self.next_layer[m] != self.L and self.abort_reason is None:
                 with self.cv:
                     self.abort_reason = (f"micro-batch {m} ran {self.next_layer[m]} of {self.L} decoder layers")
         except LayerMajorAbort:
             pass
+        except RuntimeError as e:
+            # The model writes in place into a layer output between layers (a leaf here): no window.
+            inplace = "leaf Variable that requires grad" in str(e)
+            with self.cv:
+                if self.error is None and not inplace:
+                    self.error = e
+                if self.abort_reason is None:
+                    self.abort_reason = ("the model writes in place into the hidden states between layers" if inplace
+                                         else f"micro-batch {m} raised {type(e).__name__}: {e}")
         except BaseException as e:   # surfaced by the caller once every worker is done
             with self.cv:
                 if self.error is None:
@@ -341,8 +388,7 @@ class _Window:
 
     # ---- backward, layer by layer, on the calling thread ----
     def backward(self, orig_calls):
-        g = [leaf.grad if leaf is not None else None for leaf in self.leaves]
-        self.leaves = [None] * self.n
+        g = [None] * self.n
         for l in range(self.L - 1, -1, -1):
             layer = self.layers[l]
             orig_call = orig_calls[type(layer)]
@@ -351,13 +397,18 @@ class _Window:
             try:
                 for m in range(self.n):
                     saved, self.saved[l][m] = self.saved[l][m], None
+                    leaf, self.outs[l][m] = self.outs[l][m], None
+                    # The loss part's gradient on the last output, or a loss on an intermediate one.
+                    extra = leaf.grad if leaf is not None else None
+                    if extra is not None:
+                        g[m] = extra if g[m] is None else g[m] + extra
+                    del leaf, extra
                     if saved is None or g[m] is None:
-                        g[m] = None
                         continue
-                    args2, kwargs2, where, ac = saved
+                    args2, kwargs2, where, ac, rng = saved
                     x = args2[0] if where == 0 else kwargs2[where]
                     x.requires_grad_(True)
-                    with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer):
+                    with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng):
                         out = orig_call(layer, *args2, **kwargs2)
                     out_h, _ = _split_output(out)
                     torch.autograd.backward(out_h, g[m])
@@ -455,11 +506,19 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
         for p in model.parameters():
             if p.requires_grad and id(p) not in layer_params:
                 outside.append((p, None if p.grad is None else p.grad.clone()))
+    try:
+        hooks = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    except (AttributeError, TypeError, RuntimeError):   # torch < 2.7 has no query
+        hooks = None
+    if hooks is not None:
+        # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
+        return None, "saved-tensor hooks are active (activation offloading)"
     device = stream = None
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         device = torch.device("cuda", torch.cuda.current_device())
         stream = torch.cuda.current_stream(device)
     w = _Window(layers, n, swapper, device, stream)
+    w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
     try:
         with _intercept(w, layers) as orig_calls:
             events = _WORKERS.run(w, micro_fns)
@@ -483,7 +542,7 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
     if w.abort_reason is not None:
         for p, g in outside:
             p.grad = g
-        w.saved = w.leaves = w.h0 = None
+        w.saved = w.outs = w.h0 = None
         _STATS["aborts"] += 1
         _STATS["last_abort"] = w.abort_reason
         if w.error is not None and not isinstance(w.error, torch.OutOfMemoryError):

@@ -319,6 +319,120 @@ def test_real_errors_are_raised_and_classes_restored():
     assert cls.__dict__.get("__call__") is before
 
 
+def test_dropout_masks_replayed_in_the_recompute():
+    """With one micro-batch the window draws dropout masks in the standard order, and the recompute replays them:
+    bitwise equal to standard checkpointed training with lora_dropout."""
+    for reentrant in (True, False):
+        model = _model(reentrant)
+        for mod in model.modules():
+            if isinstance(mod, torch.nn.Dropout):
+                mod.p = 0.5
+        batches, items = _batches(1)
+        torch.manual_seed(7)
+        base_losses, base_grads = _standard(model, batches, items)
+        torch.manual_seed(7)
+        losses, grads = _layer_major(model, batches, items)
+        assert torch.equal(base_losses[0], losses[0])
+        _assert_same(base_grads, grads)
+
+
+def test_loss_on_intermediate_hidden_states():
+    """A loss term on an intermediate layer's output, collected from the decoder loop as Unsloth's fast forward
+    collects hidden states, reaches the layers below it."""
+    model = _model()
+    batches, _ = _batches(3)
+
+    def step(b):
+        decoder = model.get_base_model().model
+        x = decoder.embed_tokens(b["input_ids"])
+        pe = decoder.rotary_emb(x, torch.arange(x.shape[1])[None])
+        mid = None
+        for k, layer in enumerate(_layers(model)):
+            x = layer(x, position_embeddings = pe)
+            x = x[0] if isinstance(x, tuple) else x
+            mid = x if k == 1 else mid
+        loss = x.float().pow(2).mean() + 1e-1 * mid.float().square().mean()
+        loss.backward()
+        return loss.detach()
+
+    model.zero_grad(set_to_none = True)
+    base = [step(b) for b in batches]
+    base_grads = _grads(model)
+    model.zero_grad(set_to_none = True)
+    losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
+    assert why is None
+    assert all(torch.equal(a, b) for a, b in zip(base, losses))
+    _assert_same(base_grads, _grads(model))
+
+
+def test_output_recorder_hooks_abort_or_match():
+    """transformers' output_hidden_states records layer outputs with per-call hooks (they would collect every
+    interleaved micro-batch): the window aborts. Versions that return hidden states from the loop match instead."""
+    model = _model()
+    batches, items = _batches(2)
+
+    def step(b):
+        out = model(**b, num_items_in_batch = items, output_hidden_states = True)
+        loss = out.loss + 1e-3 * out.hidden_states[2].float().square().mean()
+        loss.backward()
+        return loss.detach()
+
+    model.zero_grad(set_to_none = True)
+    base = [step(b) for b in batches]
+    base_grads = _grads(model)
+    model.zero_grad(set_to_none = True)
+    losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
+    if losses is None:
+        assert "output recorders" in why, why
+        assert _grads(model) == {}
+    else:
+        assert all(torch.equal(a, b) for a, b in zip(base, losses))
+        _assert_same(base_grads, _grads(model))
+
+
+def test_caller_autocast_reaches_the_micro_batches():
+    # Non-reentrant: older torch's reentrant checkpoint under CPU autocast leaves the LoRA weights without
+    # gradients even in standard accumulation.
+    model = _model(reentrant = False)
+    batches, items = _batches(2)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        base_losses, base_grads = _standard(model, batches, items)
+        losses, grads = _layer_major(model, batches, items)
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, grads)
+
+
+def test_abort_on_in_place_writes_between_layers():
+    model = _model()
+    batches, items = _batches(2)
+
+    def under_grad(b):
+        return _manual_forward(model, b, between = lambda x: x.mul_(1.0))
+
+    def under_no_grad(b):
+        def write(x):
+            with torch.no_grad():
+                x.mul_(1.0)
+            return x
+        return _manual_forward(model, b, between = write)
+
+    for fn in (under_grad, under_no_grad):
+        why = _abort_case(model, batches, items, [lambda b = b: fn(b) for b in batches])
+        assert "in place" in why or "changed between" in why, why
+
+
+@pytest.mark.skipif(not hasattr(torch._C._autograd, "_top_saved_tensors_default_hooks"),
+                    reason = "torch without the saved-tensor hooks query")
+def test_saved_tensor_hooks_are_refused():
+    model = _model()
+    batches, items = _batches(2)
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+        losses, why = lm.run_layer_major(_layers(model), [lambda b = b: _step(model, b, items) for b in batches],
+                                         model = model)
+    assert losses is None and "saved-tensor hooks" in why
+    assert _grads(model) == {}
+
+
 def test_boundary_bytes():
     assert lm.boundary_bytes([2 * 12, 2 * 17], 64, 4, 2) == (24 + 34) * 64 * 5 * 2
 
