@@ -19,6 +19,7 @@ __all__ = ["FastCPUModel"]
 import contextlib
 import gc
 import functools
+import itertools
 import os
 import re
 import sys
@@ -212,6 +213,43 @@ def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code,
         return None
     size = count * torch.empty((), dtype = dtype).element_size()
     return size if size * 4 <= available else None
+
+
+# float32 frozen weights may take at most this share of the free RAM (the rest: activations, LoRA, optimizer).
+_FP32_FROZEN_RAM_SHARE = 0.25
+
+
+def _fp32_frozen_storage_pays():
+    """Windows x86 only. There a bf16-stored weight's upcast on every forward, backward and decoded token was 31% of a
+    2-thread Qwen3-0.6B GRPO step (aten::copy_, Xeon 8573C), and float32 storage made GRPO 9-21% faster (SFT 5-10%,
+    DPO 3-6%). On Linux x86 (AVX2 EPYC) the upcast is cheaper and decoding through float32 weights reads twice the
+    bytes: GRPO was 1-6% slower, so bf16 storage stays there; Apple Silicon has its fp32 rollout instead."""
+    import platform
+    return sys.platform == "win32" and platform.machine().lower() in ("amd64", "x86_64")
+
+
+def _fp32_weights_fit(model_name, token, revision, trust_remote_code, **kwargs):
+    """(bytes, free RAM) when float32 frozen storage pays on this host (``_fp32_frozen_storage_pays``) and the whole
+    model in float32 takes at most a quarter of the free RAM, else None (also when either is unknown). Then the frozen
+    projections are kept in float32 instead of bfloat16, at 2 more bytes per frozen weight. None under several training
+    processes: each would read the same free RAM for its own copy."""
+    if not _fp32_frozen_storage_pays() or _multi_process():
+        return None
+    try:
+        from transformers import AutoConfig
+        config = kwargs.get("config")
+        if config is None:
+            config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                                trust_remote_code = trust_remote_code,
+                                                **{k: v for k, v in kwargs.items() if k != "config"})
+    except Exception:
+        return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    size = 4 * count
+    return (size, available) if size <= _FP32_FROZEN_RAM_SHARE * available else None
 
 
 def _checkpoint_dtype(model_name, **kwargs):
@@ -939,11 +977,12 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
-        # fp32 training of a bf16 checkpoint keeps the frozen projections in bf16 (lossless, half their RAM, no
-        # measurable step-time cost). Default where fp32 is the default (no native bf16); UNSLOTH_CPU_FROZEN_BF16=1 / 0
-        # forces it on / off.
+        # fp32 training of a bf16 checkpoint can keep the frozen projections in bf16 (lossless, half their RAM), at the
+        # cost of an upcast per call. Default where fp32 is the default (no native bf16), except on Windows x86 when the
+        # fp32 weights fit in a quarter of the free RAM; UNSLOTH_CPU_FROZEN_BF16=1 / 0 forces it on / off, =training
+        # keeps it whatever the RAM and OS (bf16 for training, fp32 for generation where that pays).
         frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
-        frozen_wanted = frozen_env in ("1", "true", "yes", "on") or (
+        frozen_wanted = frozen_env in ("1", "true", "yes", "on", "training") or (
             frozen_env not in ("0", "false", "no", "off") and not cpu_bf16_supported()
         )
         frozen_bf16 = (
@@ -952,8 +991,19 @@ class FastCPUModel:
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
         )
+        frozen_fp32 = False
+        if frozen_bf16 and frozen_env not in ("1", "true", "yes", "on", "training"):
+            fp32_fit = _fp32_weights_fit(model_name, token, revision, trust_remote_code,
+                                         **probe_kwargs, **({"config": kwargs["config"]} if "config" in kwargs else {}))
+            if fp32_fit is not None:
+                # Still loaded in bf16, then upcast one tensor at a time: a float32 load of a bf16 checkpoint peaked at
+                # 4.7 GB RSS on Qwen3-0.6B, against 1.9 GB for the bf16 load.
+                frozen_bf16, frozen_fp32 = False, True
+                _print(f"frozen weights kept in float32: they fit in RAM ({fp32_fit[0] / 1024 ** 3:.2f} GB of "
+                       f"{fp32_fit[1] / 1024 ** 3:.0f} GB free), and bfloat16 storage would upcast them on every "
+                       "call on this CPU. UNSLOTH_CPU_FROZEN_BF16=training keeps bfloat16 storage.")
         load_kwargs = dict(
-            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
+            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 or frozen_fp32 else dtype)},
             device_map = "cpu",
             token = token,
             revision = revision,
@@ -1014,6 +1064,10 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
+        if frozen_fp32:
+            for tensor in itertools.chain(model.parameters(), model.buffers()):
+                if tensor.dtype == torch.bfloat16:
+                    tensor.data = tensor.data.float()
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
             # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
@@ -1294,19 +1348,13 @@ _FP32_ROLLOUT_RAM_SHARE = 0.5
 
 def _slow_bf16_upcast():
     """Apple Silicon: upcasting the bf16-stored projections on every decoded token made a Qwen3-0.6B GRPO step 1.6x
-    slower (M1). Windows x86 without native bf16 too: the per-call upcast was 31% of a Qwen3-0.6B GRPO step on a
-    2-thread Xeon 8573C runner, and an fp32 rollout made GRPO 9-21% faster there. Not Linux x86: on AVX2 EPYC runners
-    decoding through fp32 weights read twice the bytes and was no faster."""
+    slower (M1). On x86 without native bf16 (AVX2) it cost about 2%, not worth the fp32 copy's RAM."""
     import platform
-    machine = platform.machine().lower()
-    return (sys.platform == "darwin" and machine in ("arm64", "aarch64")) or (
-        sys.platform == "win32" and machine in ("amd64", "x86_64")
-    )
+    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
 
 
 def _fp32_rollout_fits(model):
-    """True on Apple Silicon and Windows x86 when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits
-    in RAM."""
+    """True on Apple Silicon when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits in RAM."""
     if not _slow_bf16_upcast():
         return False
     extra = 2 * sum(m.weight.numel() for m in model.modules()
@@ -1339,8 +1387,7 @@ def _unpack_encoding_generate(generate):
             _frozen_bf16_for(self, training = False)
         elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self):
             # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
-            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon (and up to 1.27x
-            # on Windows x86), then store bf16.
+            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon, then store bf16.
             # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
             # tensors, and the next training forward could not save them for backward.
             with torch.inference_mode(False):
