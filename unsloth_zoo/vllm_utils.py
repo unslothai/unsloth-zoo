@@ -1928,6 +1928,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     def get_state_dict(prefix, kk, state_dict, proj, slice_weights=True, slice_index=-1):
         proj = getattr(proj, "base_layer", proj)
+        if getattr(proj, "_unsloth_nvfp4_ct", None) is not None:
+            # NVFP4: vLLM's weight is in its kernel layout; hand out the compressed-tensors tensors kept at load.
+            _nvfp4_ct_state_dict(proj, prefix, kk, slice_weights, state_dict, quant_state_dict)
+            return
+        if "CompressedTensorsW4A4Fp4" in type(getattr(proj, "scheme", None)).__name__:
+            raise NotImplementedError(
+                f"Unsloth: vLLM converted the NVFP4 layer {prefix} without keeping its compressed-tensors "
+                "weights, so training cannot share it. Load it through Unsloth's fast_inference loader."
+            )
         qweight = proj.weight
 
         # Slicing offsets
@@ -2095,6 +2104,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         layer = vllm_text_model.layers[kk]
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+            if hasattr(layer.self_attn, "kv_b_proj") or hasattr(layer.self_attn, "kv_a_proj_with_mqa"):
+                raise NotImplementedError(
+                    f"Unsloth: fast_inference = True does not support {type(layer.self_attn).__name__} yet "
+                    "(multi-head latent attention: DeepSeek-V2 / V3, Kimi, GLM-4.7-Flash, ...): its "
+                    "kv_a / kv_b projections cannot be shared with the training model. "
+                    "Load with fast_inference = False."
+                )
             # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only.
             qkv_proj = getattr(layer.self_attn, "qkv_proj", None)
             # LFM2 names the attention output projection out_proj
@@ -2746,6 +2762,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
     skipped_layernorms = []
     loaded_buffers = []
+    nvfp4_scheme, nvfp4_layers = None, 0
     for kk in range(layer_count):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
@@ -2761,6 +2778,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 is_weight = False
             else:
                 if f"{layer_name}.weight" not in quant_state_dict:
+                    if f"{layer_name}.weight_packed" in quant_state_dict:
+                        if nvfp4_scheme is None:
+                            nvfp4_scheme = _nvfp4_ct_scheme(config)
+                        _set_nvfp4_ct_linear(new_model, layer_name, quant_state_dict, nvfp4_scheme)
+                        nvfp4_layers += 1
+                        continue
                     if "norm" in layer_name:
                         skipped_layernorms.append(layer_name.split(".")[-1])
                     continue
@@ -2929,6 +2952,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
     # patch_model_and_tokenizer reads this: the loader's dtype may differ (see _shared_weight_dtype).
     new_model._unsloth_vllm_dtype = dtype
+    # Unsloth routes these packed layers to its W4A16 NVFP4 kernels (compressed-tensors' own layout).
+    new_model._unsloth_vllm_nvfp4_layers = nvfp4_layers
     return new_model
 pass
 
@@ -3580,6 +3605,257 @@ def _vllm_online_fp8_moe_ignore(config):
     if not any(_config_get(text_config, k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
         return None
     return [r"re:.*\.gate$", r"re:.*\.shared_expert_gate$", r"re:.*\.experts$"]
+pass
+
+
+# Fraction of decoder layers UNSLOTH_FP8_BF16_TAIL=1 keeps 16-bit (humans& NVFP4 RL, LMSYS FP8 RL: last 15%).
+_FP8_BF16_TAIL_DEFAULT_FRAC = 0.15
+
+
+def _fp8_bf16_tail_fraction():
+    """UNSLOTH_FP8_BF16_TAIL: unset / 0 = off, 1 = the last 15% of decoder layers, a float in
+    (0, 1) = that fraction (rounded up to whole layers)."""
+    value = os.environ.get("UNSLOTH_FP8_BF16_TAIL", "0").strip().lower()
+    if value in ("", "0", "0.0", "false", "off", "no"):
+        return 0.0
+    if value in ("1", "true", "on", "yes"):
+        return _FP8_BF16_TAIL_DEFAULT_FRAC
+    try:
+        frac = float(value)
+    except ValueError:
+        frac = -1.0
+    if not 0.0 < frac < 1.0:
+        raise ValueError(
+            f"Unsloth: UNSLOTH_FP8_BF16_TAIL={value!r} must be 0, 1 (the last 15% of decoder layers) "
+            "or a fraction in (0, 1)."
+        )
+    return frac
+pass
+
+
+def _fp8_bf16_tail_layers(config, frac):
+    """Indices of the last ceil(frac * num_hidden_layers) decoder layers."""
+    if frac <= 0:
+        return []
+    text_config = getattr(config, "text_config", None) or config
+    n = _config_get(text_config, "num_hidden_layers")
+    if not isinstance(n, int) or n <= 0:
+        return []
+    k = min(n, math.ceil(frac * n - 1e-9))
+    return list(range(n - k, n))
+pass
+
+
+def _vllm_online_fp8_bf16_tail_ignore(config):
+    """`ignore` entries that keep the last decoder layers and every MoE shared expert 16-bit in
+    vLLM's online FP8 (UNSLOTH_FP8_BF16_TAIL), else []. The trainer binds vLLM's tensors, so the
+    same layers are 16-bit in both the rollout and the training forward."""
+    layers = _fp8_bf16_tail_layers(config, _fp8_bf16_tail_fraction())
+    if not layers:
+        return []
+    joined = "|".join(str(i) for i in layers)
+    # Decoder layers only (model.layers.N / language_model.model.layers.N), never a vision encoder's.
+    ignore = [rf"re:(.*\.)?(model|language_model)\.layers\.({joined})\."]
+    # Qwen2 / 3 MoE shared_expert, DeepSeek / GLM shared_experts; the sigmoid gate is a router already.
+    ignore.append(r"re:.*\.shared_experts?\.")
+    return ignore
+pass
+
+
+# ---- compressed-tensors NVFP4 (nvfp4-pack-quantized) colocated rollouts ---------------------------------
+# The trainer runs NVFP4 checkpoints W4A16 (packed weights, bf16 activations), so vLLM is handed the same
+# checkpoint without its NVFP4 activation quantization: CompressedTensorsW4A4Fp4(use_a16 = True) (Marlin).
+# Marlin repacks the weight into its own layout, so the compressed-tensors bytes are kept on the layer at load
+# and the training model points at those (no second load from disk, no dense copy).
+
+def _ct_quant_dict(config):
+    quant = getattr(config, "quantization_config", None)
+    if quant is None:
+        return None
+    if not isinstance(quant, dict):
+        to_dict = getattr(quant, "to_dict", None)
+        quant = to_dict() if callable(to_dict) else None
+    if not isinstance(quant, dict) or quant.get("quant_method", None) != "compressed-tensors":
+        return None
+    return quant
+pass
+
+
+def _is_ct_nvfp4_args(args):
+    """compressed-tensors QuantizationArgs (dict or object) for NVFP4: float, 4 bit, tensor_group, group 16."""
+    if args is None:
+        return False
+    get = args.get if isinstance(args, dict) else (lambda k, d = None: getattr(args, k, d))
+    value = lambda v: str(getattr(v, "value", v)) if v is not None else None
+    return (
+        value(get("type", None)) == "float"
+        and get("num_bits", None) == 4
+        and get("group_size", None) == 16
+        and value(get("strategy", None)) == "tensor_group"
+        and get("symmetric", True) is not False
+    )
+pass
+
+
+def _ct_nvfp4_groups(config):
+    """{group name: group dict} of the compressed-tensors config groups whose weights are NVFP4."""
+    quant = _ct_quant_dict(config)
+    if quant is None:
+        return {}
+    groups = quant.get("config_groups", None) or {}
+    return {
+        name: group for name, group in groups.items()
+        if isinstance(group, dict) and _is_ct_nvfp4_args(group.get("weights", None))
+    }
+pass
+
+
+def _vllm_nvfp4_a16_quantization_config(config):
+    """The compressed-tensors config with NVFP4 activation quantization dropped, so vLLM builds the W4A16
+    scheme the trainer runs. None when nothing changes or UNSLOTH_VLLM_NVFP4_A16=0 (keep the checkpoint's)."""
+    if os.environ.get("UNSLOTH_VLLM_NVFP4_A16", "1") == "0":
+        return None
+    groups = _ct_nvfp4_groups(config)
+    if not any(_is_ct_nvfp4_args(group.get("input_activations", None)) for group in groups.values()):
+        return None
+    quant = copy.deepcopy(_ct_quant_dict(config))
+    for name in groups:
+        group = quant["config_groups"][name]
+        if _is_ct_nvfp4_args(group.get("input_activations", None)):
+            group["input_activations"] = None
+    return quant
+pass
+
+
+# Set by load_vllm while the engine loads an NVFP4 checkpoint, so only training loads keep the extra copy.
+_UNSLOTH_KEEP_NVFP4_CT_WEIGHTS = False
+# Set while a W4A4 checkpoint loads as W4A16: its input_global_scale tensors still need a place to land.
+_UNSLOTH_NVFP4_DROP_INPUT_SCALES = False
+
+
+def _patch_vllm_nvfp4_keep_compressed_tensors_weights():
+    """Keep each NVFP4 layer's compressed-tensors (weight_packed, weight_scale, weight_global_scale) as
+    `_unsloth_nvfp4_ct` before vLLM converts them to its kernel layout. Returns False if vLLM lacks the scheme."""
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+            CompressedTensorsW4A4Fp4,
+        )
+    except Exception:
+        return False
+    original = CompressedTensorsW4A4Fp4.process_weights_after_loading
+    if getattr(original, "_unsloth_keeps_ct_weights", False):
+        return True
+    original_create = CompressedTensorsW4A4Fp4.create_weights
+
+    @functools.wraps(original_create)
+    def create_weights(self, layer, output_partition_sizes, *args, **kwargs):
+        result = original_create(self, layer, output_partition_sizes, *args, **kwargs)
+        if _UNSLOTH_NVFP4_DROP_INPUT_SCALES and getattr(self, "use_a16", False) and not hasattr(layer, "input_global_scale"):
+            # The W4A16 scheme registers no input_global_scale, yet the W4A4 checkpoint has one per layer.
+            from vllm.model_executor.parameter import PerTensorScaleParameter
+            weight_loader = kwargs.get("weight_loader", args[2] if len(args) > 2 else None)
+            layer.register_parameter("input_global_scale", PerTensorScaleParameter(
+                data = torch.empty(len(output_partition_sizes), dtype = torch.float32), weight_loader = weight_loader,
+            ))
+            layer._unsloth_drop_input_global_scale = True
+        return result
+
+    @functools.wraps(original)
+    def process_weights_after_loading(self, layer):
+        if getattr(layer, "_unsloth_drop_input_global_scale", False):
+            del layer.input_global_scale
+            layer._unsloth_drop_input_global_scale = False
+        keep = None
+        if _UNSLOTH_KEEP_NVFP4_CT_WEIGHTS:
+            # Copies: a kernel may swizzle or repack its tensors in place. weight_global_scale is still the
+            # per-partition compressed-tensors value here (vLLM inverts it below).
+            keep = tuple(
+                getattr(layer, name).data.clone()
+                for name in ("weight_packed", "weight_scale", "weight_global_scale")
+            )
+        result = original(self, layer)
+        if keep is not None:
+            layer._unsloth_nvfp4_ct = keep
+        return result
+
+    process_weights_after_loading._unsloth_keeps_ct_weights = True
+    CompressedTensorsW4A4Fp4.create_weights = create_weights
+    CompressedTensorsW4A4Fp4.process_weights_after_loading = process_weights_after_loading
+    return True
+pass
+
+
+def _nvfp4_ct_state_dict(proj, prefix, kk, slice_weights, state_dict, quant_state_dict):
+    """compressed-tensors tensors of one HF projection out of a vLLM NVFP4 layer (views of the kept copy)."""
+    packed, scale, global_scale = proj._unsloth_nvfp4_ct
+    output_sizes = getattr(proj, "output_sizes", None)
+    if slice_weights and output_sizes is not None:
+        offsets = np.cumsum([0] + list(output_sizes))
+        lo, hi = int(offsets[kk]), int(offsets[kk + 1])
+    else:
+        lo, hi = 0, packed.shape[0]
+    # One global scale per fused partition (q, k, v / gate, up); a single-partition layer has one.
+    g = kk if (slice_weights and global_scale.numel() > 1) else 0
+    tensors = {
+        ".weight_packed": packed[lo:hi],
+        ".weight_scale": scale[lo:hi],
+        ".weight_global_scale": global_scale.reshape(-1)[g : g + 1],
+    }
+    bias = getattr(proj, "bias", None)
+    if bias is not None:
+        tensors[".bias"] = bias[lo:hi] if slice_weights else bias
+    for suffix, tensor in tensors.items():
+        state_dict[prefix + suffix] = tensor
+        quant_state_dict[prefix + suffix] = tensor
+pass
+
+
+def _nvfp4_ct_scheme(config):
+    """The checkpoint's NVFP4 QuantizationScheme, attached to rebuilt layers so Unsloth's W4A16 route runs."""
+    groups = _ct_nvfp4_groups(config)
+    if not groups:
+        return None
+    group = dict(next(iter(groups.values())))
+    try:
+        from compressed_tensors.quantization import QuantizationScheme
+        fields = getattr(QuantizationScheme, "model_fields", {}) or {}
+        return QuantizationScheme(**{k: v for k, v in group.items() if not fields or k in fields})
+    except Exception:
+        from types import SimpleNamespace
+        weights = group.get("weights", None) or {}
+        return SimpleNamespace(
+            targets = group.get("targets", None),
+            weights = SimpleNamespace(**weights),
+            input_activations = group.get("input_activations", None),
+            output_activations = group.get("output_activations", None),
+            format = group.get("format", None),
+        )
+pass
+
+
+def _set_nvfp4_ct_linear(new_model, layer_name, quant_state_dict, scheme):
+    """Rebuild one NVFP4 projection as compressed-tensors leaves it: an nn.Linear without `weight`, holding
+    weight_packed / weight_scale / weight_global_scale (the vLLM-side tensors, not copies)."""
+    packed = quant_state_dict[f"{layer_name}.weight_packed"]
+    bias = quant_state_dict.get(f"{layer_name}.bias", None)
+    layer = torch.nn.Linear(0, 0, bias = bias is not None, device = "meta")
+    del layer._parameters["weight"]
+    layer.in_features = packed.shape[1] * 2
+    layer.out_features = packed.shape[0]
+    for name in ("weight_packed", "weight_scale", "weight_global_scale"):
+        value = getattr(quant_state_dict[f"{layer_name}.{name}"], "data", quant_state_dict[f"{layer_name}.{name}"])
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad = False))
+    if bias is not None:
+        layer.bias = torch.nn.Parameter(getattr(bias, "data", bias), requires_grad = False)
+    layer.quantization_scheme = scheme
+    try:
+        from compressed_tensors.quantization import QuantizationStatus
+        layer.quantization_status = QuantizationStatus.COMPRESSED
+    except Exception:
+        from types import SimpleNamespace
+        layer.quantization_status = SimpleNamespace(value = "compressed")
+    parent_name, _, attr = layer_name.rpartition(".")
+    setattr(new_model.get_submodule(parent_name) if parent_name else new_model, attr, layer)
 pass
 
 
@@ -5353,6 +5629,17 @@ def _vllm_cascade_attn_needs_disable(vllm_version, major_version):
     return major_version < 9 and Version(str(vllm_version)) < Version("0.11.1")
 
 
+def _score_centering_k():
+    # UNSLOTH_GRPO_SCORE_CENTERING=k: the GRPO rollouts return the sampler's top-k head.
+    try:
+        from .score_centering import score_centering_top_k
+        return score_centering_top_k()
+    except ValueError:
+        raise
+    except Exception:
+        return 0
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -5401,6 +5688,7 @@ def load_vllm(
         )
 
     global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS, _UNSLOTH_SET_V1_RUNNER
+    global _UNSLOTH_KEEP_NVFP4_CT_WEIGHTS, _UNSLOTH_NVFP4_DROP_INPUT_SCALES
     _UNSLOTH_FLASHINFER_UNUSABLE = False
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
@@ -5940,6 +6228,12 @@ def load_vllm(
         if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
             native_fp8 = _get_vllm_online_fp8_quantization(fp8_mode)
             torchao_fp8 = native_fp8 is None
+        elif _fp8_bf16_tail_fraction() > 0:
+            print(
+                "Unsloth: UNSLOTH_FP8_BF16_TAIL is ignored: it only applies when vLLM quantizes a 16-bit "
+                "checkpoint online (load_in_fp8 on vLLM >= 0.12). A pre-quantized FP8 repo the name mapped "
+                "to keeps its own layers; pass use_exact_model_name = True with the 16-bit repo instead."
+            )
 
         if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
             install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
@@ -6054,7 +6348,8 @@ def load_vllm(
 
             max_num_batched_tokens = max_num_batched_tokens,
             max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
-            max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            # Disallow logprobs being returned, except the top-k head score centering records.
+            max_logprobs           = max(int(max_logprobs or 0), _score_centering_k()),
             # Match TRL when reusing this engine for RL, including temperature scaling.
             logprobs_mode          = "processed_logprobs" if training else "raw_logprobs",
             seed                   = random_state, # Default is 0
@@ -6131,10 +6426,23 @@ def load_vllm(
         if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
             if native_fp8 is not None:
                 engine_args["quantization"] = native_fp8
-                online_ignore = _vllm_online_fp8_moe_ignore(config)
-                if online_ignore is not None:
+                online_ignore = list(_vllm_online_fp8_moe_ignore(config) or [])
+                tail_ignore = _vllm_online_fp8_bf16_tail_ignore(config)
+                if tail_ignore:
+                    tail = _fp8_bf16_tail_layers(config, _fp8_bf16_tail_fraction())
+                    print(
+                        f"Unsloth: UNSLOTH_FP8_BF16_TAIL keeps decoder layers {tail[0]}-{tail[-1]} and any "
+                        "MoE shared experts in 16-bit for both vLLM and training."
+                    )
+                    online_ignore += tail_ignore
+                if online_ignore:
                     engine_args["quantization_config"] = {"ignore": online_ignore}
             else:
+                if _fp8_bf16_tail_fraction() > 0:
+                    print(
+                        "Unsloth: UNSLOTH_FP8_BF16_TAIL needs vLLM's native online FP8 (vLLM >= 0.24 for "
+                        "row-wise); the torchao fallback quantizes every layer, so it is ignored here."
+                    )
                 from torchao.core.config import config_to_dict
                 torchao_config = _get_torchao_fp8_config(fp8_mode)
                 hf_overrides = {
@@ -6142,6 +6450,37 @@ def load_vllm(
                 }
                 engine_args["quantization"] = "torchao"
                 engine_args["hf_overrides"] = hf_overrides
+
+        # NVFP4 compressed-tensors: roll out W4A16 like the trainer (UNSLOTH_VLLM_NVFP4_A16=0 keeps W4A4), and keep
+        # the compressed-tensors weights at load so the training model shares them instead of loading them again.
+        # Not for return_args (`vllm serve`) or use_async (AsyncLLMEngine runs its core in a spawned process): the
+        # hooks below live in this process only, so a separate engine keeps the checkpoint's own W4A4 config (its
+        # input_global_scale tensors would have nowhere to load), and training cannot share its weights anyway.
+        if _ct_nvfp4_groups(config) and not (return_args or use_async):
+            text_config = getattr(config, "text_config", None) or config
+            if any(_config_get(text_config, k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
+                # vLLM's NVFP4 MoE methods repack the experts and nothing hands them to training yet.
+                raise NotImplementedError(
+                    "Unsloth: fast_inference = True does not support NVFP4 compressed-tensors MoE checkpoints yet. "
+                    "Set fast_inference = False to train it, or load the 16-bit (BF16) checkpoint."
+                )
+            if not _patch_vllm_nvfp4_keep_compressed_tensors_weights():
+                raise NotImplementedError(
+                    "Unsloth: fast_inference with an NVFP4 compressed-tensors checkpoint needs vLLM's "
+                    "CompressedTensorsW4A4Fp4 scheme, which this vLLM does not have. Upgrade vLLM or set "
+                    "fast_inference = False."
+                )
+            _UNSLOTH_KEEP_NVFP4_CT_WEIGHTS = True
+            a16_quantization_config = _vllm_nvfp4_a16_quantization_config(config)
+            if a16_quantization_config is not None:
+                _UNSLOTH_NVFP4_DROP_INPUT_SCALES = True
+                engine_args["hf_overrides"] = {
+                    **engine_args.get("hf_overrides", {}), "quantization_config": a16_quantization_config,
+                }
+                print(
+                    "Unsloth: vLLM runs this NVFP4 checkpoint W4A16 (bf16 activations) like training does. "
+                    "Set UNSLOTH_VLLM_NVFP4_A16=0 to keep its NVFP4 activations (W4A4)."
+                )
 
         # vLLM reads config.json itself, so the caller's RoPE scaling only reaches it as an
         # override; without it positions past the native window index out of the cos/sin cache.
@@ -6489,6 +6828,7 @@ def load_vllm(
                 if not loaded: _release_failed_vllm_engine(registries_before)
             pass
         pass
+        _UNSLOTH_KEEP_NVFP4_CT_WEIGHTS = _UNSLOTH_NVFP4_DROP_INPUT_SCALES = False
         if count_reduces and _EXTERNAL_LAUNCHER_MEMORY_REDUCES > reduces_before:
             _external_launcher_attempt_agreed(failed = False)
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
@@ -6496,6 +6836,9 @@ def load_vllm(
         if engine_args.get("enable_return_routed_experts", False):
             from .routing_replay import wrap_vllm_generate
             wrap_vllm_generate(llm)
+        if _score_centering_k() > 0:
+            from .score_centering import wrap_vllm_generate_topk
+            wrap_vllm_generate_topk(llm, _score_centering_k())
         padded_ids = _padded_vocab_ids(config)
         if padded_ids:
             suppress_vllm_padded_vocab(
@@ -6511,6 +6854,7 @@ def load_vllm(
             _UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1
 
     except BaseException:
+        _UNSLOTH_KEEP_NVFP4_CT_WEIGHTS = _UNSLOTH_NVFP4_DROP_INPUT_SCALES = False
         # The block exists to protect an engine. If we never got one, there is nothing to
         # protect, and leaving flashinfer hidden would break an unrelated later import in
         # the same session for no reason. A successful load keeps the block, because vLLM
@@ -6531,6 +6875,12 @@ def load_vllm(
     # if unsloth_vllm_standby and not standby_util_override:
     #     print(f"Unsloth: Standby mode is enabled. Pre-sleeping vLLM model to reduce OOMs.")
     #     llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
+
+    # GRPO warns when an FP8 KV cache runs without the vLLM importance sampling correction.
+    try:
+        llm._unsloth_float8_kv_cache = bool(float8_kv_cache)
+    except Exception:
+        pass
 
     # Cleanup
     collect_garbage(after = _device_empty_cache)
@@ -6616,11 +6966,33 @@ def get_peft_config(save_directory):
 pass
 
 
+def _lora_adapter_name(model):
+    """The adapter load_lora serves: the active one, which PEFT names "default" unless the caller renamed it."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    configs = getattr(model, "peft_config", None) or {}
+    name = getattr(model, "active_adapter", None)
+    if isinstance(name, (list, tuple)):
+        name = name[0] if len(name) == 1 else None
+    if isinstance(name, str) and name in configs: return name
+    if "default" not in configs and len(configs) == 1: return next(iter(configs))
+    return "default"
+pass
+
+
+def _strip_lora_adapter_name(state_dict, name):
+    """vLLM reads lora_A.weight, PEFT names it lora_A.<adapter>.weight; other adapters' tensors stay out."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if name == "default": return {k.replace(".default", ""):v for k, v in state_dict.items()}
+    segment = re.compile(r"\.lora_([AB])\." + re.escape(name) + r"(?=\.|$)")
+    return {segment.sub(r".lora_\1", k):v for k, v in state_dict.items() if segment.search(k)}
+pass
+
+
 _LIVE_LORA_CONFIGS = {}
 def _live_lora_config(model, save_directory):
     """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
     # All Unsloth Zoo code licensed under LGPLv3
-    config = model.peft_config["default"]
+    config = model.peft_config[_lora_adapter_name(model)]
     # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
     cached = _LIVE_LORA_CONFIGS.get(save_directory)
     if cached is None or cached[0] is not config:
@@ -7301,6 +7673,9 @@ def _pad_lone_moe_expert_lora(model, state_dict):
 pass
 
 
+_MLA_KV_B_LORA_KEY = re.compile(r"(?:^|\.)kv_b_proj\.(?:base_layer\.)?lora_[AB]\.")
+
+
 def _check_lora_is_servable(model, keys, source, peft_config):
     """Refuse an adapter vLLM would accept and then silently ignore.
 
@@ -7333,6 +7708,17 @@ def _check_lora_is_servable(model, keys, source, peft_config):
     pass
 
     if os.environ.get("UNSLOTH_DISABLE_LORA_NAME_CHECK", "0") == "1": return
+    mla_keys = [k for k in keys if _MLA_KV_B_LORA_KEY.search(k)]
+    if mla_keys and _vllm_mla_layers(_get_vllm_lora_model(model)):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference=True cannot serve a LoRA on the MLA kv_b_proj ({len(mla_keys)} adapter "
+            f"tensors in {source}, e.g. '{sorted(mla_keys)[0]}'). vLLM's multi-head latent attention computes "
+            "through W_UK_T / W_UV derived from the base kv_b_proj weight and never applies a kv_b_proj LoRA, so "
+            "rollouts would sample the base model while training updates the adapter.\n"
+            "Remove kv_b_proj from target_modules, load the model in 16-bit so the merged-weight rollout folds "
+            "it into the shared weights (UNSLOTH_VLLM_MERGED_ROLLOUT unset or 1), or use fast_inference=False.\n"
+            "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
+        )
     unmatched = _unmatched_lora_keys(model, keys)
     if not unmatched: return
     examples = "\n".join(f"  {k}  ->  {n}" for k, n in sorted(unmatched)[:5])
@@ -7585,6 +7971,66 @@ class _MergedLoRARequest:
 pass
 
 
+def _vllm_mla_layers(vllm_model):
+    """[(kv_b_proj weight, {name: tensor})] per vLLM MLA layer: its decode reads W_UK_T / W_UV (AITER: W_K / W_V)
+    split off kv_b_proj.weight, held on the layer (vLLM >= 0.13) or its impl (0.11), never kv_b_proj itself."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    layers = []
+    if not isinstance(vllm_model, torch.nn.Module): return layers
+    for module in vllm_model.modules():
+        holders = [h for h in (module, getattr(module, "impl", None)) if h is not None]
+        if not any(isinstance(getattr(h, "kv_lora_rank", None), int) for h in holders): continue
+        derived, kv_b_proj = {}, None
+        for holder in holders:
+            if kv_b_proj is None: kv_b_proj = getattr(holder, "kv_b_proj", None)
+            names = set(getattr(holder, "__dict__", ()))
+            names.update(getattr(holder, "_parameters", None) or ())
+            names.update(getattr(holder, "_buffers", None) or ())
+            for name in names:
+                if not name.startswith(("W_U", "W_K", "W_V")): continue
+                value = getattr(holder, name, None)
+                if isinstance(value, torch.Tensor):
+                    derived[("impl." if holder is not module else "") + name] = value
+        if len(derived) == 0: continue
+        kv_b_proj = getattr(kv_b_proj, "base_layer", kv_b_proj)  # vLLM LoRA wrapper
+        W = getattr(kv_b_proj, "weight", None)
+        layers.append((W if isinstance(W, torch.Tensor) else None, derived))
+    return layers
+pass
+
+
+def _tensor_within(t, W):
+    """True when t is a view into W's own bytes (same storage, inside W's span)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if t.untyped_storage().data_ptr() != W.untyped_storage().data_ptr(): return False
+    if t.numel() == 0: return False
+    start = W.data_ptr()
+    end = start + W.numel() * W.element_size()
+    last = t.data_ptr() + sum((n - 1) * s for n, s in zip(t.shape, t.stride())) * t.element_size()
+    return start <= t.data_ptr() and last + t.element_size() <= end
+pass
+
+
+def _merged_rollout_mla_reason(name, W, mla_layers):
+    """None when every MLA decode weight derived from this kv_b_proj is a view of W (unquantized), so a fold is seen."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    consumers = [
+        derived for kv_W, derived in mla_layers
+        if kv_W is not None and kv_W.untyped_storage().data_ptr() == W.untyped_storage().data_ptr()
+        and kv_W.data_ptr() == W.data_ptr()
+    ]
+    if len(consumers) == 0:
+        return f"{name} is a kv_b_proj that no vLLM MLA layer could be confirmed to read in place"
+    for derived in consumers:
+        if not {"W_UK_T", "W_UV"} <= {key.rsplit(".", 1)[-1] for key in derived}:
+            return f"{name} is an MLA kv_b_proj that vLLM decodes through {sorted(derived)}, not W_UK_T / W_UV"
+        for key, value in derived.items():
+            if not _tensor_within(value, W):
+                return f"{name} is an MLA kv_b_proj whose vLLM decode weight {key} is a separate copy"
+    return None
+pass
+
+
 def _merged_rollout_targets(model):
     """(targets, None) when the adapter can be folded, else (None, reason)."""
     # All Unsloth Zoo code licensed under LGPLv3
@@ -7630,9 +8076,6 @@ def _merged_rollout_targets(model):
         leaf = name.rsplit(".", 1)[-1]
         if leaf in _MERGED_ROLLOUT_EMBEDDING_LEAVES:
             return None, f"{name} is an embedding or lm_head (possibly tied)"
-        if leaf == "kv_b_proj":
-            # MLA decodes via W_UK / W_UV copied from kv_b_proj at load, so a fold is unseen.
-            return None, f"{name} is an MLA kv_b_proj, which vLLM decodes through derived copies"
         if tuple(lora_A.keys()) != (adapter,):
             return None, f"{name} holds adapters {list(lora_A.keys())}"
         if len(getattr(module, "merged_adapters", None) or ()) != 0:
@@ -7693,6 +8136,12 @@ def _merged_rollout_targets(model):
     for name, module, W in targets:
         if W.untyped_storage().data_ptr() not in storages:
             return None, f"{name} does not share storage with the vLLM engine"
+    mla_layers = None
+    for name, module, W in targets:
+        if name.rsplit(".", 1)[-1] != "kv_b_proj": continue
+        if mla_layers is None: mla_layers = _vllm_mla_layers(vllm_model)
+        reason = _merged_rollout_mla_reason(name, W, mla_layers)
+        if reason is not None: return None, reason
     return targets, None
 pass
 
@@ -8577,6 +9026,18 @@ def _fsdp2_merged_rollout_gather(model, scope = None):
 pass
 
 
+def _lora_tensors_for_vllm(model, reuse_gathered = False):
+    """_lora_state_dict with stacked expert LoRA as views of one clone per stack (vLLM only reads them)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from unsloth_zoo.temporary_patches.moe_grouped_modulelist import packed_stacked_state_dict
+    except Exception:
+        packed_stacked_state_dict = contextlib.nullcontext
+    with packed_stacked_state_dict():
+        return _lora_state_dict(model, reuse_gathered)
+pass
+
+
 def _build_lora_request(model, save_directory, load_tensors, lora_request_id, exclude = None, reuse_gathered = False):
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
@@ -8587,7 +9048,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model, reuse_gathered).items()}
+        state_dict = _strip_lora_adapter_name(_lora_tensors_for_vllm(model, reuse_gathered), _lora_adapter_name(model))
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}

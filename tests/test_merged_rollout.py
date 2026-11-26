@@ -518,13 +518,162 @@ def test_compat_shared_base_weight_refused():
     assert reason is not None and "shares its base weight" in reason, reason
 
 
-def test_compat_kv_b_proj_refused():
-    model, llm, vm = _make_model(target_modules = ("q_proj",))
-    attn = model.base_model.model.model.layers[0].self_attn
-    attn.kv_b_proj = attn.q_proj
-    del attn.q_proj
+# MLA: vLLM decodes through W_UK_T / W_UV split off kv_b_proj.weight (views when unquantized).
+L_RANK, N_HEADS, NOPE, V_DIM = 32, 2, 8, 8
+
+
+class _FakeMLAImpl:
+    pass
+
+
+class _FakeMLAAttention(nn.Module):
+    """vLLM's MLAAttention after process_weights_after_loading, one of four layouts."""
+    def __init__(self, kv_b_weight, layout):
+        super().__init__()
+        self.kv_lora_rank = L_RANK
+        self.kv_b_proj = nn.Module()
+        self.kv_b_proj.weight = kv_b_weight
+        W = kv_b_weight.T.view(L_RANK, N_HEADS, NOPE + V_DIM)
+        W_UK, W_UV = W.split([NOPE, V_DIM], dim = -1)
+        W_UV, W_UK_T = W_UV.transpose(0, 1), W_UK.permute(1, 2, 0)
+        if layout == "views":            # vLLM >= 0.13: replace_parameter wraps the views
+            self.W_UV = nn.Parameter(W_UV, requires_grad = False)
+            self.W_UK_T = nn.Parameter(W_UK_T, requires_grad = False)
+        elif layout == "impl_views":     # vLLM 0.11: plain attributes on the impl
+            self.impl = _FakeMLAImpl()
+            self.impl.kv_lora_rank = L_RANK
+            self.impl.kv_b_proj = self.kv_b_proj
+            self.impl.W_UV, self.impl.W_UK_T = W_UV, W_UK_T
+        elif layout == "copies":         # dequantized / repacked copies
+            self.W_UV = nn.Parameter(W_UV.contiguous().clone(), requires_grad = False)
+            self.W_UK_T = nn.Parameter(W_UK_T.contiguous().clone(), requires_grad = False)
+        elif layout == "aiter_fp8":      # ROCm AITER: quantized W_K / W_V, no W_UK_T
+            self.W_K = W_UK.transpose(0, 1).contiguous().clone()
+            self.W_V = W_UV.permute(1, 2, 0).contiguous().clone()
+
+
+def _make_mla_model(layout = "views", target_modules = ("kv_b_proj",)):
+    torch.manual_seed(0)
+    base = _Tiny()
+    vllm_model = _FakeVllmModel(len(base.model.layers))
+    g = torch.Generator().manual_seed(2)
+    vllm_model.kv_b = nn.ParameterList([
+        nn.Parameter((torch.randn(N_HEADS * (NOPE + V_DIM), L_RANK, generator = g) * 0.02).to(DTYPE), requires_grad = False)
+        for _ in base.model.layers
+    ])
+    vllm_model.mla = nn.ModuleList()
+    for i, layer in enumerate(base.model.layers):
+        a = layer.self_attn
+        a.o_proj.weight = nn.Parameter(vllm_model.o[i], requires_grad = False)
+        a.kv_b_proj = nn.Linear(L_RANK, N_HEADS * (NOPE + V_DIM), bias = False)
+        a.kv_b_proj.weight = nn.Parameter(vllm_model.kv_b[i], requires_grad = False)
+        if layout is not None: vllm_model.mla.append(_FakeMLAAttention(vllm_model.kv_b[i], layout))
+    for module in base.modules():
+        if isinstance(module, nn.Linear) and module.weight.dtype != DTYPE:
+            module.weight = nn.Parameter(module.weight.detach().to(DTYPE), requires_grad = False)
+    config = LoraConfig(r = 8, lora_alpha = 16, target_modules = list(target_modules), lora_dropout = 0.0)
+    model = get_peft_model(base, config)
+    g = torch.Generator().manual_seed(1)
+    for module in _lora_modules(model):
+        module.lora_B["default"].weight.data = torch.randn(module.lora_B["default"].weight.shape, generator = g) * 0.05
+    llm = _FakeLLM(vllm_model)
+    install_merged_rollout_engine_wrapper(llm)
+    model.vllm_engine = llm
+    return model, llm, vllm_model
+
+
+def test_mla_kv_b_proj_folds_when_decode_weights_are_views():
+    model, llm, vm = _make_mla_model("views")
+    targets, reason = _merged_rollout_targets(model)
+    assert reason is None, reason
+    assert sorted(n.rsplit(".", 2)[-2] + "." + n.rsplit(".", 1)[-1] for n, _, _ in targets) == \
+        ["self_attn.kv_b_proj"] * 2
+    mla = vm.mla[0]
+    before_uk, before_uv = mla.W_UK_T.detach().clone(), mla.W_UV.detach().clone()
+    request = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert isinstance(request, _MergedLoRARequest)
+    seen = {}
+    def generate(prompts, sampling_params = None, *, use_tqdm = True, lora_request = None):
+        seen["uk"], seen["uv"] = mla.W_UK_T.detach().clone(), mla.W_UV.detach().clone()
+        seen["lora_request"] = lora_request
+        return ["out"]
+    llm.generate = vllm_utils._wrap_merged_rollout_call(generate, llm)
+    llm.generate(["hi"], lora_request = request)
+    assert seen["lora_request"] is None
+    assert not torch.equal(seen["uk"], before_uk) and not torch.equal(seen["uv"], before_uv)
+    module = model.base_model.model.model.layers[0].self_attn.kv_b_proj
+    s = module.scaling["default"]
+    A = module.lora_A["default"].weight.detach().to(DTYPE).float()
+    B = module.lora_B["default"].weight.detach().to(DTYPE).float()
+    folded = (vm.kv_b[0].detach().float() + s * (B @ A)).to(DTYPE)
+    expect_uk = folded.T.view(L_RANK, N_HEADS, NOPE + V_DIM)[..., :NOPE].permute(1, 2, 0)
+    ulp = (expect_uk.float().abs() * 2 ** -7).clamp_min(2 ** -133)
+    assert ((seen["uk"].float() - expect_uk.float()).abs() <= ulp).all()
+    assert torch.equal(mla.W_UK_T, before_uk) and torch.equal(mla.W_UV, before_uv)
+
+
+def test_mla_kv_b_proj_folds_with_impl_views_vllm_011():
+    model, llm, vm = _make_mla_model("impl_views")
+    assert _merged_rollout_targets(model)[1] is None
+
+
+@pytest.mark.parametrize("layout, expect", [
+    ("copies", "separate copy"),
+    ("aiter_fp8", "not W_UK_T / W_UV"),
+    (None, "could be confirmed"),
+])
+def test_mla_kv_b_proj_refused_unless_views(layout, expect):
+    model, llm, vm = _make_mla_model(layout)
     reason = _merged_rollout_targets(model)[1]
-    assert reason is not None and "kv_b_proj" in reason, reason
+    assert reason is not None and "kv_b_proj" in reason and expect in reason, reason
+    assert prepare_merged_rollout(model) is None
+
+
+def test_mla_view_of_another_tensor_is_not_an_alias():
+    model, llm, vm = _make_mla_model("views")
+    # Same shapes, but the decode weights read layer 1's kv_b_proj: layer 0's fold would be unseen.
+    other = _FakeMLAAttention(vm.kv_b[1], "views")
+    vm.mla[0].W_UK_T, vm.mla[0].W_UV = other.W_UK_T, other.W_UV
+    reason = _merged_rollout_targets(model)[1]
+    assert reason is not None and "separate copy" in reason, reason
+
+
+def test_tensor_within():
+    W = torch.zeros(6, 4)
+    assert vllm_utils._tensor_within(W.T, W)
+    assert vllm_utils._tensor_within(W[2:, 1:3], W)
+    assert not vllm_utils._tensor_within(W.clone(), W)
+    big = torch.zeros(12, 4)
+    assert not vllm_utils._tensor_within(big[6:], big[:6])
+    assert not vllm_utils._tensor_within(big[5:7], big[:6])
+
+
+@pytest.mark.parametrize("layout", ["views", "copies", None])
+def test_mla_kv_b_proj_lora_refused_for_vllm_lora(monkeypatch, layout):
+    monkeypatch.delenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", raising = False)
+    monkeypatch.setattr(vllm_utils, "_unmatched_lora_keys", lambda model, keys: [])
+    model, llm, vm = _make_mla_model(layout, target_modules = ("kv_b_proj", "o_proj"))
+    kv_b = ["base_model.model.model.layers.0.self_attn.kv_b_proj.lora_A.weight",
+            "base_model.model.model.layers.0.self_attn.kv_b_proj.lora_B.weight"]
+    o = ["base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight"]
+    check = vllm_utils._check_lora_is_servable
+    check(model, o, "the training model", {"r": 8})
+    if layout is None:   # no absorbed MLA: vLLM runs kv_b_proj as a Linear
+        check(model, kv_b + o, "the training model", {"r": 8})
+        return
+    with pytest.raises(NotImplementedError, match = "kv_b_proj"):
+        check(model, kv_b + o, "the training model", {"r": 8})
+    monkeypatch.setenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", "1")
+    check(model, kv_b + o, "the training model", {"r": 8})
+
+
+def test_mla_fold_off_sends_kv_b_proj_to_vllm_lora_and_refuses(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", raising = False)
+    monkeypatch.setattr(vllm_utils, "_unmatched_lora_keys", lambda model, keys: [])
+    monkeypatch.setattr(vllm_utils, "_live_lora_config", lambda model, d: {"r": 8}, raising = False)
+    model, llm, vm = _make_mla_model("copies")
+    with pytest.raises(NotImplementedError, match = "MLA kv_b_proj"):
+        load_lora(model, _ADAPTER_DIR, load_tensors = True)
 
 
 def test_compat_storage_limited_to_language_model():
