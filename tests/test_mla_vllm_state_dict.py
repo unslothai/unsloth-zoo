@@ -291,3 +291,17 @@ def test_mla_attention_lora_refused_when_vllm_forward_reads_another_wrapper(monk
         check(object(), keys, "the training model", {"r": 8})
     monkeypatch.setenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", "1")
     check(object(), keys, "the training model", {"r": 8})
+
+
+def test_vllm_lora_model_unwraps_cuda_graph_wrapper(monkeypatch):
+    # vLLM 0.11 keeps runner.model as a CUDAGraphWrapper (not an nn.Module) that forwards attributes to .runnable.
+    from unsloth_zoo import vllm_utils
+    inner = _fake_vllm_mla_lora(separate_wrappers = True)
+    class CUDAGraphWrapper:
+        def __init__(self, runnable): self.runnable = runnable
+        def __getattr__(self, key): return getattr(self.runnable, key)
+    runner = types.SimpleNamespace(model = CUDAGraphWrapper(inner))
+    assert vllm_utils._get_vllm_lora_model(None, runner) is inner
+    assert vllm_utils._vllm_mla_unread_lora_projections(vllm_utils._get_vllm_lora_model(None, runner))
+    plain = types.SimpleNamespace(model = inner)
+    assert vllm_utils._get_vllm_lora_model(None, plain) is inner

@@ -7344,7 +7344,10 @@ def _get_vllm_lora_model(model, runner = None):
     """The live vLLM nn.Module, or None when it cannot be reached."""
     # All Unsloth Zoo code licensed under LGPLv3
     if runner is None: runner = _get_vllm_model_runner(model)
-    return getattr(runner, "model", None)
+    vllm_model = getattr(runner, "model", None)
+    # vLLM 0.11's CUDAGraphWrapper is no nn.Module (modules() / isinstance checks miss the model); unwrap it.
+    inner = getattr(vllm_model, "__dict__", {}).get("runnable") if not isinstance(vllm_model, torch.nn.Module) else None
+    return inner if isinstance(inner, torch.nn.Module) else vllm_model
 pass
 
 
