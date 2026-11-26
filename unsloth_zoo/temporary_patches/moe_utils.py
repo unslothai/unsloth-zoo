@@ -384,6 +384,54 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # is cached.
     if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
+    try:
+        return _grouped_mm_native(inputs, weight, offsets)
+    except RuntimeError as exc:
+        refusal = _grouped_mm_refusal(exc)
+        if refusal is None:
+            raise
+    # Outside the except: the traceback no longer pins this call's frames while the fallback runs.
+    _latch_grouped_mm_refused(inputs.device, f"{str(inputs.dtype).replace('torch.', '')} call: {refusal}")
+    if _triton_grouped_mm_wanted(inputs, weight):
+        return _triton_grouped_mm(inputs, weight, offsets)
+    return _manual_grouped_mm(inputs, weight, offsets)
+
+
+_GROUPED_MM_REFUSALS = ("not supported on your system", "is only supported on cuda devices", "not supported on rocm")
+
+
+def _grouped_mm_refusal(exc):
+    """The message when exc is torch refusing grouped_mm for good, else None: an OOM or a shape error is not a latch."""
+    if isinstance(exc, torch.OutOfMemoryError) or torch.compiler.is_compiling():
+        return None
+    message = str(exc).strip()
+    lowered = message.lower()
+    if not any(refusal in lowered for refusal in _GROUPED_MM_REFUSALS):
+        return None
+    return (message.splitlines() or [""])[0][:240]
+
+
+def _latch_grouped_mm_refused(device, reason):
+    """A real call refused what the probe passed: latch grouped_mm off for this GPU model."""
+    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
+    else:
+        _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = False
+        _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = False
+    _GROUPED_MM_RUNTIME_REFUSALS[0] += 1
+    # grouped_mm stays selected: later forwards run on Triton or the per-expert loop instead of raising.
+    _GROUPED_MM_RUNTIME_LATCHED[0] = True
+    _use_grouped_mm_triton_standin(device, reason)
+
+
+_GROUPED_MM_RUNTIME_REFUSALS = [0]
+_GROUPED_MM_RUNTIME_LATCHED = [False]
+
+
+def _grouped_mm_native(inputs, weight, offsets):
     pad = _native_backward_pad(inputs, weight)
     if pad:
         if _is_transposed_stack(weight) and _transposed_view_safe_on(inputs.device):
@@ -524,6 +572,7 @@ _TRITON_GROUPED_MM_AUTO_ROWS = {
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
+_GROUPED_MM_TRITON_STANDIN = False
 
 
 def _triton_grouped_mm_capability(index):
@@ -536,12 +585,12 @@ def _triton_grouped_mm_capability(index):
 @_assume_constant_result
 def _triton_grouped_mm_max_rows(index, kind = "lora"):
     """Row limit for class kind on device index (0 off, -1 no limit), read from UNSLOTH_MOE_GROUPED_TRITON (auto|1|0),
-    UNSLOTH_DISABLE_MOE_TRITON=1 and UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS; baked in under torch.compile, so an env
-    change needs torch._dynamo.reset()."""
+    UNSLOTH_DISABLE_MOE_TRITON=1, UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS and the grouped_mm stand-in; baked in under
+    torch.compile, so an env change needs torch._dynamo.reset()."""
     environ = os.environ
     key = (
         index, kind, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
-        environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS"),
+        environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS"), _GROUPED_MM_TRITON_STANDIN,
     )
     limit = _TRITON_GROUPED_MM_POLICY.get(key)
     if limit is None:
@@ -555,8 +604,10 @@ def _triton_grouped_mm_lora_rank_scaled():
     return not os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
 
 
-def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
+def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = False):
     mode = (mode or "auto").strip().lower()
+    if standin and mode == "auto":
+        mode = "1"
     if mode in ("0", "false", "off") or disabled == "1":
         return 0
     if is_rocm_torch(torch) or _GROUPED_MM_TRITON_OP is None or index is None:
@@ -2053,6 +2104,12 @@ w_t  = torch.ones(4, 64, 32, **bf16).transpose(-2, -1)
 probe(torch.ones(1, 8, **half), torch.ones(1, 8, 8, **half), [1])
 probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
 probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
+# The in-process training probe's backward (dX and the 2D x 2D dW) runs here first too.
+try:
+    x = torch.ones(32, 32, **bf16).requires_grad_(); w = torch.ones(4, 32, 48, **bf16).requires_grad_()
+    offs = torch.tensor([8, 8, 13, 32], device = d, dtype = torch.int32)
+    torch._grouped_mm(x, w, offs = offs).backward(torch.ones(32, 48, **bf16)); torch.cuda.synchronize(d)
+except Exception: pass
 """
 _GROUPED_MM_SURVIVES = None
 _GROUPED_MM_SURVIVES_BY_KIND = {}
@@ -2116,6 +2173,7 @@ def _run_grouped_mm_crash_probe(device):
 
 
 def _grouped_mm_runs_on(device):
+    _GROUPED_MM_LAST_REFUSAL[0] = None
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
@@ -2127,13 +2185,72 @@ def _grouped_mm_runs_on(device):
 
         torch._grouped_mm(x, w, offs=offs)
         del x, w, offs
-        return True
     except Exception:
         return False
+    _GROUPED_MM_LAST_REFUSAL[0] = _grouped_mm_trains_on(device)
+    return _GROUPED_MM_LAST_REFUSAL[0] is None
+
+
+_GROUPED_MM_PROBE_COUNTS = (8, 0, 5, 19)
+_GROUPED_MM_TRAINING_PROBE_FAILURE = None
+_GROUPED_MM_LAST_REFUSAL = [None]
+
+
+def _grouped_mm_probe_dtype(device):
+    if device.type == "cuda" and not is_rocm_torch(torch):
+        try:
+            if torch.cuda.get_device_capability(device)[0] < 8: return torch.float16
+        except Exception:
+            return torch.float16
+    return torch.bfloat16
+
+
+def _grouped_mm_on_device(device):
+    # torch picks the kernel from the current device, not the operands'.
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    context = getattr(backend, "device", None)
+    return context(device) if context is not None else contextlib.nullcontext()
+
+
+def _grouped_mm_trains_on(device):
+    """Training-shaped fwd + dX + dW vs per-expert matmuls; None when it runs, else why not. Windows CUDA wheels serve
+    one fp16 expert but refuse bf16 multi-expert. Integer operands make the comparison exact. OOM is no verdict."""
+    if os.environ.get("UNSLOTH_MOE_GROUPED_MM_PROBE", "1") == "0": return None
+    dtype = _grouped_mm_probe_dtype(device)
+    counts = _GROUPED_MM_PROBE_COUNTS
+    try:
+        with _grouped_mm_on_device(device), torch.inference_mode(False), torch.enable_grad():
+            # CPU generator: the global RNG stays untouched.
+            gen = torch.Generator(device = "cpu").manual_seed(0)
+            E, M, K, N = len(counts), sum(counts), 32, 48
+            # device = "cpu": a torch.set_default_device("cuda") app must not move the reference off the generator.
+            x, w, dy = (torch.randint(-2, 3, shape, generator = gen, device = "cpu").double()
+                        for shape in ((M, K), (E, K, N), (M, N)))
+            ends = torch.tensor(counts, device = "cpu").cumsum(0).tolist()
+            x_d = x.to(device = device, dtype = dtype).requires_grad_()
+            w_d = w.to(device = device, dtype = dtype).requires_grad_()
+            offs = torch.tensor(ends, device = device, dtype = torch.int32)
+            y = torch._grouped_mm(x_d, w_d, offs = offs)
+            dx, dw = torch.autograd.grad(y, (x_d, w_d), dy.to(device = device, dtype = dtype))
+            spans = list(zip([0] + ends[:-1], ends))
+            want = (
+                ("forward", y, torch.cat([x[s:e] @ w[g] for g, (s, e) in enumerate(spans)])),
+                ("dX", dx, torch.cat([dy[s:e] @ w[g].T for g, (s, e) in enumerate(spans)])),
+                ("dW", dw, torch.stack([x[s:e].T @ dy[s:e] for s, e in spans])),
+            )
+            for name, got, ref in want:
+                if got.shape != ref.shape or not torch.equal(got.detach().double().cpu(), ref):
+                    raise RuntimeError(f"{name} differs from per-expert matmuls")
+        return None
+    except torch.OutOfMemoryError:
+        return None
+    except Exception as exc:
+        reason = f"{str(dtype).replace('torch.', '')}, {len(counts)} experts: {type(exc).__name__}: {exc}"
+        return reason.splitlines()[0][:240]
 
 
 def _probe_torch_grouped_mm_supported(device = None):
-    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE, _GROUPED_MM_TRAINING_PROBE_FAILURE
     kind = _grouped_mm_foreign_kind(device)
     if kind is not None:
         supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
@@ -2148,10 +2265,12 @@ def _probe_torch_grouped_mm_supported(device = None):
 
     # The anchored card, not whichever is current now: the flags must describe one card.
     device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
+    _GROUPED_MM_LAST_REFUSAL[0] = None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
         _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+    _GROUPED_MM_TRAINING_PROBE_FAILURE = _GROUPED_MM_LAST_REFUSAL[0]
     # Answer the view check here so a cold compiled block does not graph-break on it.
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
         _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _TORCH_GROUPED_MM_SUPPORTED and _transposed_view_probe(device)
@@ -2397,10 +2516,64 @@ def _check_sonic_moe_available():
         return False
 
 
+def _grouped_mm_triton_standin_available(device):
+    if os.environ.get("UNSLOTH_MOE_GROUPED_TRITON", "auto").strip().lower() in ("0", "false", "off"): return False
+    if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1": return False
+    if _GROUPED_MM_TRITON_OP is None or is_rocm_torch(torch) or getattr(device, "type", None) != "cuda": return False
+    try:
+        if _triton_grouped_mm_capability(device.index) < (8, 0): return False
+        from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+        return bool(mg.triton_grouped_available(device))
+    except Exception:
+        return False
+
+
+_GROUPED_MM_FALLBACK_LOGGED = set()
+
+
+def _log_grouped_mm_fallback(reason, fallback):
+    line = (
+        f"Unsloth: torch._grouped_mm cannot run MoE training on this GPU ({reason}). Using {fallback} instead. "
+        "Opt out: UNSLOTH_MOE_BACKEND=grouped_mm|unsloth_triton|native_torch picks the backend, "
+        "UNSLOTH_MOE_GROUPED_TRITON=0 keeps Triton out of grouped_mm, UNSLOTH_MOE_GROUPED_MM_PROBE=0 skips this check."
+    )
+    # Shared with the compiled-cache copy of this module: one line per process.
+    package = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    logged = getattr(package, "_GROUPED_MM_FALLBACK_LOGGED", _GROUPED_MM_FALLBACK_LOGGED)
+    if line not in logged:
+        logged.add(line)
+        print(line)
+
+
+def _use_grouped_mm_triton_standin(device, reason):
+    global _GROUPED_MM_TRITON_STANDIN
+    if device is None or not _grouped_mm_triton_standin_available(device):
+        _log_grouped_mm_fallback(reason, "the per-expert loop for grouped_mm calls")
+        return False
+    _GROUPED_MM_TRITON_STANDIN = True
+    _log_grouped_mm_fallback(reason, "MoE backend 'grouped_mm' on Unsloth's Triton grouped GEMM kernels")
+    return True
+
+
+def _select_grouped_mm_on_triton(explicit):
+    """Auto takes the Triton stand-in only when the single-expert op works; older failures keep the old chain."""
+    reason = _GROUPED_MM_TRAINING_PROBE_FAILURE
+    if not explicit and reason is None:
+        return False
+    device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else _grouped_mm_probe_device()
+    if device is None or not _grouped_mm_triton_standin_available(device):
+        return False
+    if reason is None:
+        reason = "the single-expert fp16 call failed" if _TORCH_GROUPED_MM_AVAILABLE else "this torch has no _grouped_mm"
+    return _use_grouped_mm_triton_standin(device, reason)
+
+
 def _select_moe_backend():
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
     if requested:
         if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
+            return "grouped_mm"
+        if requested == "grouped_mm" and _select_grouped_mm_on_triton(explicit = True):
             return "grouped_mm"
         if requested == "unsloth_triton" and _check_grouped_gemm_available():
             return "unsloth_triton"
@@ -2419,10 +2592,15 @@ def _select_moe_backend():
     if _check_torch_grouped_mm_supported():
         _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
+    if _select_grouped_mm_on_triton(explicit = False):
+        return "grouped_mm"
+    backend = "native_torch"
     if _check_grouped_gemm_available() and _unsloth_triton_beats_loop():
         _log_info("Unsloth: Using MoE backend 'unsloth_triton'")
-        return "unsloth_triton"
-    return "native_torch"
+        backend = "unsloth_triton"
+    if _GROUPED_MM_TRAINING_PROBE_FAILURE is not None:
+        _log_grouped_mm_fallback(_GROUPED_MM_TRAINING_PROBE_FAILURE, f"MoE backend '{backend}'")
+    return backend
 
 
 def _unsloth_triton_beats_loop():
@@ -5656,7 +5834,8 @@ def forward_native_grouped_mm(
     # This Unsloth Zoo code section is licensed under AGPL3
 
     # Runtime safety check (defense in depth); packed NVFP4 / MXFP8 stacks fall back to a per-group loop instead.
-    if not _check_torch_grouped_mm_supported() and not _moe_uses_new_packed_expert_weights(self):
+    if not _check_torch_grouped_mm_supported() and not _GROUPED_MM_TRITON_STANDIN \
+            and not _GROUPED_MM_RUNTIME_LATCHED[0] and not _moe_uses_new_packed_expert_weights(self):
         # Compute Capability is CUDA-only; on XPU it would mask this message.
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
