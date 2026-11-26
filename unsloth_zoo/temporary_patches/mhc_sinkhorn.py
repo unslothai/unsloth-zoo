@@ -31,7 +31,6 @@ import os
 
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 __all__ = [
     "unsloth_sinkhorn_knopp",
@@ -157,7 +156,8 @@ def unsloth_mhc_projection_rsqrt(hidden_streams, fn, eps):
         or not (hidden_streams.requires_grad or fn.requires_grad)
     ):
         return _mhc_projection_rsqrt(hidden_streams, fn, eps)
-    return checkpoint(
+    from ..gradient_checkpointing import _torch_checkpoint
+    return _torch_checkpoint()(
         _mhc_projection_rsqrt, hidden_streams, fn, eps,
         use_reentrant = False, preserve_rng_state = False,
     )
@@ -178,7 +178,8 @@ def unsloth_mhc_projection(hidden_streams, input_norm, fn):
         or not (hidden_streams.requires_grad or fn.requires_grad)
     ):
         return _mhc_projection(hidden_streams, input_norm, fn)
-    return checkpoint(
+    from ..gradient_checkpointing import _torch_checkpoint
+    return _torch_checkpoint()(
         _mhc_projection, hidden_streams, input_norm, fn,
         use_reentrant = False, preserve_rng_state = False,
     )

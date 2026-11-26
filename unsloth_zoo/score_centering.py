@@ -209,8 +209,8 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
         args = (flat_x[a:b], lm_head, lm_head_bias, flat_ids[a:b], logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature, from_hidden, mode)
         if needs_grad:
-            from torch.utils.checkpoint import checkpoint
-            outs.append(checkpoint(_head_chunk_logps, *args, use_reentrant = False))
+            from .gradient_checkpointing import _torch_checkpoint
+            outs.append(_torch_checkpoint()(_head_chunk_logps, *args, use_reentrant = False))
         else:
             outs.append(_head_chunk_logps(*args))
     return torch.cat(outs, dim = 0).reshape(R, T, k)
