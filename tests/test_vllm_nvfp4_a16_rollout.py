@@ -205,9 +205,9 @@ def test_load_hook_keeps_copies_only_while_flagged(monkeypatch):
 
 
 def test_return_args_skips_the_in_process_nvfp4_rewrite():
-    # return_args hands the args to a separate `vllm serve`, where the input_global_scale hook is not installed:
+    # return_args hands the args to a separate `vllm serve` and use_async spawns the engine core, where the input_global_scale hook is not installed:
     # the A16 rewrite and its load flags must only apply to engines built in this process.
     import inspect
     from unsloth_zoo import vllm_utils
     source = inspect.getsource(vllm_utils.load_vllm)
-    assert "if _ct_nvfp4_groups(config) and not return_args:" in source
+    assert "if _ct_nvfp4_groups(config) and not (return_args or use_async):" in source
