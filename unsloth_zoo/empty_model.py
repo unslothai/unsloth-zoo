@@ -510,10 +510,12 @@ pass
 
 # Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
 # we duplicate K -> V at loader-side quant-state stacking time.
-# vLLM 0.28 (PR #43529) moved the BnB loader into vllm-bnb-plugin, same class names.
+# vLLM 0.28 (PR #43529) moved the BnB loader into vllm-bnb-plugin, same class names; Unsloth Zoo ships a copy
+# (unsloth_zoo.vllm_bnb) for when the plugin is not installed. Same order as unsloth_zoo.vllm_bnb.resolve().
 _VLLM_BNB_LOADER_PATHS = (
     "vllm.model_executor.model_loader.bitsandbytes_loader",  # vLLM <= 0.27.1
-    "vllm_bnb_plugin.bitsandbytes_loader",                   # vLLM >= 0.28
+    "vllm_bnb_plugin.bitsandbytes_loader",                   # vLLM >= 0.28, plugin installed
+    "unsloth_zoo.vllm_bnb.bitsandbytes_loader",              # vLLM >= 0.28, Unsloth's copy
 )
 
 
@@ -533,9 +535,9 @@ def patch_gemma4_vllm_k_eq_v_support():
     if bnb_loader is None:
         # Otherwise vLLM only says "Unknown quantization method: bitsandbytes".
         raise RuntimeError(
-            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
-            "Install it with `pip install vllm-bnb-plugin` to load bitsandbytes "
-            "Gemma 4 models with fast_inference."
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree and Unsloth's copy could not load "
+            "(is bitsandbytes>=0.48.1 installed?). `pip install bitsandbytes vllm-bnb-plugin` to load "
+            "bitsandbytes Gemma 4 models with fast_inference."
         )
     BitsAndBytesModelLoader = getattr(bnb_loader, "BitsAndBytesModelLoader", None)
     if BitsAndBytesModelLoader is None:

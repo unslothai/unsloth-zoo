@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""Gemma 4 k_eq_v patch must find the BnB loader in tree or in vllm-bnb-plugin (vLLM >= 0.28). vLLM is mocked."""
+"""Gemma 4 k_eq_v patch must find the BnB loader in tree, in vllm-bnb-plugin or in Unsloth's copy (vLLM >= 0.28).
+vLLM is mocked."""
 import os
 import sys
 import types
@@ -12,9 +13,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 IN_TREE = "vllm.model_executor.model_loader.bitsandbytes_loader"
 PLUGIN = "vllm_bnb_plugin.bitsandbytes_loader"
+VENDORED = "unsloth_zoo.vllm_bnb.bitsandbytes_loader"
 _PARENTS = {
     IN_TREE: ("vllm", "vllm.model_executor", "vllm.model_executor.model_loader"),
     PLUGIN: ("vllm_bnb_plugin",),
+    VENDORED: (),
 }
 
 
@@ -30,14 +33,14 @@ def _make_loader_module(name):
 
 
 @contextmanager
-def _loader_modules(in_tree = None, plugin = None):
-    """Install `in_tree` / `plugin` as the loader modules; None means absent."""
-    names = {IN_TREE, PLUGIN}
+def _loader_modules(in_tree = None, plugin = None, vendored = None):
+    """Install `in_tree` / `plugin` / `vendored` as the loader modules; None means absent."""
+    names = {IN_TREE, PLUGIN, VENDORED}
     for parents in _PARENTS.values():
         names.update(parents)
     saved = {name: sys.modules.get(name, KeyError) for name in names}
     try:
-        for path, module in ((IN_TREE, in_tree), (PLUGIN, plugin)):
+        for path, module in ((IN_TREE, in_tree), (PLUGIN, plugin), (VENDORED, vendored)):
             if module is None:
                 # A None entry makes importlib raise ModuleNotFoundError.
                 sys.modules[path] = None
@@ -90,10 +93,29 @@ def test_in_tree_preferred_when_both_present():
     assert not _is_patched(plugin)
 
 
+def test_vendored_copy_patched_when_no_plugin():
+    from unsloth_zoo import empty_model
+    vendored = _make_loader_module(VENDORED)
+    with _loader_modules(in_tree = None, plugin = None, vendored = vendored):
+        empty_model.patch_gemma4_vllm_k_eq_v_support()
+        assert empty_model._import_vllm_bnb_loader_module() is vendored
+    assert _is_patched(vendored)
+
+
+def test_plugin_preferred_over_vendored_copy():
+    from unsloth_zoo import empty_model
+    plugin = _make_loader_module(PLUGIN)
+    vendored = _make_loader_module(VENDORED)
+    with _loader_modules(in_tree = None, plugin = plugin, vendored = vendored):
+        empty_model.patch_gemma4_vllm_k_eq_v_support()
+    assert _is_patched(plugin)
+    assert not _is_patched(vendored)
+
+
 def test_neither_raises_actionable_error():
     from unsloth_zoo import empty_model
     with _loader_modules(in_tree = None, plugin = None):
-        with pytest.raises(RuntimeError, match = "pip install vllm-bnb-plugin"):
+        with pytest.raises(RuntimeError, match = "vllm-bnb-plugin"):
             empty_model.patch_gemma4_vllm_k_eq_v_support()
         assert empty_model._import_vllm_bnb_loader_module() is None
 

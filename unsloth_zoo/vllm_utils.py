@@ -422,6 +422,8 @@ pass
 
 # Whichever bitsandbytes module is resolved below (when vLLM is installed); defined here because load_vllm reads it outside that branch.
 _vllm_bnb = None
+# "vllm" (in tree), "vllm-bnb-plugin" or "unsloth" (unsloth_zoo.vllm_bnb): who serves quantization = "bitsandbytes".
+_vllm_bnb_source = None
 
 
 def _resolve_bnb_compute_dtype(kwargs):
@@ -497,9 +499,18 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     def _dequantize_dq(self, quant_states):
         return quant_states
+    # vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin, which re-exports the same names.
+    # resolve() picks in tree, else an installed plugin, else Unsloth's copy of the plugin (unsloth_zoo.vllm_bnb),
+    # and registers the last two so quantization = "bitsandbytes" exists. Hard importing the in-tree path took out
+    # every fast_inference run, not just 4-bit, so a failure here only leaves _vllm_bnb None.
     try:
-        # Same two homes as the quantization module: in tree, else the plugin.
-        _bnb_loader = _import_vllm_bnb_loader_module()
+        from .vllm_bnb import resolve as _resolve_vllm_bnb
+        _vllm_bnb, _bnb_loader, _vllm_bnb_source = _resolve_vllm_bnb()
+    except Exception as _e:
+        _vllm_bnb, _bnb_loader, _vllm_bnb_source = None, None, None
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: no vLLM bitsandbytes support ({type(_e).__name__}: {_e})")
+    try:
         if _bnb_loader is None:
             raise ImportError("no bitsandbytes model loader")
         if hasattr(_bnb_loader, "dequantize_dq"):
@@ -510,24 +521,11 @@ if importlib.util.find_spec("vllm") is not None:
     except:
         pass
 
-    # Patch apply_bnb_4bit
-    # vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin,
-    # which re-exports the same names, so patch whichever is installed. Hard
-    # importing the in-tree path took out every fast_inference run, not just 4-bit.
-    _vllm_bnb = None
-    for _bnb_path in (
-        "vllm.model_executor.layers.quantization.bitsandbytes",  # vLLM <= 0.27.1
-        "vllm_bnb_plugin.bitsandbytes",                          # vLLM >= 0.28
-    ):
-        try:
-            _vllm_bnb = importlib.import_module(_bnb_path)
-            break
-        except ImportError:
-            continue
+    # Patch apply_bnb_4bit on whichever bitsandbytes module resolve() returned.
     if _vllm_bnb is None:
         # No bnb to wrap: only 4-bit needs this patch, and load_vllm raises there with install instructions, so the rest of this module stays usable.
         def _apply_4bit_weight(self, layer, x, bias = None):
-            raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
+            raise RuntimeError("Unsloth: `pip install bitsandbytes vllm-bnb-plugin` for load_in_4bit.")
     elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
@@ -5505,8 +5503,8 @@ def load_vllm(
     # vLLM absent is a different failure with its own message, so say nothing here.
     if use_bitsandbytes and _vllm_bnb is None and importlib.util.find_spec("vllm"):
         raise RuntimeError(
-            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
-            "Install it with `pip install vllm-bnb-plugin` to use "
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree and Unsloth's copy could not load "
+            "(is bitsandbytes>=0.48.1 installed?). `pip install bitsandbytes vllm-bnb-plugin` to use "
             "load_in_4bit with fast_inference."
         )
 

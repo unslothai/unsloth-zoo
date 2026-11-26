@@ -96,7 +96,7 @@ version = {attr = "unsloth_zoo.__init__.__version__"}
 include-package-data = false
 
 [tool.setuptools.package-data]
-unsloth_zoo = ["diffusion_studio/*.html"]
+unsloth_zoo = ["diffusion_studio/*.html", "vllm_bnb/LICENSE"]
 
 [tool.setuptools.packages.find]
 # Explicit include: auto-discovery shipped top-level tests/ and scripts/ into
