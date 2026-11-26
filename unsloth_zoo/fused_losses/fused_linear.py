@@ -113,7 +113,7 @@ _FWD_TILE_COLS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 
                   if os.environ.get("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS") is not None else None)
 _IS_HIP = is_rocm_torch(torch)
 # Bump the suffix on any schema / backward change: Inductor / AOTAutograd caches key on neither.
-_LP_OP = "fused_linear_logprobs_v6"
+_LP_OP = "fused_linear_logprobs_v7"
 _LP_BWD_OP = "fused_linear_logprobs_bwd_v4"
 _CE_OP = "fused_linear_ce_v2"
 
@@ -369,6 +369,16 @@ if _HAS_TRITON:
         return s
 
     @triton.jit
+    def _fl_top1_logits(x, z, ok, TOP1_ROUND: tl.constexpr):  # argmax logits: 0 fp32 / 1 bf16 / 2 fp16
+        # TRL's argmax reads the model's half logits: fp32 GEMM output rounded once, ties to the first column.
+        if TOP1_ROUND == 1:
+            return tl.where(ok, x.to(tl.bfloat16).to(tl.float32), -float("inf"))
+        elif TOP1_ROUND == 2:
+            return tl.where(ok, x.to(tl.float16).to(tl.float32), -float("inf"))
+        else:
+            return z
+
+    @triton.jit
     def _fl_forward_kernel(
         x_ptr, x_stride, n_cols,
         tgt_ptr, exact_ptr, bias_ptr,
@@ -376,7 +386,7 @@ if _HAS_TRITON:
         inv_t, scale, cap,
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,  # bias / scale / softcap / exact target logit
         WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,  # outputs: entropy / logit sum / log sum p^2 / argmax
-        BLOCK: tl.constexpr,  # vocab cols per loop step
+        TOP1_ROUND: tl.constexpr, BLOCK: tl.constexpr,  # argmax reads logits as 0 fp32 / 1 bf16 / 2 fp16, vocab cols per loop step
     ):
         row = tl.program_id(0).to(tl.int64)
         x_row = x_ptr + row * x_stride
@@ -405,10 +415,12 @@ if _HAS_TRITON:
             z = tl.where(ok, x * inv_t, -float("inf"))
             bm = tl.max(z, axis = 0)
             if WANT_TOP1:
-                bi = tl.argmax(z, axis = 0).to(tl.int64) + start
-                take = bm > best
+                zr = _fl_top1_logits(x, z, ok, TOP1_ROUND)
+                br = tl.max(zr, axis = 0)
+                bi = tl.argmax(zr, axis = 0).to(tl.int64) + start
+                take = br > best
                 best_i = tl.where(take, bi, best_i)
-                best = tl.where(take, bm, best)
+                best = tl.where(take, br, best)
             m_new = tl.maximum(m, bm)
             r = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
@@ -449,6 +461,7 @@ if _HAS_TRITON:
         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr,  # bias / logit scale / tanh softcap
         WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,  # outputs: entropy / logit sum / log sum p^2 / argmax
         WANT_TGT: tl.constexpr, WANT_BLOCK_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,  # target logit / per-group top2 / top2 group width / cols per step
+        TOP1_ROUND: tl.constexpr,  # argmax on logits rounded to 0 fp32 / 1 bf16 / 2 fp16
     ):
         # Split width depends only on the vocabulary, so row statistics do not depend on chunk size; WANT_BLOCK_TOP
         # writes the two largest z of each SUB-aligned column group k to top_ptr[row, 2k + {0, 1}].
@@ -491,10 +504,12 @@ if _HAS_TRITON:
                 tl.store(tp, t1, mask = kok)
                 tl.store(tp + 1, t2, mask = kok)
             if WANT_TOP1:
-                bi = tl.argmax(z, axis = 0).to(tl.int64) + start + col0
-                take = bm > best
+                zr = _fl_top1_logits(x, z, ok, TOP1_ROUND)
+                br = tl.max(zr, axis = 0)
+                bi = tl.argmax(zr, axis = 0).to(tl.int64) + start + col0
+                take = br > best
                 best_i = tl.where(take, bi, best_i)
-                best = tl.where(take, bm, best)
+                best = tl.where(take, br, best)
             m_new = tl.maximum(m, bm)
             r = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
@@ -996,7 +1011,14 @@ def _torch_transform(x, scale, cap):
     return x, d
 
 
-def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want):
+def _top1_round(x_dtype, compute_dtype):
+    """TOP1_ROUND for fp32 logits of a half GEMM (TRL <= 1.14 argmaxes the model's half logits)."""
+    if x_dtype != torch.float32 or compute_dtype not in _HALF:
+        return 0
+    return 1 if compute_dtype == torch.bfloat16 else 2
+
+
+def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want, top1_dtype = None):
     """Row statistics of raw logits x [R, V] (any dtype). want = (ent, sum, lssp, top1)."""
     sd = _stat_dtype(x.dtype)
     x = x.to(sd)
@@ -1030,7 +1052,8 @@ def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want):
     if want_lssp:
         out["lssp"] = torch.logsumexp(2 * logp_all, dim = -1).float()
     if want_top1:
-        out["top1"] = (z.argmax(-1) == tgt) & valid
+        zr = z if top1_dtype is None else xt.to(top1_dtype).float()
+        out["top1"] = (zr.argmax(-1) == tgt) & valid
     return out, z, lse, valid
 
 
@@ -1163,8 +1186,10 @@ def _u_dtype(hidden_dtype):
     return hidden_dtype
 
 
-def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write_grad, outs = None):
+def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write_grad, outs = None,
+                 compute_dtype = None):
     """Statistics of raw logits x [n, V]; with write_grad also writes dz into dz_out (may alias x)."""
+    top1_round = _top1_round(x.dtype, compute_dtype) if want[3] else 0
     inv_t, scale, cap, smooth_keep, smooth_each = scalars
     n, V = x.shape
     want_ent, want_sum, want_lssp, want_top1 = want
@@ -1199,7 +1224,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
                     x[:, c:], x.stride(0), n_c, n, _SPLIT_COLS, splits * n, c, c // _SPLIT_COLS,
                     bias[c:] if bias is not None else part, tgt, part,
                     *scal, part, 0, WANT_TGT = True, WANT_BLOCK_TOP = False, SUB = _top_cols(), BLOCK = _split_block(),
-                    num_warps = 4, enable_fp_fusion = True, **flags,
+                    TOP1_ROUND = top1_round, num_warps = 4, enable_fp_fusion = True, **flags,
                 )
             _fl_combine_kernel[(n,)](
                 part, 0, V, n, splits, splits * n, _SPLIT_COLS, part,
@@ -1221,7 +1246,7 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
                 HAS_BIAS = bias is not None, HAS_SCALE = scale != 1.0, HAS_CAP = cap != 0.0,
                 HAS_EXACT = exact is not None,
                 WANT_ENT = want_ent, WANT_SUM = want_sum, WANT_LSSP = want_lssp, WANT_TOP1 = want_top1,
-                BLOCK = block, num_warps = 8, enable_fp_fusion = True,
+                TOP1_ROUND = top1_round, BLOCK = block, num_warps = 8, enable_fp_fusion = True,
             )
         _launch(device, run)
         CALLS["triton"] += 1
@@ -1240,7 +1265,8 @@ def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write
                                (inv_t, scale, cap), 0, V, (smooth_keep, smooth_each))
         return out, dz
     CALLS["torch"] += 1
-    out, z, lse, valid = _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want)
+    top1_dtype = (None, torch.bfloat16, torch.float16)[top1_round]
+    out, z, lse, valid = _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want, top1_dtype)
     for key, dst in outs.items():
         if dst is not None and key in out:
             dst.copy_(out[key])
@@ -1266,7 +1292,7 @@ def _tiled_layout(n_keep, V, cap_rows, bpl, device):
 
 
 def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, scalars, want, fp32_logits,
-                   compute_dtype, outs, cap_rows, block_top = None, u = None, gscale = 1.0, g = None):
+                   compute_dtype, outs, cap_rows, block_top = None, u = None, gscale = 1.0, g = None, top1_half = False):
     """Recompute-path statistics from TRL-shaped tiles; u [N, H] (fp32 logits only) gets d logp / d hidden
     flash-style over vocab tiles. g (0-dim fp32) scales u before rounding."""
     inv_t, scale, cap = scalars
@@ -1275,6 +1301,8 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
     V = w.shape[0]
     f32 = dict(device = device, dtype = torch.float32)
     bpl = _bytes_per_logit(fp32_logits, compute_dtype)
+    top1_round = _top1_round(torch.float32 if fp32_logits else compute_dtype, compute_dtype) if want_top1 and top1_half \
+        else 0
     R, tile = _tiled_layout(n_keep, V, cap_rows, bpl, device)
     splits = -(-V // _SPLIT_COLS)
     buf = _Buffers(R, tile, device, fp32_logits, compute_dtype, _FWD_PAD)
@@ -1308,7 +1336,8 @@ def _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, sc
                         bias_t[c:] if bias_t is not None else part, t, part, *scal,
                         top, top.stride(0) if block_top is not None else 0,
                         WANT_TGT = True, WANT_BLOCK_TOP = block_top is not None, SUB = _top_cols(),
-                        BLOCK = _split_block(), num_warps = 4, enable_fp_fusion = True, **flags,
+                        BLOCK = _split_block(), TOP1_ROUND = top1_round, num_warps = 4, enable_fp_fusion = True,
+                        **flags,
                     )
                 if u is None:
                     return
@@ -1559,7 +1588,8 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
 
 @_guarded
 def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
-                   want_ent, want_mean, want_lssp, want_top1, want_u, rows, tiled = False, head_grad = False):
+                   want_ent, want_mean, want_lssp, want_top1, want_u, rows, tiled = False, head_grad = False,
+                   top1_half = False):
     device = weight.device
     N, H = hidden.shape
     V = weight.shape[0]
@@ -1613,7 +1643,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
             with torch.autocast(device.type, enabled = False):
                 _tiled_forward(device, hidden, idx, n_keep, w, bias, targets, exact_mode, (inv_t, scale, cap),
                                (want_ent, want_mean, want_lssp, want_top1), fp32_logits, compute_dtype, dst, -rows,
-                               top, u if want_u else None, u_scale)
+                               top, u if want_u else None, u_scale, top1_half = top1_half)
             if want_mean:
                 dst["sum"].div_(V)
             if not full:
@@ -1648,6 +1678,7 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
                 st, dz = _row_forward(
                     device, x, dz_out, t, bias, exact, coef, (inv_t, scale, cap, 1.0, 0.0),
                     (want_ent, want_mean, want_lssp, want_top1), want_u, direct,
+                    compute_dtype = compute_dtype if top1_half else None,
                 )
                 put = (lambda dst, src: dst[a:b].copy_(src)) if n_keep == N \
                     else (lambda dst, src: dst.index_copy_(0, idx[a:b], src.to(dst.dtype)))
@@ -1899,17 +1930,18 @@ if _OPS is None:
         hidden: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], targets: torch.Tensor,
         mask: Optional[torch.Tensor], temperature: float, mul: float, div: float, cap: float,
         compute_dtype: torch.dtype, want_ent: bool, want_mean: bool, want_lssp: bool, want_top1: bool,
-        want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int, ent_lazy: bool,
+        want_u: bool, need_h: bool, need_w: bool, need_b: bool, rows: int, ent_lazy: bool, top1_half: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         CALLS["logprobs"] += 1
         return _OPS["lp_impl"](hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
                                want_ent, want_mean, want_lssp, want_top1, want_u, rows,
-                               (need_h or need_w or need_b) and not want_u, need_w)
+                               (need_h or need_w or need_b) and not want_u, need_w, top1_half)
 
     @_lp_op.register_fake
     def _lp_fake(hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
-                 want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy):
+                 want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy,
+                 top1_half = False):
         N = hidden.shape[0]
         f32 = dict(device = weight.device, dtype = torch.float32)
         e = lambda: torch.empty(0, **f32)  # noqa: E731
@@ -1935,7 +1967,7 @@ if _OPS is None:
         ctx.mark_non_differentiable(mean, lssp, top1, u, lse, block_top, idx, n_keep, lpt)
         ctx.set_materialize_grads(False)
         (hidden, weight, bias, targets, mask, temperature, mul, div, cap, compute_dtype,
-         want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy) = inputs
+         want_ent, want_mean, want_lssp, want_top1, want_u, need_h, need_w, need_b, rows, ent_lazy, *_) = inputs
         ctx.want_u = want_u
         # Lazy entropy: its gradient is recomputed only when one arrives (a logged entropy costs nothing).
         ctx.ent_lazy = bool(want_u and ent_lazy and want_ent)
@@ -1954,7 +1986,7 @@ if _OPS is None:
 
     def _lp_backward(ctx, g_logps, g_ent, *_):
         need_h, need_w, need_b = ctx.need
-        none = (None,) * 19
+        none = (None,) * 20
         if ctx.want_u:
             if not need_h:
                 return (None,) + none
@@ -1980,7 +2012,7 @@ if _OPS is None:
             hidden, weight, bias, targets, idx, n_keep, lse, ent, g, ge, block_top, lpt, temperature, mul, div, cap,
             compute_dtype, need_h, need_w, need_b, rows,
         )
-        return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 17
+        return (gh if need_h else None, gw if need_w else None, gb if need_b else None) + (None,) * 18
 
     _lp_op.register_autograd(_lp_backward, setup_context = _lp_setup)
 
@@ -2648,11 +2680,13 @@ def fused_linear_logprobs(
     rows_per_chunk = None,
     entropy_requires_grad = True,
     max_rows_per_chunk = None,
+    is_top1_half_logits = False,
 ):
     """Per-token log_softmax(transform(hidden @ weight.T + bias) / temperature)[targets], float32 [...].
 
     Rows outside `mask` (or with an out-of-range target) return 0. Extras: entropy (None: gradient recomputed only
-    if one arrives), vocab mean of transformed logits, log sum p^2, argmax == target."""
+    if one arrives), vocab mean of transformed logits, log sum p^2, argmax == target (on half-rounded logits if
+    is_top1_half_logits, as TRL <= 1.14; else fp32 as TRL 1.15)."""
     device = weight.device
     lead = targets.shape
     hidden2 = hidden.reshape(-1, hidden.shape[-1]).to(device)
@@ -2673,6 +2707,7 @@ def fused_linear_logprobs(
         _compute_dtype(hidden, weight), bool(return_entropy), bool(return_mean_logits),
         bool(return_log_sum_sq_probs), bool(return_is_top1), want_u, need_h, need_w, need_b,
         int(rows_per_chunk or 0) or -int(max_rows_per_chunk or 0), bool(lazy and ent_grad),
+        bool(return_is_top1 and is_top1_half_logits),
     )
     out_device = hidden.device
     result = [logps.reshape(lead).to(out_device)]

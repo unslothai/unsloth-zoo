@@ -575,14 +575,6 @@
       "reason": "Imports a vLLM model module named in the fixed _REPLAYSSM_MAMBA2_MODELS table."
     },
     {
-      "file": "unsloth_zoo/vllm_utils.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "54cfcec6d18cb37d",
-      "count": 1,
-      "reason": "Fixed vLLM bitsandbytes module path held in a local."
-    },
-    {
       "file": "unsloth_zoo_downloads/hf_xet_fallback.py",
       "rule": "dynamic-import",
       "sink": "import_module",
