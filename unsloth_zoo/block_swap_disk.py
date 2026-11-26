@@ -43,6 +43,7 @@ __all__ = [
     "placeholder_like",
     "disk_ref",
     "read_bytes",
+    "consume_cuda_error",
 ]
 
 ALIGN = 4096
@@ -59,6 +60,65 @@ _RAM_FS = {"tmpfs", "ramfs", "devtmpfs", "hugetlbfs", "squashfs", "proc", "sysfs
 
 def _round_up(n, a = ALIGN):
     return -(-int(n) // a) * a
+
+
+_GET_LAST_ERROR = []
+
+
+def _resolve_get_last_error():
+    """cudaGetLastError (hipGetLastError on ROCm) of the runtime torch already loaded; torch does not expose it."""
+    import ctypes
+    hip = bool(getattr(torch.version, "hip", None))
+    sym = "hipGetLastError" if hip else "cudaGetLastError"
+    if sys.platform == "win32":
+        import glob
+        # torch's wheels ship the runtime DLL next to torch's own; loading it again returns the mapped module.
+        pattern = "amdhip64*.dll" if hip else "cudart64_*.dll"
+        for path in sorted(glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", pattern))):
+            fn = getattr(ctypes.CDLL(path), sym, None)
+            if fn is not None:
+                return fn
+        return None
+    # Through torch's own extension first (its dependency tree only): a global lookup could reach a second
+    # libcudart that another package or LD_PRELOAD mapped.
+    fn = getattr(ctypes.CDLL(torch._C.__file__), sym, None)
+    if fn is not None:
+        return fn
+    lib = "libamdhip64.so" if hip else "libcudart.so"
+    major = ((torch.version.hip if hip else torch.version.cuda) or "").split(".")[0]
+    mapped = []
+    try:
+        with open("/proc/self/maps", encoding = "utf-8") as maps:
+            for ln in maps:
+                path = ln.split()[-1]
+                if lib in os.path.basename(path) and path not in mapped:
+                    mapped.append(path)
+    except OSError:
+        pass
+    own = [p for p in mapped if os.path.basename(p).startswith(f"{lib}.{major}")] if major else []
+    for path in own or mapped:
+        fn = getattr(ctypes.CDLL(path), sym, None)
+        if fn is not None:
+            return fn
+    # No /proc (or a static runtime): torch usually loads the runtime globally.
+    return getattr(ctypes.CDLL(None), sym, None)
+
+
+def consume_cuda_error():
+    """Clear this thread's pending CUDA / HIP error after a handled failure (a refused cudaHostRegister or
+    cudaHostUnregister): left pending, the thread's next kernel launch raises it. Never raises."""
+    try:
+        if not _GET_LAST_ERROR:
+            import ctypes
+            fn = _resolve_get_last_error()
+            if fn is None:
+                return
+            fn.argtypes = []
+            fn.restype = ctypes.c_int
+            _GET_LAST_ERROR.append(fn)
+        _GET_LAST_ERROR[0]()
+    except Exception:  # no runtime symbol (CPU build): nothing is pending
+        pass
 
 
 def disk_tier_reason():
@@ -190,8 +250,12 @@ class _HostBuf:
         if pin and nbytes and torch.cuda.is_available() and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1":
             try:
                 cudart = torch.cuda.cudart()
-                if hasattr(cudart, "cudaHostRegister") and int(cudart.cudaHostRegister(self.view.data_ptr(), nbytes, 1)) == 0:
-                    self.ptr = self.view.data_ptr()
+                if hasattr(cudart, "cudaHostRegister"):
+                    if int(cudart.cudaHostRegister(self.view.data_ptr(), nbytes, 1)) == 0:
+                        self.ptr = self.view.data_ptr()
+                    else:
+                        # The refusal stays this thread's pending error; the next kernel launch would raise it.
+                        consume_cuda_error()
             except Exception:
                 self.ptr = None
 
@@ -202,7 +266,9 @@ class _HostBuf:
     def __del__(self):
         if self.ptr is not None:
             try:
-                torch.cuda.cudart().cudaHostUnregister(self.ptr)
+                if int(torch.cuda.cudart().cudaHostUnregister(self.ptr)) != 0:
+                    # As a refused register: pending on whichever thread dropped the last reference.
+                    consume_cuda_error()
             except Exception:
                 pass
             self.ptr = None

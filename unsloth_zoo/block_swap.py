@@ -146,6 +146,13 @@ def _disk():
     return _DISK[0]
 
 
+def _consume_cuda_error():
+    """Clear this thread's pending CUDA / HIP error (block_swap_disk.consume_cuda_error). Never raises."""
+    fn = getattr(_disk(), "consume_cuda_error", None)
+    if fn is not None:
+        fn()
+
+
 def _has_disk_ref(p):
     """True for a weight spilled to disk at load whose placeholder BlockSwap has not taken over yet."""
     return getattr(p, "_unsloth_disk", None) is not None and _disk().disk_ref(p) is not None
@@ -357,6 +364,8 @@ class _Registered:
         # cudaHostRegisterPortable: pinned for every device's context, since blocks may fetch onto several cards.
         rc = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), nbytes, 1)
         if int(rc) != 0:
+            # The refusal stays this thread's pending error; left there, the next kernel launch raises it.
+            _consume_cuda_error()
             raise RuntimeError(f"cudaHostRegister failed: {rc}")
         self.ptr = buf.data_ptr()
 
@@ -364,7 +373,8 @@ class _Registered:
         # Before the buffer can be freed: a freed range left registered would pin whatever lands there next.
         if self.ptr is not None:
             try:
-                torch.cuda.cudart().cudaHostUnregister(self.ptr)
+                if int(torch.cuda.cudart().cudaHostUnregister(self.ptr)) != 0:
+                    _consume_cuda_error()
             except Exception:
                 pass
             self.ptr = None
