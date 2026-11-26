@@ -297,3 +297,13 @@ def test_other_runtime_errors_still_raise(fresh):
     with pytest.raises(RuntimeError, match = "cannot be multiplied"):
         mu._grouped_mm_with_backward_fix(x, w, offs)
     assert mu._TORCH_GROUPED_MM_SUPPORTED is True
+
+
+def test_the_fallback_line_prints_once_across_the_compiled_cache_copy(fresh, capsys):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("unsloth_cached_moe_utils_g97", mu.__file__)
+    copy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copy)
+    mu._log_grouped_mm_fallback("bfloat16, 4 experts: refused", "MoE backend 'native_torch'")
+    copy._log_grouped_mm_fallback("bfloat16, 4 experts: refused", "MoE backend 'native_torch'")
+    assert capsys.readouterr().out.count("cannot run MoE training") == 1

@@ -2532,8 +2532,11 @@ def _log_grouped_mm_fallback(reason, fallback):
         "Opt out: UNSLOTH_MOE_BACKEND=grouped_mm|unsloth_triton|native_torch picks the backend, "
         "UNSLOTH_MOE_GROUPED_TRITON=0 keeps Triton out of grouped_mm, UNSLOTH_MOE_GROUPED_MM_PROBE=0 skips this check."
     )
-    if line not in _GROUPED_MM_FALLBACK_LOGGED:
-        _GROUPED_MM_FALLBACK_LOGGED.add(line)
+    # The compiled-cache copy of this module shares the package module's set: one line per process, not per copy.
+    package = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    logged = getattr(package, "_GROUPED_MM_FALLBACK_LOGGED", _GROUPED_MM_FALLBACK_LOGGED)
+    if line not in logged:
+        logged.add(line)
         print(line)
 
 
