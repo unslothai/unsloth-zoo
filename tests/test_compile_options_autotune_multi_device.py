@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_torch_compile leaves Inductor's autotune_multi_device at the torch default. Forcing it on made the
-subprocess autotune pool int()-parse the visible-devices mask, so a UUID / MIG mask raised ValueError, and each rank
-tuned on every visible card. CPU-only: runs in a fresh interpreter so the process config stays clean."""
+"""autotune_multi_device stays at the torch default: forced on, a UUID / MIG mask raised ValueError. CPU only."""
 from __future__ import annotations
 
 import json
