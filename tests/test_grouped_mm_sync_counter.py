@@ -178,3 +178,23 @@ def test_transformers_wrapper_classifies_at_weight_dtype(monkeypatch):
     w = torch.randn(4, 16, 8).to(torch.bfloat16)
     tm._grouped_mm(x, w, torch.tensor([3, 3, 9, 13], dtype = torch.int32))
     assert seen == [(torch.bfloat16, torch.bfloat16)]
+
+
+def test_compiled_site_keeps_group_count(monkeypatch):
+    # Over 1024 groups cuBLASLt declines, so the compiled classification must see the real count, as eager does.
+    seen = []
+    monkeypatch.setattr(
+        M, "_torch_grouped_mm_takes_fallback",
+        lambda device, dtype, weight_dtype, groups: seen.append(groups) or True,
+    )
+    torch._dynamo.reset()
+    x, w, _ = _case()
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def f(x, w):
+        M._count_grouped_mm_sync("torch_fallback", x, w, 2048)
+        return x @ w[0]
+
+    f(x, w)
+    assert seen == [2048]
+    torch._dynamo.reset()
