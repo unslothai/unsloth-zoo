@@ -423,6 +423,7 @@ pass
 # Whichever bitsandbytes module is resolved below (when vLLM is installed); defined here because load_vllm reads it outside that branch.
 _vllm_bnb = None
 _vllm_bnb_source = None
+_vllm_bnb_error = None
 
 
 def _resolve_bnb_compute_dtype(kwargs):
@@ -504,8 +505,7 @@ if importlib.util.find_spec("vllm") is not None:
         _vllm_bnb, _bnb_loader, _vllm_bnb_source = _resolve_vllm_bnb()
     except Exception as _e:
         _vllm_bnb, _bnb_loader, _vllm_bnb_source = None, None, None
-        if UNSLOTH_ENABLE_LOGGING:
-            print(f"Unsloth: no vLLM bitsandbytes support ({type(_e).__name__}: {_e})")
+        _vllm_bnb_error = f"{type(_e).__name__}: {_e}"
     try:
         if _bnb_loader is None:
             raise ImportError("no bitsandbytes model loader")
@@ -521,7 +521,7 @@ if importlib.util.find_spec("vllm") is not None:
     if _vllm_bnb is None:
         # No bnb to wrap: only 4-bit needs this patch, and load_vllm raises there with install instructions, so the rest of this module stays usable.
         def _apply_4bit_weight(self, layer, x, bias = None):
-            raise RuntimeError("Unsloth: `pip install bitsandbytes vllm-bnb-plugin` for load_in_4bit.")
+            raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
     elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
@@ -5499,9 +5499,10 @@ def load_vllm(
     # vLLM absent is a different failure with its own message, so say nothing here.
     if use_bitsandbytes and _vllm_bnb is None and importlib.util.find_spec("vllm"):
         raise RuntimeError(
-            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree and Unsloth's copy could not load "
-            "(is bitsandbytes>=0.48.1 installed?). `pip install bitsandbytes vllm-bnb-plugin` to use "
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree into vllm-bnb-plugin. "
+            "Install it with `pip install vllm-bnb-plugin` to use "
             "load_in_4bit with fast_inference."
+            + (f" Loading it failed with {_vllm_bnb_error}" if _vllm_bnb_error else "")
         )
 
     if _is_gemma4_config(config):
