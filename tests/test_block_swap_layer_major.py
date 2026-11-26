@@ -413,6 +413,34 @@ def test_abort_on_a_loss_on_the_first_layer_input():
     assert _grads(model) == {}
 
 
+def test_abort_restores_decoder_gradients_written_by_the_loss_part():
+    """A regulariser on a decoder weight writes its gradient in the loss part; a later abort puts it back too."""
+    model = _model()
+    batches, items = _batches(2)
+    weight = next(p for n, p in _layers(model)[1].named_parameters() if p.requires_grad)
+
+    def fn(b):
+        out = model(**b, num_items_in_batch = items)
+        (out.loss + weight.square().sum()).backward()
+        model(**b)   # a second forward: protocol break in the loss part
+        return out.loss.detach()
+
+    why = _abort_case(model, batches, items, [lambda b = b: fn(b) for b in batches])
+    assert "called decoder layer 0" in why
+    assert _grads(model) == {}
+
+
+def test_distributed_is_refused(monkeypatch):
+    model = _model()
+    batches, items = _batches(2)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 2)
+    losses, why = lm.run_layer_major(_layers(model), [lambda b = b: _step(model, b, items) for b in batches],
+                                     model = model)
+    assert losses is None and "distributed" in why
+    assert _grads(model) == {}
+
+
 def test_caller_autocast_reaches_the_micro_batches():
     # Non-reentrant: older torch's reentrant checkpoint under CPU autocast leaves the LoRA weights without
     # gradients even in standard accumulation.

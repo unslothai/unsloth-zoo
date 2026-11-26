@@ -506,17 +506,23 @@ def _intercept(window, layers):
 def run_layer_major(layers, micro_fns, swapper = None, model = None):
     """Run `micro_fns` (one full training step per micro-batch: forward, loss, its scaling and backward) layer-major
     over `layers`. Returns (results, None) with every gradient accumulated, or (None, reason) after a safe abort:
-    no decoder-layer gradient was written and gradients outside the layers are as they were, so the caller can run
-    the same micro-batches the standard way. A real error in a micro-batch is raised."""
+    every trainable gradient of `model` (and of `layers`) is as it was, so the caller can run the same micro-batches
+    the standard way. A real error in a micro-batch is raised."""
     n = len(micro_fns)
     if n < 1 or not len(layers):
         return None, "nothing to run"
-    layer_params = {id(p) for layer in layers for p in layer.parameters()}
-    outside = []
-    if model is not None:
-        for p in model.parameters():
-            if p.requires_grad and id(p) not in layer_params:
-                outside.append((p, None if p.grad is None else p.grad.clone()))
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and \
+            torch.distributed.get_world_size() > 1:
+        # DDP reduces in the loss parts' backwards, before the window's decoder backward exists.
+        return None, "distributed training (gradient reduction would miss the decoder backward)"
+    # A loss part can also write gradients directly (a regulariser on a decoder weight): an abort puts back all.
+    params, seen = [], set()
+    for owner in ([model] if model is not None else []) + list(layers):
+        for p in owner.parameters():
+            if p.requires_grad and id(p) not in seen:
+                seen.add(id(p))
+                params.append(p)
+    outside = [(p, None if p.grad is None else p.grad.clone()) for p in params]
     try:
         hooks = torch._C._autograd._top_saved_tensors_default_hooks(False)
     except (AttributeError, TypeError, RuntimeError):   # torch < 2.7 has no query
