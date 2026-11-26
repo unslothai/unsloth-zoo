@@ -4201,6 +4201,75 @@ def grpo_host_lengths_to_device(lengths, device):
 pass
 
 
+# Rows a re-verify of already trusted packing scores one at a time. The first verify scores every row.
+GRPO_PACKING_REVERIFY_ROWS = 3
+
+
+def grpo_packing_verify_rows(lengths, completion_counts, trusted, limit = GRPO_PACKING_REVERIFY_ROWS):
+    """Rows the packing self-verify scores alone as ground truth (host ints only, no sync).
+    Until packing is trusted, and under UNSLOTH_GRPO_SEQ_PACKING_VERIFY=1, every row. A re-verify of trusted
+    packing at a larger shape scores at most `limit` rows: the last scored row (it follows every other document
+    in the packed stream, so any cross-document leak reaches it), the longest row (the new position range) and
+    the row with the most completion tokens."""
+    import os
+    rows = [i for i, (n, c) in enumerate(zip(lengths, completion_counts)) if n >= 2 and c > 0]
+    if (not trusted) or limit is None or limit <= 0 or len(rows) <= limit \
+            or os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY", "0") == "1":
+        return [i for i, n in enumerate(lengths) if n >= 2]
+    pick = [rows[-1]]
+    for i in (max(rows, key = lambda r: lengths[r]), max(rows, key = lambda r: completion_counts[r])):
+        if i not in pick:
+            pick.append(i)
+    for i in sorted(rows, key = lambda r: -completion_counts[r]):
+        if len(pick) >= limit:
+            break
+        if i not in pick:
+            pick.append(i)
+    return sorted(pick)
+pass
+
+
+def grpo_packing_trusted_bound(model, value):
+    """Trusted packing bound after a verify passed at `value` tokens: 2x by default, so record lengths that grow a little
+    do not re-run the verify every time. RoPE that switches with length (LongRoPE short/long factors, dynamic
+    NTK) never widens across `original_max_position_embeddings`, and past it stays at `value`."""
+    import os
+    value = int(value)
+    # UNSLOTH_GRPO_SEQ_PACKING_VERIFY_GROWTH=1 trusts only the exact verified shape (the old rule).
+    try:
+        growth = float(os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY_GROWTH", "2"))
+    except ValueError:
+        growth = 2.0
+    if not growth > 1:
+        return value
+    config = getattr(model, "config", None)
+    if hasattr(config, "get_text_config"):
+        try:
+            config = config.get_text_config()
+        except Exception:
+            pass
+    switch = None
+    scalings = []
+    for scaling in (getattr(config, "rope_scaling", None), getattr(config, "rope_parameters", None)):
+        if isinstance(scaling, dict):
+            # transformers 5 can key rope_parameters by layer type
+            scalings.append(scaling)
+            scalings.extend(v for v in scaling.values() if isinstance(v, dict))
+    for scaling in scalings:
+        if str(scaling.get("rope_type", scaling.get("type", ""))).lower() in (
+            "longrope", "su", "dynamic",
+        ):
+            switch = scaling.get("original_max_position_embeddings", None) or getattr(
+                config, "original_max_position_embeddings", None,
+            ) or getattr(config, "max_position_embeddings", None)
+            break
+    if switch is None:
+        return int(growth * value)
+    switch = int(switch)
+    return min(int(growth * value), switch) if value <= switch else value
+pass
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -5080,7 +5149,9 @@ def grpo_accumulated_loss(
                 and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
             try:
                 # Imported here: this body is copied into the generated trainer.
-                from unsloth_zoo.rl_replacements import grpo_nonzero_static, grpo_host_lengths_to_device
+                from unsloth_zoo.rl_replacements import (
+                    grpo_nonzero_static, grpo_host_lengths_to_device, grpo_packing_verify_rows, grpo_packing_trusted_bound,
+                )
                 _pack_pad_id = trainer.processing_class.pad_token_id
                 _pack_keep = input_ids != _pack_pad_id
                 if pad_eos_rows is not None or prompt_real_mask is not None:
@@ -5096,13 +5167,16 @@ def grpo_accumulated_loss(
                 _pack_ctgt_2d = (_pack_keep & (_pack_csum > 1)) & (
                     torch.arange(_pack_L, device = input_ids.device) >= _pack_cstart.to(input_ids.device).unsqueeze(1)
                 )
-                # The one host read per packed batch: row lengths, active rows, target count.
+                # The one host read per packed batch: row lengths, completion tokens per row, active rows, target count.
+                _pack_ccount = completion_mask.sum(dim = 1).to(device = _pack_lengths.device, dtype = torch.long)
                 _pack_meta_cpu = torch.cat([
                     _pack_lengths.to(torch.long),
-                    (completion_mask.sum(dim = 1) > 0).sum().to(device = _pack_lengths.device, dtype = torch.long).reshape(1),
+                    _pack_ccount,
+                    (_pack_ccount > 0).sum().reshape(1),
                     _pack_ctgt_2d.sum().to(torch.long).reshape(1),
                 ]).tolist()
-                _pack_lengths_cpu = _pack_meta_cpu[:-2]
+                _pack_lengths_cpu = _pack_meta_cpu[:_pack_lengths.shape[0]]
+                _pack_ccount_cpu = _pack_meta_cpu[_pack_lengths.shape[0]:-2]
                 _pack_active_cpu, _pack_ntgt = _pack_meta_cpu[-2], _pack_meta_cpu[-1]
                 _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
                 _pack_T = sum(_pack_nz_cpu)
@@ -5198,10 +5272,14 @@ def grpo_accumulated_loss(
                     if (not _pack_force_verify) and _pack_ok is True and _pack_T <= _pack_vT and _pack_maxseg <= _pack_vS:
                         _pack_use = True                                           # already verified for this shape
                     else:
-                        # verify against the per-row clean forward (exact ground truth; no grad, value check)
+                        # verify against the per-row clean forward (exact ground truth; no grad, value check).
+                        # A re-verify of trusted packing scores at most 3 rows (grpo_packing_verify_rows).
+                        _pack_vrows = grpo_packing_verify_rows(
+                            _pack_lengths_cpu, _pack_ccount_cpu, _pack_ok is True and _pack_vT > 0,
+                        )
                         _pack_ref = torch.zeros_like(_pack_result)
                         with torch.no_grad(), autocaster:
-                            for _pack_i in range(total_rows):
+                            for _pack_i in _pack_vrows:
                                 _pack_ni = _pack_lengths_cpu[_pack_i]
                                 if _pack_ni < 2: continue
                                 _pack_rmask = _pack_keep[_pack_i]
@@ -5235,18 +5313,28 @@ def grpo_accumulated_loss(
                             eos_rows = pad_eos_rows,
                             real_mask = None if prompt_real_mask is None else _pack_keep[:, -_pack_W:],
                         ).float()
+                        if len(_pack_vrows) < total_rows:
+                            # rows not scored alone have no reference: leave them out of the compare
+                            _pack_vsel = torch.zeros(total_rows, 1, dtype = _pack_cm.dtype, device = _pack_cm.device)
+                            _pack_vsel[_pack_vrows] = 1
+                            _pack_cm = _pack_cm * _pack_vsel
                         _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
                         if UNSLOTH_ENABLE_LOGGING:
-                            print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} maxseg={_pack_maxseg} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
+                            print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} maxseg={_pack_maxseg} rows={len(_pack_vrows)}/{total_rows} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
                         # floor ~0.25 through different kernels; cross-sample contamination is >= 2.4
                         if _pack_diff < 7e-1:
                             unwrapped_model._unsloth_seq_packing_grad_ok = True
                             # only widen the trusted shape when >= 2 completion rows actually exercised
                             # cross-sample packing; a < 2 row pass proves nothing, so keep re-verifying
                             # larger shapes until a real multi-row batch clears them
+                            # (2x past this shape, so a slowly growing record length does not re-verify each time)
                             if _pack_active >= 2:
-                                unwrapped_model._unsloth_seq_packing_grad_verified_T = max(_pack_vT, _pack_T)
-                                unwrapped_model._unsloth_seq_packing_grad_verified_seg = max(_pack_vS, _pack_maxseg)
+                                unwrapped_model._unsloth_seq_packing_grad_verified_T = max(
+                                    _pack_vT, grpo_packing_trusted_bound(unwrapped_model, _pack_T),
+                                )
+                                unwrapped_model._unsloth_seq_packing_grad_verified_seg = max(
+                                    _pack_vS, grpo_packing_trusted_bound(unwrapped_model, _pack_maxseg),
+                                )
                             _pack_ok = True
                             _pack_use = True
                         else:
