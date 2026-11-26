@@ -433,12 +433,6 @@ def patch_cpu_sdpa_gqa():
 _ROWWISE_NORM_MIN_NUMEL = 1 << 20
 
 
-def _rowwise_square_sum(grad):
-    rows = torch.linalg.vector_norm(grad.reshape(-1, grad.shape[-1]), 2.0, dim = -1)
-    rows = rows.double()
-    return torch.dot(rows, rows)
-
-
 def _rowwise_eligible(grad):
     return (
         isinstance(grad, torch.Tensor) and grad.device.type == "cpu" and grad.dtype == torch.float32
@@ -484,15 +478,25 @@ def patch_cpu_grad_total_norm():
     return True
 
 
+def _square_sum_float64(norms):
+    """Sum of squares of a list of norms in float64, in a constant number of ops (one cat, one cast, one dot)."""
+    if len({n.dtype for n in norms}) > 1:
+        norms = [n.double() for n in norms]
+    flat = torch.cat([n.reshape(-1) for n in norms]).double()
+    return torch.dot(flat, flat)
+
+
 def _rowwise_total_norm(tensors, norm_type, error_if_nonfinite):
-    squares = []
+    # One norm op per tensor, as torch's own path: row norms for the large float32 ones, a plain norm for the rest.
+    rows, others = [], []
     for t in tensors:
         if _rowwise_eligible(t):
-            squares.append(_rowwise_square_sum(t))
+            rows.append(torch.linalg.vector_norm(t.reshape(-1, t.shape[-1]), 2.0, dim = -1))
         else:
-            squares.append(torch.linalg.vector_norm(t, 2.0).double().square())
+            others.append(torch.linalg.vector_norm(t, 2.0))
+    square = _square_sum_float64(rows + others)
     dtype = functools.reduce(torch.promote_types, (t.dtype for t in tensors))
-    total_norm = torch.stack(squares).sum().sqrt().to(dtype)
+    total_norm = square.sqrt().to(dtype)
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
         raise RuntimeError(
             f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, so it cannot be "
