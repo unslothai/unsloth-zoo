@@ -928,21 +928,37 @@ def patch_vllm_untiled_moe_experts():
 pass
 
 
+def _stacked_moe_lora_class(model_type):
+    """vLLM class to mark as 3D MoE LoRA, or None. Only transformers >= 5 stacks the experts into 3D tensors."""
+    if model_type == "qwen3_moe":
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts  # noqa: F401
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+        return Qwen3MoeForCausalLM
+    if model_type == "deepseek_v2":
+        from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2Experts  # noqa: F401
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV2ForCausalLM
+        return DeepseekV2ForCausalLM
+    if model_type == "deepseek_v3":
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3Experts  # noqa: F401
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV3ForCausalLM
+        return DeepseekV3ForCausalLM
+    return None
+pass
+
+
 def patch_vllm_stacked_moe_lora(config):
     """Set is_3d_moe_weight so vLLM serves the stacked expert adapter; its 2D wrapper cannot (vllm-project/vllm#41754)."""
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
-    if model_type != "qwen3_moe": return False
+    if model_type not in ("qwen3_moe", "deepseek_v2", "deepseek_v3"): return False
     try:
         from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
-        from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
-        # Only transformers >= 5 stacks the experts into 3D tensors.
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts  # noqa: F401
+        cls = _stacked_moe_lora_class(model_type)
     except Exception as e:
         logger.info(f"Unsloth: not marking {model_type} as a 3D MoE LoRA model in vLLM: {e}")
         return False
-    if getattr(Qwen3MoeForCausalLM, "is_3d_moe_weight", False) is not True:
-        Qwen3MoeForCausalLM.is_3d_moe_weight = True
+    if getattr(cls, "is_3d_moe_weight", False) is not True:
+        cls.is_3d_moe_weight = True
     return True
 pass
 
@@ -1885,6 +1901,51 @@ def _block_scale_grid_matches(weight_shape, scale_shape, block_size):
 pass
 
 
+def _is_vllm_mla_attention(attn):
+    """vLLM's DeepseekV2MLAAttention (DeepSeek-V2 / V3, Kimi, GLM-4.7-Flash, ...): kv_b_proj, no fused qkv_proj."""
+    return attn is not None and hasattr(attn, "kv_b_proj") and not hasattr(attn, "qkv_proj")
+pass
+
+
+def extract_mla_attention(attn, prefix, get_state_dict, state_dict):
+    """Alias one vLLM MLA attention onto HF DeepSeek names as row views. q_lora_rank set: vLLM's fused_qkv_a_proj
+    is [q_a_proj | kv_a_proj_with_mqa]; None: q_proj. W_UK_T / W_UV are derived from kv_b_proj after load."""
+    name = type(attn).__name__
+    mla = getattr(attn, "mla_attn", None)
+    if getattr(attn, "indexer", None) is not None or getattr(mla, "is_sparse", False) \
+        or getattr(getattr(mla, "mla_attn", None), "is_sparse", False):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference = True does not support {name} with a sparse attention indexer "
+            "(DeepSeek-V3.2 / GLM-5 DSA) yet. Load with fast_inference = False."
+        )
+    fused = getattr(attn, "fused_qkv_a_proj", None)
+    if fused is not None:
+        widths = getattr(getattr(fused, "base_layer", fused), "output_sizes", None)
+        if widths is None or len(widths) != 2:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot split {prefix}.fused_qkv_a_proj (output sizes {widths}); "
+                "load with fast_inference = False."
+            )
+        get_state_dict(f"{prefix}.q_a_proj",           0, state_dict, fused)
+        get_state_dict(f"{prefix}.kv_a_proj_with_mqa", 1, state_dict, fused)
+    else:
+        for proj in ("q_a_proj", "kv_a_proj_with_mqa"):
+            if getattr(attn, proj, None) is not None:
+                get_state_dict(f"{prefix}.{proj}", 0, state_dict, getattr(attn, proj), slice_weights = False)
+    has_q_a = fused is not None or getattr(attn, "q_a_proj", None) is not None
+    q_names = ("q_b_proj",) if has_q_a else ("q_proj",)
+    for proj in q_names + ("kv_b_proj", "o_proj"):
+        module = getattr(attn, proj, None)
+        if module is None:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot find {prefix}.{proj} in vLLM's {name}; "
+                "load with fast_inference = False."
+            )
+        get_state_dict(f"{prefix}.{proj}", 0, state_dict, module, slice_weights = False)
+    # q_a_layernorm / kv_a_layernorm come through the layernorm templates.
+pass
+
+
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
@@ -2145,15 +2206,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
         layer = vllm_text_model.layers[kk]
-        if hasattr(layer, "self_attn"):
+        if _is_vllm_mla_attention(getattr(layer, "self_attn", None)):
+            extract_mla_attention(layer.self_attn, f"{vllm_text_model_prefix}.layers.{kk}.self_attn", get_state_dict, state_dict)
+        elif hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            if hasattr(layer.self_attn, "kv_b_proj") or hasattr(layer.self_attn, "kv_a_proj_with_mqa"):
-                raise NotImplementedError(
-                    f"Unsloth: fast_inference = True does not support {type(layer.self_attn).__name__} yet "
-                    "(multi-head latent attention: DeepSeek-V2 / V3, Kimi, GLM-4.7-Flash, ...): its "
-                    "kv_a / kv_b projections cannot be shared with the training model. "
-                    "Load with fast_inference = False."
-                )
             # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only.
             qkv_proj = getattr(layer.self_attn, "qkv_proj", None)
             # LFM2 names the attention output projection out_proj
@@ -2476,6 +2532,58 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
 pass
+
+def _align_mla_softmax_scale(model, config):
+    """Set HF DeepSeek attention to vLLM's YaRN softmax scale qk_head_dim ** -0.5 * mscale(mscale_all_dim) ** 2
+    (DeepSeek's reference too); transformers < 5 DeepseekV2Attention drops the mscale ** 2. Returns modules changed."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    text_config = getattr(config, "text_config", None) or config
+    if getattr(text_config, "model_type", None) not in ("deepseek_v2", "deepseek_v3"): return 0
+    rope = getattr(text_config, "rope_parameters", None) or getattr(text_config, "rope_scaling", None) or {}
+    if not isinstance(rope, dict) or rope.get("rope_type", rope.get("type")) != "yarn": return 0
+    mscale_all_dim = float(rope.get("mscale_all_dim", 0) or 0)
+    factor = float(rope.get("factor", 1) or 1)
+    mscale = 0.1 * mscale_all_dim * math.log(factor) + 1.0 if factor > 1 else 1.0
+    head_dim = getattr(text_config, "qk_nope_head_dim", 0) + getattr(text_config, "qk_rope_head_dim", 0)
+    if not head_dim: return 0
+    want = head_dim ** -0.5 * mscale * mscale
+    changed = 0
+    for module in model.modules():
+        scaling = getattr(module, "scaling", None)
+        if hasattr(module, "kv_b_proj") and isinstance(scaling, float) and not math.isclose(scaling, want, rel_tol = 1e-6):
+            module.scaling = want
+            changed += 1
+    if changed:
+        logger.info(
+            f"Unsloth: set the softmax scale of {changed} DeepSeek attention layers to vLLM's YaRN scale {want:.6g}."
+        )
+    return changed
+pass
+
+
+def _set_per_expert_linears(experts, attr_name, weight, where):
+    """Alias each expert's rows of vLLM's stacked w13 [E, 2I, H] / w2 [E, H, I] onto a ModuleList of HF gated MLPs."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if weight.dim() != 3 or weight.shape[0] != len(experts) or \
+        not all(hasattr(e, "gate_proj") and hasattr(e, "up_proj") and hasattr(e, "down_proj") for e in experts):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot map vLLM's stacked experts {where} {tuple(weight.shape)} onto "
+            f"{len(experts)} {type(experts[0]).__name__ if len(experts) else 'missing'} experts; "
+            "set fast_inference = False."
+        )
+    for e, expert in enumerate(experts):
+        if attr_name == "gate_up_proj":
+            inter = weight.shape[1] // 2
+            parts = (("gate_proj", weight[e, :inter]), ("up_proj", weight[e, inter:]))
+        else:
+            parts = (("down_proj", weight[e]),)
+        for name, w in parts:
+            layer = torch.nn.Linear(0, 0, bias = False, device = w.device)
+            layer.out_features, layer.in_features = w.shape
+            layer.weight = torch.nn.Parameter(w, requires_grad = False)
+            setattr(expert, name, layer)
+pass
+
 
 def _refresh_placeholder_dims(parent, attr_name, weight):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2857,6 +2965,10 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 raw_value = _unwrap_tensor(weight)
                 parent_path, _, attr_name = layer_name_br.rpartition(".")
                 parent = eval(f"new_model.{parent_path}") if parent_path else new_model
+                if isinstance(parent, torch.nn.ModuleList) and attr_name in ("gate_up_proj", "down_proj"):
+                    # transformers < 5 keeps the experts as a ModuleList of gated MLPs
+                    _set_per_expert_linears(parent, attr_name, raw_value, layer_name)
+                    continue
                 if attr_name in getattr(parent, "_buffers", {}):
                     parent._buffers[attr_name] = raw_value
                     loaded_buffers.append((parent, attr_name, raw_value))
@@ -2967,6 +3079,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    _align_mla_softmax_scale(new_model, config)
     if is_vision_model and _is_gemma4_config(config):
         _load_gemma4_audio_from_checkpoint(
             new_model, config,
@@ -7506,7 +7619,10 @@ def _get_vllm_lora_model(model, runner = None):
     """The live vLLM nn.Module, or None when it cannot be reached."""
     # All Unsloth Zoo code licensed under LGPLv3
     if runner is None: runner = _get_vllm_model_runner(model)
-    return getattr(runner, "model", None)
+    vllm_model = getattr(runner, "model", None)
+    # vLLM 0.11's CUDAGraphWrapper is no nn.Module (modules() / isinstance checks miss the model); unwrap it.
+    inner = getattr(vllm_model, "__dict__", {}).get("runnable") if not isinstance(vllm_model, torch.nn.Module) else None
+    return inner if isinstance(inner, torch.nn.Module) else vllm_model
 pass
 
 
@@ -7864,6 +7980,34 @@ pass
 
 
 _MLA_KV_B_LORA_KEY = re.compile(r"(?:^|\.)kv_b_proj\.(?:base_layer\.)?lora_[AB]\.")
+_MLA_PROJ_LORA_KEY = re.compile(
+    r"(?:^|\.)self_attn\.(q_a_proj|kv_a_proj_with_mqa|q_b_proj|q_proj|o_proj)\.(?:base_layer\.)?lora_[AB]\."
+)
+# HF projection -> the vLLM module that holds it (vLLM fuses q_a_proj + kv_a_proj_with_mqa when q_lora_rank is set)
+_MLA_VLLM_PROJ = {"q_a_proj": "fused_qkv_a_proj", "kv_a_proj_with_mqa": "fused_qkv_a_proj"}
+
+
+def _is_vllm_lora_wrapped(module):
+    return module is not None and (hasattr(module, "base_layer") or type(module).__name__.endswith("WithLoRA"))
+pass
+
+
+def _vllm_mla_unread_lora_projections(vllm_model):
+    """MLA projections whose LoRA wrapper the forward never calls. The forward calls attn.mla_attn.X; vLLM 0.11.2
+    wraps attn.X and attn.mla_attn.X separately and loads the adapter into attn.X's (0.34 shares one wrapper)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    unread = set()
+    if not isinstance(vllm_model, torch.nn.Module): return unread
+    for module in vllm_model.modules():
+        mla = getattr(module, "mla_attn", None)
+        if mla is None or not hasattr(module, "kv_b_proj"): continue
+        for proj in ("fused_qkv_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "q_proj", "o_proj"):
+            outer, inner = getattr(module, proj, None), getattr(mla, proj, None)
+            if inner is None or inner is outer: continue
+            if _is_vllm_lora_wrapped(outer):
+                unread.add(proj)
+    return unread
+pass
 
 
 def _check_lora_is_servable(model, keys, source, peft_config):
@@ -7908,6 +8052,23 @@ def _check_lora_is_servable(model, keys, source, peft_config):
             "Remove kv_b_proj from target_modules, load the model in 16-bit so the merged-weight rollout folds "
             "it into the shared weights (UNSLOTH_VLLM_MERGED_ROLLOUT unset or 1), or use fast_inference=False.\n"
             "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
+        )
+    mla_proj_keys = [k for k in keys if _MLA_PROJ_LORA_KEY.search(k)]
+    unread = _vllm_mla_unread_lora_projections(_get_vllm_lora_model(model)) if mla_proj_keys else set()
+    def _unread(key):
+        # kv_a_proj_with_mqa is its own module when q_lora_rank is None, else inside fused_qkv_a_proj
+        proj = _MLA_PROJ_LORA_KEY.search(key).group(1)
+        return proj in unread or _MLA_VLLM_PROJ.get(proj) in unread
+    unread_keys = [k for k in mla_proj_keys if _unread(k)]
+    if unread_keys:
+        raise NotImplementedError(
+            f"Unsloth: fast_inference=True cannot serve a LoRA on the MLA attention projections {sorted(unread)} with "
+            f"this vLLM ({len(unread_keys)} adapter tensors in {source}, e.g. '{sorted(unread_keys)[0]}'). Its "
+            "multi-head latent attention calls its own unwrapped copy of these projections, so vLLM would load "
+            "the adapter and sample from the base model while training updates it.\n"
+            "Upgrade vLLM, load the model in 16-bit so the merged-weight rollout folds the adapter into the "
+            "shared weights (UNSLOTH_VLLM_MERGED_ROLLOUT unset or 1; not with MoE expert LoRA), or use "
+            "fast_inference=False.\nSet UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
         )
     unmatched = _unmatched_lora_keys(model, keys)
     if not unmatched: return
