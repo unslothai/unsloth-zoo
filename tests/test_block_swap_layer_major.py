@@ -485,6 +485,30 @@ def test_out_of_memory_in_the_decoder_backward_is_an_abort():
     assert _grads(model) == {}
 
 
+def test_out_of_memory_in_the_forward_frees_its_tensors():
+    """An out-of-memory error in a worker's forward is an abort, and the tensors its frames held are freed when
+    the call returns (no reference cycle through the stored traceback)."""
+    import weakref
+    model = _model()
+    batches, items = _batches(2)
+    refs = []
+
+    def oom(mod, args, out):
+        if not torch.is_grad_enabled():
+            big = torch.empty(1 << 16)
+            refs.append(weakref.ref(big))
+            raise torch.OutOfMemoryError("simulated")
+
+    h = _layers(model)[2].register_forward_hook(oom)
+    try:
+        why = _abort_case(model, batches, items)
+    finally:
+        h.remove()
+    assert "OutOfMemoryError" in why
+    assert refs and all(r() is None for r in refs)
+    assert _grads(model) == {}
+
+
 def test_distributed_is_refused(monkeypatch):
     model = _model()
     batches, items = _batches(2)

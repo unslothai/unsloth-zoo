@@ -45,6 +45,7 @@ the standard way. UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
 import functools
 import os
 import threading
+import traceback
 from contextlib import ExitStack, contextmanager
 
 import torch
@@ -571,8 +572,15 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
         w.saved = w.outs = w.h0 = None
         _STATS["aborts"] += 1
         _STATS["last_abort"] = w.abort_reason
-        if w.error is not None and not isinstance(w.error, torch.OutOfMemoryError):
-            raise w.error
+        error, w.error = w.error, None
+        if error is not None and not isinstance(error, torch.OutOfMemoryError):
+            raise error
+        if error is not None:
+            # Its traceback's frames hold the failed forward's tensors (and the window): free them now, before
+            # the caller's standard step needs the memory.
+            traceback.clear_frames(error.__traceback__)
+            error.__traceback__ = None
+        del error
         return None, w.abort_reason
     try:
         w.backward(orig_calls)
