@@ -877,6 +877,17 @@ class FastCPUModel:
                 if master_fit is not None and master_fit[2]:
                     master_fp32, master_choice, dtype = True, "fits", torch.float32
 
+        if full_finetuning and dtype == torch.float32 and not (master_fit is not None and master_fit[2]) \
+                and not _multi_process():
+            # float32 weights, grads and AdamW states (every CPU without native bf16: Apple Silicon, AVX2 x86) that do not
+            # fit in RAM swap: Qwen3-0.6B on a 7 GB Apple M1 took 266 s per step instead of about 3 s.
+            fp32_fit = master_fit or _fp32_master_fit(model_name, token, revision, trust_remote_code,
+                                                      resize_model_vocab, **kwargs)
+            if fp32_fit is not None and fp32_fit[0] > fp32_fit[1]:
+                _print(f"float32 full finetuning needs about {fp32_fit[0] / 1024 ** 3:.1f} GB for weights, grads and "
+                       f"AdamW states, but only {fp32_fit[1] / 1024 ** 3:.1f} GB of RAM is free: training will swap "
+                       "and can be 100x slower. LoRA (get_peft_model) or a smaller model fits.")
+
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
             from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
