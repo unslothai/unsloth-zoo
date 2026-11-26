@@ -225,7 +225,9 @@ def chunked_hidden_states_selective_log_softmax(
     # fused kernels' logits are float32-out already, so vLLM's default fp32 rollout head matches them.
     fp32_lm_head_cuda: bool = (
         os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
-        and torch.version.hip is None and torch.cuda.is_available()
+        # Inline import: this source is also copied into the compiled trainer. SDK ROCm wheels leave version.hip unset.
+        and not __import__("unsloth_zoo.rocm_build", fromlist = ["is_rocm_torch"]).is_rocm_torch(torch)
+        and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
     ),
@@ -383,7 +385,9 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # fused kernels' logits are float32-out already, so vLLM's default fp32 rollout head matches them.
     fp32_lm_head_cuda: bool = (
         os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
-        and torch.version.hip is None and torch.cuda.is_available()
+        # Inline import: this source is also copied into the compiled trainer. SDK ROCm wheels leave version.hip unset.
+        and not __import__("unsloth_zoo.rocm_build", fromlist = ["is_rocm_torch"]).is_rocm_torch(torch)
+        and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
     ),
@@ -491,6 +495,10 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                 try:
                     return kernel(*args)
                 except Exception as error:
+                    # Checkpoint control flow (the non-reentrant early stop, a forward / recompute mismatch) is not
+                    # a compile failure: re-raise it, never latch the compiled path off for the rest of the process.
+                    if type(error).__name__ in ("_StopRecomputationError", "CheckpointError"):
+                        raise
                     # An OOM (bare or while compiling) is transient: eager for this call only, after the except.
                     if not (
                         isinstance(error, torch.OutOfMemoryError)
@@ -657,8 +665,9 @@ def grpo_fp32_lm_head_default(lm_head = None):
     if value.lower() in ("1", "true", "on", "yes"):
         return True
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    from unsloth_zoo.rocm_build import is_rocm_torch
     return bool(
-        value == "" and torch.version.hip is None and torch.cuda.is_available()
+        value == "" and not is_rocm_torch(torch) and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
         and (lm_head is None or _chunked_logprob.fp32_lm_head_auto_ok(lm_head))
@@ -2634,7 +2643,9 @@ pass
 
 
 def _grpo_truncated_support_auto_platform():
-    return getattr(torch.version, "hip", None) is None and torch.cuda.is_available()
+    # is_rocm_torch: ROCm SDK wheels leave torch.version.hip unset.
+    from unsloth_zoo.rocm_build import is_rocm_torch
+    return not is_rocm_torch(torch) and torch.cuda.is_available()
 pass
 
 
