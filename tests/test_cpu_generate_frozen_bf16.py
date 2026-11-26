@@ -170,8 +170,8 @@ def test_lora_rollout_under_inference_mode_leaves_trainable_weights():
     lora(input_ids = _IDS, labels = _IDS).loss.backward()
 
 
-def test_train_mode_generate_stays_bf16_off_apple_silicon(monkeypatch):
-    """x86 without native bf16 gained about 2% from the fp32 copy: not worth its RAM, so nothing changes there."""
+def test_train_mode_generate_stays_bf16_where_the_upcast_is_cheap(monkeypatch):
+    """Linux x86 without native bf16 gained nothing from the fp32 copy: not worth its RAM, so nothing changes there."""
     from unsloth_zoo.cpu import loader
     monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: False, raising = False)
     model, _ = _tiny_bf16_llama("training")
@@ -183,13 +183,14 @@ def test_train_mode_generate_stays_bf16_off_apple_silicon(monkeypatch):
     assert set(seen) == {torch.bfloat16}
 
 
-def test_slow_bf16_upcast_is_apple_silicon_only(monkeypatch):
+def test_slow_bf16_upcast_is_apple_silicon_and_windows_x86(monkeypatch):
     import platform
     import sys
     from unsloth_zoo.cpu import loader
     monkeypatch.undo()  # the real check, not the autouse stand-in
     for plat, machine, expected in (("darwin", "arm64", True), ("darwin", "x86_64", False), ("linux", "aarch64", False),
-                                    ("linux", "x86_64", False), ("win32", "AMD64", False)):
+                                    ("linux", "x86_64", False), ("win32", "AMD64", True),
+                                    ("win32", "x86_64", True), ("win32", "ARM64", False)):
         monkeypatch.setattr(sys, "platform", plat)
         monkeypatch.setattr(platform, "machine", lambda m = machine: m)
         assert loader._slow_bf16_upcast() is expected, (plat, machine)
