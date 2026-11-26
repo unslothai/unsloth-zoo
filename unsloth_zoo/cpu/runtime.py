@@ -247,13 +247,49 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
     return max(1, math.ceil(min(limits)))
 
 
+# OpenMP thread binding. With any of these set, the OpenMP runtime binds the main thread to its first place when torch
+# loads (OMP_PLACES=cores: one core and its SMT sibling), so the main thread's affinity no longer shows the CPUs the
+# process was given; the pool's worker threads hold the other places.
+_OMP_BIND_ENV = ("OMP_PROC_BIND", "OMP_PLACES", "GOMP_CPU_AFFINITY", "KMP_AFFINITY")
+
+
+def _omp_binding_requested():
+    for name in _OMP_BIND_ENV:
+        value = os.environ.get(name, "").strip().lower()
+        if value and not (name == "OMP_PROC_BIND" and value == "false") and \
+                not (name == "KMP_AFFINITY" and value in ("disabled", "none")):
+            return True
+    return False
+
+
+def _process_affinity():
+    """CPUs this process may run on. Under OpenMP binding the main thread's mask is only its own place, so the union of
+    every thread's mask is used, after one small op has started torch's pool (each worker binds to its place)."""
+    cpus = set(os.sched_getaffinity(0))
+    if not _omp_binding_requested():
+        return cpus
+    try:
+        import torch
+        threads = torch.get_num_threads()
+        if threads > 1:
+            torch.ones(threads * 65536).add_(1)
+        for entry in os.listdir("/proc/self/task"):
+            try:
+                cpus |= set(os.sched_getaffinity(int(entry)))
+            except (OSError, ValueError):
+                pass
+    except Exception:
+        pass
+    return cpus
+
+
 def cpu_compute_cores():
     """Cores this process can really compute on: physical cores in its affinity mask (SMT siblings share one core's
     vector / AMX units), capped by a cgroup CPU quota. Linux only; None elsewhere (keep torch's default)."""
     if not sys.platform.startswith("linux"):
         return None
     try:
-        cpus = sorted(os.sched_getaffinity(0))
+        cpus = sorted(_process_affinity())
     except (AttributeError, OSError):
         return None
     if not cpus:
@@ -273,7 +309,7 @@ def _affinity_split_per_rank(ranks):
     if ranks <= 1 or not sys.platform.startswith("linux"):
         return False
     try:
-        mine = os.sched_getaffinity(0)
+        mine = _process_affinity()
         parent = os.sched_getaffinity(os.getppid())
     except (AttributeError, OSError):
         return False
