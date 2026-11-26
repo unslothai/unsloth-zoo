@@ -2549,14 +2549,46 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
 pass
 
 
+def _grpo_fsdp_module_types():
+    """FSDP2 (fully_shard, also accelerate's FSDP2) and FSDP1 wrapper classes this torch has."""
+    types_ = []
+    try:
+        from torch.distributed.fsdp import FSDPModule
+        types_.append(FSDPModule)
+    except Exception:
+        try:
+            from torch.distributed._composable.fsdp import FSDPModule
+            types_.append(FSDPModule)
+        except Exception:
+            pass
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+        types_.append(FullyShardedDataParallel)
+    except Exception:
+        pass
+    return tuple(types_)
+pass
+
+
 def grpo_forwards_are_collective(model):
-    """FSDP2 sharded layout, DeepSpeed ZeRO-3 or expert parallel: every forward all-gathers (or, under expert
-    parallel, every MoE block all-to-alls), so ranks must run the same number of forwards."""
+    """FSDP (Unsloth's native FSDP2, accelerate's FSDP2 / FSDP1), DeepSpeed ZeRO-3, expert, tensor or context
+    parallel: every forward all-gathers (expert parallel all-to-alls per MoE block, tensor parallel all-reduces
+    per block, Ulysses context parallel all-to-alls per attention layer), so ranks must run the same number of
+    forwards."""
     import torch.distributed as dist
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
         return False
-    # Unsloth's apply_expert_parallel stamps its ep mesh on every model level (PeftModel included).
-    if model.__dict__.get("_unsloth_ep", None) is not None:
+    # Unsloth's apply_expert_parallel / apply_tensor_parallel stamp their mesh on every model level (PeftModel included).
+    if model.__dict__.get("_unsloth_ep", None) is not None or model.__dict__.get("_unsloth_tp", None) is not None:
+        return True
+    # Unsloth's DPO / GRPO context parallel scope is live inside compute_loss and the logps passes.
+    _cp = sys.modules.get("unsloth.context_parallel", None)
+    _get_cp_manager = getattr(_cp, "get_cp_manager", None)
+    if _get_cp_manager is not None and _get_cp_manager() is not None:
+        return True
+    # accelerate shards the root itself (fully_shard / FSDP wrapper), after any cached walk below.
+    _fsdp_types = _grpo_fsdp_module_types()
+    if _fsdp_types and isinstance(model, _fsdp_types):
         return True
     # ZeRO-3 is read live, not cached: the DeepSpeed config can go live after the first call.
     from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
@@ -2576,8 +2608,12 @@ def grpo_forwards_are_collective(model):
     if cached is None:
         cached = any(
             module.__dict__.get("_unsloth_reshard_after_forward", False) not in (False, None, 0)
-            # Expert parallel under a wrapper that is not a model level (a DDP module).
+            # Expert / tensor parallel under a wrapper that is not a model level (a DDP module).
             or module.__dict__.get("_unsloth_ep", None) is not None
+            or module.__dict__.get("_unsloth_tp", None) is not None
+            # Decoders Unsloth's DPO / GRPO context parallel hooked.
+            or module.__dict__.get("_unsloth_cp_rl_manager", None) is not None
+            or (bool(_fsdp_types) and isinstance(module, _fsdp_types))
             for module in model.modules()
         )
         model.__dict__["_unsloth_grpo_collective_forwards"] = cached
