@@ -277,13 +277,19 @@ class SpillFile:
             self._bounce = _aligned_empty(_WRITE_CHUNK, pin = torch.cuda.is_available())
         return self._bounce[1]
 
-    def write_region(self, pieces, region_bytes):
+    def write_region(self, pieces, region_bytes, at = None):
         """Append one region of `region_bytes`: `pieces` [(tensor, offset in region)] laid back to back, the gaps
-        zeroed. Returns the region's file offset (ALIGN aligned)."""
+        zeroed. Returns the region's file offset (ALIGN aligned). `at` rewrites a region already in the file
+        there instead (the caller keeps it no longer than the region it replaces)."""
+        total = _round_up(region_bytes)
         with self.lock:
-            base = self.size
-            total = _round_up(region_bytes)
-            self.size = base + total
+            if at is None:
+                base = self.size
+                self.size = base + total
+            else:
+                base = int(at)
+                if base % ALIGN or base + total > self.size:
+                    raise ValueError("Unsloth: a spill file rewrite must stay inside an aligned region already written.")
         flat = []
         for t, off in pieces:
             src = t.detach()
@@ -307,7 +313,8 @@ class SpillFile:
             while done < n:
                 done += os.pwrite(self.fd, mv[done:], base + pos + done)
             pos += n
-        self.written += total
+        if at is None:
+            self.written += total
         return base
 
     def read(self, offset, dst):
@@ -459,15 +466,21 @@ class DiskTier:
         """Enqueue the staging -> slot copy of a block whose read finished; frees its staging slot after it."""
         stage = self.ring[block.stage][1]
         bufs, _ = block.slot
+        codecs = getattr(block, "codec", None) or {}
         for d, event in block.events.items():
             stream = block.streams[d]
             stream.wait_event(block.disk_ready[d])
+            c = codecs.get(d)
             with torch.cuda.stream(stream):
                 if block.t_copy is not None:
                     block.t_copy[d].record(stream)
-                n = block.sizes[d]
-                bufs[d][:n].copy_(stage[:n], non_blocking = True)
-                event.record(stream)
+                if c is None:
+                    n = block.sizes[d]
+                    bufs[d][:n].copy_(stage[:n], non_blocking = True)
+                    event.record(stream)
+            if c is not None:
+                # Stored encoded (lossless): the encoded bytes go over the bus and decode into the slot on the card.
+                block.decoders[d].fetch(c, stage[:c.nbytes], bufs[d], stream, event)
         done = torch.cuda.Event()
         done.record(block.streams[next(iter(block.events))])
         self.slot_done[block.stage] = done
