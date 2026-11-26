@@ -153,3 +153,28 @@ def test_compiled_cache_copy_counts_into_package():
     record("loop")
     assert _delta(before) == {"torch_fallback": 0, "loop": 1, "compiled_sites": 0}
     assert copy.GROUPED_MM_SYNC_CALLS["loop"] == 0
+
+
+def test_transformers_wrapper_classifies_at_weight_dtype(monkeypatch):
+    # transformers casts input.to(weight.dtype) before torch._grouped_mm: fp32 input + bf16 weight is a bf16 call.
+    seen = []
+    monkeypatch.setattr(
+        M, "_torch_grouped_mm_takes_fallback",
+        lambda device, dtype, weight_dtype, groups: seen.append((dtype, weight_dtype)) or False,
+    )
+    import sys
+    import types
+    import transformers.integrations
+    from unsloth_zoo.temporary_patches import moe_experts_interface as MEI
+    tm = types.ModuleType("transformers.integrations.moe")  # stand-in: the real one moves across versions
+    tm._grouped_mm = lambda i, w, o: None
+    monkeypatch.setitem(sys.modules, "transformers.integrations.moe", tm)
+    monkeypatch.setattr(transformers.integrations, "moe", tm, raising = False)
+    monkeypatch.setattr(MEI, "_moe_utils_module", lambda: M)
+    monkeypatch.setattr(M, "_triton_grouped_mm_wanted", lambda i, w: False)
+    monkeypatch.setattr(M, "_GROUPED_MM_TRITON_OP", object())
+    MEI._patch_transformers_grouped_mm()
+    x = torch.randn(13, 16)
+    w = torch.randn(4, 16, 8).to(torch.bfloat16)
+    tm._grouped_mm(x, w, torch.tensor([3, 3, 9, 13], dtype = torch.int32))
+    assert seen == [(torch.bfloat16, torch.bfloat16)]
