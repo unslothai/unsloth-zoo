@@ -71,12 +71,13 @@ def test_no_binding_reads_main_thread_only(monkeypatch):
     assert calls == [0]
 
 
-def _fit_in_child(extra):
+def _fit_in_child(extra, start_threads = None):
     env = {k: v for k, v in os.environ.items() if k not in _ENV}
     env.update(extra)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
     code = ("import json, torch\nfrom unsloth_zoo.cpu import runtime\n"
-            "print(json.dumps([runtime.cpu_compute_cores(), list(runtime.fit_cpu_threads()), torch.get_num_threads()]))\n")
+            + (f"torch.set_num_threads({start_threads})\n" if start_threads else "")
+            + "print(json.dumps([runtime.cpu_compute_cores(), list(runtime.fit_cpu_threads()), torch.get_num_threads()]))\n")
     r = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 600)
     assert r.returncode == 0, r.stderr[-2000:]
     return json.loads(r.stdout.strip().splitlines()[-1])
@@ -87,6 +88,7 @@ def _fit_in_child(extra):
     {"OMP_PROC_BIND": "close", "OMP_PLACES": "cores"},
     {"OMP_PROC_BIND": "spread"},
     {"OMP_PROC_BIND": "true"},
+    {"OMP_PROC_BIND": "close", "OMP_PLACES": "threads"},
 ])
 def test_real_binding_keeps_core_count(bind):
     plain = _fit_in_child({})
@@ -96,3 +98,31 @@ def test_real_binding_keeps_core_count(bind):
     assert bound[0] == plain[0]
     assert bound[1][0] == plain[1][0]
     assert bound[2] == plain[2] > 1
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the thread fit is Linux-only")
+def test_binding_narrowed_default_is_raised():
+    # aarch64 torch wheels start at 1 thread under OMP_PROC_BIND (sized from the main thread's bound mask)
+    plain = _fit_in_child({})
+    if plain[0] is None or plain[0] < 2:
+        pytest.skip("needs at least 2 physical cores")
+    bound = _fit_in_child({"OMP_PROC_BIND": "close", "OMP_PLACES": "cores"}, start_threads = 1)
+    assert bound[1] == [plain[1][0], "OpenMP binding narrowed torch's default"]
+    assert bound[2] == plain[2]
+    unbound = _fit_in_child({}, start_threads = 1)  # no binding: torch's smaller pool is kept, as before
+    assert unbound[2] == 1
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the thread fit is Linux-only")
+def test_omp_places_cover_the_process_mask():
+    env = {k: v for k, v in os.environ.items() if k not in _ENV}
+    env.update({"OMP_PROC_BIND": "close", "OMP_PLACES": "threads"})
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
+    code = ("import json, os\nmask = sorted(os.sched_getaffinity(0))\nimport torch\n"
+            "from unsloth_zoo.cpu import runtime\nprint(json.dumps([mask, sorted(runtime._omp_place_cpus())]))\n")
+    r = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    mask, places = json.loads(r.stdout.strip().splitlines()[-1])
+    if not places:
+        pytest.skip("no OpenMP runtime answered omp_get_num_places")
+    assert places == mask

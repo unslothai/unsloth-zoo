@@ -262,14 +262,46 @@ def _omp_binding_requested():
     return False
 
 
+def _omp_place_cpus():
+    """CPUs in the OpenMP runtime's place list, which it built from the process mask before binding the main thread
+    (OMP_PLACES / GOMP_CPU_AFFINITY narrow it to what the user listed). Empty when no OpenMP runtime answers."""
+    import ctypes
+    try:
+        with open("/proc/self/maps") as f:
+            paths = sorted({line.split()[-1] for line in f if "/" in line})
+    except OSError:
+        return set()
+    for path in paths:
+        if not os.path.basename(path).startswith(("libgomp", "libiomp", "libomp")):
+            continue
+        try:
+            lib = ctypes.CDLL(path)
+            cpus = set()
+            for place in range(int(lib.omp_get_num_places())):
+                count = int(lib.omp_get_place_num_procs(place))
+                if count <= 0:
+                    continue
+                ids = (ctypes.c_int * count)()
+                lib.omp_get_place_proc_ids(place, ids)
+                cpus.update(int(cpu) for cpu in ids)
+        except (OSError, AttributeError, ValueError):
+            continue
+        if cpus:
+            return cpus
+    return set()
+
+
 def _process_affinity():
-    """CPUs this process may run on. Under OpenMP binding the main thread's mask is only its own place, so the union of
-    every thread's mask is used, after one small op has started torch's pool (each worker binds to its place)."""
+    """CPUs this process may run on. Under OpenMP binding the main thread's mask is only its own place, so the OpenMP
+    place list is used; without one, the union of every thread's mask after one small op has started torch's pool."""
     cpus = set(os.sched_getaffinity(0))
     if not _omp_binding_requested():
         return cpus
     try:
         import torch
+        places = _omp_place_cpus()
+        if places:
+            return cpus | places
         threads = torch.get_num_threads()
         if threads > 1:
             torch.ones(threads * 65536).add_(1)
@@ -281,6 +313,16 @@ def _process_affinity():
     except Exception:
         pass
     return cpus
+
+
+def _binding_narrowed_default(current):
+    """torch sized its default pool from the main thread's bound mask (aarch64 wheels: 1 thread under OMP_PROC_BIND)."""
+    if not sys.platform.startswith("linux") or not _omp_binding_requested():
+        return False
+    try:
+        return current <= len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return False
 
 
 def cpu_compute_cores():
@@ -351,7 +393,8 @@ def fit_cpu_threads():
     """Sizes torch's intra-op pool for CPU training. Idempotent; returns (threads, reason).
     UNSLOTH_CPU_THREADS wins; a user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept; otherwise one thread per physical
     core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate, and at most
-    _DEFAULT_THREAD_CAP. Never raises the count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
+    _DEFAULT_THREAD_CAP. Never raises the count above torch's default except to undo a launcher's OMP_NUM_THREADS=1
+    or an OpenMP binding (OMP_PROC_BIND / OMP_PLACES) that sized torch's default from the main thread's one place."""
     global _THREADS_FITTED
     import torch
     if _THREADS_FITTED is not None:
@@ -393,6 +436,8 @@ def fit_cpu_threads():
             fitted = min(fitted, _DEFAULT_THREAD_CAP)
             if launcher:
                 target, reason = fitted, "launcher OMP_NUM_THREADS=1 undone"
+            elif fitted > current and _binding_narrowed_default(current):
+                target, reason = fitted, "OpenMP binding narrowed torch's default"
             elif fitted < current:
                 try:
                     quota = _cgroup_cpu_limit() if sys.platform.startswith("linux") else None
