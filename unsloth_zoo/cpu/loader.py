@@ -703,12 +703,10 @@ _CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi
 
 
 def _parallel_kernel_builds():
-    """Windows: build the C++ kernels of a compile in parallel. torch sets ``compile_threads = 1`` on win32 (its Triton
-    worker process pool), so Inductor runs one MSVC build at a time; a cold Qwen3 layer compile is about 27 builds
-    (45 s first step on a 4 vCPU runner, 21 s with 4). CPU kernels build on Inductor's in-process thread pool, not that
-    process pool, which stays off (TORCH_WARM_POOL=0: the CPU backend never compiles Triton). A user's
-    TORCHINDUCTOR_COMPILE_THREADS, a compile_threads already raised, or UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=1 is kept.
-    Returns the thread count set, or None when unchanged."""
+    """Windows: build a compile's C++ kernels in parallel. torch sets compile_threads = 1 on win32 for its Triton
+    worker pool, so MSVC builds ran one at a time (cold Qwen3 layer: 45 s first step on 4 vCPU, 21 s parallel). CPU
+    kernels build on Inductor's in-process thread pool; the Triton pool stays off (TORCH_WARM_POOL=0). A user's
+    TORCHINDUCTOR_COMPILE_THREADS, a raised compile_threads or UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=1 is kept."""
     if sys.platform != "win32" or "TORCHINDUCTOR_COMPILE_THREADS" in os.environ:
         return None
     if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1":
