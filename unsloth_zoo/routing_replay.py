@@ -784,9 +784,11 @@ def _router_hook(layer_index, compact = None):
             or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         )
-        # The recompute always reweights via the opaque pick; reweight here too (all rows invalid)
-        # so the non-reentrant checkpoint sees identical saved tensors.
-        mirror = natural and _STATE.record is not None and torch.compiler.is_compiling() \
+        # The recompute reweights whenever another pending forward replayed this layer (compiled:
+        # always, via the opaque pick); reweight here too (all rows invalid) so the non-reentrant
+        # checkpoint sees identical saved tensors. Eager too: a replayed and a natural forward of the
+        # same length before one backward (rows without rollout routes) hit it there as well.
+        mirror = natural and _STATE.record is not None \
             and isinstance(getattr(module, "_unsloth_replay_formula", None), str)
         if natural and not mirror:
             _count("router_calls_natural")
@@ -855,7 +857,8 @@ def _router_hook(layer_index, compact = None):
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
             _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed.to(_STATE.changed.device)
-        _count("router_calls_replayed")
+        # A mirrored call keeps every row natural.
+        _count("router_calls_natural" if mirror else "router_calls_replayed")
 
         if dense:
             new_weights = torch.zeros_like(scores2).scatter(-1, forced, new_weights)
