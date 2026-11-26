@@ -584,6 +584,8 @@ def _tiled_forward(self, *args, **kwargs):
     state = self.__dict__.get("_unsloth_tiling")
     if state is None or kwargs or len(args) != 1 or not torch.is_tensor(args[0]) or args[0].dim() < 2:
         return inner(*args, **kwargs)
+    if _expert_parallel(self):  # tiles would mismatch across ranks' all_to_all
+        return inner(*args)
     x = args[0]
     lead = x.shape[:-1]
     if state.in_widths is not None and x.shape[-1] not in state.in_widths:
@@ -1266,6 +1268,14 @@ def _tensor_parallel(module):
     return False
 
 
+_EP_ATTR = "_unsloth_ep"  # set by unsloth models/ep_native.py
+
+
+def _expert_parallel(module):
+    """Ranks' row counts differ, so per-tile all_to_all calls would not line up."""
+    return any(getattr(p, _EP_ATTR, None) is not None for p in module.parameters())
+
+
 def _select(model, plan, extra, force):
     out = []
     claimed = []
@@ -1278,6 +1288,10 @@ def _select(model, plan, extra, force):
         forced = bool(force) and _matches(name, cls_name, force)
         spec = lookup(module)
         opted = bool(plan.modules) or (bool(extra) and _matches(name, cls_name, extra))
+        if (spec is not None or opted or forced) and _expert_parallel(module):
+            out.append((name, module, None, "expert parallel (each tile would be its own all_to_all)"))
+            claimed.append(name + "." if name else "")
+            continue
         if spec is None and not (opted or forced):
             if name.lower().endswith(_OLD_SUFFIXES) and _sequence_mixer(module) is None:
                 out.append((name, module, None, f"unknown class, opt in with {_ENV_MODULES}"))
@@ -1337,6 +1351,9 @@ def install(model, mode = DEFAULT_MODE, modules = None, *, force = None, verbose
     for _, module in model.named_modules():
         # "_unsloth_tiling" too: a wrapper installed after tiling (accelerate) hides the tiled forward from is_tiled.
         if id(module) not in keep and (is_tiled(module) or "_unsloth_tiling" in module.__dict__):
+            if _expert_parallel(module) and not is_tiled(module):
+                # EP wrapped the tiled forward; detaching would drop it from the chain.
+                continue
             _detach(module)
     previous = model.__dict__.get("_unsloth_tiling_report")
     model.__dict__["_unsloth_tiling_plan"] = (plan, force)
