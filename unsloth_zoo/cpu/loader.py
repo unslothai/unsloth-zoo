@@ -214,6 +214,32 @@ def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code,
     return size if size * 4 <= available else None
 
 
+# float32 frozen weights may take at most this share of the free RAM (the rest: activations, LoRA, optimizer).
+_FP32_FROZEN_RAM_SHARE = 0.25
+
+
+def _fp32_weights_fit(model_name, token, revision, trust_remote_code, **kwargs):
+    """(bytes, free RAM) when the whole model in float32 takes at most a quarter of the free RAM, else None (also when
+    either is unknown). Then the frozen projections are kept in float32 instead of bfloat16: a bfloat16-stored weight
+    is upcast on every forward, backward and decoded token, which was 30-34% of a Qwen3-0.6B GRPO step (aten::copy_)
+    on 2-core AVX-512 runners without native bf16; float32 storage costs 2 more bytes per frozen weight."""
+    try:
+        from transformers import AutoConfig
+        config = kwargs.get("config")
+        if config is None:
+            config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                                trust_remote_code = trust_remote_code,
+                                                **{k: v for k, v in kwargs.items() if k != "config"})
+    except Exception:
+        return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    size = 4 * count
+    return (size, available) if size <= _FP32_FROZEN_RAM_SHARE * available else None
+
+
 def _checkpoint_dtype(model_name, **kwargs):
     """The dtype the checkpoint's weights are stored in, from its config (None when unknown)."""
     try:
@@ -939,11 +965,12 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
-        # fp32 training of a bf16 checkpoint keeps the frozen projections in bf16 (lossless, half their RAM, no
-        # measurable step-time cost). Default where fp32 is the default (no native bf16); UNSLOTH_CPU_FROZEN_BF16=1 / 0
-        # forces it on / off.
+        # fp32 training of a bf16 checkpoint can keep the frozen projections in bf16 (lossless, half their RAM), at the
+        # cost of an upcast per call. Default where fp32 is the default (no native bf16) and the fp32 weights do not fit
+        # in a quarter of the free RAM; UNSLOTH_CPU_FROZEN_BF16=1 / 0 forces it on / off, =training keeps it whatever
+        # the RAM (bf16 for training, fp32 for generation).
         frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
-        frozen_wanted = frozen_env in ("1", "true", "yes", "on") or (
+        frozen_wanted = frozen_env in ("1", "true", "yes", "on", "training") or (
             frozen_env not in ("0", "false", "no", "off") and not cpu_bf16_supported()
         )
         frozen_bf16 = (
@@ -952,6 +979,14 @@ class FastCPUModel:
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
         )
+        if frozen_bf16 and frozen_env not in ("1", "true", "yes", "on", "training"):
+            fp32_fit = _fp32_weights_fit(model_name, token, revision, trust_remote_code,
+                                         **probe_kwargs, **({"config": kwargs["config"]} if "config" in kwargs else {}))
+            if fp32_fit is not None:
+                frozen_bf16 = False
+                _print(f"frozen weights kept in float32: they fit in RAM ({fp32_fit[0] / 1024 ** 3:.2f} GB of "
+                       f"{fp32_fit[1] / 1024 ** 3:.0f} GB free), and bfloat16 storage would upcast them on every "
+                       "call on this CPU. UNSLOTH_CPU_FROZEN_BF16=training keeps bfloat16 storage.")
         load_kwargs = dict(
             **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
             device_map = "cpu",
