@@ -216,14 +216,18 @@ def test_fp32_residue_in_a_correct_grouped_mm_still_selects_grouped_mm(fresh):
     assert mu._GROUPED_MM_TRAINING_PROBE_FAILURE is None
 
 
-@pytest.mark.parametrize("defect", ["zeros", "dx", "empty_dw", "no_backward"])
+@pytest.mark.parametrize("defect", ["zeros", "dx", "empty_dw", "no_backward", "nan"])
 def test_the_probe_checks_forward_and_both_grads(fresh, defect):
     class Wrong(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, w, offs):
             ctx.save_for_backward(x, w, offs)
-            return torch.zeros(x.shape[0], w.shape[-1], dtype = x.dtype) if defect == "zeros" else \
-                _reference_grouped_mm(x, w, offs)
+            if defect == "zeros":
+                return torch.zeros(x.shape[0], w.shape[-1], dtype = x.dtype)
+            out = _reference_grouped_mm(x, w, offs)
+            if defect == "nan":
+                out[0, 0] = float("nan")
+            return out
         @staticmethod
         def backward(ctx, grad):
             if defect == "no_backward":

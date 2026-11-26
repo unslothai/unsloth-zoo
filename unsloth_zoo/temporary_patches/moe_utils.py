@@ -2241,8 +2241,8 @@ def _grouped_mm_trains_on(device):
             for name, got, ref in want:
                 # The exact answers are small integers (at most 192, exact in bf16 / fp16), so a wrong kernel misses
                 # by 1 or more. A correct one can still carry fp32 accumulation residue: gfx1151's grouped_mm gives
-                # 2**-19 where the answer is 0. Half a unit tells the two apart.
-                if got.shape != ref.shape or float((got.detach().double().cpu() - ref).abs().max()) > 0.5:
+                # 2**-19 where the answer is 0. Half a unit tells the two apart; `not <=` also rejects a NaN.
+                if got.shape != ref.shape or not float((got.detach().double().cpu() - ref).abs().max()) <= 0.5:
                     raise RuntimeError(f"{name} differs from per-expert matmuls")
         return None
     except torch.OutOfMemoryError:
