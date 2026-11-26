@@ -122,7 +122,9 @@ def test_nested_reduction_fires_on_norm_block_amax_and_matches():
     try:
         for nested in (True, False):
             metrics.reset()
-            outs[nested] = _compile(norm_block_amax, nested)(x, w)
+            # A graph-cache hit skips codegen and leaves the counter at 0.
+            with config.patch(force_disable_caches = True):
+                outs[nested] = _compile(norm_block_amax, nested)(x, w)
             fired[nested] = metrics.codegen_nested_reduction
     finally:
         config.triton.nested_reduction = default
