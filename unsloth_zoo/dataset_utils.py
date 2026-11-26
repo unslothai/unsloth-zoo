@@ -2562,10 +2562,26 @@ def train_on_responses_only(
         # DataCollatorForTokenClassification carrying `padding = "max_length"` is
         # a separate class, not a subclass, so an isinstance check on that one
         # class dropped its settings and silently turned the run into a
-        # dynamically padded one. Ask whether the fields are there.
-        _padding_class = _processor_backed and not _same_class and any(
+        # dynamically padded one. Ask whether the fields are there. Not only on
+        # the processor repair: the plain swap of one built on a real tokenizer
+        # replaces it too.
+        _padding_class = not _same_class and isinstance(
+            _collator, _PAD_DELEGATING_COLLATORS
+        ) and any(
             hasattr(_collator, _n)
             for _n in ("padding", "max_length", "pad_to_multiple_of")
+        )
+        # TRL's text and vision collators do not pad through `tokenizer.pad`,
+        # but their `pad_to_multiple_of` is the same rounding of the batch width
+        # (what `SFTConfig.pad_to_multiple_of` sets). Only that field: their
+        # other same-named ones, such as the vision collator's truncating
+        # `max_length`, do not mean what DataCollatorForSeq2Seq reads.
+        _trl_rounding = not _same_class and not _padding_class and any(
+            _cls.__module__.startswith("trl.") and _cls.__name__ in (
+                "DataCollatorForLanguageModeling",
+                "DataCollatorForVisionLanguageModeling",
+            )
+            for _cls in type(_collator).__mro__
         )
         # `label_pad_token_id` means the same thing to DataCollatorForSeq2Seq as
         # it does to a DataCollatorForTokenClassification, so a caller who chose
@@ -2575,10 +2591,12 @@ def train_on_responses_only(
                   "label_pad_token_id", "return_tensors") if _same_class else \
                  ("padding", "max_length", "pad_to_multiple_of",
                   "label_pad_token_id", "return_tensors")
+        if _trl_rounding: _names = ("pad_to_multiple_of",)
         _kept = {
             name: getattr(_collator, name)
             for name in _names
-            if (_same_class or _padding_class) and hasattr(_collator, name)
+            if (_same_class or _padding_class or _trl_rounding)
+            and hasattr(_collator, name)
         }
         _text_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
         # Only when a media-capable collator was displaced. Everywhere else the
