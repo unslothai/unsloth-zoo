@@ -1868,12 +1868,8 @@ pass
 
 
 def extract_mla_attention(attn, prefix, get_state_dict, state_dict):
-    """Alias one vLLM MLA attention onto HF DeepseekV2 / V3 names; every shard is a row slice of vLLM's weight.
-
-    vLLM fuses HF q_a_proj + kv_a_proj_with_mqa into fused_qkv_a_proj when q_lora_rank is set (rows
-    [q_lora_rank | kv_lora_rank + qk_rope_head_dim]), and keeps q_proj when it is None. kv_b_proj stays a
-    plain weight: the MLA decode weights W_UK_T / W_UV are derived from it after load.
-    """
+    """Alias one vLLM MLA attention onto HF DeepSeek names as row views. q_lora_rank set: vLLM's fused_qkv_a_proj
+    is [q_a_proj | kv_a_proj_with_mqa]; None: q_proj. W_UK_T / W_UV are derived from kv_b_proj after load."""
     name = type(attn).__name__
     mla = getattr(attn, "mla_attn", None)
     if getattr(attn, "indexer", None) is not None or getattr(mla, "is_sparse", False) \
@@ -2162,7 +2158,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     for kk in range(len(vllm_text_model.layers)):
         layer = vllm_text_model.layers[kk]
         if _is_vllm_mla_attention(getattr(layer, "self_attn", None)):
-            # DeepSeek-V2 / V3 family multi-head latent attention
             extract_mla_attention(layer.self_attn, f"{vllm_text_model_prefix}.layers.{kk}.self_attn", get_state_dict, state_dict)
         elif hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
@@ -2490,12 +2485,8 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 pass
 
 def _align_mla_softmax_scale(model, config):
-    """Give HF DeepSeek-V2 / V3 attention the softmax scale vLLM samples with; returns the modules changed.
-
-    With YaRN rope, DeepSeek's reference code and vLLM scale the logits by qk_head_dim ** -0.5 * mscale ** 2
-    (mscale from mscale_all_dim). transformers < 5 DeepseekV2Attention leaves out the mscale ** 2, so training
-    would score a different model than vLLM rolls out (V2 / V2-Lite / Coder-V2 all set mscale_all_dim = 0.707).
-    """
+    """Set HF DeepSeek attention to vLLM's YaRN softmax scale qk_head_dim ** -0.5 * mscale(mscale_all_dim) ** 2
+    (DeepSeek's reference too); transformers < 5 DeepseekV2Attention drops the mscale ** 2. Returns modules changed."""
     # All Unsloth Zoo code licensed under LGPLv3
     text_config = getattr(config, "text_config", None) or config
     if getattr(text_config, "model_type", None) not in ("deepseek_v2", "deepseek_v3"): return 0
@@ -7718,13 +7709,8 @@ pass
 
 
 def _vllm_mla_unread_lora_projections(vllm_model):
-    """vLLM MLA projections whose LoRA wrapper the forward never calls.
-
-    DeepseekV2MLAAttention registers each projection twice, as attn.X and as attn.mla_attn.X, and the forward
-    only calls the mla_attn one. vLLM 0.11.2's LoRA manager gives the two names separate wrappers and loads the
-    adapter (named attn.X) into the one the forward never calls, so it is accepted and silently ignored. vLLM
-    0.34 wraps the module once and both names hold that wrapper. Returns {vLLM projection name} where they differ.
-    """
+    """MLA projections whose LoRA wrapper the forward never calls. The forward calls attn.mla_attn.X; vLLM 0.11.2
+    wraps attn.X and attn.mla_attn.X separately and loads the adapter into attn.X's (0.34 shares one wrapper)."""
     # All Unsloth Zoo code licensed under LGPLv3
     unread = set()
     if not isinstance(vllm_model, torch.nn.Module): return unread
