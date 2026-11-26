@@ -266,3 +266,18 @@ def test_r2_off_by_default(monkeypatch):
     monkeypatch.delenv(rr.ROUTING_REPLAY_R2_ENV, raising = False)
     rr.reset_routing_replay()
     assert rr.install_routing_replay(_model(), None, SimpleNamespace(pad_token_id = PAD)) == 0
+
+
+def test_no_pad_id_and_no_mask_still_replays(r2):
+    model = _model()
+    assert rr.install_routing_replay(model, None, None) == NUM_LAYERS
+    routes = _Routes(model)
+    _rollout(model)
+    ids = torch.tensor([[5, 6, 7, 30, 31, 32]])
+    with torch.no_grad():
+        model(input_ids = ids)
+    old = routes.ids()
+    _policy_update(model)
+    model(input_ids = ids)
+    assert torch.equal(routes.ids(), old)
+    assert rr.routing_replay_stats()["r2_replayed_tokens"] == ids.numel()

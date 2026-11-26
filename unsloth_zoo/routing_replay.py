@@ -748,9 +748,9 @@ def _r2_store_forward():
         exact = tuple(tokens)
         # The first forward of a row after the rollout is pi_old's: later ones never overwrite it.
         _STATE.r2_exact.setdefault(exact, full[[c + row * T for c in cols]])
-        if pad is not None:
-            kept = [c for c, t in zip(cols, tokens) if t != pad]
-            _STATE.r2_unpadded.setdefault(_make_key(tokens, pad), full[[c + row * T for c in kept]])
+        # Without a pad id the key keeps every token, as the lookup's does.
+        kept = [c for c, t in zip(cols, tokens) if pad is None or t != pad]
+        _STATE.r2_unpadded.setdefault(_make_key(tokens, pad), full[[c + row * T for c in kept]])
         stored += 1
     for table in (_STATE.r2_exact, _STATE.r2_unpadded):
         while len(table) > _MAX_R2_ROWS:
