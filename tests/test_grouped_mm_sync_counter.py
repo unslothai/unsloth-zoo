@@ -180,23 +180,20 @@ def test_transformers_wrapper_classifies_at_weight_dtype(monkeypatch):
     assert seen == [(torch.bfloat16, torch.bfloat16)]
 
 
-def test_compiled_site_keeps_group_count(monkeypatch):
-    # Over 1024 groups cuBLASLt declines, so the compiled classification must see the real count, as eager does.
-    seen = []
-    monkeypatch.setattr(
-        M, "_torch_grouped_mm_takes_fallback",
-        lambda device, dtype, weight_dtype, groups: seen.append(groups) or True,
-    )
+def test_compiled_site_with_symbolic_expert_count():
+    # dynamic=True makes the expert count a SymInt: tracing must not fail, and each trace counts once.
     torch._dynamo.reset()
-    x, w, _ = _case()
 
-    @torch.compile(fullgraph = True, backend = "eager")
+    @torch.compile(fullgraph = True, dynamic = True, backend = "eager")
     def f(x, w):
-        M._count_grouped_mm_sync("torch_fallback", x, w, 2048)
+        M._count_grouped_mm_sync("torch_fallback", x, w, w.shape[0])
         return x @ w[0]
 
-    f(x, w)
-    assert seen == [2048]
+    before = M.grouped_mm_sync_calls()
+    for experts in (4, 6, 8):
+        f(torch.randn(13, 16), torch.randn(experts, 16, 8))
+    delta = _delta(before)
+    assert delta["torch_fallback"] == 0 and delta["loop"] == 0 and delta["compiled_sites"] >= 1
     torch._dynamo.reset()
 
 

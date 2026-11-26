@@ -476,10 +476,10 @@ def _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, groups):
 
 
 @_assume_constant_result
-def _note_compiled_grouped_mm_site(device_type, device_index, dtype, weight_dtype, groups):
+def _note_compiled_grouped_mm_site(device_type, device_index, dtype, weight_dtype):
     # Dynamo runs this once per trace (assume_constant_result), never inside the compiled graph.
     device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
-    if _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, groups):
+    if _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, 1):
         _record_grouped_mm_sync("compiled_sites")
     return True
 
@@ -496,9 +496,9 @@ def _count_grouped_mm_sync(kind, inputs = None, weight = None, groups = 0):
         if kind == "opaque_loop":
             _note_compiled_loop_site()
         elif kind == "torch_fallback":
-            # A symbolic expert count is passed as 1: the cuBLASLt limit is 1024 groups, far above real expert counts.
-            groups = groups if isinstance(groups, int) else 1
-            _note_compiled_grouped_mm_site(inputs.device.type, inputs.device.index, inputs.dtype, weight.dtype, groups)
+            # The expert count can be symbolic (dynamic=True), which the constant helper cannot take, so traced
+            # calls are classified at 1 group: cuBLASLt's 1024-group limit is far above real expert counts.
+            _note_compiled_grouped_mm_site(inputs.device.type, inputs.device.index, inputs.dtype, weight.dtype)
         return
     if kind == "torch_fallback" and not _torch_grouped_mm_takes_fallback(inputs.device, inputs.dtype, weight.dtype, groups):
         return
