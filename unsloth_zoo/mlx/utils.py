@@ -18933,9 +18933,36 @@ def _copy_source_sidecars(src_path, path):
         copied += 1
     return copied
 
+def _fuse_dense_lora_linear(module):
+    """Fuse an mlx-lm LoRALinear over a dense 16-bit Linear with one rounding, or return None for any other module.
+    mlx-lm's fuse casts the LoRA delta to the base dtype and then adds it, rounding twice; adding in float32 and
+    casting the sum once keeps the merged weight as close to the live adapter as that dtype allows."""
+    import mlx.nn as nn
+    try:
+        from mlx_lm.tuner.lora import LoRALinear
+    except Exception:
+        return None
+    if type(module) is not LoRALinear or type(module.linear) is not nn.Linear:
+        return None
+    linear = module.linear
+    weight = linear.weight
+    if weight.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    delta = (module.scale * module.lora_b.T.astype(mx.float32)) @ module.lora_a.T.astype(mx.float32)
+    output_dims, input_dims = weight.shape
+    has_bias = "bias" in linear
+    fused = nn.Linear(input_dims, output_dims, bias=has_bias)
+    fused.weight = (weight.astype(mx.float32) + delta).astype(weight.dtype)
+    if has_bias:
+        fused.bias = linear.bias
+    return fused
+
 def _fuse_mlx_module(module, dequantize):
     """Call module.fuse(dequantize=); a flagless fuse (ExtendedLmHead) is called as is, and save_merged_model
     dequantizes afterwards."""
+    fused = _fuse_dense_lora_linear(module)
+    if fused is not None:
+        return fused
     fuse = module.fuse
     try:
         parameters = inspect.signature(fuse).parameters
