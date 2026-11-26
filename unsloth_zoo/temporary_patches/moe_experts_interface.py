@@ -467,6 +467,9 @@ def _patch_transformers_grouped_mm():
     def _grouped_mm(input, weight, offs, *args, **kwargs):
         if not args and not kwargs and input.dtype == weight.dtype and wanted(input, weight):
             return op(input, weight, offs)
+        count = getattr(moe_utils, "_count_grouped_mm_sync", None)
+        if count is not None and weight.dim() == 3:
+            count("torch_fallback", input, weight, offs.shape[0])
         return original(input, weight, offs, *args, **kwargs)
 
     _grouped_mm._unsloth_patched = True

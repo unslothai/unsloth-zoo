@@ -431,7 +431,86 @@ _GROUPED_MM_RUNTIME_REFUSALS = [0]
 _GROUPED_MM_RUNTIME_LATCHED = [False]
 
 
+# Grouped GEMMs that read the expert offsets on the host (one sync per call). "torch_fallback": eager torch._grouped_mm
+# forwards that torch serves with _grouped_mm_fallback, a per-expert mm loop (GroupedBlas.cpp: off bf16 sm90 / sm100,
+# off cuBLASLt grouped on CUDA >= 13.3 sm9x-11x, and on ROCm without the opt-in CK kernels); torch's own backward adds
+# up to two more per forward. "loop": Unsloth's per-expert loop (forward, backward and the dW loop; it runs eagerly
+# even inside compiled code). "compiled_sites": such torch._grouped_mm calls traced into a compiled graph, counted once
+# per trace, since a graph cannot count its own runs. Read deltas around a step: grouped_mm_sync_calls().
+GROUPED_MM_SYNC_CALLS = {"torch_fallback": 0, "loop": 0, "compiled_sites": 0}
+_GROUPED_MM_SYNC_LOGGED = [False]
+_TORCH_GROUPED_MM_FALLBACK_BY_KEY = {}
+
+
+def grouped_mm_sync_calls():
+    """Copy of GROUPED_MM_SYNC_CALLS (eager grouped GEMM calls that synced on the expert offsets)."""
+    return dict(GROUPED_MM_SYNC_CALLS)
+
+
+def _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, groups):
+    """Whether torch._grouped_mm serves this call with its synced per-expert loop, from GroupedBlas.cpp's dispatch."""
+    key = (device.type, device.index, dtype, weight_dtype, groups <= 1024)
+    takes = _TORCH_GROUPED_MM_FALLBACK_BY_KEY.get(key)
+    if takes is not None:
+        return takes
+    takes = True
+    try:
+        if device.type == "cuda":
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            if is_rocm_torch(torch):
+                arch = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", "")).split(":")[0]
+                ck = os.environ.get("ROCM_ALLOW_GROUP_GEMM_CK", "0") == "1"
+                takes = not (ck and arch in ("gfx942", "gfx950", "gfx90a"))
+            else:
+                major, minor = torch.cuda.get_device_capability(index)
+                bf16 = dtype == weight_dtype == torch.bfloat16
+                cuda = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
+                # bf16 takes cuBLASLt only behind an opt-in flag, so only fp16 is counted as served there.
+                cublaslt = cuda >= (13, 3) and 9 <= major <= 11 and dtype == weight_dtype == torch.float16 \
+                    and key[-1]
+                takes = not (cublaslt or (bf16 and ((major, minor) == (9, 0) or major == 10)))
+    except Exception:
+        takes = True
+    _TORCH_GROUPED_MM_FALLBACK_BY_KEY[key] = takes
+    return takes
+
+
+@_assume_constant_result
+def _note_compiled_grouped_mm_site(device_type, device_index, dtype, weight_dtype):
+    # Dynamo runs this once per trace (assume_constant_result), never inside the compiled graph.
+    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
+    if _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, 1):
+        _record_grouped_mm_sync("compiled_sites")
+    return True
+
+
+def _count_grouped_mm_sync(kind, inputs = None, weight = None, groups = 0):
+    if torch.compiler.is_compiling():
+        if kind == "torch_fallback":
+            _note_compiled_grouped_mm_site(inputs.device.type, inputs.device.index, inputs.dtype, weight.dtype)
+        return
+    if kind == "torch_fallback" and not _torch_grouped_mm_takes_fallback(inputs.device, inputs.dtype, weight.dtype, groups):
+        return
+    _record_grouped_mm_sync(kind)
+
+
+def _record_grouped_mm_sync(kind):
+    # Shared with the compiled-cache copy of this module, so the package's counters see every call.
+    package = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    calls = getattr(package, "GROUPED_MM_SYNC_CALLS", GROUPED_MM_SYNC_CALLS)
+    logged = getattr(package, "_GROUPED_MM_SYNC_LOGGED", _GROUPED_MM_SYNC_LOGGED)
+    calls[kind] += 1
+    if not logged[0] and os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        logged[0] = True
+        where = "Unsloth's per-expert loop" if kind == "loop" else "torch._grouped_mm's per-expert fallback"
+        print(
+            f"Unsloth: MoE expert GEMMs run on {where}, one host sync per call. "
+            "Per-step counts: unsloth_zoo.temporary_patches.moe_utils.grouped_mm_sync_calls()."
+        )
+
+
 def _grouped_mm_native(inputs, weight, offsets):
+    _count_grouped_mm_sync("torch_fallback", inputs, weight, offsets.shape[0])
     pad = _native_backward_pad(inputs, weight)
     if pad:
         if _is_transposed_stack(weight) and _transposed_view_safe_on(inputs.device):
@@ -479,9 +558,11 @@ def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     grad_output = grad_output.contiguous()
     try:
         if _grouped_mm_supported_on(inputs.device):
+            _count_grouped_mm_sync("torch_fallback", inputs, grad_output, offsets.shape[0])
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
     except RuntimeError:
         pass
+    _count_grouped_mm_sync("loop")
     out = inputs.new_zeros((offsets.shape[0], inputs.shape[1], grad_output.shape[1]))
     start = 0
     for g, end in enumerate(offsets.tolist()):
@@ -789,6 +870,7 @@ _GROUPED_MM_TRITON_OP = _register_grouped_mm_triton_op()
 def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
     """Per-group loop out[s:e] = inputs[s:e] @ weight[g] with no autograd; bounds are pre-decoded group ends, since
     re-reading offsets would add a second stream sync per grouped matmul."""
+    _count_grouped_mm_sync("loop")
     outputs = []
     start = 0
     if bounds is None: bounds = offsets.detach().cpu().tolist()
@@ -881,6 +963,7 @@ class _ManualGroupedMM(torch.autograd.Function):
                 "make the router deterministic."
             )
         bounds = routing[:-_SIGNATURE_WIDTH]
+        _count_grouped_mm_sync("loop")
         need_x, need_w, _ = ctx.needs_input_grad
         grad_output = grad_output.contiguous()
         # Backward runs outside the forward's autocast, so grad_output can be bf16 while saved tensors are fp32; dtypes
