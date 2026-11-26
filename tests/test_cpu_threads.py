@@ -34,7 +34,7 @@ _THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "UNSLOTH_CPU_THREADS", "TOR
                "MV2_COMM_WORLD_LOCAL_SIZE")
 
 
-def _fit_in_subprocess(extra, cores = None):
+def _fit_in_subprocess(extra, cores = None, patch = ""):
     """fit_cpu_threads() in a fresh interpreter (torch reads OMP_NUM_THREADS once), with cpu_compute_cores pinned."""
     env = {k: v for k, v in os.environ.items() if k not in _THREAD_ENV}
     env.update(extra)
@@ -44,6 +44,7 @@ def _fit_in_subprocess(extra, cores = None):
         "from unsloth_zoo.cpu import runtime\n"
         f"cores = {cores!r}\n"
         "if cores is not None: runtime.cpu_compute_cores = lambda: cores\n"
+        f"{patch}\n"
         "before = torch.get_num_threads()\n"
         "first = runtime.fit_cpu_threads(); second = runtime.fit_cpu_threads()\n"
         "print(json.dumps([before, first[0], first[1], list(first) == list(second), torch.get_num_threads()]))\n"
@@ -271,3 +272,55 @@ def test_user_omp_env_is_never_rewritten(monkeypatch):
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
     runtime._pin_omp_env(8)
     assert os.environ["OMP_NUM_THREADS"] == "1"
+
+
+# SMT siblings: AMD x86 training in float32 gets one thread per logical CPU (measured 7-28% faster on EPYC runners).
+_SMT_ON = "runtime.smt_threads_help = lambda: True\nruntime._logical_cpus = lambda: torch.get_num_threads() + 2"
+_SMT_OFF = "runtime.smt_threads_help = lambda: False\nruntime._logical_cpus = lambda: torch.get_num_threads() + 2"
+
+
+def test_fit_cpu_threads_uses_smt_siblings_where_they_help():
+    before, fitted, reason, idempotent, live = _fit_in_subprocess({}, 1, _SMT_ON)
+    assert fitted == live == before + 2 and reason == "SMT threads (AMD, float32)", (before, fitted, reason)
+    assert idempotent
+
+
+def test_fit_cpu_threads_keeps_physical_cores_elsewhere():
+    before, fitted, reason, _, _ = _fit_in_subprocess({}, 1, _SMT_OFF)
+    assert fitted == 1 and (before == 1 or reason == "physical cores")
+
+
+@pytest.mark.parametrize("extra", [{"UNSLOTH_CPU_THREADS": "1"}, {"OMP_NUM_THREADS": "1"}, {"LOCAL_WORLD_SIZE": "2"},
+                                   {"OMP_NUM_THREADS": "1", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2"}])
+def test_fit_cpu_threads_smt_never_overrides_users_or_ranks(extra):
+    before, fitted, reason, _, _ = _fit_in_subprocess(extra, 8, _SMT_ON)
+    assert reason != "SMT threads (AMD, float32)", (extra, before, fitted, reason)
+
+
+@pytest.mark.parametrize("machine, vendor, dtype, override, expected", [
+    ("x86_64", "AuthenticAMD", None, "", True),
+    ("AMD64", "AuthenticAMD", None, "", True),  # Windows spelling
+    ("x86_64", "AuthenticAMD", torch.bfloat16, "", False),  # native bf16 path: SMT threads were slower
+    ("x86_64", "GenuineIntel", None, "", False),  # Intel float32: SMT threads were slower
+    ("aarch64", "", None, "", False),
+    ("x86_64", "GenuineIntel", None, "1", True),
+    ("x86_64", "AuthenticAMD", None, "0", False),
+])
+def test_smt_threads_help(monkeypatch, machine, vendor, dtype, override, expected):
+    from unsloth_zoo.cpu import runtime
+    monkeypatch.setattr(runtime.platform, "machine", lambda: machine)
+    monkeypatch.setattr(runtime, "_cpu_vendor", lambda: vendor)
+    monkeypatch.setattr(runtime, "cpu_autocast_dtype", lambda: dtype)
+    monkeypatch.setenv("UNSLOTH_CPU_SMT", override)
+    assert runtime.smt_threads_help() is expected
+
+
+def test_cpu_vendor_reads_windows_processor_string(monkeypatch):
+    from unsloth_zoo.cpu import runtime
+    monkeypatch.setattr(runtime.sys, "platform", "win32")
+    monkeypatch.setattr(runtime.platform, "processor", lambda: "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD")
+    runtime._cpu_vendor.cache_clear()
+    try:
+        assert runtime._cpu_vendor() == "AuthenticAMD"
+    finally:
+        runtime._cpu_vendor.cache_clear()

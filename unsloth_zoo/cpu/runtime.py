@@ -24,6 +24,7 @@ __all__ = [
     "apply_cpu_security_patches",
     "cpu_compute_cores",
     "fit_cpu_threads",
+    "smt_threads_help",
     "available_ram",
 ]
 
@@ -302,6 +303,59 @@ def _launcher_set_one_thread():
     return "ACCELERATE_MIXED_PRECISION" in os.environ
 
 
+@functools.cache
+def _cpu_vendor():
+    """x86 vendor string (AuthenticAMD / GenuineIntel), "" when unknown."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/cpuinfo", "r", encoding = "utf-8", errors = "ignore") as f:
+                for line in f:
+                    if line.split(":", 1)[0].strip().lower() == "vendor_id":
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+        return ""
+    if sys.platform == "win32":
+        name = platform.processor() or ""  # "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD"
+        return name.rsplit(",", 1)[-1].strip() if "," in name else ""
+    return ""
+
+
+def smt_threads_help():
+    """True when SMT siblings speed up CPU training: AMD x86 training in float32 (no native bf16 / fp16). Measured on
+    2-core x 2-SMT runners, SFT LoRA and GRPO on Qwen3-0.6B: 4 threads beat 2 by 7-28% on EPYC 7763 (Zen 3) and on
+    EPYC 9V74 (Zen 4) with bf16 off; on Intel, and on AMD's bf16 path, 4 threads were 0-17% slower. UNSLOTH_CPU_SMT=0/1
+    overrides."""
+    override = os.environ.get("UNSLOTH_CPU_SMT", "").strip().lower()
+    if override in ("0", "false", "no", "off"):
+        return False
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if platform.machine().lower() not in ("x86_64", "amd64") or _cpu_vendor() != "AuthenticAMD":
+        return False
+    try:
+        return cpu_autocast_dtype() is None
+    except Exception:
+        return False
+
+
+def _logical_cpus():
+    """CPUs this process may run on, SMT siblings included, capped by a cgroup quota; None off Linux / Windows."""
+    if sys.platform.startswith("linux"):
+        try:
+            count = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            return None
+        try:
+            quota = _cgroup_cpu_limit()
+        except Exception:
+            quota = None
+        return max(1, min(count, quota) if quota else count)
+    if sys.platform == "win32":
+        return getattr(os, "process_cpu_count", os.cpu_count)()
+    return None
+
+
 _THREADS_FITTED = None
 
 
@@ -309,7 +363,8 @@ def fit_cpu_threads():
     """Sizes torch's intra-op pool for CPU training. Idempotent; returns (threads, reason).
     UNSLOTH_CPU_THREADS wins; a user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept; otherwise one thread per physical
     core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate. Never raises the
-    count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
+    count above torch's default except to undo a launcher's OMP_NUM_THREADS=1, or to one thread per logical CPU where
+    smt_threads_help() (AMD, float32, one process)."""
     global _THREADS_FITTED
     import torch
     if _THREADS_FITTED is not None:
@@ -335,7 +390,10 @@ def fit_cpu_threads():
             return _THREADS_FITTED
         cores = cpu_compute_cores()
         ranks = _local_world_size()
-        if cores is None:
+        logical = _logical_cpus() if ranks == 1 and not launcher else None
+        if logical is not None and logical > current and smt_threads_help():
+            target, reason = logical, "SMT threads (AMD, float32)"
+        elif cores is None:
             if launcher:
                 target, reason = max(1, (os.cpu_count() or 1) // ranks), "launcher OMP_NUM_THREADS=1 undone"
         else:
