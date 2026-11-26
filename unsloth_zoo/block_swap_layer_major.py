@@ -140,20 +140,19 @@ def _autocast(state):
     return stack
 
 
-def _rng_state(device):
-    """CPU and device generator states before a layer call: its recompute must draw the same dropout masks."""
-    cuda = device is not None and device.type == "cuda"
-    return torch.get_rng_state(), (torch.cuda.get_rng_state(device) if cuda else None), device
+def _rng_state(devices):
+    """CPU generator state and those of the CUDA devices a layer call runs on (its parameters' and its input's):
+    the recompute must draw the same dropout masks."""
+    return torch.get_rng_state(), [(d, torch.cuda.get_rng_state(d)) for d in devices]
 
 
 @contextmanager
 def _replay_rng(state):
-    cpu, dev_state, device = state
-    devices = [device] if dev_state is not None else []
-    with torch.random.fork_rng(devices = devices, enabled = True):
+    cpu, devices = state
+    with torch.random.fork_rng(devices = [d for d, _ in devices], enabled = True):
         torch.set_rng_state(cpu)
-        if dev_state is not None:
-            torch.cuda.set_rng_state(dev_state, device)
+        for d, dev_state in devices:
+            torch.cuda.set_rng_state(dev_state, d)
         yield
 
 
@@ -255,6 +254,7 @@ class _Window:
         self.abort_reason = None
         self.held = set()
         self.signatures = [self._call_signature(l) for l in range(self.L)]
+        self.layer_devices = [{p.device for p in layer.parameters() if p.is_cuda} for layer in self.layers]
         self.in_backward = False
         self.input_used = [False] * n
 
@@ -332,7 +332,8 @@ class _Window:
             # A live KV cache (use_cache without checkpointing): the recompute would update it a second time.
             self._abort("a decoder layer call with a live KV cache")
         args2, kwargs2 = _with_hidden(args, kwargs, where, x)
-        self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(self.device))
+        devices = self.layer_devices[l] | ({x.device} if x.is_cuda else set())
+        self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(sorted(devices, key = str)))
         if m == 0 and self.swapper is not None:
             self.swapper.hold(l)
             self.held.add(l)

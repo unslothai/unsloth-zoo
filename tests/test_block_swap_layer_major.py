@@ -336,6 +336,25 @@ def test_dropout_masks_replayed_in_the_recompute():
         _assert_same(base_grads, grads)
 
 
+@_cuda
+def test_gpu_dropout_replayed_on_the_layers_device():
+    """A model on a CUDA device other than the current one: the recompute replays that device's generator."""
+    n_dev = torch.cuda.device_count()
+    dev = torch.device("cuda", n_dev - 1)
+    model = _model(device = dev)
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Dropout):
+            mod.p = 0.5
+    batches, items = _batches(1, device = dev)
+    with torch.cuda.device(0):
+        torch.manual_seed(7)
+        base_losses, base_grads = _standard(model, batches, items)
+        torch.manual_seed(7)
+        losses, grads = _layer_major(model, batches, items)
+    assert torch.equal(base_losses[0], losses[0])
+    _assert_same(base_grads, grads)
+
+
 def test_loss_on_intermediate_hidden_states():
     """A loss term on an intermediate layer's output, collected from the decoder loop as Unsloth's fast forward
     collects hidden states, reaches the layers below it."""
