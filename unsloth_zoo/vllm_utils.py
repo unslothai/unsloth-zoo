@@ -422,7 +422,6 @@ pass
 
 # Whichever bitsandbytes module is resolved below (when vLLM is installed); defined here because load_vllm reads it outside that branch.
 _vllm_bnb = None
-# "vllm" (in tree), "vllm-bnb-plugin" or "unsloth" (unsloth_zoo.vllm_bnb): who serves quantization = "bitsandbytes".
 _vllm_bnb_source = None
 
 
@@ -499,10 +498,7 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     def _dequantize_dq(self, quant_states):
         return quant_states
-    # vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin, which re-exports the same names.
-    # resolve() picks in tree, else an installed plugin, else Unsloth's copy of the plugin (unsloth_zoo.vllm_bnb),
-    # and registers the last two so quantization = "bitsandbytes" exists. Hard importing the in-tree path took out
-    # every fast_inference run, not just 4-bit, so a failure here only leaves _vllm_bnb None.
+    # Never hard import bnb here: a failure would break every fast_inference run, not just 4-bit.
     try:
         from .vllm_bnb import resolve as _resolve_vllm_bnb
         _vllm_bnb, _bnb_loader, _vllm_bnb_source = _resolve_vllm_bnb()
@@ -521,7 +517,7 @@ if importlib.util.find_spec("vllm") is not None:
     except:
         pass
 
-    # Patch apply_bnb_4bit on whichever bitsandbytes module resolve() returned.
+    # Patch apply_bnb_4bit
     if _vllm_bnb is None:
         # No bnb to wrap: only 4-bit needs this patch, and load_vllm raises there with install instructions, so the rest of this module stays usable.
         def _apply_4bit_weight(self, layer, x, bias = None):

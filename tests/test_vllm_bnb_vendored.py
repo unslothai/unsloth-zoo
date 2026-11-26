@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""vLLM >= 0.28 has no built-in bitsandbytes; unsloth_zoo.vllm_bnb (a copy of vllm-bnb-plugin) fills in when the
-plugin is not installed. Resolution order, the forced provider, and the copy's invariants. vLLM is not imported."""
+"""unsloth_zoo.vllm_bnb resolution order, forced provider and copy invariants. vLLM is not imported."""
 import ast
 import importlib.util
 import os
@@ -22,7 +21,6 @@ def _load_vllm_bnb():
 
 
 def _env(vb, monkeypatch, *, modules, specs, plugin_raises = False):
-    """modules: importable dotted names; specs: names find_spec sees. Records register calls."""
     calls = []
 
     def plugin_register():
@@ -72,7 +70,6 @@ def test_vendored_copy_when_vllm_has_no_bitsandbytes(monkeypatch):
     quant, loader, source = vb.resolve()
     assert source == "unsloth" and quant.__name__ == vb._VENDORED[0] and loader.__name__ == vb._VENDORED[1]
     assert calls == ["unsloth"]
-    # Cached: a second call registers nothing more.
     assert vb.resolve()[2] == "unsloth" and calls == ["unsloth"]
 
 
@@ -156,7 +153,6 @@ def test_weights_mapper_falls_back_to_vllm_028_name():
         def get_rename_mapper(self):
             return "m029"
 
-    # Same expression as the loader.
     for mapper, want in ((Mapper028(), "m028"), (Mapper029(), "m029")):
         get = getattr(mapper, "get_rename_mapper", None) or getattr(mapper, "get_unstacked_mapper")
         assert get() == want

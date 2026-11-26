@@ -2,20 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Vendored by Unsloth from vllm-project/vllm-bnb-plugin v0.0.3 (commit d4914a9), Apache-2.0 (LICENSE in this
 # directory). The rest of Unsloth Zoo is LGPLv3; the files in this directory stay under Apache-2.0.
-"""bitsandbytes quantization + model loader for vLLM >= 0.28.
-
-vLLM 0.28 (vllm-project/vllm#43529) removed `quantization="bitsandbytes"` and `load_format="bitsandbytes"` from the
-tree and moved them to the separately installed vllm-bnb-plugin. Without it, `load_in_4bit=True,
-fast_inference=True` fails with "Unknown quantization method: bitsandbytes". This package is a copy of that
-plugin, registered at runtime only when neither vLLM nor an installed vllm-bnb-plugin provides bitsandbytes.
+"""bitsandbytes for vLLM >= 0.28 (vllm-project/vllm#43529 moved it to vllm-bnb-plugin), used when neither
+vLLM nor an installed plugin provides it.
 
 Changes from upstream v0.0.3:
-- files moved from `vllm_bnb_plugin/` to `unsloth_zoo/vllm_bnb/`; this `__init__` replaces the plugin's and adds
-  `resolve()`; no `vllm.general_plugins` entry point (registered by Unsloth Zoo instead).
-- the 4-bit custom op is `torch.ops.vllm.unsloth_apply_bnb_4bit`, so it never collides with the plugin's
-  `apply_bnb_4bit` when both are importable.
-- `BitsAndBytesModelLoader` falls back to `WeightsMapper.get_unstacked_mapper` (vLLM 0.28.0) when
-  `get_rename_mapper` (vLLM >= 0.29) is missing.
+- this `__init__` replaces the plugin's (adds `resolve()`, no entry point).
+- custom op renamed `torch.ops.vllm.unsloth_apply_bnb_4bit` to avoid colliding with the plugin's.
+- loader falls back to `get_unstacked_mapper` (vLLM 0.28.0) when `get_rename_mapper` is missing.
 """
 
 import importlib
@@ -28,7 +21,6 @@ __all__ = ["register", "resolve"]
 _REGISTERED = False
 _RESOLVED = None
 
-# (quantization module, model loader module) for each provider, in the order they are tried.
 _IN_TREE = (
     "vllm.model_executor.layers.quantization.bitsandbytes",  # vLLM <= 0.27.1
     "vllm.model_executor.model_loader.bitsandbytes_loader",
@@ -47,8 +39,7 @@ def _enforce_eager_for_8bit(model_config: Any) -> None:
 
 
 def _patch_engine_args() -> None:
-    """A pre-quantized bitsandbytes checkpoint resolves quantization from its config.json: load it with the
-    bitsandbytes loader too (upstream plugin behaviour)."""
+    """Pre-quantized bnb checkpoints also need the bnb loader (upstream plugin behaviour)."""
     from vllm.engine.arg_utils import EngineArgs
 
     if getattr(EngineArgs, "_unsloth_vllm_bnb_patched", False):
@@ -76,7 +67,6 @@ def _patch_engine_args() -> None:
 
 
 def register() -> None:
-    """Register the vendored bitsandbytes config + loader with vLLM (idempotent)."""
     global _REGISTERED
     if _REGISTERED:
         return
@@ -92,7 +82,6 @@ def register() -> None:
     _REGISTERED = True
 
 
-# Indirection points for tests.
 _find_spec = importlib.util.find_spec
 _import = importlib.import_module
 
@@ -106,20 +95,16 @@ def _register_plugin():
 
 
 def resolve():
-    """(quantization module, loader module, source) serving bitsandbytes for the installed vLLM, registering it.
+    """(quant module, loader module, source in "vllm" / "vllm-bnb-plugin" / "unsloth"), or Nones.
 
-    source is "vllm" (in tree, vLLM <= 0.27.1), "vllm-bnb-plugin" (installed plugin, which vLLM would also load
-    from its entry point) or "unsloth" (this copy); (None, None, None) when vLLM or bitsandbytes is missing.
-    The plugin wins over this copy when installed: vLLM loads it from its entry point anyway, and a second
-    registration of the same name would silently replace the first.
+    An installed plugin wins: vLLM loads it anyway and a second registration would silently replace it.
     """
     global _RESOLVED
     if _RESOLVED is not None:
         return _RESOLVED
     if _find_spec("vllm") is None:
         return (None, None, None)
-    # UNSLOTH_VLLM_BNB=unsloth uses this copy even where vLLM has its own (A/A against in-tree bitsandbytes);
-    # =vllm-bnb-plugin or =vllm require that provider. A forced provider that cannot load raises.
+    # UNSLOTH_VLLM_BNB forces a provider (unsloth / vllm-bnb-plugin / vllm); one that cannot load raises.
     forced = os.environ.get("UNSLOTH_VLLM_BNB", "").strip().lower()
     if forced == "unsloth":
         register()
@@ -149,7 +134,7 @@ def resolve():
             quant, loader = _import_pair(_PLUGIN)
             _RESOLVED = (quant, loader, "vllm-bnb-plugin")
             return _RESOLVED
-        except Exception as e:  # a plugin built for another vLLM: fall back to the vendored copy
+        except Exception as e:  # plugin built for another vLLM
             print(f"Unsloth: vllm-bnb-plugin failed to load ({type(e).__name__}: {e}); using Unsloth's copy.")
     register()
     quant, loader = _import_pair(_VENDORED)

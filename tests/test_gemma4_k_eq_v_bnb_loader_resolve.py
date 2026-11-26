@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""Gemma 4 k_eq_v patch must find the BnB loader in tree, in vllm-bnb-plugin or in Unsloth's copy (vLLM >= 0.28).
-vLLM is mocked."""
+"""Gemma 4 k_eq_v patch finds the BnB loader in tree, plugin or Unsloth's copy. vLLM is mocked."""
 import os
 import sys
 import types
