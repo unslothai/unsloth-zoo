@@ -6622,11 +6622,33 @@ def get_peft_config(save_directory):
 pass
 
 
+def _lora_adapter_name(model):
+    """The adapter load_lora serves: the active one, which PEFT names "default" unless the caller renamed it."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    configs = getattr(model, "peft_config", None) or {}
+    name = getattr(model, "active_adapter", None)
+    if isinstance(name, (list, tuple)):
+        name = name[0] if len(name) == 1 else None
+    if isinstance(name, str) and name in configs: return name
+    if "default" not in configs and len(configs) == 1: return next(iter(configs))
+    return "default"
+pass
+
+
+def _strip_lora_adapter_name(state_dict, name):
+    """vLLM reads lora_A.weight, PEFT names it lora_A.<adapter>.weight; other adapters' tensors stay out."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if name == "default": return {k.replace(".default", ""):v for k, v in state_dict.items()}
+    segment = re.compile(r"\.lora_([AB])\." + re.escape(name) + r"(?=\.|$)")
+    return {segment.sub(r".lora_\1", k):v for k, v in state_dict.items() if segment.search(k)}
+pass
+
+
 _LIVE_LORA_CONFIGS = {}
 def _live_lora_config(model, save_directory):
     """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
     # All Unsloth Zoo code licensed under LGPLv3
-    config = model.peft_config["default"]
+    config = model.peft_config[_lora_adapter_name(model)]
     # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
     cached = _LIVE_LORA_CONFIGS.get(save_directory)
     if cached is None or cached[0] is not config:
@@ -8593,7 +8615,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model, reuse_gathered).items()}
+        state_dict = _strip_lora_adapter_name(_lora_state_dict(model, reuse_gathered), _lora_adapter_name(model))
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
