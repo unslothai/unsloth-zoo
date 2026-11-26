@@ -285,6 +285,13 @@ def test_fit_cpu_threads_uses_smt_siblings_where_they_help():
     assert idempotent
 
 
+def test_fit_cpu_threads_smt_keeps_a_pool_already_at_the_logical_count():
+    # torch already runs one thread per logical CPU: the SMT rule keeps it, the physical-core cut must not apply.
+    patch = "runtime.smt_threads_help = lambda: True\nruntime._logical_cpus = lambda: torch.get_num_threads()"
+    before, fitted, reason, _, live = _fit_in_subprocess({}, 1, patch)
+    assert fitted == live == before, (before, fitted, reason)
+
+
 def test_fit_cpu_threads_keeps_physical_cores_elsewhere():
     before, fitted, reason, _, _ = _fit_in_subprocess({}, 1, _SMT_OFF)
     assert fitted == 1 and (before == 1 or reason == "physical cores")

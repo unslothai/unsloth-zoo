@@ -391,7 +391,7 @@ def fit_cpu_threads():
         cores = cpu_compute_cores()
         ranks = _local_world_size()
         logical = _logical_cpus() if ranks == 1 and not launcher else None
-        if logical is not None and logical > current and smt_threads_help():
+        if logical is not None and smt_threads_help():
             target, reason = logical, "SMT threads (AMD, float32)"
         elif cores is None:
             if launcher:
