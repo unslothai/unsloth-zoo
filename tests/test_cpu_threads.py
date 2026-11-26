@@ -85,7 +85,7 @@ def test_fit_cpu_threads_default_drops_smt_siblings_never_raises():
     assert fitted == 1 and (before == 1 or reason == "physical cores")
     big = 10 ** 6
     before, fitted, reason, _, _ = _fit_in_subprocess({}, big)
-    assert fitted == before  # more cores than torch's default: left alone
+    assert fitted == min(before, 16)  # more cores than torch's default: never raised, only the default cap applies
 
 
 @pytest.mark.parametrize("variable", ["LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE",
