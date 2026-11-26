@@ -390,6 +390,29 @@ def test_output_recorder_hooks_abort_or_match():
         _assert_same(base_grads, _grads(model))
 
 
+def test_abort_on_a_loss_on_the_first_layer_input():
+    """A trainable embedding whose output also feeds a loss term: the loss part consumes the input-side graph
+    before the window's backward, so the window aborts and puts the embedding gradient back."""
+    model = _model(train_embed = True)
+    batches, items = _batches(2)
+    decoder = model.get_base_model().model
+
+    def fn(b):
+        x0 = decoder.embed_tokens(b["input_ids"])
+        pe = decoder.rotary_emb(x0, torch.arange(x0.shape[1])[None])
+        x = x0
+        for layer in _layers(model):
+            x = layer(x, position_embeddings = pe)
+            x = x[0] if isinstance(x, tuple) else x
+        loss = x.float().pow(2).mean() + x0.float().square().mean()
+        loss.backward()
+        return loss.detach()
+
+    why = _abort_case(model, batches, items, [lambda b = b: fn(b) for b in batches])
+    assert "first decoder layer's input" in why
+    assert _grads(model) == {}
+
+
 def test_caller_autocast_reaches_the_micro_batches():
     # Non-reentrant: older torch's reentrant checkpoint under CPU autocast leaves the LoRA weights without
     # gradients even in standard accumulation.

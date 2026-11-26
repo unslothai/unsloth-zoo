@@ -42,6 +42,7 @@ gradient exists; gradients the loss part already wrote are put back, and the cal
 the standard way. UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
 """
 
+import functools
 import os
 import threading
 from contextlib import ExitStack, contextmanager
@@ -254,6 +255,8 @@ class _Window:
         self.abort_reason = None
         self.held = set()
         self.signatures = [self._call_signature(l) for l in range(self.L)]
+        self.in_backward = False
+        self.input_used = [False] * n
 
     def _call_signature(self, l):
         """Forward hooks and instance-level forwards in layer l (and the global hooks): what a per-call output
@@ -319,6 +322,9 @@ class _Window:
             self._abort("a decoder layer's forward or hooks changed during the window (output recorders)")
         if l == 0 and h.requires_grad:
             self.h0[m] = h
+            # The input-side graph is traversed once, after the layers: a loss part that backpropagates into it
+            # directly (a loss on the embedding output) would consume it first.
+            h.register_hook(functools.partial(self._input_grad, m))
         x = h.detach()
         args2, kwargs2 = _with_hidden(args, _uncached(layer, dict(kwargs)), where, x)
         self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(self.device))
@@ -345,6 +351,10 @@ class _Window:
         self._pass_turn(m)
         self._wait_turn(m)
         return out
+
+    def _input_grad(self, m, grad):
+        if not self.in_backward:
+            self.input_used[m] = True
 
     def _worker(self, m, fn):
         _TLS.window, _TLS.micro = self, m
@@ -388,6 +398,7 @@ class _Window:
 
     # ---- backward, layer by layer, on the calling thread ----
     def backward(self, orig_calls):
+        self.in_backward = True
         g = [None] * self.n
         for l in range(self.L - 1, -1, -1):
             layer = self.layers[l]
@@ -534,6 +545,9 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
                 for done in events:
                     done.wait()
                 raise
+            if w.abort_reason is None and any(w.input_used):
+                w.abort_reason = ("a loss part backpropagated into the first decoder layer's input directly "
+                                  "(a loss on the embedding output)")
     finally:
         if w.swapper is not None:
             for l in sorted(w.held):
