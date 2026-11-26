@@ -3801,8 +3801,10 @@ def grpo_score_centering_k(trainer, loss_kwargs, rollout_logps_as_old = False, k
     """Head size k for this batch's score centering (UNSLOTH_GRPO_SCORE_CENTERING, loss_type="reinforce"),
     0 when it cannot center the loss's own score: the head is weighted with pi_theta / pi_rollout, which is
     the sampled token's weight in bypass mode (rollout logps as pi_old) or without an IS weight, but not
-    with the vLLM IS ratio pi_old / pi_rollout once the policy has moved (verl also requires bypass); and
-    kept-set scoring of truncated sampling leaves no full-vocabulary trainer log-probs."""
+    with the vLLM IS ratio pi_old / pi_rollout once the policy has moved (verl also requires bypass);
+    kept-set scoring of truncated sampling leaves no full-vocabulary trainer log-probs; and untruncated
+    rollout logprobs under top_k / top_p / min_p are not the sampler's q, which is zero outside the kept
+    set while the estimator models that tail as 1 - q(H)."""
     from unsloth_zoo.score_centering import score_centering_top_k
     k = score_centering_top_k()
     if not k:
@@ -3810,6 +3812,9 @@ def grpo_score_centering_k(trainer, loss_kwargs, rollout_logps_as_old = False, k
     reason = None
     if kept_set_scoring:
         reason = ("needs full-vocabulary trainer logprobs, but kept-set scoring is on (truncated vLLM sampling)")
+    elif grpo_rollout_logprobs_untruncated(trainer) and grpo_sampling_support(trainer) is not None:
+        reason = ("needs the sampler's own logprobs, but this vLLM engine returns them from before "
+                  "top_k / top_p / min_p (set UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS=0, or sample without those filters)")
     elif not rollout_logps_as_old and getattr(trainer, "use_vllm", False) \
             and loss_kwargs.get("vllm_importance_sampling_correction", False):
         reason = ("with the vLLM importance-sampling correction needs bypass mode "
