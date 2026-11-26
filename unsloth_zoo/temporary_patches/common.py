@@ -197,7 +197,9 @@ def determine_compile_threads():
     # unconditionally at import (vllm/env_override.py), which would drop every vLLM user to
     # a single compile worker.
     if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1": return 1
-    cpu_count = os.cpu_count()
+    # CPUs this process may run on (taskset / cpuset / Slurm / k8s), as Inductor itself counts; not the host total.
+    try:    cpu_count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError): cpu_count = os.cpu_count() or 1
     return min(32, max(4, cpu_count))
 pass
 
