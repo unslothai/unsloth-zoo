@@ -2173,10 +2173,8 @@ def _run_grouped_mm_crash_probe(device):
     return False
 
 
-def _grouped_mm_runs_on(device, home = False):
-    global _GROUPED_MM_TRAINING_PROBE_FAILURE
-    if home:
-        _GROUPED_MM_TRAINING_PROBE_FAILURE = None
+def _grouped_mm_runs_on(device):
+    _GROUPED_MM_LAST_REFUSAL[0] = None
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
@@ -2190,16 +2188,16 @@ def _grouped_mm_runs_on(device, home = False):
         del x, w, offs
     except Exception:
         return False
-    reason = _grouped_mm_trains_on(device)
-    if home:
-        _GROUPED_MM_TRAINING_PROBE_FAILURE = reason
-    return reason is None
+    _GROUPED_MM_LAST_REFUSAL[0] = _grouped_mm_trains_on(device)
+    return _GROUPED_MM_LAST_REFUSAL[0] is None
 
 
 # Routing of one tiny training step: uneven token counts and an expert that got none.
 _GROUPED_MM_PROBE_COUNTS = (8, 0, 5, 19)
 # Why the home card's training-shaped call failed where its single fp16 expert passed (the op exists, refuses training).
 _GROUPED_MM_TRAINING_PROBE_FAILURE = None
+# The last _grouped_mm_runs_on's training-call failure, read by the home probe.
+_GROUPED_MM_LAST_REFUSAL = [None]
 
 
 def _grouped_mm_probe_dtype(device):
@@ -2258,7 +2256,7 @@ def _grouped_mm_trains_on(device):
 
 
 def _probe_torch_grouped_mm_supported(device = None):
-    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE, _GROUPED_MM_TRAINING_PROBE_FAILURE
     kind = _grouped_mm_foreign_kind(device)
     if kind is not None:
         supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
@@ -2273,10 +2271,12 @@ def _probe_torch_grouped_mm_supported(device = None):
 
     # The anchored card, not whichever is current now: the flags must describe one card.
     device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
+    _GROUPED_MM_LAST_REFUSAL[0] = None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
-        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device, home = True)
+        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+    _GROUPED_MM_TRAINING_PROBE_FAILURE = _GROUPED_MM_LAST_REFUSAL[0]
     # Answer the view check here so a cold compiled block does not graph-break on it.
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
         _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _TORCH_GROUPED_MM_SUPPORTED and _transposed_view_probe(device)

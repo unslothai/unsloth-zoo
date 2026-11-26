@@ -61,6 +61,7 @@ def fresh(monkeypatch):
         monkeypatch.setattr(mu, name, {}, raising = False)
     monkeypatch.setattr(mu, "_GROUPED_MM_FALLBACK_LOGGED", set(), raising = False)
     monkeypatch.setattr(mu, "_GROUPED_MM_RUNTIME_REFUSALS", [0], raising = False)
+    monkeypatch.setattr(mu, "_GROUPED_MM_LAST_REFUSAL", [None], raising = False)
     monkeypatch.setattr(mu, "_grouped_mm_probe_device", lambda: CPU)
     monkeypatch.setattr(mu, "_check_grouped_gemm_available", lambda: False)
     for var in ("UNSLOTH_MOE_BACKEND", "UNSLOTH_MOE_GROUPED_TRITON", "UNSLOTH_DISABLE_MOE_TRITON",
