@@ -71,6 +71,17 @@ def _chunk_loss(hidden, labels, teacher_hidden, weight, teacher_weight, loss_typ
 LOGITS_BUDGET_BYTES = 256 << 20
 
 
+def _checkpoint():
+    """torch's own checkpoint (gradient_checkpointing._torch_checkpoint); this module is also loaded on its own,
+    without the package, by tests/test_speculative_losses.py when unsloth is not installed."""
+    try:
+        from ..gradient_checkpointing import _torch_checkpoint
+    except ImportError:
+        import torch.utils.checkpoint as ck
+        return getattr(ck, "_unsloth_pristine_checkpoint", None) or ck.checkpoint
+    return _torch_checkpoint()
+
+
 def chunked_lm_loss(
     hidden,
     lm_head_weight,
@@ -132,8 +143,7 @@ def chunked_lm_loss(
             logit_softcap,
         )
         if needs_grad:
-            from ..gradient_checkpointing import _torch_checkpoint
-            chunk_sum, chunk_correct = _torch_checkpoint()(_chunk_loss, *args, use_reentrant = False)
+            chunk_sum, chunk_correct = _checkpoint()(_chunk_loss, *args, use_reentrant = False)
         else:
             chunk_sum, chunk_correct = _chunk_loss(*args)
         loss_sum = loss_sum + chunk_sum.to(loss_sum.dtype)
