@@ -800,7 +800,8 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = (), moe_layers = 
     use_r2 = False
     if _STATE.r2_on:
         # Generation hands the decoder a KV cache; scoring forwards build none before the call.
-        generating = kwargs.get("past_key_values", None) is not None
+        # transformers 5.24 renamed past_key_values to cache.
+        generating = any(kwargs.get(name, None) is not None for name in _CACHE_KWARGS)
         if generating and not _STATE.r2_generating:
             _r2_new_rollout()
         _STATE.r2_generating = generating
@@ -827,6 +828,9 @@ def _decoder_post_hook(module, args, output):
     if _STATE.r2_capture is not None:
         _r2_store_forward()
     return None
+
+
+_CACHE_KWARGS = ("cache", "past_key_values", "past_key_value", "cache_params")
 
 
 def _uses_checkpointing(decoder):
