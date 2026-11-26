@@ -166,6 +166,7 @@ _GUARDED = (
     "unsloth_zoo/fused_losses/fused_linear.py",
     "unsloth_zoo/fused_losses/preference_loss.py",
     "unsloth_zoo/score_centering.py",
+    "unsloth_zoo/rl_replacements.py",
     "unsloth_zoo/temporary_patches/fla_vendor.py",
     "unsloth_zoo/temporary_patches/moe_utils.py",
 )
@@ -235,3 +236,29 @@ def test_truncated_support_auto_stays_on_for_a_cuda_wheel(cuda_wheel, monkeypatc
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     assert rl_replacements._grpo_truncated_support_auto_platform() is True
+
+
+@pytest.mark.skipif(not hasattr(torch.ops.aten.mm, "dtype"), reason = "the fp32 default needs aten::mm.dtype")
+@pytest.mark.parametrize("wheel, want", [("sdk_wheel", False), ("cuda_wheel", True)])
+def test_grpo_scorer_fp32_defaults_agree_with_score_centering(wheel, want, request, monkeypatch):
+    # Old / new logps and score centering must project the head in the same precision on every wheel.
+    import inspect as _inspect
+    from unsloth_zoo import rl_replacements
+
+    request.getfixturevalue(wheel)
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    monkeypatch.delenv("UNSLOTH_LOGPROB_FP32_LOGITS", raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert rl_replacements.grpo_fp32_lm_head_default(None) is want
+    # The scorers' defaults are evaluated wherever the source is copied (the compiled trainer), with no is_rocm_torch.
+    for fn in (
+        rl_replacements.chunked_hidden_states_selective_log_softmax,
+        rl_replacements.chunked_hidden_states_selective_log_softmax_recompute,
+    ):
+        namespace = dict(vars(rl_replacements))
+        namespace.pop("is_rocm_torch", None)
+        exec(compile(_inspect.getsource(fn), "<copied>", "exec"), namespace)
+        default = _inspect.signature(namespace[fn.__name__]).parameters["fp32_lm_head_cuda"].default
+        assert default is want, fn.__name__
+    mode, _ = _score_centering_head_mode(monkeypatch)
+    assert (mode != "plain") is want
