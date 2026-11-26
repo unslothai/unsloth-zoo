@@ -4205,16 +4205,18 @@ pass
 GRPO_PACKING_REVERIFY_ROWS = 3
 
 
-def grpo_packing_verify_rows(lengths, completion_counts, trusted, limit = GRPO_PACKING_REVERIFY_ROWS):
+def grpo_packing_verify_rows(lengths, completion_counts, trusted, limit = GRPO_PACKING_REVERIFY_ROWS, model = None):
     """Rows the packing self-verify scores alone as ground truth (host ints only, no sync).
-    Until packing is trusted, and under UNSLOTH_GRPO_SEQ_PACKING_VERIFY=1, every row. A re-verify of trusted
-    packing at a larger shape scores at most `limit` rows: the last scored row (it follows every other document
-    in the packed stream, so any cross-document leak reaches it), the longest row (the new position range) and
-    the row with the most completion tokens."""
+    Until packing is trusted, under UNSLOTH_GRPO_SEQ_PACKING_VERIFY=1, and for RoPE that switches with length
+    (rows on either side of the switch run different frequencies alone), every row. Otherwise a re-verify of
+    trusted packing at a larger shape scores at most `limit` rows: the last scored row (it follows every other
+    document in the packed stream, so any cross-document leak reaches it), the longest row (the new position
+    range) and the row with the most completion tokens."""
     import os
     rows = [i for i, (n, c) in enumerate(zip(lengths, completion_counts)) if n >= 2 and c > 0]
     if (not trusted) or limit is None or limit <= 0 or len(rows) <= limit \
-            or os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY", "0") == "1":
+            or os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY", "0") == "1" \
+            or (model is not None and grpo_packing_rope_switch(model) is not None):
         return [i for i, n in enumerate(lengths) if n >= 2]
     pick = [rows[-1]]
     for i in (max(rows, key = lambda r: lengths[r]), max(rows, key = lambda r: completion_counts[r])):
@@ -4226,6 +4228,30 @@ def grpo_packing_verify_rows(lengths, completion_counts, trusted, limit = GRPO_P
         if i not in pick:
             pick.append(i)
     return sorted(pick)
+pass
+
+
+def grpo_packing_rope_switch(model):
+    """Length where the model's RoPE changes its frequencies (LongRoPE short / long factors, dynamic NTK), else None."""
+    config = getattr(model, "config", None)
+    if hasattr(config, "get_text_config"):
+        try:
+            config = config.get_text_config()
+        except Exception:
+            pass
+    scalings = []
+    for scaling in (getattr(config, "rope_scaling", None), getattr(config, "rope_parameters", None)):
+        if isinstance(scaling, dict):
+            # transformers 5 can key rope_parameters by layer type
+            scalings.append(scaling)
+            scalings.extend(v for v in scaling.values() if isinstance(v, dict))
+    for scaling in scalings:
+        if str(scaling.get("rope_type", scaling.get("type", ""))).lower() in ("longrope", "su", "dynamic"):
+            switch = scaling.get("original_max_position_embeddings", None) or getattr(
+                config, "original_max_position_embeddings", None,
+            ) or getattr(config, "max_position_embeddings", None)
+            return int(switch) if switch else None
+    return None
 pass
 
 
@@ -4242,30 +4268,9 @@ def grpo_packing_trusted_bound(model, value):
         growth = 2.0
     if not growth > 1:
         return value
-    config = getattr(model, "config", None)
-    if hasattr(config, "get_text_config"):
-        try:
-            config = config.get_text_config()
-        except Exception:
-            pass
-    switch = None
-    scalings = []
-    for scaling in (getattr(config, "rope_scaling", None), getattr(config, "rope_parameters", None)):
-        if isinstance(scaling, dict):
-            # transformers 5 can key rope_parameters by layer type
-            scalings.append(scaling)
-            scalings.extend(v for v in scaling.values() if isinstance(v, dict))
-    for scaling in scalings:
-        if str(scaling.get("rope_type", scaling.get("type", ""))).lower() in (
-            "longrope", "su", "dynamic",
-        ):
-            switch = scaling.get("original_max_position_embeddings", None) or getattr(
-                config, "original_max_position_embeddings", None,
-            ) or getattr(config, "max_position_embeddings", None)
-            break
+    switch = grpo_packing_rope_switch(model)
     if switch is None:
         return int(growth * value)
-    switch = int(switch)
     return min(int(growth * value), switch) if value <= switch else value
 pass
 
@@ -5276,6 +5281,7 @@ def grpo_accumulated_loss(
                         # A re-verify of trusted packing scores at most 3 rows (grpo_packing_verify_rows).
                         _pack_vrows = grpo_packing_verify_rows(
                             _pack_lengths_cpu, _pack_ccount_cpu, _pack_ok is True and _pack_vT > 0,
+                            model = unwrapped_model,
                         )
                         _pack_ref = torch.zeros_like(_pack_result)
                         with torch.no_grad(), autocaster:

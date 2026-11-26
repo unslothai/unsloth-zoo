@@ -134,3 +134,14 @@ def test_rope_switch_caps_the_bound():
     assert rr.grpo_packing_trusted_bound(longrope, 3000) == 4096
     assert rr.grpo_packing_trusted_bound(longrope, 5000) == 5000
     assert rr.grpo_packing_trusted_bound(SimpleNamespace(config = SimpleNamespace()), 300) == 600
+
+
+def test_length_dependent_rope_reverifies_every_row():
+    """Rows on either side of a LongRoPE switch run different frequencies alone, so a 3-row sample could miss the
+    short side: such models keep scoring every row."""
+    model, T = _trusted()
+    model.config = SimpleNamespace(rope_scaling = {"rope_type": "longrope", "original_max_position_embeddings": 4096})
+    ns = _run(model, 8)
+    assert ns["_pack_T"] > 2 * T
+    assert model.per_row == 8 and ns["_pack_use"] is True
+    assert rr.grpo_packing_verify_rows([5, 6, 7, 8, 9], [1] * 5, True, model = model) == [0, 1, 2, 3, 4]
