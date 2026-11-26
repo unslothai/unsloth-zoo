@@ -467,7 +467,7 @@ def patch_cpu_grad_total_norm():
         except (TypeError, ValueError):
             two = False
         if not two or foreach or not any(_rowwise_eligible(t) for t in tensors) or \
-                any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" for t in tensors):
+                any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.is_complex() for t in tensors):
             return original(tensors, norm_type, error_if_nonfinite, foreach)
         with torch.no_grad():
             return _rowwise_total_norm(tensors, norm_type, error_if_nonfinite)
@@ -495,7 +495,8 @@ def _rowwise_total_norm(tensors, norm_type, error_if_nonfinite):
         else:
             others.append(torch.linalg.vector_norm(t, 2.0))
     square = _square_sum_float64(rows + others)
-    dtype = functools.reduce(torch.promote_types, (t.dtype for t in tensors))
+    # torch promotes the per-tensor norm dtypes; for the real tensors that reach here they equal the inputs' dtypes.
+    dtype = functools.reduce(torch.promote_types, (n.dtype for n in rows + others))
     total_norm = square.sqrt().to(dtype)
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
         raise RuntimeError(

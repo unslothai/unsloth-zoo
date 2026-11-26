@@ -144,3 +144,15 @@ def test_installed_by_cpu_defaults_and_kill_switch():
         assert r.returncode == 0, r.stderr[-2000:]
         outs[flag] = r.stdout.strip().splitlines()[-1]
     assert outs == {"1": "True", "0": "False"}
+
+
+def test_complex_gradient_keeps_torch_path(patched):
+    tensors = [_grads()[0], torch.randn(64, dtype = torch.complex64)]
+    expected = patched._unsloth_original(tensors)
+    got = patched(tensors)
+    assert not got.is_complex() and got.dtype == expected.dtype
+    assert torch.equal(got, expected)
+    params = [torch.nn.Parameter(torch.zeros_like(t)) for t in tensors]
+    for p, t in zip(params, tensors):
+        p.grad = t.clone()
+    torch.nn.utils.clip_grad_norm_(params, max_norm = 0.5)  # clamps a real coefficient, as without the patch
