@@ -118,10 +118,10 @@ def test_determine_compile_threads_follows_cpu_affinity_not_the_host_total(monke
     assert determine_compile_threads() == 6
     determine_compile_threads.cache_clear()
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0})
-    assert determine_compile_threads() == 4  # floor kept
+    assert determine_compile_threads() == 4
     determine_compile_threads.cache_clear()
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(96)))
-    assert determine_compile_threads() == 32  # cap kept
+    assert determine_compile_threads() == 32
 
 
 def test_determine_compile_threads_falls_back_to_cpu_count_without_affinity(monkeypatch):
@@ -136,7 +136,6 @@ def test_determine_compile_threads_falls_back_to_cpu_count_without_affinity(monk
 
 
 def test_compile_options_use_the_affinity_count_under_taskset():
-    """End to end under a real taskset: the Inductor options dict carries the pinned CPU count."""
     import shutil, subprocess, sys, pathlib
     if sys.platform != "linux" or shutil.which("taskset") is None:
         pytest.skip("needs Linux taskset")
