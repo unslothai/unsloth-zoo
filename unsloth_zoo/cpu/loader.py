@@ -702,6 +702,30 @@ def _cpu_compile_unavailable():
 _CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
 
 
+def _parallel_kernel_builds():
+    """Windows: build a compile's C++ kernels in parallel. torch sets compile_threads = 1 on win32 for its Triton
+    worker pool, so MSVC builds ran one at a time (cold Qwen3 layer: 45 s first step on 4 vCPU, 21 s parallel). CPU
+    kernels build on Inductor's in-process thread pool; the Triton pool stays off (TORCH_WARM_POOL=0). A user's
+    TORCHINDUCTOR_COMPILE_THREADS, a raised compile_threads or UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=1 is kept."""
+    if sys.platform != "win32" or "TORCHINDUCTOR_COMPILE_THREADS" in os.environ:
+        return None
+    if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1":
+        return None
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return None
+    if getattr(inductor_config, "compile_threads", 1) not in (None, 1):
+        return None
+    count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    threads = min(32, count)
+    if threads <= 1:
+        return None
+    os.environ.setdefault("TORCH_WARM_POOL", "0")
+    inductor_config.compile_threads = threads
+    return threads
+
+
 def compile_cpu_layers(model, explicit = False):
     """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
     if getattr(model, "_unsloth_cpu_compiled", False):
@@ -713,6 +737,7 @@ def compile_cpu_layers(model, explicit = False):
         else:
             _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
         return 0
+    _parallel_kernel_builds()
     count = _compile_layers(model)
     model._unsloth_cpu_compiled = True
     _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
