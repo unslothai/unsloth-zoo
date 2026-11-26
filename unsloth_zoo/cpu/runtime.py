@@ -247,13 +247,114 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
     return max(1, math.ceil(min(limits)))
 
 
+# OpenMP thread binding. With any of these set, the OpenMP runtime binds the main thread to its first place when torch
+# loads (OMP_PLACES=cores: one core and its SMT sibling), so the main thread's affinity no longer shows the CPUs the
+# process was given; the pool's worker threads hold the other places.
+_OMP_BIND_ENV = ("OMP_PROC_BIND", "OMP_PLACES", "GOMP_CPU_AFFINITY", "KMP_AFFINITY")
+
+
+def _omp_binding_requested():
+    for name in _OMP_BIND_ENV:
+        value = os.environ.get(name, "").strip().lower()
+        if value and not (name == "OMP_PROC_BIND" and value == "false") and \
+                not (name == "KMP_AFFINITY" and value in ("disabled", "none")):
+            return True
+    return False
+
+
+_OMP_RUNTIMES = ("libgomp", "libiomp", "libomp")
+_OMP_SONAMES = ("libgomp.so.1", "libiomp5.so", "libomp.so", "libomp.so.5")
+
+
+def _torch_omp_runtime(paths):
+    """The loaded OpenMP runtime that is torch's own, or None when that is ambiguous. Another wheel can bundle its own
+    copy (auditwheel renames it libgomp-<hash>.so.1 under <package>.libs); its place list is not torch's."""
+    if len(paths) == 1:
+        return paths[0]
+    try:
+        import torch
+        torch_dir = os.path.dirname(os.path.realpath(torch.__file__))
+    except Exception:
+        return None
+    # pip wheels: torch/lib (x86) or torch.libs (aarch64)
+    own = [p for p in paths if os.path.realpath(p).startswith((torch_dir + os.sep, torch_dir + ".libs" + os.sep))]
+    if own:
+        return own[0] if len(own) == 1 else None
+    # conda / distro torch links the system runtime by its soname
+    plain = [p for p in paths if os.path.basename(p) in _OMP_SONAMES]
+    return plain[0] if len(plain) == 1 else None
+
+
+def _omp_place_cpus():
+    """CPUs in the place list of torch's OpenMP runtime, which it built from the process mask before binding the main
+    thread (OMP_PLACES / GOMP_CPU_AFFINITY narrow it to what the user listed). Empty when unknown."""
+    import ctypes
+    try:
+        with open("/proc/self/maps") as f:
+            paths = sorted({line.split()[-1] for line in f if "/" in line
+                            and os.path.basename(line.split()[-1]).startswith(_OMP_RUNTIMES)})
+    except OSError:
+        return set()
+    path = _torch_omp_runtime(paths)
+    if path is None:
+        return set()
+    try:
+        lib = ctypes.CDLL(path)
+        cpus = set()
+        for place in range(int(lib.omp_get_num_places())):
+            count = int(lib.omp_get_place_num_procs(place))
+            if count <= 0:
+                continue
+            ids = (ctypes.c_int * count)()
+            lib.omp_get_place_proc_ids(place, ids)
+            cpus.update(int(cpu) for cpu in ids)
+    except (OSError, AttributeError, ValueError):
+        return set()
+    return cpus
+
+
+def _process_affinity():
+    """CPUs this process may run on. Under OpenMP binding the main thread's mask is only its own place, so the place
+    list of torch's OpenMP runtime is used; when that runtime is ambiguous, the union of every thread's mask after one
+    small op has started torch's pool (never wider than where the pool runs)."""
+    cpus = set(os.sched_getaffinity(0))
+    if not _omp_binding_requested():
+        return cpus
+    try:
+        import torch
+        places = _omp_place_cpus()
+        if places:
+            return cpus | places
+        threads = torch.get_num_threads()
+        if threads > 1:
+            torch.ones(threads * 65536).add_(1)
+        for entry in os.listdir("/proc/self/task"):
+            try:
+                cpus |= set(os.sched_getaffinity(int(entry)))
+            except (OSError, ValueError):
+                pass
+    except Exception:
+        pass
+    return cpus
+
+
+def _binding_narrowed_default(current):
+    """torch sized its default pool from the main thread's bound mask (aarch64 wheels: 1 thread under OMP_PROC_BIND)."""
+    if not sys.platform.startswith("linux") or not _omp_binding_requested():
+        return False
+    try:
+        return current <= len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return False
+
+
 def cpu_compute_cores():
     """Cores this process can really compute on: physical cores in its affinity mask (SMT siblings share one core's
     vector / AMX units), capped by a cgroup CPU quota. Linux only; None elsewhere (keep torch's default)."""
     if not sys.platform.startswith("linux"):
         return None
     try:
-        cpus = sorted(os.sched_getaffinity(0))
+        cpus = sorted(_process_affinity())
     except (AttributeError, OSError):
         return None
     if not cpus:
@@ -273,7 +374,7 @@ def _affinity_split_per_rank(ranks):
     if ranks <= 1 or not sys.platform.startswith("linux"):
         return False
     try:
-        mine = os.sched_getaffinity(0)
+        mine = _process_affinity()
         parent = os.sched_getaffinity(os.getppid())
     except (AttributeError, OSError):
         return False
@@ -315,7 +416,8 @@ def fit_cpu_threads():
     """Sizes torch's intra-op pool for CPU training. Idempotent; returns (threads, reason).
     UNSLOTH_CPU_THREADS wins; a user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept; otherwise one thread per physical
     core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate, and at most
-    _DEFAULT_THREAD_CAP. Never raises the count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
+    _DEFAULT_THREAD_CAP. Never raises the count above torch's default except to undo a launcher's OMP_NUM_THREADS=1
+    or an OpenMP binding (OMP_PROC_BIND / OMP_PLACES) that sized torch's default from the main thread's one place."""
     global _THREADS_FITTED
     import torch
     if _THREADS_FITTED is not None:
@@ -357,6 +459,8 @@ def fit_cpu_threads():
             fitted = min(fitted, _DEFAULT_THREAD_CAP)
             if launcher:
                 target, reason = fitted, "launcher OMP_NUM_THREADS=1 undone"
+            elif fitted > current and _binding_narrowed_default(current):
+                target, reason = fitted, "OpenMP binding narrowed torch's default"
             elif fitted < current:
                 try:
                     quota = _cgroup_cpu_limit() if sys.platform.startswith("linux") else None
