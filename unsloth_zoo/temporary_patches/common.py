@@ -133,8 +133,7 @@ def apply_inductor_correctness_workarounds():
         try:
             import torch._inductor.config as inductor_config
             from unsloth_zoo.torch_config import set_torch_config
-            # Every thread: torch >= 2.12 keeps config per thread, and a checkpoint recompute
-            # compiles on autograd's device thread.
+            # torch >= 2.12 config is per thread; checkpoint recompute compiles on autograd's thread.
             set_torch_config(inductor_config, "triton.mix_order_reduction", False)
             active.append("mix_order_reduction")
         except Exception as error:

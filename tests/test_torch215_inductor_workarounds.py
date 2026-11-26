@@ -63,7 +63,6 @@ def test_mix_order_reduction_off_only_where_buggy():
 
 
 def test_mix_order_reduction_off_on_every_thread():
-    # torch >= 2.12 keeps config per thread; a checkpoint recompute compiles on autograd's device thread.
     import threading
     import torch._inductor.config as config
     import unsloth_zoo.temporary_patches.common  # noqa: F401

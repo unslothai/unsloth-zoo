@@ -214,7 +214,7 @@ def _launch_sites():
         func_of, tests_of = _enclosing(tree)
         options = _options_names(tree)
         aliases = _launcher_aliases(rel, tree, entry_points)
-        # The module's own launchers called by bare name are launches too.
+        # Bare-name calls to the module's own launchers.
         aliases.update({f: f for f in entry_points.get(rel[: -len(".py")].replace("/", "."), ())})
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

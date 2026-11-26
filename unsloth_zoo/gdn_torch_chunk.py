@@ -215,7 +215,7 @@ def torch_chunk_gated_delta_rule(
         # (bfloat16 has no sm75 tensor cores and a range float16 cannot hold): float32.
         mm_dtype = torch.float16 if q.dtype == torch.float16 else torch.float32
     if use_qk_l2norm_in_kernel:
-        # fla's l2norm: x * rsqrt(sum(x^2) + 1e-6), reduced in float32. Per head, so before the repeat.
+        # fla's l2norm: x * rsqrt(sum(x^2) + 1e-6), reduced in float32, per head (before the repeat).
         acc = torch.float64 if q.dtype == torch.float64 else torch.float32
         q = q.to(acc)
         k = k.to(acc)
