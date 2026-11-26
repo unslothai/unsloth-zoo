@@ -594,13 +594,12 @@ def test_mla_kv_b_proj_folds_when_decode_weights_are_views():
     assert isinstance(request, _MergedLoRARequest)
     seen = {}
     def generate(prompts, sampling_params = None, *, use_tqdm = True, lora_request = None):
-        # What MLA decode reads during the rollout: the views see the fold.
         seen["uk"], seen["uv"] = mla.W_UK_T.detach().clone(), mla.W_UV.detach().clone()
         seen["lora_request"] = lora_request
         return ["out"]
     llm.generate = vllm_utils._wrap_merged_rollout_call(generate, llm)
     llm.generate(["hi"], lora_request = request)
-    assert seen["lora_request"] is None   # every LoRA layer was folded: nothing left for vLLM LoRA
+    assert seen["lora_request"] is None
     assert not torch.equal(seen["uk"], before_uk) and not torch.equal(seen["uv"], before_uv)
     module = model.base_model.model.model.layers[0].self_attn.kv_b_proj
     s = module.scaling["default"]
@@ -610,7 +609,6 @@ def test_mla_kv_b_proj_folds_when_decode_weights_are_views():
     expect_uk = folded.T.view(L_RANK, N_HEADS, NOPE + V_DIM)[..., :NOPE].permute(1, 2, 0)
     ulp = (expect_uk.float().abs() * 2 ** -7).clamp_min(2 ** -133)
     assert ((seen["uk"].float() - expect_uk.float()).abs() <= ulp).all()
-    # Restored bit exactly after the rollout.
     assert torch.equal(mla.W_UK_T, before_uk) and torch.equal(mla.W_UV, before_uv)
 
 
@@ -660,7 +658,7 @@ def test_mla_kv_b_proj_lora_refused_for_vllm_lora(monkeypatch, layout):
     o = ["base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight"]
     check = vllm_utils._check_lora_is_servable
     check(model, o, "the training model", {"r": 8})
-    if layout is None:   # no absorbed MLA in the engine: vLLM runs kv_b_proj as a Linear
+    if layout is None:   # no absorbed MLA: vLLM runs kv_b_proj as a Linear
         check(model, kv_b + o, "the training model", {"r": 8})
         return
     with pytest.raises(NotImplementedError, match = "kv_b_proj"):

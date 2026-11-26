@@ -7884,11 +7884,8 @@ pass
 
 
 def _vllm_mla_layers(vllm_model):
-    """[(kv_b_proj weight or None, {name: tensor})] per vLLM MLA attention layer that decodes through absorbed weights.
-
-    vLLM's MLA decode never runs kv_b_proj: process_weights_after_loading splits its weight into W_UK_T / W_UV
-    (ROCm AITER: quantized W_K / W_V; DCP: a W_UK_T_dcp_qrep copy) on the layer (vLLM >= 0.13) or its impl (0.11).
-    """
+    """[(kv_b_proj weight, {name: tensor})] per vLLM MLA layer: its decode reads W_UK_T / W_UV (AITER: W_K / W_V)
+    split off kv_b_proj.weight, held on the layer (vLLM >= 0.13) or its impl (0.11), never kv_b_proj itself."""
     # All Unsloth Zoo code licensed under LGPLv3
     layers = []
     if not isinstance(vllm_model, torch.nn.Module): return layers
@@ -7921,15 +7918,13 @@ def _tensor_within(t, W):
     if t.numel() == 0: return False
     start = W.data_ptr()
     end = start + W.numel() * W.element_size()
-    # Last byte t can touch, for any (non-negative) strides.
     last = t.data_ptr() + sum((n - 1) * s for n, s in zip(t.shape, t.stride())) * t.element_size()
     return start <= t.data_ptr() and last + t.element_size() <= end
 pass
 
 
 def _merged_rollout_mla_reason(name, W, mla_layers):
-    """None when every absorbed decode weight vLLM derived from this kv_b_proj is a view of W, so a fold is seen.
-    True for unquantized bf16 / fp16 MLA on vLLM 0.11 to 0.34 (W_UK_T / W_UV are kv_b_proj.weight views)."""
+    """None when every MLA decode weight derived from this kv_b_proj is a view of W (unquantized), so a fold is seen."""
     # All Unsloth Zoo code licensed under LGPLv3
     consumers = [
         derived for kv_W, derived in mla_layers
@@ -8053,7 +8048,6 @@ def _merged_rollout_targets(model):
     for name, module, W in targets:
         if W.untyped_storage().data_ptr() not in storages:
             return None, f"{name} does not share storage with the vLLM engine"
-    # MLA decodes through W_UK_T / W_UV derived from kv_b_proj: fold only when they are views of it.
     mla_layers = None
     for name, module, W in targets:
         if name.rsplit(".", 1)[-1] != "kv_b_proj": continue
