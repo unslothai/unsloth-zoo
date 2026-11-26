@@ -490,8 +490,13 @@ def chunked_hidden_states_selective_log_softmax_recompute(
             if getattr(self_fn, "_use_compiled", True):
                 try:
                     return kernel(*args)
-                except Exception:
-                    self_fn._use_compiled = False
+                except Exception as error:
+                    # An OOM (bare or while compiling) is transient: eager for this call only, after the except.
+                    if not (
+                        isinstance(error, torch.OutOfMemoryError)
+                        or isinstance(getattr(error, "inner_exception", None), torch.OutOfMemoryError)
+                    ):
+                        self_fn._use_compiled = False
             return eager(*args)
 
         # aten::mm.dtype (torch >= 2.8) has CUDA / ROCm kernels only.
