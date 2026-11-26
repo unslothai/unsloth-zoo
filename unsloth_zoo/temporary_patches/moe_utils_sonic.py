@@ -428,7 +428,8 @@ def _interleaved_gate_up(weight):
     perm = torch.empty(two_i, dtype=torch.long, device=weight.device)
     perm[0::2] = torch.arange(0, half, device=weight.device)
     perm[1::2] = torch.arange(half, two_i, device=weight.device)
-    with torch.no_grad():
+    # Not an inference tensor: _SonicGatedGroupedMM saves it for backward.
+    with torch.inference_mode(False), torch.no_grad():
         interleaved = weight[:, :, perm].contiguous()
     _INTERLEAVE_CACHE[key] = (stamp[0], stamp[1], stamp[2], interleaved,
                               weakref.ref(owner, lambda ref, k = key: _drop_interleaved(k, ref)))
