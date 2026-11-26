@@ -748,7 +748,7 @@ def test_the_bare_engine_has_every_attribute_init_sets():
 
     names = _init_attributes(SpeculativeEngine)
     # The flags _verify branches on: if the reader stops finding them, the helper is reading nothing.
-    assert {"_exact", "_invariant", "lm", "cache", "_verify_forward"} <= names
+    assert {"_exact", "_invariant", "_marked_rows", "lm", "cache", "_verify_forward"} <= names
     engine = _bare_engine(SpeculativeEngine)
     assert all(getattr(engine, name) is None for name in names)
 
@@ -783,6 +783,57 @@ def test_only_the_verify_forward_is_built_as_a_verify_block():
     engine._verify_forward = lambda lm, inputs, cache: seen.append(marked()) or (type("Out", (), {"logits": None}), None)
     engine._verify(None)
     assert seen == [True] and not marked()
+
+
+@pytest.mark.parametrize("family, marked", [("inkling2", True), ("qwen3_5", False)])
+def test_only_inkling2_is_verified_through_its_marked_call(family, marked):
+    import importlib
+    from types import SimpleNamespace
+
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    try:
+        language = importlib.import_module(f"mlx_vlm.models.{family}.language")
+        importlib.import_module("mlx_vlm.speculative.common").verify_forward
+    except (ImportError, AttributeError):
+        pytest.skip(f"mlx-vlm has no {family} or no verify_forward")
+
+    class Bare(language.LanguageModel):
+        def __init__(self):
+            nn.Module.__init__(self)
+
+    engine = SpeculativeEngine(SimpleNamespace(language_model = Bare()), DraftController(max_depth = 4))
+    from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
+
+    assert engine._marked_rows == (DECODE_BLOCK_SIZE if marked else 0)
+
+
+@pytest.mark.parametrize("length, marked_call", [(8, True), (9, False)])
+def test_a_marked_family_verifies_a_decode_sized_block_in_one_call_marked_as_verifying(length, marked_call):
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+
+    calls, transaction, inputs = [], object(), mx.zeros((1, length), dtype = mx.int32)
+
+    def lm(inputs, cache, **kwargs):
+        calls.append((inputs, cache, kwargs))
+        return SimpleNamespace(logits = "logits", gdn_states = transaction)
+
+    def forward(model, inputs, cache, **kwargs):
+        calls.append(("verify_forward", inputs, cache, kwargs))
+        return SimpleNamespace(logits = "chunked"), "chunks"
+
+    engine = _bare_engine(SpeculativeEngine, _marked_rows = 8, lm = lm, cache = "cache", _kwargs = lambda: {"capture_layer_ids": [5]},
+                          _hidden = lambda out: "hidden", _verify_forward = forward)
+    if marked_call:
+        assert engine._verify(inputs) == ("logits", "hidden", transaction)
+        assert calls == [(inputs, "cache", {"speculative_verify": True, "capture_layer_ids": [5]})]
+    else:
+        assert engine._verify(inputs) == ("chunked", "hidden", "chunks")
+        assert calls == [("verify_forward", inputs, "cache", {"capture_layer_ids": [5]})]
 
 
 @pytest.mark.parametrize("history_only", [True, False])
