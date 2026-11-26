@@ -6362,6 +6362,13 @@ def load_vllm(
         # NVFP4 compressed-tensors: roll out W4A16 like the trainer (UNSLOTH_VLLM_NVFP4_A16=0 keeps W4A4), and keep
         # the compressed-tensors weights at load so the training model shares them instead of loading them again.
         if _ct_nvfp4_groups(config):
+            text_config = getattr(config, "text_config", None) or config
+            if any(_config_get(text_config, k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
+                # vLLM's NVFP4 MoE methods repack the experts and nothing hands them to training yet.
+                raise NotImplementedError(
+                    "Unsloth: fast_inference = True does not support NVFP4 compressed-tensors MoE checkpoints yet. "
+                    "Set fast_inference = False to train it, or load the 16-bit (BF16) checkpoint."
+                )
             if not _patch_vllm_nvfp4_keep_compressed_tensors_weights():
                 raise NotImplementedError(
                     "Unsloth: fast_inference with an NVFP4 compressed-tensors checkpoint needs vLLM's "
