@@ -137,26 +137,35 @@ def _launch():
     (x * 2).sum().item()
 
 
+_hip = bool(getattr(torch.version, "hip", None))
+# Refusals both runtimes give: a zero-byte range (invalid value). CUDA also refuses a range registered twice
+# (cudaErrorHostMemoryAlreadyRegistered); HIP accepts that one, so it is CUDA only.
+_REFUSALS = ["zero_bytes", pytest.param("already_registered", marks = pytest.mark.skipif(
+    _hip, reason = "HIP accepts a second registration of the same range"))]
+
+
 @_cuda
-def test_the_next_kernel_after_a_refused_arena_registration_runs():
+@pytest.mark.parametrize("refusal", _REFUSALS)
+def test_the_next_kernel_after_a_refused_arena_registration_runs(refusal):
     buf = torch.empty(1 << 20, dtype = torch.uint8)
-    first = _mod._Registered(buf, buf.numel())
-    # The same range again is refused (cudaErrorHostMemoryAlreadyRegistered).
+    first = _mod._Registered(buf, buf.numel()) if refusal == "already_registered" else None
     with pytest.raises(RuntimeError, match = "cudaHostRegister failed"):
-        _mod._Registered(buf, buf.numel())
+        _mod._Registered(buf, 0 if refusal == "zero_bytes" else buf.numel())
     _launch()
     del first
 
 
 @_cuda
-def test_the_next_kernel_after_a_refused_disk_buffer_registration_runs(monkeypatch):
+@pytest.mark.parametrize("refusal", _REFUSALS)
+def test_the_next_kernel_after_a_refused_disk_buffer_registration_runs(monkeypatch, refusal):
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
-    first = _disk._HostBuf(1 << 20, pin = True)
-    assert first.pinned
-    real, taken = torch.cuda.cudart(), first.ptr
-    # The next buffer's registration goes to the runtime for pages already registered, so it is refused for real.
+    first = _disk._HostBuf(1 << 20, pin = True) if refusal == "already_registered" else None
+    real = torch.cuda.cudart()
+    taken = first.ptr if first is not None else None
+    # The buffer's registration reaches the runtime with arguments it refuses for real.
     redirect = types.SimpleNamespace(
-        cudaHostRegister = lambda ptr, n, flags: real.cudaHostRegister(taken, 1 << 20, flags),
+        cudaHostRegister = lambda ptr, n, flags: (real.cudaHostRegister(ptr, 0, flags) if taken is None
+                                                  else real.cudaHostRegister(taken, n, flags)),
         cudaHostUnregister = real.cudaHostUnregister,
     )
     monkeypatch.setattr(torch.cuda, "cudart", lambda: redirect)
