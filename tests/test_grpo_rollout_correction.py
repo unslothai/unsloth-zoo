@@ -524,9 +524,9 @@ def test_bucket_stats_match_oracle_and_split_the_mean():
     sampling[0, 0] = float("nan")  # unscored by vLLM: left out
     train[1, 1] = float("-inf")
     stats = rr.grpo_rollout_bucket_stats(train.float(), sampling.float(), mask)
-    assert stats.device.type == "cpu" and stats.dtype == torch.float64 and stats.numel() == 8
+    assert stats.device.type == "cpu" and stats.dtype == torch.float64 and stats.numel() == 10
     want = _bucket_oracle(train.float().double(), sampling.float().double(), mask)
-    assert stats.tolist() == pytest.approx(want, rel = 1e-9, abs = 1e-12)
+    assert stats.tolist() == pytest.approx(want + [0.0, 0.0], rel = 1e-9, abs = 1e-12)
     metrics = rr.grpo_rollout_bucket_metrics(stats)
     n = want[0] + want[2] + want[4]
     names = ("p_gt_0.9", "p_0.1_0.9", "p_lt_0.1")
@@ -534,8 +534,23 @@ def test_bucket_stats_match_oracle_and_split_the_mean():
     # share x mean over the buckets is the overall mean |dlogp|.
     overall = sum(metrics[f"sampling/token_frac/{b}"] * metrics[f"sampling/logp_abs_diff/{b}"] for b in names)
     assert overall == pytest.approx((want[1] + want[3] + want[5]) / n)
-    assert metrics["sampling/policy_entropy/mean"] == pytest.approx(want[6] / n)
-    assert metrics["sampling/rollout_entropy/mean"] == pytest.approx(want[7] / n)
+    assert metrics["sampling/policy_nll/mean"] == pytest.approx(want[6] / n)
+    assert metrics["sampling/rollout_nll/mean"] == pytest.approx(want[7] / n)
+    # Without entropies from the loss there is no entropy metric: the surprisals are not entropies.
+    assert "sampling/policy_entropy/mean" not in metrics
+
+
+def test_bucket_stats_report_the_policy_entropy_the_loss_computed():
+    train = torch.tensor([[-0.1, -2.0, -0.5]])
+    sampling = torch.tensor([[-0.2, -2.5, -0.4]])
+    mask = torch.tensor([[1, 1, 0]])
+    entropies = torch.tensor([[0.7, 1.3, 9.0]])
+    stats = rr.grpo_rollout_bucket_stats(train, sampling, mask, entropies)
+    assert stats[8:].tolist() == pytest.approx([2.0, 2.0])
+    metrics = rr.grpo_rollout_bucket_metrics(stats)
+    assert metrics["sampling/policy_entropy/mean"] == pytest.approx(1.0)
+    # The sampled-token surprisal is a cross-entropy under a mismatch, kept apart from the entropy.
+    assert metrics["sampling/policy_nll/mean"] == pytest.approx(1.05)
 
 
 def test_bucket_metrics_pool_like_sums_and_handle_empty():
@@ -546,7 +561,7 @@ def test_bucket_metrics_pool_like_sums_and_handle_empty():
     assert metrics["sampling/logp_abs_diff/p_lt_0.1"] == pytest.approx(1.0)
     assert metrics["sampling/logp_abs_diff/p_gt_0.9"] == pytest.approx(0.01)
     assert metrics["sampling/logp_abs_diff/p_0.1_0.9"] == pytest.approx(0.5)
-    empty = rr.grpo_rollout_bucket_metrics(torch.zeros(8, dtype = torch.float64))
+    empty = rr.grpo_rollout_bucket_metrics(torch.zeros(10, dtype = torch.float64))
     assert all(value == 0.0 for value in empty.values())
 
 
@@ -555,8 +570,9 @@ def test_rollout_metrics_log_the_bucket_split_and_entropy(monkeypatch, shift, bu
     metrics = _drive(monkeypatch, correction = True, sampling_shift = shift)["train"]
     assert metrics[f"sampling/token_frac/{bucket}"] == [pytest.approx(1.0)]
     assert metrics[f"sampling/logp_abs_diff/{bucket}"] == [pytest.approx(shift)]
-    assert metrics["sampling/rollout_entropy/mean"] == [pytest.approx(shift)]
-    assert metrics["sampling/policy_entropy/mean"] == [pytest.approx(0.0, abs = 1e-12)]
+    assert metrics["sampling/rollout_nll/mean"] == [pytest.approx(shift)]
+    assert metrics["sampling/policy_nll/mean"] == [pytest.approx(0.0, abs = 1e-12)]
+    assert "sampling/policy_entropy/mean" not in metrics
     # The existing metrics are unchanged by the appended sums.
     assert metrics["sampling/rollout_kl_k1/mean"] == [pytest.approx(-shift)]
 
@@ -567,7 +583,7 @@ def test_rollout_bucket_metrics_pool_micro_batches_until_log(monkeypatch):
     metrics = _drive(monkeypatch, correction = True, sampling_shift = 3.0, state = state)["train"]
     assert metrics["sampling/token_frac/p_gt_0.9"] == [pytest.approx(0.5)]
     assert metrics["sampling/token_frac/p_lt_0.1"] == [pytest.approx(0.5)]
-    assert metrics["sampling/rollout_entropy/mean"] == [pytest.approx((0.05 + 3.0) / 2)]
+    assert metrics["sampling/rollout_nll/mean"] == [pytest.approx((0.05 + 3.0) / 2)]
 
 
 def _penalty_trainer(correction = True, use_vllm = True, **args):
@@ -615,3 +631,16 @@ def test_the_loss_warns_about_penalties(monkeypatch):
     _drive(monkeypatch, correction = True, state = state)
     _drive(monkeypatch, correction = True, state = state)
     assert sum("repetition_penalty=1.2" in m for m in seen) == 1
+
+
+def test_rollout_metrics_log_the_policy_entropy_when_the_loss_has_it(monkeypatch):
+    state = {}
+    first = _drive(monkeypatch, correction = True, state = state)["train"]
+    assert "sampling/policy_entropy/mean" not in first
+    state["trainer"].args.entropy_coef = 0.01
+    # The bonus weights need TRL's num_items_in_batch, which the driver does not pass.
+    monkeypatch.setattr(rr, "grpo_entropy_bonus_weights", lambda mask, *a, **k: torch.zeros(mask.shape))
+    first.clear()
+    metrics = _drive(monkeypatch, correction = True, state = state)["train"]
+    entropy = metrics["sampling/policy_entropy/mean"][0]
+    assert 0.0 < entropy <= math.log(8) + 1e-6  # the driver model's vocabulary is 8

@@ -3368,10 +3368,12 @@ RL_REPLACEMENTS["grpo_rollout_mismatch_metrics"] = grpo_rollout_mismatch_metrics
 _ROLLOUT_BUCKETS = ("p_gt_0.9", "p_0.1_0.9", "p_lt_0.1")
 
 
-def grpo_rollout_bucket_stats(train_logps, sampling_logps, mask):
+def grpo_rollout_bucket_stats(train_logps, sampling_logps, mask, entropies = None):
     """Poolable float64 sums splitting the mismatch by rollout probability p = exp(sampling logp):
     [tokens, sum |dlogp|] for p > 0.9, 0.1 <= p <= 0.9, p < 0.1, then sum -log pi_train(y) and
-    sum -log pi_rollout(y) (sampled-token entropy estimates, y ~ rollout, no vocabulary pass).
+    sum -log pi_rollout(y) over the sampled tokens, then [tokens, sum] of the policy entropies when the
+    loss computed them (else zeros). The negative logps are surprisals, not entropies: under a mismatch the
+    first is a cross-entropy, and untruncated sampling logps are not the truncated sampler's distribution.
     Runs on the host: the caller's metric gather already waits for these logps."""
     with torch.no_grad():
         train = train_logps.detach().to(device = "cpu", dtype = torch.float64)
@@ -3387,6 +3389,13 @@ def grpo_rollout_bucket_stats(train_logps, sampling_logps, mask):
         zero = torch.zeros_like(train)
         out.append(torch.where(keep, -train, zero).sum())
         out.append(torch.where(keep, -sampling, zero).sum())
+        if entropies is not None and entropies.shape == train.shape:
+            entropies = entropies.detach().to(device = "cpu", dtype = torch.float64)
+            scored = mask.detach().to(device = "cpu", dtype = torch.bool) & torch.isfinite(entropies)
+            out.append(scored.to(torch.float64).sum())
+            out.append(torch.where(scored, entropies, zero).sum())
+        else:
+            out.extend([zero.new_zeros(()), zero.new_zeros(())])
         return torch.stack(out)
 pass
 RL_REPLACEMENTS["grpo_rollout_bucket_stats"] = grpo_rollout_bucket_stats
@@ -3394,7 +3403,8 @@ RL_REPLACEMENTS["grpo_rollout_bucket_stats"] = grpo_rollout_bucket_stats
 
 def grpo_rollout_bucket_metrics(stats):
     """Metric dict from summed grpo_rollout_bucket_stats: per bucket the token share and the mean
-    |log pi_train - log pi_rollout|; share x mean over the buckets is the overall mean |dlogp|."""
+    |log pi_train - log pi_rollout| (share x mean over the buckets is the overall mean |dlogp|), the mean
+    sampled-token surprisals, and the policy entropy when the loss computed it (entropy bonus / mask)."""
     stats = [float(x) for x in stats.tolist()]
     counts = stats[0:6:2]
     total = sum(counts)
@@ -3402,8 +3412,10 @@ def grpo_rollout_bucket_metrics(stats):
     for name, count, abs_sum in zip(_ROLLOUT_BUCKETS, counts, stats[1:6:2]):
         metrics[f"sampling/logp_abs_diff/{name}"] = abs_sum / count if count > 0 else 0.0
         metrics[f"sampling/token_frac/{name}"] = count / total if total > 0 else 0.0
-    metrics["sampling/policy_entropy/mean"] = stats[6] / total if total > 0 else 0.0
-    metrics["sampling/rollout_entropy/mean"] = stats[7] / total if total > 0 else 0.0
+    metrics["sampling/policy_nll/mean"] = stats[6] / total if total > 0 else 0.0
+    metrics["sampling/rollout_nll/mean"] = stats[7] / total if total > 0 else 0.0
+    if stats[8] > 0:
+        metrics["sampling/policy_entropy/mean"] = stats[9] / stats[8]
     return metrics
 pass
 RL_REPLACEMENTS["grpo_rollout_bucket_metrics"] = grpo_rollout_bucket_metrics
@@ -5225,6 +5237,7 @@ def grpo_accumulated_loss(
             )
 
         entropy_mask = None
+        new_entropies = None
         if _need_entropy and not _fused_items:
             new_entropies = torch.cat(all_entropies_list, dim = 0)
             if _entropy_mask_on:
@@ -5349,14 +5362,14 @@ def grpo_accumulated_loss(
                     _bucket_mask = completion_mask.to(torch.bool)
                     if _rollout_unscored is not None:
                         _bucket_mask = _bucket_mask & ~_rollout_unscored
-                    _rollout_bucket_args = (new_logprobs, old_logps, _bucket_mask)
+                    _rollout_bucket_args = (new_logprobs, old_logps, _bucket_mask, new_entropies)
         elif (
             _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None
             and flat_is_ratio is not None and flat_is_ratio.numel() > 0
         ):
             _rollout_stats_args = (old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
             if old_logps.shape == sampling_per_token_logps.shape == completion_mask.shape:
-                _rollout_bucket_args = (old_logps, sampling_per_token_logps, completion_mask)
+                _rollout_bucket_args = (old_logps, sampling_per_token_logps, completion_mask, new_entropies)
         if _rollout_stats_args is not None:
             from unsloth_zoo.rl_replacements import (
                 grpo_rollout_mismatch_stats as _grpo_rollout_mismatch_stats,
@@ -5370,7 +5383,7 @@ def grpo_accumulated_loss(
             if _rollout_bucket_args is not None:
                 _bucket_stats = _grpo_rollout_bucket_stats(*_rollout_bucket_args)
             else:
-                _bucket_stats = torch.zeros(8, dtype = torch.float64)
+                _bucket_stats = torch.zeros(10, dtype = torch.float64)
             _rollout_stats = torch.cat([_rollout_stats, _bucket_stats.to(_rollout_stats.device)])
             _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
             _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
