@@ -1458,6 +1458,22 @@ def _capture_pristine_checkpoint_once():
         ck._unsloth_pristine_checkpoint = current
 
 
+def _torch_checkpoint():
+    """torch's own checkpoint, looked up per call. Smart gradient checkpointing replaces
+    torch.utils.checkpoint.checkpoint with unsloth_checkpoint, which forces the reentrant, CPU-offloading
+    UnslothCheckpointFunction: a chunk loop inside a decoder layer would offload every chunk, advance the
+    per-layer offload counters, and drop the grads of parameters the chunk only reaches through a closure."""
+    ck = torch.utils.checkpoint
+    for func in (
+        getattr(ck, "_unsloth_pristine_checkpoint", None),
+        ck.checkpoint,
+        getattr(ck, "_old_checkpoint", None),
+    ):
+        if getattr(func, "__module__", None) == ck.__name__:
+            return func
+    return ck.checkpoint
+
+
 def patch_unsloth_gradient_checkpointing():
     print("Unsloth: Patched gradient checkpointing for long context finetuning.")
     import torch.utils

@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 from transformers import Trainer, TrainingArguments
 
 from . import losses
@@ -407,7 +406,8 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
         args = (hidden[e], None if prev_emb is None else prev_emb[e], lm_w, None if mk is None else mk.markov_w2.weight,
                 None if teacher_rows is None else teacher_rows[e], None if teacher_rows is None else teacher_w, labels[e])
         if torch.is_grad_enabled() and hidden.requires_grad:
-            ce, l1, correct = checkpoint(_row_terms, *args, use_reentrant = False)
+            from ..gradient_checkpointing import _torch_checkpoint
+            ce, l1, correct = _torch_checkpoint()(_row_terms, *args, use_reentrant = False)
         else:
             ce, l1, correct = _row_terms(*args)
         ce_all.append(ce)

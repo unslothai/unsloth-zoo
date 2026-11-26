@@ -420,8 +420,8 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
         stop = min(s, start + chunk)
         args = (q[:, start:stop], kv_pad, sink, safe[:, start:stop], valid[:, start:stop])
         if recompute:
-            from torch.utils.checkpoint import checkpoint
-            outs.append(checkpoint(block, *args, use_reentrant = False))
+            from .gradient_checkpointing import _torch_checkpoint
+            outs.append(_torch_checkpoint()(block, *args, use_reentrant = False))
         else:
             outs.append(block(*args))
     return torch.cat(outs, dim = 1)

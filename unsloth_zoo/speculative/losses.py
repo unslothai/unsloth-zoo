@@ -16,7 +16,6 @@
 
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 __all__ = [
     "fastmtp_step_weights",
@@ -133,7 +132,8 @@ def chunked_lm_loss(
             logit_softcap,
         )
         if needs_grad:
-            chunk_sum, chunk_correct = checkpoint(_chunk_loss, *args, use_reentrant = False)
+            from ..gradient_checkpointing import _torch_checkpoint
+            chunk_sum, chunk_correct = _torch_checkpoint()(_chunk_loss, *args, use_reentrant = False)
         else:
             chunk_sum, chunk_correct = _chunk_loss(*args)
         loss_sum = loss_sum + chunk_sum.to(loss_sum.dtype)

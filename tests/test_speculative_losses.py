@@ -168,7 +168,8 @@ def test_saved_activations_scale_with_chunk_not_rows(monkeypatch):
     ckpt_bytes, (loss, _, _) = _saved_bytes(lambda: losses.chunked_lm_loss(hidden, weight, labels, "ce", chunk_size = 32))
     loss.backward()
     grad_ckpt = hidden.grad.clone()
-    monkeypatch.setattr(losses, "checkpoint", lambda fn, *args, **kwargs: fn(*args))
+    import unsloth_zoo.gradient_checkpointing as zoo_gc
+    monkeypatch.setattr(zoo_gc, "_torch_checkpoint", lambda: lambda fn, *args, **kwargs: fn(*args))
     hidden.grad = None
     plain_bytes, (loss, _, _) = _saved_bytes(lambda: losses.chunked_lm_loss(hidden, weight, labels, "ce", chunk_size = 32))
     loss.backward()
