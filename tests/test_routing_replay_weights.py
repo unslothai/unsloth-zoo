@@ -445,3 +445,24 @@ def test_engine_args_warn_when_weights_cannot_be_returned(replay, monkeypatch):
     with _warnings.catch_warnings():
         _warnings.simplefilter("error")
         assert rr.routing_replay_engine_args(_model().config) == {"enable_return_routed_experts": True}
+
+
+def test_prompt_start_prefix_reuse_keeps_the_earlier_turn_weights(replay):
+    # Multi-turn: turn 2 skips the rows turn 1 returned; the reused prefix keeps turn 1's weights too.
+    generator = torch.Generator().manual_seed(0)
+    ids1 = torch.stack([torch.randperm(NUM_EXPERTS, generator = generator)[:TOP_K] for _ in range(5 * NUM_LAYERS)]).reshape(5, NUM_LAYERS, TOP_K)
+    w1 = torch.rand(5, NUM_LAYERS, TOP_K, generator = generator)
+    w1 = w1 / w1.sum(-1, keepdim = True)
+    turn1 = SimpleNamespace(prompt_token_ids = [3, 4, 5], outputs = [SimpleNamespace(token_ids = [6, 7, 8], routed_experts = _packed(ids1, w1))])
+    rr.record_routed_experts([turn1])
+    ids2 = torch.stack([torch.randperm(NUM_EXPERTS, generator = generator)[:TOP_K] for _ in range(2 * NUM_LAYERS)]).reshape(2, NUM_LAYERS, TOP_K)
+    w2 = torch.rand(2, NUM_LAYERS, TOP_K, generator = generator)
+    w2 = w2 / w2.sum(-1, keepdim = True)
+    prompt2 = [3, 4, 5, 6, 7, 8, 9]
+    turn2 = SimpleNamespace(prompt_token_ids = prompt2, outputs = [SimpleNamespace(token_ids = [11, 12], routed_experts = _packed(ids2, w2))])
+    rr.record_routed_experts([turn2], prompt_starts = [6])
+    rows, weights = rr._lookup_routes(tuple(prompt2 + [11, 12]))
+    assert torch.equal(rows[:5].long(), ids1.long()) and torch.equal(rows[6:8].long(), ids2.long())
+    assert torch.equal(weights[:5], w1) and torch.equal(weights[6:8], w2)
+    # Turn 1 never forwarded its last sampled token, nor turn 2 its own: no weights there.
+    assert bool(torch.isnan(weights[5]).all()) and bool(torch.isnan(weights[8]).all())

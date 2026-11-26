@@ -369,14 +369,16 @@ def _count_conflicts(a, b):
         _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
 
 
-def _fill_prefix(rows, full, start, store):
-    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
+def _fill_prefix(rows, full, start, store, weights = None):
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1.
+    `weights`: this capture's weight rows, filled from the same captures as the ids (so their order matches)."""
     prefix = tuple(full[:start])
     stores = [store]
     if not _STATE.forwarded_since_record and _STATE.generations:
         # Earlier rollouts ran on older weights: their routes are not this policy's.
         stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
     merged = rows[:start].clone()
+    merged_weights = None if weights is None else weights[:start].clone()
     seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
     conflict = seen.clone()
     for candidate in stores:
@@ -392,9 +394,16 @@ def _fill_prefix(rows, full, start, store):
             new = routed & ~seen[:m]
             if bool(new.any()):
                 merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                if merged_weights is not None:
+                    earlier_weights = getattr(candidate, "weights", {}).get(key, None)
+                    part_weights = torch.full(part.shape, float("nan")) if earlier_weights is None \
+                        or earlier_weights.shape[1:] != part.shape[1:] else earlier_weights[:m]
+                    merged_weights[:m] = torch.where(new.unsqueeze(-1), part_weights, merged_weights[:m])
                 seen[:m] |= new
     keep = seen & ~conflict
     rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
+    if weights is not None:
+        weights[:start] = torch.where(keep.unsqueeze(-1), merged_weights, weights[:start])
 
 
 class _Store(dict):
@@ -471,7 +480,7 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
                 if wrows is not None and part_weights is not None and part_weights.shape[1:] == wrows.shape[1:]:
                     wrows[offset : offset + n] = part_weights[:n]
             if start > 0 and not split:
-                _fill_prefix(rows, full, start, store)
+                _fill_prefix(rows, full, start, store, wrows)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
