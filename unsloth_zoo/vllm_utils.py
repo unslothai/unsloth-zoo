@@ -506,112 +506,118 @@ if importlib.util.find_spec("vllm") is not None:
     except Exception as _e:
         _vllm_bnb, _bnb_loader, _vllm_bnb_source = None, None, None
         _vllm_bnb_error = f"{type(_e).__name__}: {_e}"
-    try:
-        if _bnb_loader is None:
-            raise ImportError("no bitsandbytes model loader")
-        if hasattr(_bnb_loader, "dequantize_dq"):
-            _bnb_loader.dequantize_dq = dequantize_dq
-        elif hasattr(_bnb_loader.BitsAndBytesModelLoader, "_dequantize_dq"):
-            _bnb_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
-        pass
-    except:
-        pass
+    def _patch_bnb_loader(_bnb_loader):
+        try:
+            if _bnb_loader is None:
+                raise ImportError("no bitsandbytes model loader")
+            if hasattr(_bnb_loader, "dequantize_dq"):
+                _bnb_loader.dequantize_dq = dequantize_dq
+            elif hasattr(_bnb_loader.BitsAndBytesModelLoader, "_dequantize_dq"):
+                _bnb_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
+            pass
+        except:
+            pass
+    _patch_bnb_loader(_bnb_loader)
 
     # Patch apply_bnb_4bit
-    if _vllm_bnb is None:
-        # No bnb to wrap: only 4-bit needs this patch, and load_vllm raises there with install instructions, so the rest of this module stays usable.
-        def _apply_4bit_weight(self, layer, x, bias = None):
-            raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
-    elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
-        # Make the compute dtype dynamic instead of forcing torch.bfloat16
-        def _apply_4bit_weight(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            bias: Optional[torch.Tensor] = None,
-        ) -> torch.Tensor:
-            from bitsandbytes import matmul_4bit
+    def _make_apply_4bit_weight(_vllm_bnb):
+        if _vllm_bnb is None:
+            # No bnb to wrap: only 4-bit needs this patch, and load_vllm raises there with install instructions, so the rest of this module stays usable.
+            def _apply_4bit_weight(self, layer, x, bias = None):
+                raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin==0.0.3` for load_in_4bit.")
+        elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
+            # Make the compute dtype dynamic instead of forcing torch.bfloat16
+            def _apply_4bit_weight(
+                self,
+                layer: torch.nn.Module,
+                x: torch.Tensor,
+                bias: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+                from bitsandbytes import matmul_4bit
 
-            original_type = x.dtype
-            original_shape = x.shape
-            reshape_after_matmul = False
-            if x.ndim > 2:
-                x = x.reshape(-1, x.size(-1))
-                reshape_after_matmul = True
+                original_type = x.dtype
+                original_shape = x.shape
+                reshape_after_matmul = False
+                if x.ndim > 2:
+                    x = x.reshape(-1, x.size(-1))
+                    reshape_after_matmul = True
 
-            qweight = layer.weight
-            quant_states = qweight.bnb_quant_state
-            offsets = qweight.bnb_shard_offsets
-            inference_dtype = quant_states[0].dtype
-            bf_x = x.to(inference_dtype) # Originally used bfloat16
+                qweight = layer.weight
+                quant_states = qweight.bnb_quant_state
+                offsets = qweight.bnb_shard_offsets
+                inference_dtype = quant_states[0].dtype
+                bf_x = x.to(inference_dtype) # Originally used bfloat16
 
-            out_dim_0 = x.shape[0]
-            out_dim_1 = sum(
-                [quant_state[1].shape[0] for quant_state in quant_states.items()])
-            out = torch.empty(out_dim_0,
-                              out_dim_1,
-                              dtype=inference_dtype,
-                              device=x.device)
+                out_dim_0 = x.shape[0]
+                out_dim_1 = sum(
+                    [quant_state[1].shape[0] for quant_state in quant_states.items()])
+                out = torch.empty(out_dim_0,
+                                  out_dim_1,
+                                  dtype=inference_dtype,
+                                  device=x.device)
 
-            current_index = 0
-            for i in range(len(quant_states)):
-                output_size = quant_states[i].shape[0]
-                # matmul_4bit's out kwarg is more efficient but infeasible until bitsandbytes bug TimDettmers/bitsandbytes issue 1235 is fixed.
-                out[:, current_index:current_index + output_size] = matmul_4bit(
-                    bf_x, qweight[offsets[i]:offsets[i + 1]].t(), quant_states[i])
+                current_index = 0
+                for i in range(len(quant_states)):
+                    output_size = quant_states[i].shape[0]
+                    # matmul_4bit's out kwarg is more efficient but infeasible until bitsandbytes bug TimDettmers/bitsandbytes issue 1235 is fixed.
+                    out[:, current_index:current_index + output_size] = matmul_4bit(
+                        bf_x, qweight[offsets[i]:offsets[i + 1]].t(), quant_states[i])
 
-                current_index += output_size
+                    current_index += output_size
 
-            out = out.to(original_type)
+                out = out.to(original_type)
 
-            if reshape_after_matmul:
-                out = out.view(*original_shape[:-1], out.size(-1))
+                if reshape_after_matmul:
+                    out = out.view(*original_shape[:-1], out.size(-1))
 
-            if bias is not None:
-                out += bias
+                if bias is not None:
+                    out += bias
 
-            return out
-    else:
-        # Newer vLLM versions have _apply_bnb_4bit
-        apply_bnb_4bit = _vllm_bnb.apply_bnb_4bit
-        def _apply_4bit_weight(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            bias: Optional[torch.Tensor] = None,
-        ) -> torch.Tensor:
-            original_type = x.dtype
-            original_shape = x.shape
-            reshape_after_matmul = False
-            if x.ndim > 2:
-                x = x.reshape(-1, x.size(-1))
-                reshape_after_matmul = True
+                return out
+        else:
+            # Newer vLLM versions have _apply_bnb_4bit
+            apply_bnb_4bit = _vllm_bnb.apply_bnb_4bit
+            def _apply_4bit_weight(
+                self,
+                layer: torch.nn.Module,
+                x: torch.Tensor,
+                bias: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+                original_type = x.dtype
+                original_shape = x.shape
+                reshape_after_matmul = False
+                if x.ndim > 2:
+                    x = x.reshape(-1, x.size(-1))
+                    reshape_after_matmul = True
 
-            qweight = layer.weight
-            quant_states = qweight.bnb_quant_state
-            offsets = qweight.bnb_shard_offsets
-            inference_dtype = quant_states[0].dtype
-            bf_x = x.to(inference_dtype) # Originally used bfloat16
+                qweight = layer.weight
+                quant_states = qweight.bnb_quant_state
+                offsets = qweight.bnb_shard_offsets
+                inference_dtype = quant_states[0].dtype
+                bf_x = x.to(inference_dtype) # Originally used bfloat16
 
-            out_dim_0 = x.shape[0]
-            out_dim_1 = sum(
-                [quant_state[1].shape[0] for quant_state in quant_states.items()])
-            out = torch.empty(out_dim_0,
-                              out_dim_1,
-                              dtype=inference_dtype,
-                              device=x.device)
-            apply_bnb_4bit(bf_x, qweight, offsets, out)
-            out = out.to(original_type)
+                out_dim_0 = x.shape[0]
+                out_dim_1 = sum(
+                    [quant_state[1].shape[0] for quant_state in quant_states.items()])
+                out = torch.empty(out_dim_0,
+                                  out_dim_1,
+                                  dtype=inference_dtype,
+                                  device=x.device)
+                apply_bnb_4bit(bf_x, qweight, offsets, out)
+                out = out.to(original_type)
 
-            if reshape_after_matmul:
-                out = out.view(*original_shape[:-1], out.size(-1))
+                if reshape_after_matmul:
+                    out = out.view(*original_shape[:-1], out.size(-1))
 
-            if bias is not None:
-                out += bias
+                if bias is not None:
+                    out += bias
 
-            return out
+                return out
+            pass
         pass
+        return _apply_4bit_weight
     pass
+    _apply_4bit_weight = _make_apply_4bit_weight(_vllm_bnb)
 
     def patch_vllm_bitsandbytes():
         # All Unsloth Zoo code licensed under LGPLv3
@@ -632,17 +638,48 @@ if importlib.util.find_spec("vllm") is not None:
         del vllm_config_logger
     pass
 
-    # `object` keeps the class definition legal with no bnb; it is never installed then.
-    _BitsAndBytesConfigBase = (
-        _vllm_bnb.BitsAndBytesConfig if _vllm_bnb is not None else object
-    )
+    def _make_bnb_config_class(_vllm_bnb):
+        # `object` keeps the class definition legal with no bnb; it is never installed then.
+        _BitsAndBytesConfigBase = (
+            _vllm_bnb.BitsAndBytesConfig if _vllm_bnb is not None else object
+        )
 
-    class BitsAndBytesConfig(_BitsAndBytesConfigBase):
-        # All Unsloth Zoo code licensed under LGPLv3
-        def __init__(self, *args, **kwargs):
-            kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
-            print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
-            super().__init__(*args, **kwargs)
+        class BitsAndBytesConfig(_BitsAndBytesConfigBase):
+            # All Unsloth Zoo code licensed under LGPLv3
+            def __init__(self, *args, **kwargs):
+                kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
+                print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
+                super().__init__(*args, **kwargs)
+        return BitsAndBytesConfig
+    pass
+    BitsAndBytesConfig = _make_bnb_config_class(_vllm_bnb)
+
+    def _ensure_vllm_bnb():
+        """vLLM >= 0.28 without vllm-bnb-plugin: install it at first 4-bit use (UNSLOTH_VLLM_BNB_AUTO_INSTALL=0 opts
+        out), then bind it as import time would have. True when bitsandbytes is usable."""
+        global _vllm_bnb, _bnb_loader, _vllm_bnb_source, _vllm_bnb_error, _apply_4bit_weight, BitsAndBytesConfig
+        if _vllm_bnb is not None: return True
+        from . import vllm_bnb as _vb
+        # A plugin that is installed but failed to load is reported, not reinstalled.
+        if _vllm_bnb_error is not None or importlib.util.find_spec("vllm_bnb_plugin") is not None: return False
+        if os.environ.get("UNSLOTH_VLLM_BNB_AUTO_INSTALL", "1") == "0": return False
+        print(f"Unsloth: vLLM {vllm_version} has no built-in bitsandbytes, so installing {_vb.PLUGIN_SPEC} for load_in_4bit.")
+        ok, output = _vb.install_plugin()
+        if not ok:
+            _vllm_bnb_error = f"`{_vb.INSTALL_HINT}` failed: {output}"
+            return False
+        try:
+            _vb.reset()
+            _vllm_bnb, _bnb_loader, _vllm_bnb_source = _vb.resolve()
+        except Exception as e:
+            _vllm_bnb_error = f"{type(e).__name__}: {e}"
+            return False
+        if _vllm_bnb is None: return False
+        _patch_bnb_loader(_bnb_loader)
+        _apply_4bit_weight = _make_apply_4bit_weight(_vllm_bnb)
+        BitsAndBytesConfig = _make_bnb_config_class(_vllm_bnb)
+        patch_vllm_bitsandbytes()
+        return True
     pass
 
     def patch_vllm_compute_dtype(dtype = torch.float16):
@@ -738,6 +775,10 @@ if importlib.util.find_spec("vllm") is not None:
 else:
     def patch_vllm_bitsandbytes():
         return
+    pass
+
+    def _ensure_vllm_bnb():
+        return False
     pass
 
     def patch_vllm_compute_dtype():
@@ -5785,12 +5826,12 @@ def load_vllm(
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
     # vLLM absent is a different failure with its own message, so say nothing here.
-    if use_bitsandbytes and _vllm_bnb is None and importlib.util.find_spec("vllm"):
+    if use_bitsandbytes and _vllm_bnb is None and importlib.util.find_spec("vllm") and not _ensure_vllm_bnb():
         raise RuntimeError(
             "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree into vllm-bnb-plugin. "
-            "Install it with `pip install vllm-bnb-plugin` to use "
+            "Install it with `pip install vllm-bnb-plugin==0.0.3` to use "
             "load_in_4bit with fast_inference."
-            + (f" Loading it failed with {_vllm_bnb_error}" if _vllm_bnb_error else "")
+            + (f" Details: {_vllm_bnb_error}" if _vllm_bnb_error else "")
         )
 
     if _is_gemma4_config(config):
