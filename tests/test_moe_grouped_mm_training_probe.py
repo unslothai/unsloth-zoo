@@ -311,8 +311,7 @@ def test_the_fallback_line_prints_once_across_the_compiled_cache_copy(fresh, cap
 
 
 def test_a_runtime_refusal_without_triton_keeps_training_on_the_loop(fresh):
-    # Triton cannot stand in (UNSLOTH_MOE_GROUPED_TRITON=0 here): grouped_mm stays selected and every later forward
-    # takes the per-expert loop instead of raising at forward_native_grouped_mm's safety check.
+    # No Triton stand-in: later forwards must take the loop, not raise at forward_native_grouped_mm's safety check.
     fresh.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
     calls = []
     def refuse(x, w, offs = None):
