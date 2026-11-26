@@ -6119,7 +6119,7 @@ def load_vllm(
     if enable_lora:
         patch_vllm_stacked_moe_lora(config)
     if is_qwen4_exp_config(config):
-        patch_vllm_qwen4_exp(config)
+        patch_vllm_qwen4_exp(config, enable_lora = enable_lora)
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 

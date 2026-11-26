@@ -337,3 +337,15 @@ def test_vllm_without_qwen4_exp_is_refused_before_loading():
     with pytest.raises(NotImplementedError, match = "vLLM 0.34"):
         check_vllm_supports_qwen4_exp(config, supported = {"Qwen3NextForCausalLM"})
     check_vllm_supports_qwen4_exp(config, supported = {"Qwen4ExpForConditionalGeneration"})
+
+
+def test_qwen4_exp_marked_as_3d_moe_lora_model():
+    # transformers stacks Qwen4Exp's experts, so vLLM must serve the adapter with FusedMoE3DWithLoRA.
+    from unsloth_zoo.vllm_qwen4_exp import _mark_stacked_moe_lora
+    module = types.ModuleType("fake_vllm_qwen4_exp")
+    module.Qwen4ExpForCausalLM = type("Qwen4ExpForCausalLM", (), {})
+    module.Qwen4ExpForConditionalGeneration = type("Qwen4ExpForConditionalGeneration", (), {})
+    assert not hasattr(module.Qwen4ExpForConditionalGeneration, "is_3d_moe_weight")
+    assert len(_mark_stacked_moe_lora(module)) == 2
+    assert module.Qwen4ExpForConditionalGeneration.is_3d_moe_weight is True
+    assert _mark_stacked_moe_lora(module) == []

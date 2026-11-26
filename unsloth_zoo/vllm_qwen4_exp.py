@@ -104,11 +104,32 @@ def check_vllm_supports_qwen4_exp(config, supported = None):
 pass
 
 
-def patch_vllm_qwen4_exp(config = None):
+def _mark_stacked_moe_lora(module):
+    """transformers keeps Qwen4Exp's routed experts stacked (gate_up_proj [E, 2I, H]); PEFT adapts them through
+    target_parameters, which only vLLM's FusedMoE3DWithLoRA reads. vLLM picks it when the model class sets
+    is_3d_moe_weight (as Unsloth does for Qwen3-MoE and DeepSeek-V2 / V3)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    marked = []
+    for name in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"):
+        cls = getattr(module, name, None)
+        if cls is not None and getattr(cls, "is_3d_moe_weight", False) is not True:
+            cls.is_3d_moe_weight = True
+            marked.append(f"{module.__name__}.{name}")
+    return marked
+pass
+
+
+def patch_vllm_qwen4_exp(config = None, enable_lora = False):
     """Idempotent vLLM patches for Qwen4Exp. Returns the names of the classes patched."""
     # All Unsloth Zoo code licensed under LGPLv3
     if config is not None: check_vllm_supports_qwen4_exp(config)
     patched = []
+    if enable_lora:
+        for module_name in ("vllm.models.qwen4_exp.nvidia.model", "vllm.models.qwen4_exp.amd.model"):
+            try:
+                patched += _mark_stacked_moe_lora(__import__(module_name, fromlist = ["Qwen4ExpForCausalLM"]))
+            except Exception:
+                continue
     for module_name in ("vllm.models.qwen4_exp.nvidia.hyperconnection", "vllm.models.qwen4_exp.amd.hyperconnection"):
         try:
             module = __import__(module_name, fromlist = ["GatedResidual"])
@@ -118,7 +139,7 @@ def patch_vllm_qwen4_exp(config = None):
         if cls is not None and _patch_gated_residual_padding(cls):
             patched.append(f"{module_name}.GatedResidual")
     if patched:
-        logger.info(f"Unsloth: zeroed the Qwen4Exp hyper-connection GEMM padding in {patched}.")
+        logger.info(f"Unsloth: patched vLLM Qwen4Exp classes {patched}.")
     return patched
 pass
 
