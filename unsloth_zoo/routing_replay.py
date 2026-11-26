@@ -1179,8 +1179,12 @@ def _router_hook(layer_index, compact = None):
         # always, via the opaque pick); reweight here too (all rows invalid) so the non-reentrant
         # checkpoint sees identical saved tensors. Eager too: a replayed and a natural forward of the
         # same length before one backward (rows without rollout routes) hit it there as well.
-        mirror = natural and _STATE.record is not None \
-            and isinstance(getattr(module, "_unsloth_replay_formula", None), str)
+        # Eager, a router without a formula yet picks it here (below), so the first checkpointed forward
+        # mirrors too: with R2 that forward is natural and the later ones of the same rows are replayed.
+        known = getattr(module, "_unsloth_replay_formula", None)
+        mirror = natural and _STATE.record is not None and (
+            isinstance(known, str) or (known is None and not torch.compiler.is_compiling())
+        )
         if natural and not mirror:
             _count("router_calls_natural")
             return None

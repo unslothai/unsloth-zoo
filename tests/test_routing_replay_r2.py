@@ -303,3 +303,31 @@ def test_looped_model_refuses_routing_replay(monkeypatch, env):
             assert rr.routing_replay_engine_args(looped.config) == {}
         assert rr.routing_replay_engine_args(plain.config) != {}
     rr.reset_routing_replay()
+
+
+@pytest.mark.parametrize("primed", [False, True])
+def test_pi_old_forward_and_its_replay_share_one_checkpointed_backward(r2, primed):
+    # pi_old from the first grad forward (natural, records R2), then the same rows replayed before a single
+    # non-reentrant backward: both recomputes must save what their forwards saved, grads as without GC.
+    input_ids, mask = _batch()
+
+    def run(checkpointing):
+        rr.reset_routing_replay()
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+        m.model.embed_tokens.weight.requires_grad_(True)
+        _install(m)
+        if primed:  # as Unsloth's prepare_routing_replay does
+            for layer in m.model.layers:
+                layer.mlp.gate._unsloth_replay_formula = "softmax_renorm"
+        _rollout(m)
+        first = m(input_ids = input_ids, attention_mask = mask).logits
+        second = m(input_ids = input_ids, attention_mask = mask).logits
+        (first.float().pow(2).mean() + second.float().pow(2).mean()).backward()
+        assert rr.routing_replay_stats()["r2_replayed_tokens"] == int(mask.sum())
+        return first.detach(), second.detach(), m.model.layers[0].mlp.gate.weight.grad.clone()
+
+    for got, want in zip(run(True), run(False)):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
