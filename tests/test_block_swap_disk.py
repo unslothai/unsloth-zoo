@@ -116,8 +116,14 @@ def test_auto_swap_indices_names_the_disk_tier():
     per = 64 * 64 * 4
     idx = list(range(10))
     assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 10 * per) == []
-    # Staging ring (2 layers) and a layer of lag come first: 6 layers of room keep 3 in RAM, the rest go to disk.
-    assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == list(range(3, 10))
+    # Staging ring (2 layers) and a layer of lag come first: 6 layers of room keep 3 in RAM, the rest go to disk:
+    # both turnarounds' blocks first, the rest spread between the RAM blocks.
+    assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == [0, 1, 3, 5, 7, 8, 9]
+    os.environ["UNSLOTH_OFFLOAD_DISK_PLACEMENT"] = "tail"
+    try:
+        assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == list(range(3, 10))
+    finally:
+        del os.environ["UNSLOTH_OFFLOAD_DISK_PLACEMENT"]
 
 
 # GPU -------------------------------------------------------------------------------------------------------------
@@ -219,7 +225,10 @@ def test_disk_tier_trains_bitwise_like_host_ram(monkeypatch, depth, reentrant):
     st = sw.stats()
     per = _layer_bytes(base)
     # Engagement: every disk layer read at least once per forward and per backward (3 steps + one inference pass).
-    assert st["disk_reads"] >= 3 * 7 and st["disk_read_bytes"] >= st["disk_reads"] * (per // 4096) * 4096, st
+    # Each read moves the block's stored region: raw, or encoded when the codec took it.
+    stored = min(n for b in sw.blocks if b.disk is not None for _, n, _ in b.disk_runs)
+    assert stored <= -(-per // 4096) * 4096
+    assert st["disk_reads"] >= 3 * 7 and st["disk_read_bytes"] >= st["disk_reads"] * stored, st
     sw.remove()
     ram.remove()
     # Restored weights are the originals.
