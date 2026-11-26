@@ -14,11 +14,18 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU frozen bf16 storage: generate() called in train mode (GRPO rollouts) decodes with fp32 frozen weights and
-stores them in bf16 again afterwards, bit for bit."""
+"""CPU frozen bf16 storage: on Apple Silicon, generate() called in train mode (GRPO rollouts) decodes with fp32 frozen
+weights and stores them in bf16 again afterwards, bit for bit. Elsewhere it keeps decoding through the bf16 weights."""
 
 import pytest
 import torch
+
+
+@pytest.fixture(autouse = True)
+def _apple_silicon(monkeypatch):
+    """Every test runs as on Apple Silicon, where the rollout upcast applies."""
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: True, raising = False)
 
 
 def _tiny_bf16_llama(mode):
@@ -161,3 +168,28 @@ def test_lora_rollout_under_inference_mode_leaves_trainable_weights():
     assert not any(m.weight.is_inference() for m in _stored(lora))
     assert {m.weight.dtype for m in _stored(lora)} == {torch.bfloat16}
     lora(input_ids = _IDS, labels = _IDS).loss.backward()
+
+
+def test_train_mode_generate_stays_bf16_off_apple_silicon(monkeypatch):
+    """x86 without native bf16 gained about 2% from the fp32 copy: not worth its RAM, so nothing changes there."""
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: False, raising = False)
+    model, _ = _tiny_bf16_llama("training")
+    model.train()
+    seen, handles = _record_weight_dtypes(model)
+    model.generate(input_ids = _IDS, **_GEN)
+    for h in handles:
+        h.remove()
+    assert set(seen) == {torch.bfloat16}
+
+
+def test_slow_bf16_upcast_is_apple_silicon_only(monkeypatch):
+    import platform
+    import sys
+    from unsloth_zoo.cpu import loader
+    monkeypatch.undo()  # the real check, not the autouse stand-in
+    for plat, machine, expected in (("darwin", "arm64", True), ("darwin", "x86_64", False), ("linux", "aarch64", False),
+                                    ("linux", "x86_64", False), ("win32", "AMD64", False)):
+        monkeypatch.setattr(sys, "platform", plat)
+        monkeypatch.setattr(platform, "machine", lambda m = machine: m)
+        assert loader._slow_bf16_upcast() is expected, (plat, machine)

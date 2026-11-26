@@ -21,6 +21,7 @@ import gc
 import functools
 import os
 import re
+import sys
 import types
 import warnings
 import weakref
@@ -1248,8 +1249,17 @@ def _frozen_bf16_mode(model):
 _FP32_ROLLOUT_RAM_SHARE = 0.5
 
 
+def _slow_bf16_upcast():
+    """Apple Silicon: upcasting the bf16-stored projections on every decoded token made a Qwen3-0.6B GRPO step 1.6x
+    slower (M1). On x86 without native bf16 (AVX2) it cost about 2%, not worth the fp32 copy's RAM."""
+    import platform
+    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
+
+
 def _fp32_rollout_fits(model):
-    """True when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits in available RAM."""
+    """True on Apple Silicon when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits in RAM."""
+    if not _slow_bf16_upcast():
+        return False
     extra = 2 * sum(m.weight.numel() for m in model.modules()
                     if isinstance(m, Bf16StoredLinear) and m.weight.dtype == torch.bfloat16 and not m.weight.requires_grad)
     if extra == 0:
@@ -1280,7 +1290,7 @@ def _unpack_encoding_generate(generate):
             _frozen_bf16_for(self, training = False)
         elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self):
             # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
-            # upcasting every projection per token made CPU GRPO steps 12-41% slower, then store bf16 again.
+            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon, then store bf16.
             # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
             # tensors, and the next training forward could not save them for backward.
             with torch.inference_mode(False):
