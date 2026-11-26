@@ -1281,7 +1281,10 @@ def _unpack_encoding_generate(generate):
         elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self):
             # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
             # upcasting every projection per token made CPU GRPO steps 12-41% slower, then store bf16 again.
-            restore = set_bf16_stored_dtype(self, torch.float32) > 0
+            # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
+            # tensors, and the next training forward could not save them for backward.
+            with torch.inference_mode(False):
+                restore = set_bf16_stored_dtype(self, torch.float32) > 0
         try:
             set_stance = getattr(torch.compiler, "set_stance", None)
             modules = self.modules() if isinstance(self, torch.nn.Module) else ()
@@ -1292,7 +1295,8 @@ def _unpack_encoding_generate(generate):
             return generate(self, *args, **kwargs)
         finally:
             if restore:
-                set_bf16_stored_dtype(self, torch.bfloat16)
+                with torch.inference_mode(False):
+                    set_bf16_stored_dtype(self, torch.bfloat16)
     wrapper._unsloth_cpu = True
     return wrapper
 

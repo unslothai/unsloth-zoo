@@ -147,3 +147,17 @@ def test_train_mode_generate_stays_bf16_without_ram_headroom(monkeypatch):
     for h in handles:
         h.remove()
     assert set(seen) == {torch.float32}
+
+
+def test_lora_rollout_under_inference_mode_leaves_trainable_weights():
+    """A rollout inside torch.inference_mode() must not leave inference tensors behind: the next LoRA forward saves
+    the bf16 frozen weights for backward."""
+    from unsloth_zoo.cpu import loader
+    model, _ = _tiny_bf16_llama("training")
+    lora = loader.FastCPUModel.get_peft_model(model, r = 4, lora_alpha = 4, use_gradient_checkpointing = False)
+    lora.train()
+    with torch.inference_mode():
+        lora.generate(input_ids = _IDS, **_GEN)
+    assert not any(m.weight.is_inference() for m in _stored(lora))
+    assert {m.weight.dtype for m in _stored(lora)} == {torch.bfloat16}
+    lora(input_ids = _IDS, labels = _IDS).loss.backward()
