@@ -202,3 +202,12 @@ def test_load_hook_keeps_copies_only_while_flagged(monkeypatch):
     # W4A4 (kill switch) keeps its own input scales untouched.
     w4a4, registered = load(CompressedTensorsW4A4Fp4(use_a16 = False))
     assert not registered and torch.equal(w4a4.input_global_scale, torch.ones(2))
+
+
+def test_return_args_skips_the_in_process_nvfp4_rewrite():
+    # return_args hands the args to a separate `vllm serve`, where the input_global_scale hook is not installed:
+    # the A16 rewrite and its load flags must only apply to engines built in this process.
+    import inspect
+    from unsloth_zoo import vllm_utils
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert "if _ct_nvfp4_groups(config) and not return_args:" in source

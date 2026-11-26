@@ -6361,7 +6361,9 @@ def load_vllm(
 
         # NVFP4 compressed-tensors: roll out W4A16 like the trainer (UNSLOTH_VLLM_NVFP4_A16=0 keeps W4A4), and keep
         # the compressed-tensors weights at load so the training model shares them instead of loading them again.
-        if _ct_nvfp4_groups(config):
+        # Not for return_args (`vllm serve`): the hooks below live in this process only, so a separate engine
+        # keeps the checkpoint's own W4A4 config (its input_global_scale tensors would have nowhere to load).
+        if _ct_nvfp4_groups(config) and not return_args:
             text_config = getattr(config, "text_config", None) or config
             if any(_config_get(text_config, k) for k in ("num_experts", "num_local_experts", "n_routed_experts")):
                 # vLLM's NVFP4 MoE methods repack the experts and nothing hands them to training yet.
