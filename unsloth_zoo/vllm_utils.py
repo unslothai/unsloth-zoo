@@ -1565,17 +1565,14 @@ def patch_vllm_processed_logprobs_fast_path():
 pass
 
 
-# GRPO vLLM IS correction: rollout logprobs scaled by temperature but taken before min_p / top_k / top_p, so
-# pi_train / pi_vllm compare full-vocabulary distributions and the trainer need not rebuild the kept set (which
-# cost +27% s/step with min_p and +67% with top_p + top_k on Qwen3-0.6B). Off unless a GRPO trainer turns it on.
+# GRPO IS correction: temperature-scaled logprobs from before min_p / top_k / top_p, so the trainer skips
+# rebuilding the kept set (+27% to +67% s/step on Qwen3-0.6B).
 UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS = {"on": False, "installed": False, "calls": 0}
 _UNTRUNCATED_CAPTURE = {"on": False, "scaled": None}
 
 
 def patch_vllm_untruncated_logprobs():
-    """Patch vLLM's V1 and V2 samplers (0.11 to 0.34+) to return log_softmax(logits / temperature) from before
-    min_p / top_k / top_p when the engine runs processed_logprobs and the flag above is on. True if a sampler
-    was patched."""
+    """Patch vLLM V1/V2 samplers (0.11 to 0.34+) to return pre-truncation log_softmax(logits / T)."""
     state = UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
     if state["installed"]:
         return True
@@ -1591,7 +1588,7 @@ def patch_vllm_untruncated_logprobs():
         original_temperature = descriptor.__func__ if is_static else descriptor
         original_sample = V1Sampler.sample
 
-        # A static method from vLLM 0.11.2 on, an instance method before (0.11.0): keep whichever it is.
+        # Static from vLLM 0.11.2, instance method on 0.11.0.
         def apply_temperature(*args, **kwargs):
             out = original_temperature(*args, **kwargs)
             if capture["on"]:
@@ -1692,9 +1689,7 @@ pass
 
 
 def set_vllm_untruncated_logprobs(on, llm = None):
-    """Turn the untruncated rollout logprobs on or off (UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS=0 keeps them off).
-    Off for a speculative engine: draft positions are scored by the rejection sampler from truncated logits.
-    Returns whether they are on."""
+    """Toggle untruncated logprobs; off for speculative engines (rejection sampler uses truncated logits)."""
     state = UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
     on = bool(on) and os.environ.get("UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS", "1") != "0"
     on = on and not (llm is not None and _vllm_engine_speculative(llm))

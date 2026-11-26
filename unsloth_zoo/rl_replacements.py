@@ -2307,8 +2307,7 @@ def grpo_truncated_support_kwargs(trainer):
     if support is None and excluded is None:
         return {}
     if grpo_rollout_logprobs_untruncated(trainer):
-        # The engine returned logprobs from before min_p / top_k / top_p: score the full vocabulary, minus
-        # only the rows vLLM biases to -inf on every request.
+        # Full vocabulary minus rows vLLM always biases to -inf.
         if excluded is None:
             return {}
         return {"support_top_k": 0, "support_top_p": 1.0, "support_min_p": 0.0, "support_excluded_ids": excluded}
@@ -2378,8 +2377,7 @@ _GRPO_TRUNCATED_SUPPORT_STATS = {"on": 0}
 
 
 def grpo_rollout_logprobs_untruncated(trainer):
-    """True when this trainer's colocated vLLM engine returns temperature-scaled logprobs from before
-    min_p / top_k / top_p (vllm_utils.set_vllm_untruncated_logprobs, turned on by unsloth's GRPO trainer)."""
+    """True when the colocated vLLM engine returns logprobs from before min_p / top_k / top_p."""
     if not getattr(trainer, "_unsloth_vllm_untruncated_logprobs", False):
         return False
     try:
