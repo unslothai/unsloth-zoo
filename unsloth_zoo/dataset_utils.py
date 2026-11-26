@@ -1094,6 +1094,18 @@ def train_on_responses_only(
     if sample_start:  boundary_first.add(sample_start[0])
     inner_stop_ids = tuple(boundary_first | {Q_first})
 
+    # Gemma 4 and FunctionGemma render a tool result inside the model's own turn. Generation stops at the
+    # opening marker and the tool writes the rest, so a response span must not train past it.
+    token_ids = {getattr(t, "content", None): i for i, t in added_tokens.items()}
+    tool_result_ids = [
+        (token_ids[opener], token_ids[closer], token_ids.get(turn))
+        for opener, closer, turn in (
+            ("<|tool_response>", "<tool_response|>", "<|turn>"),
+            ("<start_function_response>", "<end_function_response>", "<start_of_turn>"),
+        )
+        if opener in token_ids and closer in token_ids
+    ]
+
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -1292,6 +1304,18 @@ def train_on_responses_only(
                     labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
                 else:
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+
+            # A result runs through its closing marker, or to the next turn when the call was never answered.
+            for opener, closer, turn in tool_result_ids:
+                if opener not in input_ids: continue
+                row = list(input_ids)
+                starts = [i for i, t in enumerate(row) if t == opener]
+                for start, limit in zip(starts, starts[1:] + [n]):
+                    body = row[start + 1 : limit]
+                    if   closer in body: stop = start + 2 + body.index(closer)
+                    elif turn   in body: stop = start + 1 + body.index(turn)
+                    else:                stop = limit
+                    labels[start + 1 : stop] = [-100] * (stop - start - 1)
 
             # Outside kept spans labels are already -100, so masking everywhere is safe.
             if mask_out_lookup:
