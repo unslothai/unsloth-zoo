@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-"""_fp8_dequant_blockwise multiplies exactly tiled block scales in place through a broadcast view.
-The result must stay bitwise identical to the repeat_interleave reference, and the input is never mutated."""
+"""In-place tiled _fp8_dequant_blockwise is bitwise identical to repeat_interleave and never mutates input."""
 
 import pytest
 import torch
@@ -11,7 +10,6 @@ from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_dequant_blockwise
 
 
 def _reference(W_fp8, scale_inv, block_size = None):
-    # The previous implementation: full-size repeated scale, then W * scale.
     rows, cols = W_fp8.shape
     if scale_inv.dtype == torch.uint8:
         scale_inv = (scale_inv.to(torch.float32) - 127.0).exp2()
@@ -78,7 +76,6 @@ def test_block_scale_bitwise_matches_reference(fp8_dtype, kind, shape, block, pa
     W_bytes = W.view(torch.uint8).clone()
     assert _same(_fp8_dequant_blockwise(W, S, bs), _reference(W, S, bs))
     assert torch.equal(W.view(torch.uint8), W_bytes)
-    # Column-major (non-contiguous) input takes the unchanged path and still matches.
     Wt = W.t().contiguous().t()
     assert _same(_fp8_dequant_blockwise(Wt, S, bs), _reference(Wt, S, bs))
 

@@ -1262,9 +1262,7 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
         bm = -(-rows // srows)  # ceil(rows / srows)
         bn = -(-cols // scols)  # ceil(cols / scols)
     scale = scale_inv.to(out_dtype)
-    # Exact tiling: multiply in place through a (srows, bm, scols, bn) view with a broadcast scale instead of
-    # materializing a full-size repeated scale and a second full-size product. Same elementwise products, so the
-    # result is bitwise identical. Only on a fresh contiguous W (never mutate the caller's tensor).
+    # Exact tiling: in-place broadcast multiply (bitwise identical, no full-size scale). Never mutate W_fp8.
     if (
         srows * bm == rows and scols * bn == cols
         and W is not W_fp8 and W.is_contiguous() and scale.is_contiguous()
