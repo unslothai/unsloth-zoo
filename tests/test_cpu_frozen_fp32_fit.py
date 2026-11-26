@@ -1,6 +1,6 @@
-"""Windows x86 without native bf16: a bf16 checkpoint's frozen projections stay float32 when the float32 model fits in
-a quarter of the free RAM (no per-call upcast), bf16-stored otherwise and on other OSes; UNSLOTH_CPU_FROZEN_BF16 still
-decides."""
+"""x86 without native bf16 (Windows, and Linux with AVX-512): a bf16 checkpoint's frozen projections stay float32 when
+the float32 model fits in a quarter of the free RAM (no per-call upcast), bf16-stored otherwise and on other hosts;
+UNSLOTH_CPU_FROZEN_BF16 still decides."""
 import pytest
 import torch
 
@@ -140,13 +140,22 @@ def test_other_hosts_keep_bf16_storage(monkeypatch, checkpoint):
     assert _stored(model) == 14 and model._unsloth_cpu_frozen_bf16 == "training"
 
 
-def test_fp32_frozen_storage_pays_on_windows_x86_only(monkeypatch):
+def test_fp32_frozen_storage_pays_on_windows_x86_and_avx512_linux(monkeypatch):
     import platform
     import sys
-    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.cpu import loader, runtime
     monkeypatch.undo()  # the real check, not the autouse stand-in
-    for plat, machine, expected in (("win32", "AMD64", True), ("win32", "x86_64", True), ("win32", "ARM64", False),
-                                    ("linux", "x86_64", False), ("linux", "aarch64", False), ("darwin", "arm64", False)):
+    avx512 = frozenset({"avx2", "avx512f", "avx512bw"})
+    avx2 = frozenset({"avx2", "fma"})
+    for plat, machine, flags, expected in (
+        ("win32", "AMD64", avx2, True), ("win32", "x86_64", avx512, True), ("win32", "ARM64", frozenset(), False),
+        ("linux", "x86_64", avx512, True),   # Xeon 8370C / 8573C without bf16: decode through fp32 is faster
+        ("linux", "x86_64", avx2, False),    # EPYC 7763: fp32 decode reads 2x the bytes, GRPO was slower
+        ("linux", "x86_64", frozenset(), False),
+        ("linux", "aarch64", frozenset({"asimd", "avx512f"}), False),
+        ("darwin", "x86_64", avx512, False), ("darwin", "arm64", frozenset(), False),
+    ):
         monkeypatch.setattr(sys, "platform", plat)
         monkeypatch.setattr(platform, "machine", lambda m = machine: m)
-        assert loader._fp32_frozen_storage_pays() is expected, (plat, machine)
+        monkeypatch.setattr(runtime, "cpu_flags", lambda f = flags: f)
+        assert loader._fp32_frozen_storage_pays() is expected, (plat, machine, sorted(flags))
