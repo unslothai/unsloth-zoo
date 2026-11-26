@@ -427,6 +427,86 @@ def patch_cpu_sdpa_gqa():
     return True
 
 
+# torch's CPU 2-norm of one float32 tensor sums every square into float32 partials: on a 151936 x 1024 embedding
+# gradient it is 2% off the float64 norm (6e-5 at 3072 x 1024) and runs at ~10 GB/s. One float32 norm per row (a
+# row is at most a few thousand elements) combined in float64 is accurate to 1e-9 and reads the gradient faster.
+_ROWWISE_NORM_MIN_NUMEL = 1 << 20
+
+
+def _rowwise_eligible(grad):
+    return (
+        isinstance(grad, torch.Tensor) and grad.device.type == "cpu" and grad.dtype == torch.float32
+        and grad.layout == torch.strided and grad.dim() >= 2 and grad.numel() >= _ROWWISE_NORM_MIN_NUMEL
+        and type(grad) is torch.Tensor
+    )
+
+
+def patch_cpu_grad_total_norm():
+    """clip_grad_norm_ (Trainer's max_grad_norm, via accelerate) computes the total 2-norm with one torch norm per
+    gradient. For large float32 CPU gradients that norm is inexact (2% on Qwen3-0.6B's embedding) and slow (22% of a
+    full finetuning step). Those gradients get row-wise float32 norms combined in float64; every other tensor, device,
+    dtype and norm type keeps torch's own norm, and the result keeps torch's dtype and non-finite check. Idempotent;
+    returns True when installed (torch >= 2.6, where clip_grad_norm_ calls clip_grad._get_total_norm)."""
+    try:
+        from torch.nn.utils import clip_grad
+    except Exception:
+        return False
+    original = getattr(clip_grad, "_get_total_norm", None)
+    if original is None:
+        return False
+    if getattr(original, "_unsloth_cpu", False):
+        return True
+
+    @functools.wraps(original)
+    def _get_total_norm(tensors, norm_type = 2.0, error_if_nonfinite = False, foreach = None):
+        if isinstance(tensors, torch.Tensor):
+            tensors = [tensors]
+        tensors = list(tensors)
+        try:
+            two = float(norm_type) == 2.0
+        except (TypeError, ValueError):
+            two = False
+        if not two or foreach or not any(_rowwise_eligible(t) for t in tensors) or \
+                any(not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.is_complex() for t in tensors):
+            return original(tensors, norm_type, error_if_nonfinite, foreach)
+        with torch.no_grad():
+            return _rowwise_total_norm(tensors, norm_type, error_if_nonfinite)
+
+    _get_total_norm._unsloth_cpu = True
+    _get_total_norm._unsloth_original = original
+    clip_grad._get_total_norm = _get_total_norm
+    return True
+
+
+def _square_sum_float64(norms):
+    """Sum of squares of a list of norms in float64, in a constant number of ops (one cat, one cast, one dot)."""
+    if len({n.dtype for n in norms}) > 1:
+        norms = [n.double() for n in norms]
+    flat = torch.cat([n.reshape(-1) for n in norms]).double()
+    return torch.dot(flat, flat)
+
+
+def _rowwise_total_norm(tensors, norm_type, error_if_nonfinite):
+    # One norm op per tensor, as torch's own path: row norms for the large float32 ones, a plain norm for the rest.
+    rows, others = [], []
+    for t in tensors:
+        if _rowwise_eligible(t):
+            rows.append(torch.linalg.vector_norm(t.reshape(-1, t.shape[-1]), 2.0, dim = -1))
+        else:
+            others.append(torch.linalg.vector_norm(t, 2.0))
+    square = _square_sum_float64(rows + others)
+    # torch promotes the per-tensor norm dtypes; for the real tensors that reach here they equal the inputs' dtypes.
+    dtype = functools.reduce(torch.promote_types, (n.dtype for n in rows + others))
+    total_norm = square.sqrt().to(dtype)
+    if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, so it cannot be "
+            "clipped. To disable this error and scale the gradients by the non-finite norm anyway, set "
+            "`error_if_nonfinite=False`"
+        )
+    return total_norm
+
+
 def _lora_input_cast_is_undone(layer, x, dtype):
     """True when lora_A would only cast x back: a bf16 / fp16 CPU input, fp32 adapters, CPU autocast in x's dtype,
     and one vanilla adapter behind an identity dropout (DoRA and friends read the fp32 input themselves; several

@@ -120,6 +120,16 @@ def _unpack_routed_weights(routed, top_k):
     return ids, weights
 
 
+def _select_reads_capture_fn(select):
+    """True when vLLM's BaseRouter._select_experts reads self.capture_fn itself, as 0.28 - 0.34 do to capture the
+    logical ids before the EPLB map; the wrapper below swaps that attribute for the call. A probe of the attribute
+    names the compiled function loads, not of its source text, so a reformat or a renamed local keeps it."""
+    if select is None:
+        return False
+    code = getattr(inspect.unwrap(select), "__code__", None)
+    return code is not None and "capture_fn" in code.co_names
+
+
 def _patch_vllm_routed_weights():
     """Make the in-process vLLM return fp32 top-k weights beside the expert ids. Every transport
     (0.28 - 0.30 slot buffer, 0.31+ aux output connector) sizes itself from
@@ -137,11 +147,7 @@ def _patch_vllm_routed_weights():
     capturer_cls = getattr(capturer_module, "RoutedExpertsCapturer", None)
     select = getattr(BaseRouter, "_select_experts", None)
     capture = getattr(capturer_cls, "capture", None)
-    try:
-        select_source = inspect.getsource(select) if select is not None else ""
-    except (OSError, TypeError):
-        select_source = ""
-    if shape_fn is None or capture is None or "self.capture_fn(topk_ids)" not in select_source:
+    if shape_fn is None or capture is None or not _select_reads_capture_fn(select):
         return False
     if getattr(shape_fn, "_unsloth_routed_weights", False):
         _VLLM_WEIGHTS_PACKED = True

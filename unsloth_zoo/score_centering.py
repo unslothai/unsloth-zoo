@@ -129,9 +129,12 @@ def _head_projection(lm_head, lm_head_bias):
     logits under UNSLOTH_VLLM_FP32_LM_HEAD=1, or by default for a 16-bit CUDA head; otherwise the head's own
     dtype under the caller's autocast. Returns (mode, lm_head, lm_head_bias)."""
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    from unsloth_zoo.rocm_build import is_rocm_torch
     flag = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower()
+    # is_rocm_torch, not torch.version.hip: ROCm SDK wheels leave hip unset, and the fp32 default would then copy
+    # the whole head to float32 on every call (fp32_out_linear_ok is off on ROCm).
     fp32_cuda_default = (
-        flag == "" and torch.version.hip is None and torch.cuda.is_available()
+        flag == "" and not is_rocm_torch(torch) and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
     )

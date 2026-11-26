@@ -559,6 +559,22 @@
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
     {
+      "file": "unsloth_zoo/vllm_qwen4_exp.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "1dc350e70b1b2c25",
+      "count": 1,
+      "reason": "patch_vllm_qwen4_exp imports from a fixed tuple of vLLM's own qwen4_exp nvidia / amd module paths; nothing comes from config or user input."
+    },
+    {
+      "file": "unsloth_zoo/vllm_qwen4_exp.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "22622b234fd10a80",
+      "count": 1,
+      "reason": "patch_vllm_qwen4_exp imports from a fixed tuple of vLLM's own qwen4_exp nvidia / amd module paths; nothing comes from config or user input."
+    },
+    {
       "file": "unsloth_zoo/vllm_utils.py",
       "rule": "dynamic-import",
       "sink": "__import__",

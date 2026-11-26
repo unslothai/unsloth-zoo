@@ -114,6 +114,12 @@ except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
 
 try:
+    from .moe_utils import _count_grouped_mm_sync
+except Exception:
+    def _count_grouped_mm_sync(*args, **kwargs):
+        return None
+
+try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
 except Exception:
     def _fused_route_or_none(*args, **kwargs):
@@ -167,6 +173,7 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     x = x.contiguous()
     if not _view_weight_ok(w):
         w = w.contiguous()
+    _count_grouped_mm_sync("torch_fallback", x, w, offs.shape[0])
     try:
         return torch._grouped_mm(x, w, offs=offs)
     except RuntimeError as e:

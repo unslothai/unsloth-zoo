@@ -61,6 +61,13 @@ from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from ._gc_passes import collect_garbage
 from .empty_model import *
+from .vllm_qwen4_exp import (
+    is_qwen4_exp_config,
+    extract_qwen4_exp_layer,
+    extract_qwen4_exp_model,
+    install_qwen4_exp_shared_tensors,
+    patch_vllm_qwen4_exp,
+)
 from .empty_model import (
     FP8_MOE_SHARED_BLOCK,
     _is_gemma4_config,
@@ -2202,6 +2209,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         packed = packed_modules_mapping.get(name)
         return isinstance(packed, (list, tuple)) and len(packed) == 1 and packed[0] == name
 
+    # Qwen3.8-Flash-Next: hyper-connections, PLE and the QSA indexer (vllm_qwen4_exp)
+    is_qwen4_exp = is_qwen4_exp_config(config)
+
     # All layers
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
@@ -2265,6 +2275,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 state_dict, quant_state_dict, get_state_dict, config = text_config,
             )
         pass
+
+        if is_qwen4_exp:
+            extract_qwen4_exp_layer(layer, f"{vllm_text_model_prefix}.layers.{kk}", state_dict, quant_state_dict, get_state_dict)
 
         if getattr(layer, "per_layer_input_gate", None) is not None:
             get_state_dict(
@@ -2381,10 +2394,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     if is_vision_model:
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
     # Final norm: model.norm, model.embedding_norm on LFM2, model.norm_f on Nemotron-H
-    norm_name = next(x for x in ("norm", "embedding_norm", "norm_f") if hasattr(vllm_text_model, x))
-    norm_prefix = f"{vllm_text_model_prefix}.{norm_name}.weight"
-    state_dict[norm_prefix] = getattr(vllm_text_model, norm_name).weight.data
-    quant_state_dict[norm_prefix] = state_dict[norm_prefix]
+    if is_qwen4_exp:
+        # No final RMSNorm: the hyper-connection mixer folds the residual streams
+        extract_qwen4_exp_model(vllm_text_model, vllm_text_model_prefix, state_dict, quant_state_dict, get_state_dict)
+    else:
+        norm_name = next(x for x in ("norm", "embedding_norm", "norm_f") if hasattr(vllm_text_model, x))
+        norm_prefix = f"{vllm_text_model_prefix}.{norm_name}.weight"
+        state_dict[norm_prefix] = getattr(vllm_text_model, norm_name).weight.data
+        quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # Gemma4 top-level per-layer-input modules
     for extra_name in ("embed_tokens_per_layer", "per_layer_model_projection", "per_layer_projection_norm"):
@@ -3080,6 +3097,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         bnb_config = bnb_config,
     )
     _align_mla_softmax_scale(new_model, config)
+    if is_qwen4_exp_config(config):
+        install_qwen4_exp_shared_tensors(new_model, quant_state_dict, config)
     if is_vision_model and _is_gemma4_config(config):
         _load_gemma4_audio_from_checkpoint(
             new_model, config,
@@ -6099,6 +6118,8 @@ def load_vllm(
             patch_gemma4_vllm_k_eq_v_support()
     if enable_lora:
         patch_vllm_stacked_moe_lora(config)
+    if is_qwen4_exp_config(config):
+        patch_vllm_qwen4_exp(config, enable_lora = enable_lora)
 
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
