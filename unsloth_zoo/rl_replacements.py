@@ -3369,13 +3369,10 @@ _ROLLOUT_BUCKETS = ("p_gt_0.9", "p_0.1_0.9", "p_lt_0.1")
 
 
 def grpo_rollout_bucket_stats(train_logps, sampling_logps, mask):
-    """Sums that split the train / rollout mismatch by the sampled token's rollout probability
-    p = exp(sampling logp) into p > 0.9, 0.1 <= p <= 0.9 and p < 0.1, plus sampled-token entropy
-    estimates, so they pool over processes and micro-batches like grpo_rollout_mismatch_stats.
-    Float64 vector: [tokens, sum |dlogp|] per bucket, then sum -log pi_train(y), sum -log pi_rollout(y).
-    The entropies are the Monte-Carlo estimates over the sampled tokens (y ~ rollout): no vocabulary pass.
-    Computed on the host from per-token copies, so the training stream gets no extra kernels; the caller's
-    metric gather already waits for these logps, so the copies add no synchronisation of their own."""
+    """Poolable float64 sums splitting the mismatch by rollout probability p = exp(sampling logp):
+    [tokens, sum |dlogp|] for p > 0.9, 0.1 <= p <= 0.9, p < 0.1, then sum -log pi_train(y) and
+    sum -log pi_rollout(y) (sampled-token entropy estimates, y ~ rollout, no vocabulary pass).
+    Runs on the host: the caller's metric gather already waits for these logps."""
     with torch.no_grad():
         train = train_logps.detach().to(device = "cpu", dtype = torch.float64)
         sampling = sampling_logps.detach().to(device = "cpu", dtype = torch.float64)
@@ -5368,8 +5365,7 @@ def grpo_accumulated_loss(
                 grpo_rollout_bucket_metrics as _grpo_rollout_bucket_metrics,
             )
             _rollout_stats = _grpo_rollout_mismatch_stats(*_rollout_stats_args)
-            # Appended sums pool like the others below (only index 3 is a max). Zeros keep every rank's
-            # vector the same length for the gather when a micro-batch has no bucket inputs.
+            # Appended sums pool like the rest (only index 3 is a max); zeros keep the gather length equal.
             _n_mismatch = _rollout_stats.numel()
             if _rollout_bucket_args is not None:
                 _bucket_stats = _grpo_rollout_bucket_stats(*_rollout_bucket_args)
