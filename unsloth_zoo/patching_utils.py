@@ -303,7 +303,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         f"config.max_autotune_gemm = False", # GEMM is unnecessary
         "config.max_autotune_gemm_backends = 'ATEN,TRITON,CPP'", # Not much faster
         "config.autotune_fallback_to_aten = True", # Fallback to ATEN backend
-        "config.autotune_multi_device = True", # If autotuning in subprocess, whether to use multiple devices
+        # No autotune_multi_device: int()-parses CUDA_VISIBLE_DEVICES (UUID / MIG masks raise) and tunes on every visible card.
         f"config.coordinate_descent_tuning = {O3}",
         f"config.aggressive_fusion = {O3}", # Careful changes results!
         # [TODO] COMBO KERNELS makes everything slower!
