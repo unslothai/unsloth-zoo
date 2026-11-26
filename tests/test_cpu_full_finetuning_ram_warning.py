@@ -25,21 +25,34 @@ _RANK_VARS = ("LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE
               "WORLD_SIZE", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE")
 
 
-@pytest.fixture(scope = "module")
-def tiny(tmp_path_factory):
+def _checkpoint(path, dtype):
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
-    path = tmp_path_factory.mktemp("tiny-bf16") / "tiny"
     config = Qwen3Config(vocab_size = 128, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
                          num_attention_heads = 2, num_key_value_heads = 1, head_dim = 16, max_position_embeddings = 64,
                          tie_word_embeddings = True)
     torch.manual_seed(0)
-    Qwen3ForCausalLM(config).to(torch.bfloat16).save_pretrained(path)
+    Qwen3ForCausalLM(config).to(dtype).save_pretrained(path)
     vocab = {"<unk>": 0, "<eos>": 1, **{f"t{i}": i for i in range(2, 128)}}
     tokenizer = Tokenizer(models.WordLevel(vocab, unk_token = "<unk>"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     PreTrainedTokenizerFast(tokenizer_object = tokenizer, unk_token = "<unk>", eos_token = "<eos>").save_pretrained(path)
     return str(path)
+
+
+@pytest.fixture(scope = "module")
+def tiny(tmp_path_factory):
+    return _checkpoint(tmp_path_factory.mktemp("tiny-bf16") / "tiny", torch.bfloat16)
+
+
+@pytest.fixture(scope = "module")
+def tiny_fp32(tmp_path_factory):
+    return _checkpoint(tmp_path_factory.mktemp("tiny-fp32") / "tiny", torch.float32)
+
+
+@pytest.fixture(scope = "module")
+def tiny_fp16(tmp_path_factory):
+    return _checkpoint(tmp_path_factory.mktemp("tiny-fp16") / "tiny", torch.float16)
 
 
 @pytest.fixture(autouse = True)
@@ -120,4 +133,19 @@ def test_lora_and_unknown_ram_do_not_warn(tiny, monkeypatch, ram):
 def test_several_processes_do_not_warn(tiny, monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "2")
     _, out = _load(monkeypatch, tiny, 1, False, full_finetuning = True)
+    assert not _warned(out), out
+
+
+@pytest.mark.parametrize("key", ["dtype", "torch_dtype"])
+def test_auto_dtype_sizes_the_dtype_that_loads(tiny, tiny_fp32, tiny_fp16, monkeypatch, key):
+    """dtype = "auto" loads the checkpoint's dtype: a bf16 checkpoint stays bf16 (no float32 state, no warning) even on a
+    CPU without native bf16, a float32 one is float32 even on a native-bf16 CPU, and float16 becomes the CPU's."""
+    low = _needed(tiny) // 2
+    _, out = _load(monkeypatch, tiny, low, False, full_finetuning = True, **{key: "auto"})
+    assert not _warned(out), out
+    _, out = _load(monkeypatch, tiny_fp32, low, True, full_finetuning = True, **{key: "auto"})
+    assert _warned(out), out
+    _, out = _load(monkeypatch, tiny_fp16, low, False, full_finetuning = True, **{key: "auto"})
+    assert _warned(out), out
+    _, out = _load(monkeypatch, tiny_fp16, low, True, full_finetuning = True, **{key: "auto"})
     assert not _warned(out), out

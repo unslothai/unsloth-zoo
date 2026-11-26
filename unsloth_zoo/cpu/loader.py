@@ -877,7 +877,14 @@ class FastCPUModel:
                 if master_fit is not None and master_fit[2]:
                     master_fp32, master_choice, dtype = True, "fits", torch.float32
 
-        if full_finetuning and dtype == torch.float32 and not (master_fit is not None and master_fit[2]) \
+        # dtype = "auto" loads the checkpoint's dtype (float16 moves to bfloat16 / float32 after loading, as below).
+        loaded_dtype = dtype
+        if auto_dtype and full_finetuning:
+            loaded_dtype = _checkpoint_dtype(model_name, token = token, revision = revision,
+                                             trust_remote_code = trust_remote_code, **probe_kwargs)
+            if loaded_dtype == torch.float16:
+                loaded_dtype = torch.bfloat16 if cpu_bf16_supported() else torch.float32
+        if full_finetuning and loaded_dtype == torch.float32 and not (master_fit is not None and master_fit[2]) \
                 and not _multi_process():
             # float32 weights, grads and AdamW states (every CPU without native bf16: Apple Silicon, AVX2 x86) that do not
             # fit in RAM swap: Qwen3-0.6B on a 7 GB Apple M1 took 266 s per step instead of about 3 s.
