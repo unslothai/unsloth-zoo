@@ -817,3 +817,14 @@ def test_load_vllm_tags_the_fp8_kv_cache():
     import unsloth_zoo.vllm_utils as vu
 
     assert "llm._unsloth_float8_kv_cache = bool(float8_kv_cache)" in inspect.getsource(vu.load_vllm)
+
+
+@pytest.mark.parametrize("clip_min, low", [(None, 1.0), (0.0, 0.0), (0.1, 0.0), (0.2, 1.0)])
+def test_ratio_fraction_low_respects_an_explicit_zero_bound(clip_min, low):
+    # Raw ratio exp(-2) = 0.135 against [clip_min, 2]: unset defaults to 1 / 2, an explicit 0 is no bound.
+    old = torch.tensor([[-3.0]], dtype = torch.float64)
+    sampling = torch.tensor([[-1.0]], dtype = torch.float64)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, torch.ones(1, 1), torch.ones(1, 1), clip_max = 2.0, clip_min = clip_min)
+    metrics = rr.grpo_rollout_mismatch_metrics(stats)
+    assert metrics["sampling/importance_sampling_ratio_fraction_low"] == low
+    assert metrics["sampling/importance_sampling_ratio_fraction_high"] == 0.0

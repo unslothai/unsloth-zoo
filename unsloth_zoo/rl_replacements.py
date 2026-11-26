@@ -3380,7 +3380,7 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights, cli
     +-20 first, verl's and ms-swift's chi2_seq); 12-21: ppl rows, then per row sums of training ppl, training
     log ppl, rollout ppl, rollout log ppl, log_ppl_diff, |log_ppl_diff|, max and -min of log_ppl_diff,
     exp(log_ppl_diff); 22-27: max w, -min w, tokens with raw rho above clip_max / below clip_min (default
-    1 / clip_max), tokens the bounds were counted over, tokens whose two logps differ bitwise.
+    1 / clip_max when unset, none when 0), tokens the bounds were counted over, tokens whose two logps differ bitwise.
     k1 = log pi_rollout - log pi_train and k3 = r - 1 - log r (r = pi_train / pi_rollout) estimate
     KL(rollout || train) as verl compute_offpolicy_metrics; w = the applied IS weights. logps = False when
     the inputs are a log ratio and zeros, not two logps: the ppl fields are then left empty."""
@@ -3433,7 +3433,11 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights, cli
             ppl = [zero] * 7 + [neg_inf, neg_inf, zero]
         if clip_max is not None and float(clip_max) > 0:
             upper = math.log(float(clip_max))
-            lower = math.log(float(clip_min)) if clip_min is not None and float(clip_min) > 0 else -upper
+            # Unset lower bound: 1 / clip_max (verl's default); an explicit 0 means no lower bound.
+            if clip_min is None:
+                lower = -upper
+            else:
+                lower = math.log(float(clip_min)) if float(clip_min) > 0 else float("-inf")
             bounds = [((log_ratio > upper) & keep).sum().to(torch.float64),
                       ((log_ratio < lower) & keep).sum().to(torch.float64), maskd.sum()]
         else:
