@@ -33,6 +33,7 @@ __all__ = [
 ]
 
 import functools
+import os
 
 import torch
 
@@ -72,6 +73,39 @@ def _patch_gated_residual_padding(cls):
     cls.__init__ = __init__
     return True
 pass
+
+
+def _is_vllm_lora_wrapped(module):
+    return module is not None and (hasattr(module, "base_layer") or type(module).__name__.endswith("WithLoRA"))
+pass
+
+
+def _patch_gated_residual_lora(cls):
+    """vLLM's fused hyper-connection down + SiLU kernel (CuTeDSL, M <= 48 tokens: decode and short prompts) reads
+    input_mix_weight_down_block_inject.weight directly. Under LoRA that is the wrapper's base weight, so an adapter
+    on input_mix_weight_down / block_inject_weight would be dropped in decode while prefill applies it. When the
+    projection is LoRA-wrapped, use the unfused path, which calls the wrapper.
+    UNSLOTH_QWEN4_EXP_HC_LORA_FALLBACK=0 keeps the fused kernel."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    original = getattr(cls, "_down_and_inject", None)
+    if original is None or getattr(original, "_unsloth_hc_lora", False): return False
+
+    @functools.wraps(original)
+    def _down_and_inject(self, xn):
+        if getattr(self, "_use_hc_down_silu", False) \
+            and os.environ.get("UNSLOTH_QWEN4_EXP_HC_LORA_FALLBACK", "1") != "0" \
+            and _is_vllm_lora_wrapped(getattr(self, "input_mix_weight_down_block_inject", None)):
+            self._use_hc_down_silu = False
+            _HC_LORA_FALLBACKS[0] += 1
+        return original(self, xn)
+    _down_and_inject._unsloth_hc_lora = True
+    cls._down_and_inject = _down_and_inject
+    return True
+pass
+
+
+# Hyper-connections switched to the unfused down + inject GEMM because the projection is LoRA-wrapped.
+_HC_LORA_FALLBACKS = [0]
 
 
 def _vllm_supported_architectures():
@@ -138,6 +172,8 @@ def patch_vllm_qwen4_exp(config = None, enable_lora = False):
         cls = getattr(module, "GatedResidual", None)
         if cls is not None and _patch_gated_residual_padding(cls):
             patched.append(f"{module_name}.GatedResidual")
+        if cls is not None and enable_lora and _patch_gated_residual_lora(cls):
+            patched.append(f"{module_name}.GatedResidual._down_and_inject")
     if patched:
         logger.info(f"Unsloth: patched vLLM Qwen4Exp classes {patched}.")
     return patched

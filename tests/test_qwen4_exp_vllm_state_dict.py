@@ -358,3 +358,35 @@ def test_qwen4_exp_vision_tower_keeps_fused_qkv(vision_type):
     from unsloth_zoo.empty_model import QWEN_VL_MERGED_QKV_TYPES, get_model_type
     config = types.SimpleNamespace(model_type = "qwen4_exp", vision_config = types.SimpleNamespace(model_type = vision_type))
     assert get_model_type(config) in QWEN_VL_MERGED_QKV_TYPES
+
+
+def _fake_hc_with_fused_kernel(wrapped):
+    class GatedResidual:
+        def __init__(self):
+            self._use_hc_down_silu = True
+            linear = torch.nn.Module()
+            if wrapped:
+                linear.base_layer = torch.nn.Module()
+            self.input_mix_weight_down_block_inject = linear
+            self.paths = []
+
+        def _down_and_inject(self, xn):
+            self.paths.append("fused" if self._use_hc_down_silu else "module")
+            return xn, None
+    return GatedResidual
+
+
+@pytest.mark.parametrize("wrapped,env,expected", [(True, None, "module"), (False, None, "fused"), (True, "0", "fused")])
+def test_hc_fused_down_kernel_skipped_under_lora(monkeypatch, wrapped, env, expected):
+    # The fused CuTeDSL kernel reads the base weight, so a LoRA-wrapped down / inject projection must take the
+    # module path (which runs the adapter); without LoRA, or with the kill switch, the fused kernel stays.
+    from unsloth_zoo.vllm_qwen4_exp import _patch_gated_residual_lora
+    if env is None: monkeypatch.delenv("UNSLOTH_QWEN4_EXP_HC_LORA_FALLBACK", raising = False)
+    else: monkeypatch.setenv("UNSLOTH_QWEN4_EXP_HC_LORA_FALLBACK", env)
+    cls = _fake_hc_with_fused_kernel(wrapped)
+    assert _patch_gated_residual_lora(cls) is True
+    assert _patch_gated_residual_lora(cls) is False
+    hc = cls()
+    hc._down_and_inject(torch.zeros(1))
+    hc._down_and_inject(torch.zeros(1))
+    assert hc.paths == [expected, expected]
