@@ -303,13 +303,19 @@ def _launcher_set_one_thread():
 
 
 _THREADS_FITTED = None
+# Default ceiling on the fitted count. A training step is thousands of small ops (a 0.6B LoRA step at 2 x 128 tokens
+# is ~3000 GEMMs plus elementwise ops), each an OpenMP fork / join: past ~16 threads the barriers cost more than the
+# cores add, and oneDNN's AMX bf16 matmul for 256 x 3072 x 1024 runs 10-15x slower at 32+ threads than at 16. Xeon
+# 8559C (48 cores per node), Qwen3-0.6B: SFT LoRA 0.25 s/step at 16 threads vs 24-50 s at 48; GRPO and full
+# finetuning best or within spread at 16 too. UNSLOTH_CPU_THREADS / OMP_NUM_THREADS still set any count.
+_DEFAULT_THREAD_CAP = 16
 
 
 def fit_cpu_threads():
     """Sizes torch's intra-op pool for CPU training. Idempotent; returns (threads, reason).
     UNSLOTH_CPU_THREADS wins; a user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept; otherwise one thread per physical
-    core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate. Never raises the
-    count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
+    core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate, and at most
+    _DEFAULT_THREAD_CAP. Never raises the count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
     global _THREADS_FITTED
     import torch
     if _THREADS_FITTED is not None:
@@ -347,6 +353,8 @@ def fit_cpu_threads():
                 except Exception:
                     quota = None
                 fitted = max(1, min(cores, quota // ranks) if quota else cores)
+            capped = fitted > _DEFAULT_THREAD_CAP
+            fitted = min(fitted, _DEFAULT_THREAD_CAP)
             if launcher:
                 target, reason = fitted, "launcher OMP_NUM_THREADS=1 undone"
             elif fitted < current:
@@ -356,6 +364,8 @@ def fit_cpu_threads():
                     quota = None
                 basis = "cgroup CPU quota" if quota is not None and quota <= cores else "physical cores"
                 target, reason = fitted, basis + (f" / {ranks} local ranks" if ranks > 1 else "")
+                if capped:
+                    reason += f", capped at {_DEFAULT_THREAD_CAP}"
     if target is not None and target != current:
         try:
             torch.set_num_threads(target)
