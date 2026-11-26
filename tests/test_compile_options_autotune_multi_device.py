@@ -32,13 +32,15 @@ import json, os, sys
 import torch
 import unsloth_zoo, unsloth_zoo.patching_utils as pu
 import torch._inductor.config as config
-default = config._config["autotune_multi_device"].default
+default = config.autotune_multi_device  # fresh interpreter, env override popped: the torch default
 pu.patch_torch_compile()
 out = {"file": unsloth_zoo.__file__, "value": config.autotune_multi_device, "default": default}
 from torch._inductor import autotune_process as ap
 # A UUID mask under a private env var name, so the host's real device mask is never touched.
 os.environ["UNSLOTH_TEST_VISIBLE_DEVICES"] = "GPU-6f1d3a2c-1b2e-4c3d-9e8f-0a1b2c3d4e5f"
-ap.get_visible_devices_env_var = lambda *a, **k: "UNSLOTH_TEST_VISIBLE_DEVICES"
+out["masked"] = hasattr(ap, "get_visible_devices_env_var")  # older torch reads CUDA_VISIBLE_DEVICES directly
+if out["masked"]:
+    ap.get_visible_devices_env_var = lambda *a, **k: "UNSLOTH_TEST_VISIBLE_DEVICES"
 try:
     out["devices"] = list(ap.TuningProcessPool.get_device_list())
 except Exception as e:
@@ -63,8 +65,9 @@ def test_autotune_multi_device_is_torch_default_and_uuid_mask_does_not_raise():
     out = _probe()
     assert pathlib.Path(out["file"]).resolve().is_relative_to(_REPO), out["file"]
     assert out["value"] == out["default"], out
-    assert "error" not in out, out["error"]
-    assert out["devices"] == [None], out
+    if out["masked"]:
+        assert "error" not in out, out["error"]
+        assert out["devices"] == [None], out
 
 
 def test_patching_utils_does_not_force_autotune_multi_device():
