@@ -1601,7 +1601,9 @@ def grpo_compute_loss(
                 # Geometric mean of the token ratios (verl seq_mean_k1): the product blows up on long rows.
                 importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
 
-            importance_sampling_ratio = torch.exp(importance_sampling_ratio)
+            # Bounded like verl (SAFETY_BOUND): a row whose log ratios sum past ~88 overflows float32 to inf,
+            # which an unbounded *_mask mode keeps as an infinite weight.
+            importance_sampling_ratio = torch.exp(torch.clamp(importance_sampling_ratio, min = -20.0, max = 20.0))
 
             if vllm_importance_sampling_mode in ["token_truncate", "sequence_truncate", "geometric_truncate"]:
                 importance_sampling_ratio = torch.clamp(
@@ -2288,6 +2290,53 @@ def grpo_warn_unreplayed_penalties(trainer):
         _warnings.warn(message)
 pass
 RL_REPLACEMENTS["grpo_warn_unreplayed_penalties"] = grpo_warn_unreplayed_penalties
+
+
+def _grpo_rollout_kv_cache_is_fp8(trainer):
+    """Whether the engine generating the rollouts stores its KV cache in FP8 (load_vllm's float8_kv_cache,
+    or the engine's own cache_dtype)."""
+    llm = getattr(trainer, "llm", None)
+    if llm is None:
+        llm = getattr(getattr(trainer, "vllm_generation", None), "llm", None)
+    if llm is None:
+        llm = getattr(getattr(trainer, "model", None), "vllm_engine", None)
+    if llm is None:
+        return False
+    if getattr(llm, "_unsloth_float8_kv_cache", False):
+        return True
+    config = getattr(getattr(llm, "llm_engine", None), "vllm_config", None)
+    dtype = getattr(getattr(config, "cache_config", None), "cache_dtype", None)
+    return isinstance(dtype, str) and dtype.startswith("fp8")
+pass
+
+
+def grpo_warn_fp8_kv_cache_without_is(trainer):
+    """Warn once per trainer when the vLLM rollouts use an FP8 KV cache and the vLLM importance sampling
+    correction is off: verl measured the train / rollout k3 mismatch doubling with an FP8 KV cache
+    (0.00264 -> 0.00534), mostly from uncalibrated KV scales, and nothing then corrects for it."""
+    if getattr(trainer, "_unsloth_grpo_fp8_kv_warned", False):
+        return
+    try:
+        trainer._unsloth_grpo_fp8_kv_warned = True
+    except Exception:
+        pass
+    if not getattr(trainer, "use_vllm", False) or getattr(trainer, "vllm_importance_sampling_correction", False):
+        return
+    if not _grpo_rollout_kv_cache_is_fp8(trainer):
+        return
+    message = (
+        "Unsloth: GRPO rollouts use an FP8 KV cache (float8_kv_cache = True) with "
+        "vllm_importance_sampling_correction off. An FP8 KV cache about doubles the train / rollout "
+        "logprob mismatch (verl: k3 0.00264 -> 0.00534); set vllm_importance_sampling_correction = True "
+        "to correct for it, or load without float8_kv_cache."
+    )
+    try:
+        logger.warning(message)
+    except Exception:
+        import warnings as _warnings
+        _warnings.warn(message)
+pass
+RL_REPLACEMENTS["grpo_warn_fp8_kv_cache_without_is"] = grpo_warn_fp8_kv_cache_without_is
 
 
 def grpo_truncated_support_blockers(trainer):
@@ -3311,14 +3360,29 @@ pass
 RL_REPLACEMENTS["grpo_rollout_rs_keep"] = grpo_rollout_rs_keep
 
 
-def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
+# Bound on log ratios before exp in the chi2 metrics and the IS ratio (verl SAFETY_BOUND).
+_ROLLOUT_LOG_RATIO_BOUND = 20.0
+# Fields of grpo_rollout_mismatch_stats pooled by max (a min is stored negated); every other field is a sum.
+_ROLLOUT_STATS_MAX = (3, 19, 20, 22, 23)
+_ROLLOUT_STATS_LEN = 28
+
+
+def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights, clip_max = None, clip_min = None, logps = True):
     """Sums for the rollout / trainer mismatch metrics over valid tokens, so processes and
-    micro-batches can be pooled before dividing. Returns a float64 vector:
-    [tokens, sum k1, sum k3, max k3, sum w, sum w^2, rejected tokens, rows, rejected rows],
+    micro-batches can be pooled before dividing (grpo_rollout_stats_reduce). Float64 vector:
+    0-8: tokens, sum k1, sum k3, max k3, sum w, sum w^2, rejected tokens, rows, rejected rows;
+    9-11: sum rho^2 (token), sum (prod rho)^2 and sum (geometric mean rho)^2 per row (log ratios clamped to
+    +-20 first, verl's and ms-swift's chi2_seq); 12-21: ppl rows, then per row sums of training ppl, training
+    log ppl, rollout ppl, rollout log ppl, log_ppl_diff, |log_ppl_diff|, max and -min of log_ppl_diff,
+    exp(log_ppl_diff); 22-27: max w, -min w, tokens with raw rho above clip_max / below clip_min (default
+    1 / clip_max), tokens the bounds were counted over, tokens whose two logps differ bitwise.
     k1 = log pi_rollout - log pi_train and k3 = r - 1 - log r (r = pi_train / pi_rollout) estimate
-    KL(rollout || train) as verl compute_offpolicy_metrics; w = the applied IS weights."""
+    KL(rollout || train) as verl compute_offpolicy_metrics; w = the applied IS weights. logps = False when
+    the inputs are a log ratio and zeros, not two logps: the ppl fields are then left empty."""
     with torch.no_grad():
-        log_ratio = old_logps.to(torch.float64) - sampling_logps.to(torch.float64)
+        old = old_logps.to(torch.float64)
+        sampling = sampling_logps.to(torch.float64)
+        log_ratio = old - sampling
         # Tokens vLLM could not score (NaN) carry no divergence information: leave them out.
         keep = mask.to(torch.bool) & ~torch.isnan(log_ratio)
         maskd = keep.to(torch.float64)
@@ -3330,29 +3394,118 @@ def grpo_rollout_mismatch_stats(old_logps, sampling_logps, mask, is_weights):
         k3 = (torch.expm1(log_ratio) - log_ratio) * maskd
         w = torch.broadcast_to(is_weights.to(torch.float64), maskd.shape) * maskd
         rejected = ((w == 0) & keep).to(torch.float64)
-        rows = (maskd.sum(-1) > 0).to(torch.float64)
+        counts = maskd.sum(-1)
+        rows = (counts > 0).to(torch.float64)
+        zero = log_ratio.new_zeros(())
+        neg_inf = log_ratio.new_full((), float("-inf"))
+        bound = _ROLLOUT_LOG_RATIO_BOUND
+        row_log_ratio = log_ratio.sum(-1)
+        row_mean_log_ratio = row_log_ratio / counts.clamp(min = 1.0)
+        chi2 = [
+            (torch.exp(2.0 * torch.clamp(log_ratio, min = -bound, max = bound)) * maskd).sum(),
+            (torch.exp(2.0 * torch.clamp(row_log_ratio, min = -bound, max = bound)) * rows).sum(),
+            (torch.exp(2.0 * torch.clamp(row_mean_log_ratio, min = -bound, max = bound)) * rows).sum(),
+        ]
+        if logps:
+            # Per row mean logps over the scored tokens, as verl's masked_mean(axis = -1); -inf logps stay finite.
+            train_mean = (torch.nan_to_num(old, nan = 0.0, neginf = -670.0, posinf = 670.0) * maskd).sum(-1) / counts.clamp(min = 1.0)
+            rollout_mean = (torch.nan_to_num(sampling, nan = 0.0, neginf = -670.0, posinf = 670.0) * maskd).sum(-1) / counts.clamp(min = 1.0)
+            diff = rollout_mean - train_mean
+            valid = rows.to(torch.bool)
+            ppl = [
+                rows.sum(),
+                (torch.exp(torch.clamp(-train_mean, max = 670.0)) * rows).sum(),
+                (-train_mean * rows).sum(),
+                (torch.exp(torch.clamp(-rollout_mean, max = 670.0)) * rows).sum(),
+                (-rollout_mean * rows).sum(),
+                (diff * rows).sum(),
+                (diff.abs() * rows).sum(),
+                diff.masked_fill(~valid, float("-inf")).amax() if diff.numel() > 0 else neg_inf,
+                (-diff).masked_fill(~valid, float("-inf")).amax() if diff.numel() > 0 else neg_inf,
+                (torch.exp(torch.clamp(diff, max = 670.0)) * rows).sum(),
+            ]
+        else:
+            ppl = [zero] * 7 + [neg_inf, neg_inf, zero]
+        if clip_max is not None and float(clip_max) > 0:
+            upper = math.log(float(clip_max))
+            lower = math.log(float(clip_min)) if clip_min is not None and float(clip_min) > 0 else -upper
+            bounds = [((log_ratio > upper) & keep).sum().to(torch.float64),
+                      ((log_ratio < lower) & keep).sum().to(torch.float64), maskd.sum()]
+        else:
+            bounds = [zero, zero, zero]
+        # Bitwise: also right for a log ratio against zeros (logps = False).
+        differ = ((old != sampling) & keep).sum().to(torch.float64)
         return torch.stack([
             maskd.sum(),
             (-log_ratio).sum(),
             k3.sum(),
-            k3.amax() if k3.numel() > 0 else k3.new_zeros(()),
+            k3.amax() if k3.numel() > 0 else zero,
             w.sum(),
             (w * w).sum(),
             rejected.sum(),
             rows.sum(),
             ((rejected.sum(-1) > 0).to(torch.float64) * rows).sum(),
+            *chi2,
+            *ppl,
+            w.masked_fill(~keep, float("-inf")).amax() if w.numel() > 0 else neg_inf,
+            (-w).masked_fill(~keep, float("-inf")).amax() if w.numel() > 0 else neg_inf,
+            *bounds,
+            differ,
         ])
 pass
 RL_REPLACEMENTS["grpo_rollout_mismatch_stats"] = grpo_rollout_mismatch_stats
 
 
+def grpo_rollout_stats_reduce(stacked):
+    """Pools stacked [n, L] grpo_rollout_mismatch_stats rows (processes or micro-batches), plus any summed
+    fields appended after them: max for the max fields, sum for the rest."""
+    stacked = stacked.to(torch.float64)
+    is_max = torch.zeros(stacked.shape[-1], dtype = torch.bool, device = stacked.device)
+    is_max[list(_ROLLOUT_STATS_MAX)] = True
+    return torch.where(is_max, stacked.amax(0), stacked.sum(0))
+pass
+RL_REPLACEMENTS["grpo_rollout_stats_reduce"] = grpo_rollout_stats_reduce
+
+
+def grpo_warn_rollout_mismatch(trainer, metrics):
+    """Warn once per trainer on verl's rule of thumb for a train / rollout mismatch the IS correction
+    struggles with: effective sample size below 0.3 or token chi2 above 1."""
+    if getattr(trainer, "_unsloth_grpo_mismatch_warned", False):
+        return
+    ess = metrics.get("sampling/importance_sampling_ess", None)
+    chi2 = metrics.get("sampling/rollout_chi2_token", None)
+    found = []
+    if ess is not None and 0.0 < ess < 0.3:
+        found.append(f"importance sampling ESS {ess:.3f} < 0.3")
+    if chi2 is not None and chi2 > 1.0:
+        found.append(f"token chi2 {chi2:.3f} > 1.0")
+    if not found:
+        return
+    try:
+        trainer._unsloth_grpo_mismatch_warned = True
+    except Exception:
+        pass
+    message = (
+        "Unsloth: large GRPO train / rollout mismatch (" + ", ".join(found) + "). The vLLM rollouts differ "
+        "enough from the trainer's policy that importance sampling weights are dominated by a few tokens; "
+        "check the rollout precision (fp16 / FP8 KV cache), sampling penalties and the weight sync."
+    )
+    try:
+        logger.warning(message)
+    except Exception:
+        import warnings as _warnings
+        _warnings.warn(message)
+pass
+RL_REPLACEMENTS["grpo_warn_rollout_mismatch"] = grpo_warn_rollout_mismatch
+
+
 def grpo_rollout_mismatch_metrics(stats):
-    """Metric dict from (summed, k3 max maxed) grpo_rollout_mismatch_stats. ESS is the normalised
-    effective sample size (sum w)^2 / (N sum w^2) of the applied IS weights, verl's
-    rollout_is_eff_sample_size."""
+    """Metric dict from pooled grpo_rollout_mismatch_stats. ESS is the normalised effective sample
+    size (sum w)^2 / (N sum w^2) of the applied IS weights, verl's rollout_is_eff_sample_size. The rest
+    follow verl compute_offpolicy_metrics / compute_is_metrics (token-level), pooled over the window."""
     stats = [float(x) for x in stats.tolist()]
-    n, k1, k3, k3_max, w1, w2, rej, rows, rej_rows = stats
-    return {
+    n, k1, k3, k3_max, w1, w2, rej, rows, rej_rows = stats[:9]
+    metrics = {
         "sampling/rollout_kl_k1/mean": k1 / max(n, 1.0),
         "sampling/rollout_kl_k3/mean": k3 / max(n, 1.0),
         "sampling/rollout_kl_k3/max": k3_max,
@@ -3360,6 +3513,34 @@ def grpo_rollout_mismatch_metrics(stats):
         "sampling/importance_sampling_rejected_frac": rej / max(n, 1.0),
         "sampling/importance_sampling_rejected_seq_frac": rej_rows / max(rows, 1.0),
     }
+    if len(stats) < _ROLLOUT_STATS_LEN:
+        return metrics
+    rho2, seq2, geo2, ppl_rows = stats[9:13]
+    if n > 0:
+        mean_w = w1 / n
+        metrics["sampling/rollout_chi2_token"] = rho2 / n - 1.0
+        metrics["sampling/importance_sampling_weight/mean"] = mean_w
+        metrics["sampling/importance_sampling_weight/std"] = math.sqrt(max(w2 / n - mean_w * mean_w, 0.0)) if n > 1 else 0.0
+        metrics["sampling/importance_sampling_weight/max"] = stats[22]
+        metrics["sampling/importance_sampling_weight/min"] = -stats[23]
+        metrics["sampling/rollout_logprobs_mismatch_count"] = stats[27]
+    if rows > 0:
+        metrics["sampling/rollout_chi2_seq"] = seq2 / rows - 1.0
+        metrics["sampling/rollout_chi2_seq_geometric"] = geo2 / rows - 1.0
+    if ppl_rows > 0:
+        metrics["sampling/training_ppl"] = stats[13] / ppl_rows
+        metrics["sampling/training_log_ppl"] = stats[14] / ppl_rows
+        metrics["sampling/rollout_ppl"] = stats[15] / ppl_rows
+        metrics["sampling/rollout_log_ppl"] = stats[16] / ppl_rows
+        metrics["sampling/log_ppl_diff/mean"] = stats[17] / ppl_rows
+        metrics["sampling/log_ppl_diff/abs_mean"] = stats[18] / ppl_rows
+        metrics["sampling/log_ppl_diff/max"] = stats[19]
+        metrics["sampling/log_ppl_diff/min"] = -stats[20]
+        metrics["sampling/ppl_ratio"] = stats[21] / ppl_rows
+    if stats[26] > 0:
+        metrics["sampling/importance_sampling_ratio_fraction_high"] = stats[24] / stats[26]
+        metrics["sampling/importance_sampling_ratio_fraction_low"] = stats[25] / stats[26]
+    return metrics
 pass
 RL_REPLACEMENTS["grpo_rollout_mismatch_metrics"] = grpo_rollout_mismatch_metrics
 
@@ -3796,6 +3977,12 @@ def grpo_accumulated_loss(
         try:
             from unsloth_zoo.rl_replacements import grpo_warn_unreplayed_penalties
             grpo_warn_unreplayed_penalties(trainer)
+        except Exception:
+            pass
+    if not getattr(trainer, "_unsloth_grpo_fp8_kv_warned", False):
+        try:
+            from unsloth_zoo.rl_replacements import grpo_warn_fp8_kv_cache_without_is
+            grpo_warn_fp8_kv_cache_without_is(trainer)
         except Exception:
             pass
 
@@ -5338,6 +5525,7 @@ def grpo_accumulated_loss(
                     upstream_scale,
                 )
         _rollout_stats_args = None
+        _rollout_stats_kwargs = {}
         # (pi_train logps, rollout logps, mask) for the per-probability-bucket split of the mismatch.
         _rollout_bucket_args = None
         if _rollout_logps_as_old:
@@ -5358,6 +5546,7 @@ def grpo_accumulated_loss(
                 # An overflowed ratio is capped (finite squares) so ESS tends to its 1 / N limit, not nan.
                 _ess_weights = torch.clamp(flat_is_ratio.to(torch.float64), max = 1e100)
                 _rollout_stats_args = (_log_ratio, torch.zeros_like(_log_ratio), completion_mask, _ess_weights)
+                _rollout_stats_kwargs = {"logps": False}
                 if new_logprobs.shape == completion_mask.shape and old_logps.shape == completion_mask.shape:
                     _bucket_mask = completion_mask.to(torch.bool)
                     if _rollout_unscored is not None:
@@ -5368,6 +5557,10 @@ def grpo_accumulated_loss(
             and flat_is_ratio is not None and flat_is_ratio.numel() > 0
         ):
             _rollout_stats_args = (old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
+            _rollout_stats_kwargs = {
+                "clip_max": kwargs.get("vllm_importance_sampling_clip_max", None),
+                "clip_min": kwargs.get("vllm_importance_sampling_clip_min", None),
+            }
             if old_logps.shape == sampling_per_token_logps.shape == completion_mask.shape:
                 _rollout_bucket_args = (old_logps, sampling_per_token_logps, completion_mask, new_entropies)
         if _rollout_stats_args is not None:
@@ -5376,9 +5569,11 @@ def grpo_accumulated_loss(
                 grpo_rollout_mismatch_metrics as _grpo_rollout_mismatch_metrics,
                 grpo_rollout_bucket_stats as _grpo_rollout_bucket_stats,
                 grpo_rollout_bucket_metrics as _grpo_rollout_bucket_metrics,
+                grpo_rollout_stats_reduce as _grpo_rollout_stats_reduce,
+                grpo_warn_rollout_mismatch as _grpo_warn_rollout_mismatch,
             )
-            _rollout_stats = _grpo_rollout_mismatch_stats(*_rollout_stats_args)
-            # Appended sums pool like the rest (only index 3 is a max); zeros keep the gather length equal.
+            _rollout_stats = _grpo_rollout_mismatch_stats(*_rollout_stats_args, **_rollout_stats_kwargs)
+            # Appended bucket sums pool as sums; zeros keep the gather length equal.
             _n_mismatch = _rollout_stats.numel()
             if _rollout_bucket_args is not None:
                 _bucket_stats = _grpo_rollout_bucket_stats(*_rollout_bucket_args)
@@ -5386,7 +5581,7 @@ def grpo_accumulated_loss(
                 _bucket_stats = torch.zeros(10, dtype = torch.float64)
             _rollout_stats = torch.cat([_rollout_stats, _bucket_stats.to(_rollout_stats.device)])
             _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
-            _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
+            _rollout_stats = _grpo_rollout_stats_reduce(_rollout_stats)
             _metrics = trainer._metrics
             _bucket = "train" if _training else "eval"
             if "train" in _metrics:
@@ -5400,14 +5595,13 @@ def grpo_accumulated_loss(
             _prev = _rollout_acc.get(_bucket)
             if _prev is not None and "sampling/rollout_kl_k1/mean" in _metrics:
                 _prev = _prev.to(_rollout_stats.device)
-                _rollout_stats = torch.cat([
-                    _prev[:3] + _rollout_stats[:3],
-                    torch.maximum(_prev[3:4], _rollout_stats[3:4]),
-                    _prev[4:] + _rollout_stats[4:],
-                ])
+                _rollout_stats = _grpo_rollout_stats_reduce(torch.stack([_prev, _rollout_stats]))
             _rollout_acc[_bucket] = _rollout_stats.detach()
-            for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats[:_n_mismatch]).items():
+            _mismatch_metrics = _grpo_rollout_mismatch_metrics(_rollout_stats[:_n_mismatch])
+            for _name, _value in _mismatch_metrics.items():
                 _metrics[_name] = [_value]
+            if _training:
+                _grpo_warn_rollout_mismatch(trainer, _mismatch_metrics)
             for _name, _value in _grpo_rollout_bucket_metrics(_rollout_stats[_n_mismatch:]).items():
                 _metrics[_name] = [_value]
         if _entropy_bonus_on and not _fused_done:
