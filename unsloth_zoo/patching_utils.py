@@ -197,11 +197,8 @@ _ALLOW_CUSTOM_AUTOGRAD_ENV = "TORCHINDUCTOR_AUTOGRAD_CACHE_ALLOW_CUSTOM_AUTOGRAD
 
 
 def allow_custom_autograd_functions_in_aot_cache():
-    """A compiled graph holding a custom autograd.Function (the fused LoRA in a compiled decoder
-    block) bypasses the AOTAutograd cache by default, so every warm start traces it again. Dynamo
-    traces the Function's forward and backward into the graph that keys the cache, so an edited
-    forward or backward misses. Torch reads the env var at import and it outranks this write, so
-    a user's TORCHINDUCTOR_AUTOGRAD_CACHE_ALLOW_CUSTOM_AUTOGRAD=0 keeps it off. Older torch lacks it."""
+    """Custom autograd.Functions (fused LoRA) otherwise bypass the AOTAutograd cache. Safe: dynamo traces
+    their forward and backward into the cache key, so an edit misses. A user's env setting wins."""
     if _ALLOW_CUSTOM_AUTOGRAD_ENV in os.environ:
         return False
     try:
