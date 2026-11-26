@@ -4,6 +4,7 @@
 """UNSLOTH_GC_SAVE_ATTENTION=1 reuses the first pass's attention outputs in checkpoint replay; CPU
 only, where SDPA's CPU flash kernel returns the logsumexp the backward needs."""
 import sys
+import types
 
 import pytest
 import torch
@@ -1073,11 +1074,16 @@ def test_auto_kill_switch_runs_like_main(monkeypatch, auto):
     assert sum(SA.SAVED_ATTENTION_STATS.values()) == 0
 
 
-def _fake_gpu(monkeypatch, capability, hip = None, cuda = True):
+def _fake_gpu(monkeypatch, capability, hip = None, cuda = True, arch = "gfx1100"):
     monkeypatch.setattr(SA, "_AUTO_ACTIVE", [False])
     monkeypatch.setattr(torch.version, "hip", hip, raising = False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda *a: types.SimpleNamespace(gcnArchName = arch)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1115,6 +1121,58 @@ def test_auto_min_seq_is_off(monkeypatch, capability, hip, cuda, setting):
     # An explicit setting keeps its own (unbudgeted) mode; ROCm eligibility is stubbed (tested above).
     monkeypatch.setattr(SA, "_rocm_sdpa_is_kept", lambda device = None: True)
     assert SA.save_attention_enabled() is (setting in ("1", "offload"))
+
+
+@pytest.mark.parametrize("arch", ["gfx1151", "gfx1151:sramecc-:xnack-"])
+def test_auto_min_seq_on_measured_rocm_arch(monkeypatch, arch):
+    _fake_gpu(monkeypatch, (11, 5), hip = "7.13.0", arch = arch)
+    assert SA.save_attention_auto_min_seq() == 8192
+    assert SA._AUTO_ACTIVE[0] is True
+    monkeypatch.setattr(SA, "_rocm_sdpa_is_kept", lambda device = None: True)
+    assert SA._auto_frame_min_seq(torch.device("cuda", 0)) == 8192
+    # SDPA not kept (or no answer): no frame.
+    for kept in (False, None):
+        monkeypatch.setattr(SA, "_rocm_sdpa_is_kept", lambda device = None, kept = kept: kept)
+        assert SA._auto_frame_min_seq(torch.device("cuda", 0)) is None
+
+
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201", "gfx942", "gfx90a", ""])
+def test_auto_min_seq_off_on_unmeasured_rocm_arch(monkeypatch, arch):
+    _fake_gpu(monkeypatch, (11, 0), hip = "7.13.0", arch = arch)
+    assert SA.save_attention_auto_min_seq() is None
+    assert SA._AUTO_ACTIVE[0] is False
+    assert SA._auto_frame_min_seq(torch.device("cuda", 0)) is None
+
+
+def test_auto_min_seq_is_decided_per_device(monkeypatch):
+    # Mixed host: A100 (8K), L4 (16K), unmeasured; each checkpoint uses its own device's length.
+    caps = {0: (8, 0), 1: (8, 9), 2: (9, 0)}
+    _fake_gpu(monkeypatch, None)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: caps[index])
+    assert SA.save_attention_auto_min_seq() == 8192
+    assert SA.save_attention_auto_min_seq(torch.device("cuda", 1)) == 16384
+    assert SA._auto_frame_min_seq(torch.device("cuda", 0)) == 8192
+    assert SA._auto_frame_min_seq(torch.device("cuda", 1)) == 16384
+    assert SA._auto_frame_min_seq(torch.device("cuda", 2)) is None
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert SA.save_attention_auto_min_seq("cuda") == 16384
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", "256")
+    assert SA._auto_frame_min_seq(torch.device("cuda", 1)) == 256
+
+
+def test_auto_declines_calls_shorter_than_the_frame_device_length(monkeypatch, auto):
+    _fake_memory(monkeypatch, base_peak = 0, capacity = 1 << 40)
+    meta = torch.device("meta")
+    short, long = torch.empty(1, 2, 8, 4, device = meta), torch.empty(1, 2, 64, 4, device = meta)
+    measure = SA.SavedAttentionFrame(auto = True)
+    SA._auto_admit(measure, [long])
+    SA._auto_release(measure, True)
+    frame = SA.SavedAttentionFrame(True, {meta: 16})
+    assert not SA._auto_admit(frame, [short])
+    assert SA.SAVED_ATTENTION_STATS["declined_short"] == 1
+    assert SA._auto_admit(frame, [long])
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [short])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (the real allocator's peak and free memory)")
