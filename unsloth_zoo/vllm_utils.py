@@ -6532,6 +6532,12 @@ def load_vllm(
     #     print(f"Unsloth: Standby mode is enabled. Pre-sleeping vLLM model to reduce OOMs.")
     #     llm.sleep(os.environ.get('VLLM_SLEEP_MODE', "1"))
 
+    # GRPO warns when an FP8 KV cache runs without the vLLM importance sampling correction.
+    try:
+        llm._unsloth_float8_kv_cache = bool(float8_kv_cache)
+    except Exception:
+        pass
+
     # Cleanup
     collect_garbage(after = _device_empty_cache)
     return llm

@@ -191,7 +191,7 @@ def test_mismatch_metrics_match_oracle():
         "sampling/importance_sampling_rejected_frac": float((w == 0).double().mean()),
         "sampling/importance_sampling_rejected_seq_frac": float(((flat == 0) & m).any(-1)[rows].double().mean()),
     }
-    assert got.keys() == want.keys()
+    assert want.keys() <= got.keys()
     for k in want:
         assert abs(got[k] - want[k]) <= 1e-12 * max(1.0, abs(want[k])), (k, got[k], want[k])
     assert 0 < want["sampling/importance_sampling_rejected_frac"] < 1
@@ -202,8 +202,7 @@ def test_mismatch_metrics_pool_across_shards():
     _, flat = _loss(new, old, sampling, mask, adv, "sequence_truncate", 0.5, 2.0)
     whole = rr.grpo_rollout_mismatch_stats(old, sampling, mask, flat)
     parts = [rr.grpo_rollout_mismatch_stats(old[s], sampling[s], mask[s], flat[s]) for s in (slice(0, 3), slice(3, 8))]
-    pooled = torch.stack(parts)
-    pooled = torch.cat([pooled[:, :3].sum(0), pooled[:, 3:4].amax(0), pooled[:, 4:].sum(0)])
+    pooled = rr.grpo_rollout_stats_reduce(torch.stack(parts))
     torch.testing.assert_close(pooled, whole, rtol = 1e-12, atol = 1e-14)
 
 
@@ -644,3 +643,188 @@ def test_rollout_metrics_log_the_policy_entropy_when_the_loss_has_it(monkeypatch
     metrics = _drive(monkeypatch, correction = True, state = state)["train"]
     entropy = metrics["sampling/policy_entropy/mean"][0]
     assert 0.0 < entropy <= math.log(8) + 1e-6  # the driver model's vocabulary is 8
+
+
+# verl 95ede34 (Apache-2.0), verl/trainer/ppo/rollout_corr_helper.py:940-1057 compute_offpolicy_metrics and the
+# token-level branch of compute_is_metrics, with verl.utils.torch_functional's masked helpers: the parity oracle.
+_VERL_SAFETY_BOUND = 20.0
+
+
+def _verl_masked_sum(values, mask, axis = None):
+    return (torch.where(mask.bool(), values, 0.0) * mask).sum(axis = axis)
+
+
+def _verl_masked_mean(values, mask, axis = None):
+    return _verl_masked_sum(values, mask, axis) / (mask.sum(axis = axis) + 1e-8)
+
+
+def _verl_compute_offpolicy_metrics(old_log_prob, rollout_log_prob, response_mask):
+    metrics = {}
+    seq_valid_mask = response_mask.sum(dim = -1) > 0
+    mean_log_prob_training = _verl_masked_mean(old_log_prob, response_mask, axis = -1)
+    metrics["training_ppl"] = _verl_masked_mean(torch.exp(-mean_log_prob_training), seq_valid_mask).item()
+    metrics["training_log_ppl"] = _verl_masked_mean(-mean_log_prob_training, seq_valid_mask).item()
+    metrics["kl"] = _verl_masked_mean(rollout_log_prob - old_log_prob, response_mask).item()
+    log_ratio = old_log_prob - rollout_log_prob
+    metrics["k3_kl"] = _verl_masked_mean(torch.exp(log_ratio) - log_ratio - 1, response_mask).item()
+    mean_log_prob_rollout = _verl_masked_mean(rollout_log_prob, response_mask, axis = -1)
+    metrics["rollout_ppl"] = _verl_masked_mean(torch.exp(-mean_log_prob_rollout), seq_valid_mask).item()
+    metrics["rollout_log_ppl"] = _verl_masked_mean(-mean_log_prob_rollout, seq_valid_mask).item()
+    log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
+    metrics["log_ppl_diff"] = _verl_masked_mean(log_ppl_diff, seq_valid_mask).item()
+    metrics["log_ppl_abs_diff"] = _verl_masked_mean(log_ppl_diff.abs(), seq_valid_mask).item()
+    metrics["log_ppl_diff_max"] = log_ppl_diff.masked_fill(~seq_valid_mask, float("-inf")).max().item()
+    metrics["log_ppl_diff_min"] = log_ppl_diff.masked_fill(~seq_valid_mask, float("inf")).min().item()
+    metrics["ppl_ratio"] = _verl_masked_mean(torch.exp(log_ppl_diff), seq_valid_mask).item()
+    rho_token = torch.exp(torch.clamp(log_ratio, min = -_VERL_SAFETY_BOUND, max = _VERL_SAFETY_BOUND))
+    metrics["chi2_token"] = (_verl_masked_mean(rho_token.square(), response_mask) - 1.0).item()
+    log_ratio_sum = _verl_masked_sum(log_ratio, response_mask, axis = -1)
+    rho_squared_seq = torch.exp(2.0 * torch.clamp(log_ratio_sum, min = -_VERL_SAFETY_BOUND, max = _VERL_SAFETY_BOUND))
+    metrics["chi2_seq"] = (_verl_masked_mean(rho_squared_seq, seq_valid_mask) - 1.0).item()
+    return metrics
+
+
+def _verl_token_is_metrics(weights, raw_weights, response_mask, threshold, threshold_lower):
+    metrics = {"rollout_is_mean": _verl_masked_mean(weights, response_mask).item()}
+    metrics["rollout_is_ratio_fraction_high"] = _verl_masked_mean((raw_weights > threshold).double(), response_mask).item()
+    metrics["rollout_is_ratio_fraction_low"] = _verl_masked_mean((raw_weights < threshold_lower).double(), response_mask).item()
+    m = response_mask.bool()
+    metrics["rollout_is_max"] = weights.masked_fill(~m, float("-inf")).max().item()
+    metrics["rollout_is_min"] = weights.masked_fill(~m, float("inf")).min().item()
+    clipped = weights.clamp(min = 0.0, max = threshold)
+    mean = _verl_masked_mean(clipped, response_mask)
+    metrics["rollout_is_std"] = torch.sqrt(torch.clamp(_verl_masked_mean((clipped - mean) ** 2, response_mask), min = 0.0)).item()
+    normalized = clipped / (_verl_masked_mean(clipped, response_mask) + 1e-8)
+    metrics["rollout_is_eff_sample_size"] = 1.0 / _verl_masked_mean(normalized.square(), response_mask).item()
+    return metrics
+
+
+_VERL_TO_UNSLOTH = {
+    "kl": "sampling/rollout_kl_k1/mean",
+    "k3_kl": "sampling/rollout_kl_k3/mean",
+    "training_ppl": "sampling/training_ppl",
+    "training_log_ppl": "sampling/training_log_ppl",
+    "rollout_ppl": "sampling/rollout_ppl",
+    "rollout_log_ppl": "sampling/rollout_log_ppl",
+    "log_ppl_diff": "sampling/log_ppl_diff/mean",
+    "log_ppl_abs_diff": "sampling/log_ppl_diff/abs_mean",
+    "log_ppl_diff_max": "sampling/log_ppl_diff/max",
+    "log_ppl_diff_min": "sampling/log_ppl_diff/min",
+    "ppl_ratio": "sampling/ppl_ratio",
+    "chi2_token": "sampling/rollout_chi2_token",
+    "chi2_seq": "sampling/rollout_chi2_seq",
+    "rollout_is_mean": "sampling/importance_sampling_weight/mean",
+    "rollout_is_std": "sampling/importance_sampling_weight/std",
+    "rollout_is_max": "sampling/importance_sampling_weight/max",
+    "rollout_is_min": "sampling/importance_sampling_weight/min",
+    "rollout_is_ratio_fraction_high": "sampling/importance_sampling_ratio_fraction_high",
+    "rollout_is_ratio_fraction_low": "sampling/importance_sampling_ratio_fraction_low",
+    "rollout_is_eff_sample_size": "sampling/importance_sampling_ess",
+}
+
+
+@pytest.mark.parametrize("seed, scale", [(11, 0.05), (12, 0.3), (13, 1.0)])
+def test_mismatch_metrics_match_verl(seed, scale):
+    new, old, sampling, mask, adv = _data(rows = 7, seed = seed, scale = scale)
+    clip_min, clip_max = 0.5, 2.0
+    _, flat = _loss(new, old, sampling, mask, adv, "token_truncate", clip_min, clip_max)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, mask, flat, clip_max = clip_max, clip_min = clip_min)
+    # Pooled over two shards first: the sums must give the whole batch's numbers.
+    parts = [rr.grpo_rollout_mismatch_stats(old[s], sampling[s], mask[s], flat[s], clip_max = clip_max, clip_min = clip_min)
+             for s in (slice(0, 3), slice(3, 7))]
+    torch.testing.assert_close(rr.grpo_rollout_stats_reduce(torch.stack(parts)), stats, rtol = 1e-12, atol = 1e-12)
+    got = rr.grpo_rollout_mismatch_metrics(stats)
+    want = _verl_compute_offpolicy_metrics(old, sampling, mask)
+    raw = torch.exp(old - sampling)
+    want.update(_verl_token_is_metrics(torch.broadcast_to(flat, mask.shape), raw, mask, clip_max, clip_min))
+    for key, name in _VERL_TO_UNSLOTH.items():
+        assert abs(got[name] - want[key]) <= 1e-6 * max(1.0, abs(want[key])), (key, got[name], want[key])
+    # ms-swift's geometric chi2_seq: E_seq[exp(2 clamp(mean log rho))] - 1 over rows with tokens.
+    rows = mask.sum(-1) > 0
+    geo = torch.exp(2 * torch.clamp(((old - sampling) * mask).sum(-1) / mask.sum(-1).clamp(min = 1), -20, 20))
+    assert got["sampling/rollout_chi2_seq_geometric"] == pytest.approx(float(geo[rows].mean() - 1), rel = 1e-9)
+    assert got["sampling/rollout_logprobs_mismatch_count"] == float(((old != sampling) & mask.bool()).sum())
+
+
+def test_mismatch_count_is_bitwise():
+    x = torch.tensor([[-1.0, -2.0, -3.0]])
+    y = x.clone()
+    y[0, 1] = torch.nextafter(y[0, 1], torch.tensor(0.0))
+    stats = rr.grpo_rollout_mismatch_stats(x, y, torch.ones(1, 3), torch.ones(1, 3))
+    assert rr.grpo_rollout_mismatch_metrics(stats)["sampling/rollout_logprobs_mismatch_count"] == 1.0
+
+
+@pytest.mark.parametrize("metrics, warns", [
+    ({"sampling/importance_sampling_ess": 0.2, "sampling/rollout_chi2_token": 0.1}, True),
+    ({"sampling/importance_sampling_ess": 0.9, "sampling/rollout_chi2_token": 1.5}, True),
+    ({"sampling/importance_sampling_ess": 0.9, "sampling/rollout_chi2_token": 0.1}, False),
+])
+def test_large_mismatch_warns_once(monkeypatch, metrics, warns):
+    import types
+
+    seen = []
+    monkeypatch.setattr(rr.logger, "warning", lambda message, *a, **k: seen.append(message))
+    trainer = types.SimpleNamespace()
+    rr.grpo_warn_rollout_mismatch(trainer, metrics)
+    rr.grpo_warn_rollout_mismatch(trainer, metrics)
+    assert len(seen) == (1 if warns else 0)
+
+
+@pytest.mark.parametrize("mode", ["sequence_mask", "sequence_truncate", "token_mask"])
+def test_is_ratio_stays_finite_when_a_row_sums_past_float32_exp(mode):
+    # A row whose log rho sums to 100 (exp overflows float32 past ~88.7): an unbounded *_mask mode kept an
+    # infinite weight, and the sequence metrics went inf / nan.
+    new, old, sampling, mask, adv = _data(rows = 3, cols = 10, seed = 5)
+    mask = torch.ones_like(mask)
+    new, old, sampling = new.detach().float().requires_grad_(True), old.float(), sampling.float()
+    sampling = sampling.clone()
+    sampling[2] = old[2] - (100.0 if mode != "token_mask" else torch.tensor([100.0] + [0.0] * 9))
+    clip_max = None if mode.endswith("_mask") else 2.0
+    loss, flat = _loss(new, old, sampling, mask, adv, mode, None, clip_max)
+    assert torch.isfinite(flat).all() and torch.isfinite(loss)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, mask, flat, clip_max = clip_max)
+    got = rr.grpo_rollout_mismatch_metrics(stats)
+    assert all(math.isfinite(v) for v in got.values()), got
+    assert float(flat.max()) <= math.exp(20.0) * (1 + 1e-6)
+
+
+def test_fp8_kv_cache_without_is_warns_once(monkeypatch):
+    import types
+
+    seen = []
+    monkeypatch.setattr(rr.logger, "warning", lambda message, *a, **k: seen.append(message))
+
+    def trainer(correction, fp8, by_config = False):
+        config = types.SimpleNamespace(cache_config = types.SimpleNamespace(cache_dtype = "fp8" if by_config else "auto"))
+        llm = types.SimpleNamespace(llm_engine = types.SimpleNamespace(vllm_config = config))
+        if fp8 and not by_config:
+            llm._unsloth_float8_kv_cache = True
+        return types.SimpleNamespace(use_vllm = True, vllm_importance_sampling_correction = correction, llm = llm)
+
+    off = trainer(False, True)
+    rr.grpo_warn_fp8_kv_cache_without_is(off)
+    rr.grpo_warn_fp8_kv_cache_without_is(off)
+    assert len(seen) == 1 and "float8_kv_cache" in seen[0]
+    rr.grpo_warn_fp8_kv_cache_without_is(trainer(False, True, by_config = True))
+    assert len(seen) == 2
+    rr.grpo_warn_fp8_kv_cache_without_is(trainer(True, True))
+    rr.grpo_warn_fp8_kv_cache_without_is(trainer(False, False))
+    assert len(seen) == 2
+
+
+def test_load_vllm_tags_the_fp8_kv_cache():
+    import inspect
+    import unsloth_zoo.vllm_utils as vu
+
+    assert "llm._unsloth_float8_kv_cache = bool(float8_kv_cache)" in inspect.getsource(vu.load_vllm)
+
+
+@pytest.mark.parametrize("clip_min, low", [(None, 1.0), (0.0, 0.0), (0.1, 0.0), (0.2, 1.0)])
+def test_ratio_fraction_low_respects_an_explicit_zero_bound(clip_min, low):
+    # Raw ratio exp(-2) = 0.135 against [clip_min, 2]: unset defaults to 1 / 2, an explicit 0 is no bound.
+    old = torch.tensor([[-3.0]], dtype = torch.float64)
+    sampling = torch.tensor([[-1.0]], dtype = torch.float64)
+    stats = rr.grpo_rollout_mismatch_stats(old, sampling, torch.ones(1, 1), torch.ones(1, 1), clip_max = 2.0, clip_min = clip_min)
+    metrics = rr.grpo_rollout_mismatch_metrics(stats)
+    assert metrics["sampling/importance_sampling_ratio_fraction_low"] == low
+    assert metrics["sampling/importance_sampling_ratio_fraction_high"] == 0.0
