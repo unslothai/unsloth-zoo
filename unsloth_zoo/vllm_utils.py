@@ -1980,6 +1980,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         else:
             dim_offsets = [0, qweight.shape[0]]
 
+        _fp8_method = getattr(proj, "quant_method", None)
+        if "Fp8" in type(_fp8_method).__name__ and (
+            type(getattr(_fp8_method, "fp8_linear", None)).__name__ in _VLLM_REPACKING_FP8_BLOCK_KERNELS
+            or (not qweight.dtype.is_floating_point and (
+                getattr(_fp8_method, "use_marlin", False) or isinstance(getattr(proj, "weight_block_size", None), (list, tuple))
+            ))
+        ):
+            raise _vllm_fp8_repacked_weight_error(prefix, proj, qweight)
+
         ## FP8 weights (BlockQuantized only for now)
         if qweight.dtype == torch.float8_e4m3fn:
             if hasattr(proj, 'weight_scale'):
@@ -3624,6 +3633,143 @@ def _get_vllm_online_fp8_quantization(fp8_mode, quantization_methods = None, dev
         )
         return None
     return scheme
+
+
+# vLLM block-FP8 linear kernels that rewrite the weight or its scales in place, so training can no longer share them:
+# FP8 Marlin / Humming repack the weight into int32 tiles; DeepGEMM (and FlashInfer's DeepGEMM dispatch) turns the
+# [N / 128, K / 128] scales into its packed per-row layout (Qwen3-0.6B q_proj [4096, 2] on an RTX PRO 6000).
+_VLLM_REPACKING_FP8_BLOCK_KERNELS = (
+    "MarlinFP8ScaledMMLinearKernel", "HummingFP8ScaledMMLinearKernel",
+    "DeepGemmFp8BlockScaledMMKernel", "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
+)
+# Block-FP8 kernels that keep the checkpoint layout, fastest first, with their --linear-backend name.
+_VLLM_LAYOUT_KEEPING_FP8_BLOCK_BACKENDS = (
+    ("CutlassFp8BlockScaledMMKernel", "cutlass"), ("TritonFp8BlockScaledMMKernel", "triton"),
+)
+
+
+def _vllm_fp8_block_supported_kernels(device_capability = None):
+    """Block-FP8 linear kernels vLLM's automatic selection would consider on this GPU, in its priority order
+    (prioritize_humming, VLLM_DISABLED_KERNELS, then each kernel's is_supported), or None when this vLLM has
+    no such kernel list. vLLM >= 0.29 lists FP8 Marlin ahead of Triton and no longer limits it to GPUs below
+    sm89, so on an L4 (sm89: no CUTLASS block FP8, no DeepGEMM) Marlin wins."""
+    try:
+        import vllm.model_executor.kernels.linear as vllm_linear
+        from vllm.platforms import current_platform
+        import vllm.envs as vllm_envs
+    except Exception:
+        return None
+    kernels = getattr(vllm_linear, "_POSSIBLE_FP8_BLOCK_KERNELS", None)
+    if not isinstance(kernels, dict):
+        return None
+    kernels = list(kernels.get(getattr(current_platform, "_enum", None), []))
+    if device_capability is None:
+        capability = current_platform.get_device_capability()
+        if capability is None:
+            return None
+        device_capability = capability[0] * 10 + capability[1]
+    prioritize_humming = getattr(vllm_linear, "prioritize_humming", None)
+    if prioritize_humming is not None:
+        try:
+            kernels = prioritize_humming(kernels, device_capability)
+        except Exception:
+            pass
+    disabled = getattr(vllm_envs, "VLLM_DISABLED_KERNELS", None) or ()
+    supported = []
+    for kernel in kernels:
+        if kernel.__name__ in disabled:
+            continue
+        try:
+            ok, _ = kernel.is_supported(device_capability)
+        except Exception:
+            continue
+        if ok:
+            supported.append(kernel.__name__)
+    return supported
+
+
+def _vllm_fp8_block_auto_kernel(device_capability = None):
+    """Name of the kernel vLLM's automatic selection gives a block-FP8 linear on this GPU, or None."""
+    supported = _vllm_fp8_block_supported_kernels(device_capability)
+    return supported[0] if supported else None
+
+
+def _kernel_config_get(kernel_config, key):
+    if isinstance(kernel_config, dict):
+        return kernel_config.get(key)
+    return getattr(kernel_config, key, None)
+
+
+def _vllm_fp8_block_share_backend_args(engine_args, good_keys, device_capability = None):
+    """Engine args that keep vLLM's block-FP8 linear weights in their checkpoint layout so training can share them.
+
+    The training model is built from vLLM's own weight tensors. On vLLM >= 0.29 an sm89 GPU runs block FP8 on FP8
+    Marlin, which repacks each weight into int32 tiles in place (Qwen3-0.6B qkv [4096, 1024] float8 -> [64, 16384]
+    int32), and the training forward fails with "mat1 and mat2 shapes cannot be multiplied". Where DeepGEMM is
+    installed (sm90, sm120), it rewrites the block scales into its own layout. This pins the fastest kernel that keeps
+    the layout, CUTLASS block FP8 (sm90+), else Triton (what vLLM <= 0.28 ran on sm89), for block FP8 only. Returns
+    (args to merge, message), or ({}, None) when the automatic pick already keeps the layout or the user chose a
+    linear backend."""
+    supported = _vllm_fp8_block_supported_kernels(device_capability)
+    if not supported or supported[0] not in _VLLM_REPACKING_FP8_BLOCK_KERNELS:
+        return {}, None
+    picked = supported[0]
+    backend = next((name for kernel, name in _VLLM_LAYOUT_KEEPING_FP8_BLOCK_BACKENDS if kernel in supported), None)
+    if backend is None:
+        return {}, None
+    user_kernel_config = engine_args.get("kernel_config")
+    if engine_args.get("linear_backend", "auto") != "auto" or (
+        user_kernel_config is not None and (
+            _kernel_config_get(user_kernel_config, "linear_backend") not in (None, "auto")
+            or (_kernel_config_get(user_kernel_config, "linear_backend_per_quant") or {}).get("fp8_block_w8a8")
+        )
+    ):
+        return {}, None
+    message = (
+        f"Unsloth: vLLM would run block FP8 linears on {picked}, which rewrites the weights training shares, "
+        f"so vLLM uses its {backend} block FP8 kernel instead."
+    )
+    try:
+        from vllm.config import KernelConfig
+        has_per_quant = "linear_backend_per_quant" in (
+            getattr(KernelConfig, "__dataclass_fields__", None) or getattr(KernelConfig, "model_fields", None) or {}
+        )
+    except Exception:
+        has_per_quant = False
+    if has_per_quant and "kernel_config" in good_keys:
+        if user_kernel_config is None:
+            kernel_config = {}
+        elif isinstance(user_kernel_config, dict):
+            kernel_config = dict(user_kernel_config)
+        else:
+            # A KernelConfig object: fill the per-quant override on a copy.
+            import copy
+            kernel_config = copy.deepcopy(user_kernel_config)
+            per_quant = dict(getattr(kernel_config, "linear_backend_per_quant", None) or {})
+            per_quant["fp8_block_w8a8"] = backend
+            kernel_config.linear_backend_per_quant = per_quant
+            return {"kernel_config": kernel_config}, message
+        per_quant = dict(kernel_config.get("linear_backend_per_quant") or {})
+        per_quant["fp8_block_w8a8"] = backend
+        kernel_config["linear_backend_per_quant"] = per_quant
+        return {"kernel_config": kernel_config}, message
+    if "linear_backend" in good_keys:
+        # vLLM 0.29 has no per-quantization override; layer types without a kernel from that backend keep auto.
+        return {"linear_backend": backend}, message
+    return {}, None
+
+
+def _vllm_fp8_repacked_weight_error(prefix, proj, qweight):
+    """A clear error for an FP8 layer whose weight or scales vLLM rewrote for its kernel (FP8 Marlin, DeepGEMM),
+    instead of a shape mismatch deep inside the training forward."""
+    quant_method = getattr(proj, "quant_method", None)
+    kernel = type(getattr(quant_method, "fp8_linear", None)).__name__
+    return RuntimeError(
+        f"Unsloth: vLLM rewrote the FP8 weight of {prefix} for its {kernel} kernel (weight {qweight.dtype} "
+        f"{tuple(qweight.shape)}), so training cannot share it. Use a block FP8 kernel that keeps the checkpoint "
+        "layout with kernel_config = {'linear_backend_per_quant': {'fp8_block_w8a8': 'cutlass'}} on sm90+ or "
+        "'triton' on sm89 (linear_backend = ... on vLLM 0.29), or set fast_inference = False."
+    )
 
 
 def _vllm_online_fp8_moe_ignore(config):
@@ -6620,6 +6766,15 @@ def load_vllm(
             # vLLM's switch for the sm90+ warmup's unguarded flashinfer.autotuner import; dropped on older vLLM.
             if "enable_flashinfer_autotune" not in engine_args and "kernel_config" not in engine_args:
                 engine_args["enable_flashinfer_autotune"] = False
+
+        # Training builds its FP8 layers from vLLM's weight tensors, so keep block FP8 off kernels that repack
+        # them (FP8 Marlin on sm89, vLLM >= 0.29). Not for `vllm serve` or the async engine: nothing is shared.
+        if (is_fp8 or native_fp8 is not None) and DEVICE_TYPE == "cuda" and not (return_args or use_async):
+            _good_keys = inspect.signature(EngineArgs).parameters.keys()
+            fp8_share_args, fp8_share_message = _vllm_fp8_block_share_backend_args(engine_args, _good_keys)
+            if fp8_share_args:
+                engine_args.update(fp8_share_args)
+                print(fp8_share_message)
 
         # torchrun / DDP: one engine per rank in the job's process group (see the helper).
         # The async engine always runs its core in a subprocess, which external_launcher refuses.
