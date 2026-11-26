@@ -655,8 +655,7 @@ if importlib.util.find_spec("vllm") is not None:
     BitsAndBytesConfig = _make_bnb_config_class(_vllm_bnb)
 
     def _ensure_vllm_bnb():
-        """vLLM >= 0.28 without vllm-bnb-plugin: install it at first 4-bit use (UNSLOTH_VLLM_BNB_AUTO_INSTALL=0 opts
-        out), then bind it as import time would have. True when bitsandbytes is usable."""
+        """Install vllm-bnb-plugin at first 4-bit use and bind it as import would have (UNSLOTH_VLLM_BNB_AUTO_INSTALL=0 opts out)."""
         global _vllm_bnb, _bnb_loader, _vllm_bnb_source, _vllm_bnb_error, _apply_4bit_weight, BitsAndBytesConfig
         if _vllm_bnb is not None: return True
         from . import vllm_bnb as _vb

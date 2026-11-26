@@ -55,9 +55,8 @@ def _alias_rename_mapper():
 
 
 def _keep_plugin_off():
-    # vLLM loads every installed vllm.general_plugins entry point when it builds an engine. On a vLLM with built-in
-    # bitsandbytes the plugin must stay off: importing it registers vllm::apply_bnb_4bit a second time, and its
-    # config would replace the built-in one. VLLM_PLUGINS is vLLM's allow-list, so list everything but it.
+    # vLLM imports every installed plugin at engine build; with built-in bitsandbytes that registers
+    # vllm::apply_bnb_4bit twice. VLLM_PLUGINS is vLLM's allow-list, so list everything but it.
     if _find_spec("vllm_bnb_plugin") is None:
         return False
     current = os.environ.get("VLLM_PLUGINS")
