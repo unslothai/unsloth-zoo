@@ -407,3 +407,21 @@ def test_existing_loss_types_unchanged_by_reinforce_edit():
     ref = (-(torch.ones_like(new)) * adv.unsqueeze(1) * new * w * mask).sum() / mask.sum()
     assert abs(loss.item() - ref.item()) < 1e-6
 
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA head precision path")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_head_logprobs_match_policy_scorer_cuda(dtype):
+    # Same projection precision as the sampled-token scorer, so p and the loss describe one policy.
+    from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as scorer
+    gen = torch.Generator(device = "cuda").manual_seed(11)
+    R, T, H, V, k = 4, 33, 256, 32000, 8
+    h = torch.randn(R, T, H, device = "cuda", dtype = dtype, generator = gen)
+    W = (torch.randn(V, H, device = "cuda", dtype = dtype, generator = gen) * 0.05)
+    ids = torch.randint(0, V, (R, T, k), device = "cuda", generator = gen)
+    with torch.autocast("cuda", dtype = dtype):
+        head = sc.grpo_topk_head_logprobs(h, W, ids, 4, temperature = 0.9)
+        ref = torch.stack([scorer(h, W, ids[..., j], 4, temperature = 0.9) for j in range(k)], dim = -1)
+    exact = torch.log_softmax((h.float() @ W.float().t()) / 0.9, -1).gather(-1, ids)
+    assert (head - ref).abs().max().item() < 5e-5
+    assert (head - exact).abs().max().item() < 5e-4

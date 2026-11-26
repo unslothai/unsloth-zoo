@@ -124,12 +124,40 @@ def score_centering_correction(train_head_logps, sampler_head_logps, weight_fn, 
     return correction, q_mass, p_mass
 
 
+def _head_projection(lm_head, lm_head_bias):
+    """The GRPO scorer's projection precision (chunked_hidden_states_selective_log_softmax): float32-output
+    logits under UNSLOTH_VLLM_FP32_LM_HEAD=1, or by default for a 16-bit CUDA head; otherwise the head's own
+    dtype under the caller's autocast. Returns (mode, lm_head, lm_head_bias)."""
+    from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    flag = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower()
+    fp32_cuda_default = (
+        flag == "" and torch.version.hip is None and torch.cuda.is_available()
+        and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+        and hasattr(torch.ops.aten.mm, "dtype")
+    )
+    fp32 = flag in ("1", "true", "on", "yes") or (fp32_cuda_default and _chunked_logprob.fp32_lm_head_auto_ok(lm_head))
+    if not fp32:
+        return "plain", lm_head, lm_head_bias
+    if _chunked_logprob.fp32_out_linear_ok(lm_head):
+        return "fp32_out", lm_head, lm_head_bias
+    return "fp32", lm_head.to(torch.float32), None if lm_head_bias is None else lm_head_bias.to(torch.float32)
+
+
 def _head_chunk_logps(x, lm_head, lm_head_bias, ids, logit_scale_multiply, logit_scale_divide,
-                      logit_softcapping, temperature, from_hidden):
+                      logit_softcapping, temperature, from_hidden, mode = "plain"):
     out_device = x.device
     if from_hidden:
         x = x.to(device = lm_head.device, dtype = lm_head.dtype)
-        logits = torch.nn.functional.linear(x, lm_head, lm_head_bias)
+        if mode == "fp32_out":
+            from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+            with torch.autocast(device_type = x.device.type, enabled = False):
+                logits = _chunked_logprob.fp32_out_linear(x, lm_head, lm_head_bias)
+        elif mode == "fp32":
+            # The scorer runs under bf16 / fp16 autocast, which would downcast this matmul.
+            with torch.autocast(device_type = x.device.type, enabled = False):
+                logits = torch.nn.functional.linear(x, lm_head, lm_head_bias)
+        else:
+            logits = torch.nn.functional.linear(x, lm_head, lm_head_bias)
         if logit_scale_multiply != 0.0:
             logits = logits * logit_scale_multiply
         if logit_scale_divide != 0.0:
@@ -170,10 +198,13 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
         flat_x.requires_grad or (from_hidden and lm_head.requires_grad)
         or (lm_head_bias is not None and lm_head_bias.requires_grad)
     )
+    mode = "plain"
+    if from_hidden:
+        mode, lm_head, lm_head_bias = _head_projection(lm_head, lm_head_bias)
     outs = []
     for a, b in zip(bounds[:-1], bounds[1:]):
         args = (flat_x[a:b], lm_head, lm_head_bias, flat_ids[a:b], logit_scale_multiply, logit_scale_divide,
-                logit_softcapping, temperature, from_hidden)
+                logit_softcapping, temperature, from_hidden, mode)
         if needs_grad:
             from torch.utils.checkpoint import checkpoint
             outs.append(checkpoint(_head_chunk_logps, *args, use_reentrant = False))
