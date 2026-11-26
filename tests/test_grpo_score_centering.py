@@ -425,3 +425,19 @@ def test_head_logprobs_match_policy_scorer_cuda(dtype):
     exact = torch.log_softmax((h.float() @ W.float().t()) / 0.9, -1).gather(-1, ids)
     assert (head - ref).abs().max().item() < 5e-5
     assert (head - exact).abs().max().item() < 5e-4
+
+
+def test_score_centering_gate(monkeypatch):
+    from unsloth_zoo.rl_replacements import grpo_score_centering_k
+    trainer = types.SimpleNamespace(use_vllm = True)
+    monkeypatch.setenv(sc.SCORE_CENTERING_ENV, "32")
+    is_on = {"vllm_importance_sampling_correction": True}
+    # Bypass: the head and the sampled token share pi_theta / pi_rollout.
+    assert grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+    # No IS weight on either side.
+    assert grpo_score_centering_k(trainer, {"vllm_importance_sampling_correction": False}) == 32
+    # vLLM IS ratio pi_old / pi_rollout outside bypass, and kept-set scoring: off.
+    assert grpo_score_centering_k(types.SimpleNamespace(use_vllm = True), is_on) == 0
+    assert grpo_score_centering_k(types.SimpleNamespace(use_vllm = True), is_on, True, kept_set_scoring = True) == 0
+    monkeypatch.setenv(sc.SCORE_CENTERING_ENV, "0")
+    assert grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 0

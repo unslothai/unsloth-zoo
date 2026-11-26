@@ -3713,6 +3713,34 @@ pass
 RL_REPLACEMENTS["grpo_rollout_logps_as_old"] = grpo_rollout_logps_as_old
 
 
+def grpo_score_centering_k(trainer, loss_kwargs, rollout_logps_as_old = False, kept_set_scoring = False):
+    """Head size k for this batch's score centering (UNSLOTH_GRPO_SCORE_CENTERING, loss_type="reinforce"),
+    0 when it cannot center the loss's own score: the head is weighted with pi_theta / pi_rollout, which is
+    the sampled token's weight in bypass mode (rollout logps as pi_old) or without an IS weight, but not
+    with the vLLM IS ratio pi_old / pi_rollout once the policy has moved (verl also requires bypass); and
+    kept-set scoring of truncated sampling leaves no full-vocabulary trainer log-probs."""
+    from unsloth_zoo.score_centering import score_centering_top_k
+    k = score_centering_top_k()
+    if not k:
+        return 0
+    reason = None
+    if kept_set_scoring:
+        reason = ("needs full-vocabulary trainer logprobs, but kept-set scoring is on (truncated vLLM sampling)")
+    elif not rollout_logps_as_old and getattr(trainer, "use_vllm", False) \
+            and loss_kwargs.get("vllm_importance_sampling_correction", False):
+        reason = ("with the vLLM importance-sampling correction needs bypass mode "
+                  "(UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1), so the head and the sampled token share one weight")
+    if reason is None:
+        return k
+    if not getattr(trainer, "_unsloth_score_centering_off_warned", False):
+        from unsloth_zoo.log import logger as _zoo_logger
+        _zoo_logger.warning(f"Unsloth: score centering {reason}. Score centering is off for this run.")
+        trainer._unsloth_score_centering_off_warned = True
+    return 0
+pass
+RL_REPLACEMENTS["grpo_score_centering_k"] = grpo_score_centering_k
+
+
 def grpo_score_centering_term(trainer, loss_kwargs, head_list, head_ids, sampler_head_logps, completion_mask,
                               rollout_logps_as_old = False, training = True):
     """[B, T] score-centering correction (with gradient to the trainer head log-probs) for
@@ -3732,9 +3760,8 @@ def grpo_score_centering_term(trainer, loss_kwargs, head_list, head_ids, sampler
             )
             trainer._unsloth_score_centering_shape_warned = True
         return None
-    is_on = rollout_logps_as_old or (
-        getattr(trainer, "use_vllm", False) and loss_kwargs.get("vllm_importance_sampling_correction", False)
-    )
+    # grpo_score_centering_k admits bypass mode (the head shares the sampled token's IS rule) or no IS weight.
+    is_on = rollout_logps_as_old
     weight_fn = score_centering_weight_fn(
         loss_kwargs.get("vllm_importance_sampling_mode", None) if is_on else None,
         loss_kwargs.get("vllm_importance_sampling_clip_min", None),
@@ -4142,6 +4169,7 @@ def grpo_accumulated_loss(
         grpo_rollout_as_old_ratio_metrics,
         grpo_rollout_old_fill_unscored,
         grpo_score_centering_term,
+        grpo_score_centering_k,
     )
     if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
         from unsloth_zoo.rl_replacements import (
@@ -4483,17 +4511,8 @@ def grpo_accumulated_loss(
         _sc_ids = _sc_logps = None
         _sc_head_list = []
         if kwargs.get("loss_type", "grpo") == "reinforce" and getattr(trainer, "use_vllm", False):
-            from unsloth_zoo.score_centering import score_centering_top_k as _sc_top_k
-            _sc_k = _sc_top_k()
-            if _sc_k and _support_kwargs:
-                if not getattr(trainer, "_unsloth_score_centering_support_warned", False):
-                    from unsloth_zoo.log import logger as _zoo_logger
-                    _zoo_logger.warning(
-                        "Unsloth: score centering needs full-vocabulary trainer logprobs, but kept-set scoring "
-                        "is on (truncated vLLM sampling). Score centering is off for this run."
-                    )
-                    trainer._unsloth_score_centering_support_warned = True
-                _sc_k = 0
+            from unsloth_zoo.rl_replacements import grpo_score_centering_k as _sc_enabled_k
+            _sc_k = _sc_enabled_k(trainer, kwargs, _rollout_logps_as_old, bool(_support_kwargs))
             if _sc_k:
                 from unsloth_zoo.score_centering import lookup_rollout_topk as _sc_lookup
                 _sc_ids, _sc_logps, _sc_matched = _sc_lookup(
