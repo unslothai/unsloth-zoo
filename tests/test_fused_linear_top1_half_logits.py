@@ -15,10 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""return_is_top1 with is_top1_half_logits=True is TRL <= 1.14's token accuracy: the argmax of the model's half logits,
-ties to the first column. With fp32 GEMM logits (the CUDA default) it must read them rounded to the half dtype, else
-DPO's mean_token_accuracy drifts from TRL's (L4, Qwen3-0.6B bf16, TRL 1.14: 0.7030 vs 0.7107 at step 1). The default
-keeps the fp32 argmax, which is TRL 1.15's chunked kernel definition."""
+"""is_top1_half_logits=True matches TRL <= 1.14's argmax of half logits under fp32 GEMM logits (else DPO
+mean_token_accuracy drifts: 0.7030 vs 0.7107); the default keeps TRL 1.15's fp32 argmax."""
 
 import inspect
 import json
@@ -35,8 +33,7 @@ from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
 
 
 def _tied_case(dtype):
-    # Column 1's fp32 logit is 1 + 2^-12, column 0's is 1: both round to 1.0 in bf16 / fp16, so TRL's argmax ties
-    # to column 0, while the fp32 GEMM output says column 1.
+    # fp32 logits 1 vs 1 + 2^-12 tie in half: TRL picks column 0, fp32 column 1.
     V = 32
     hidden = torch.tensor([[1.0, 1.0], [1.0, 1.0]], dtype = dtype)
     weight = torch.zeros(V, 2, dtype = dtype)
@@ -52,13 +49,11 @@ def _trl_top1(hidden, weight, targets):
 
 
 def _half_flag():
-    # Older zoo without the keyword: run its default, so the test fails on the result rather than the signature.
     has = "is_top1_half_logits" in inspect.signature(fused_linear_logprobs).parameters
     return {"is_top1_half_logits": True} if has else {}
 
 
 def _fp32_gemm(monkeypatch):
-    # CUDA's default logits mode (fp32 GEMM output, UNSLOTH_LOGPROB_FP32_LOGITS=1), on the torch row path.
     monkeypatch.setattr(fl, "_logits_mode", lambda device, dtype = torch.float16: (True, False))
 
 
@@ -76,7 +71,6 @@ def test_top1_reads_half_logits_with_fp32_gemm(monkeypatch, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_top1_default_keeps_fp32_argmax(monkeypatch, dtype):
-    # TRL 1.15's chunked kernel: argmax of the fp32 GEMM logits (first max), the default for every other caller.
     hidden, weight, targets = _tied_case(dtype)
     _fp32_gemm(monkeypatch)
     *_, top1 = fused_linear_logprobs(hidden, weight, targets, return_entropy = True, return_is_top1 = True)
@@ -85,7 +79,6 @@ def test_top1_default_keeps_fp32_argmax(monkeypatch, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_top1_half_logits_mode_matches_trl(dtype):
-    # Half logits (CPU) and fp32 models were already TRL's argmax: unchanged.
     hidden, weight, targets = _tied_case(dtype)
     *_, top1 = fused_linear_logprobs(hidden, weight, targets, return_is_top1 = True, **_half_flag())
     assert top1.tolist() == _trl_top1(hidden, weight, targets).tolist()
@@ -133,6 +126,5 @@ def test_top1_kernels_read_half_logits():
     line = next(s for s in proc.stdout.splitlines() if s.startswith("RESULT "))
     result = json.loads(line[len("RESULT "):])
     assert result.pop("file") == fl.__file__
-    # bf16 ties column 3 and 5 at 1.0: the first one wins, as torch.argmax on TRL's bf16 logits.
     assert result == {"0_fp32": [False, True], "0_half": [True, False], "16_fp32": [False, True],
                       "16_half": [True, False]}

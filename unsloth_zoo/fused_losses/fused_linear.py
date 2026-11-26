@@ -1012,16 +1012,14 @@ def _torch_transform(x, scale, cap):
 
 
 def _top1_round(x_dtype, compute_dtype):
-    """TOP1_ROUND of fp32 logits from a half GEMM: TRL <= 1.14's token accuracy is the argmax of the model's half
-    logits (TRL 1.15's chunked kernel takes it on the fp32 logits, the default)."""
+    """TOP1_ROUND for fp32 logits of a half GEMM (TRL <= 1.14 argmaxes the model's half logits)."""
     if x_dtype != torch.float32 or compute_dtype not in _HALF:
         return 0
     return 1 if compute_dtype == torch.bfloat16 else 2
 
 
 def _torch_forward(x, bias, tgt, inv_t, scale, cap, exact, want, top1_dtype = None):
-    """Row statistics of raw logits x [R, V] (any dtype). want = (ent, sum, lssp, top1); top1_dtype rounds the
-    logits the argmax reads (TRL's half logits)."""
+    """Row statistics of raw logits x [R, V] (any dtype). want = (ent, sum, lssp, top1)."""
     sd = _stat_dtype(x.dtype)
     x = x.to(sd)
     if bias is not None:
@@ -1190,8 +1188,7 @@ def _u_dtype(hidden_dtype):
 
 def _row_forward(device, x, dz_out, tgt, bias, exact, coef, scalars, want, write_grad, outs = None,
                  compute_dtype = None):
-    """Statistics of raw logits x [n, V]; with write_grad also writes dz into dz_out (may alias x). compute_dtype:
-    the GEMM operand dtype when top1 should read fp32 logits rounded as the model's own half logits (None: as is)."""
+    """Statistics of raw logits x [n, V]; with write_grad also writes dz into dz_out (may alias x)."""
     top1_round = _top1_round(x.dtype, compute_dtype) if want[3] else 0
     inv_t, scale, cap, smooth_keep, smooth_each = scalars
     n, V = x.shape
@@ -2688,9 +2685,8 @@ def fused_linear_logprobs(
     """Per-token log_softmax(transform(hidden @ weight.T + bias) / temperature)[targets], float32 [...].
 
     Rows outside `mask` (or with an out-of-range target) return 0. Extras: entropy (None: gradient recomputed only
-    if one arrives), vocab mean of transformed logits, log sum p^2, argmax == target. is_top1_half_logits: that argmax
-    reads the logits rounded to the half compute dtype, ties to the first column (TRL <= 1.14's argmax of the model's
-    logits); off, it reads the fp32 GEMM logits as TRL 1.15's chunked kernel does."""
+    if one arrives), vocab mean of transformed logits, log sum p^2, argmax == target (on half-rounded logits if
+    is_top1_half_logits, as TRL <= 1.14; else fp32 as TRL 1.15)."""
     device = weight.device
     lead = targets.shape
     hidden2 = hidden.reshape(-1, hidden.shape[-1]).to(device)
