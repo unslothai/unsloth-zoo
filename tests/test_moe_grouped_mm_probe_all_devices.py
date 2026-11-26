@@ -86,6 +86,8 @@ def spoof(monkeypatch):
         # The view probe builds real tensors on the card, which on a GPU host would run on the real device and log extra
         # _grouped_mm calls; answer from failing instead (view-probe tests override it)
         monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
+        # The training-shaped probe builds real tensors on the card too; the single-expert call answers for it here
+        monkeypatch.setattr(moe_utils, "_grouped_mm_trains_on", lambda d: None, raising = False)
         return probed
     return make
 
