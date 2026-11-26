@@ -2306,6 +2306,11 @@ def grpo_truncated_support_kwargs(trainer):
     excluded = _grpo_engine_excluded_ids(trainer)
     if support is None and excluded is None:
         return {}
+    if grpo_rollout_logprobs_untruncated(trainer):
+        # Full vocabulary minus rows vLLM always biases to -inf.
+        if excluded is None:
+            return {}
+        return {"support_top_k": 0, "support_top_p": 1.0, "support_min_p": 0.0, "support_excluded_ids": excluded}
     top_k, top_p, min_p = support if support is not None else (0, 1.0, 0.0)
     setting = grpo_truncated_support_setting()
     automatic = setting == "default" and grpo_truncated_support_automatic(trainer, support)
@@ -2371,12 +2376,26 @@ RL_REPLACEMENTS["grpo_truncated_support_kwargs"] = grpo_truncated_support_kwargs
 _GRPO_TRUNCATED_SUPPORT_STATS = {"on": 0}
 
 
+def grpo_rollout_logprobs_untruncated(trainer):
+    """True when the colocated vLLM engine returns logprobs from before min_p / top_k / top_p."""
+    if not getattr(trainer, "_unsloth_vllm_untruncated_logprobs", False):
+        return False
+    try:
+        from unsloth_zoo.vllm_utils import UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS as state
+    except Exception:
+        return False
+    return bool(state.get("on")) and bool(state.get("installed"))
+pass
+
+
 def grpo_truncated_support_automatic(trainer, support = None):
     """Unset setting scores the kept set: truncated rollouts at temperature > 0 feeding the IS correction from an
     engine known to return processed logprobs. Gated on the engine's logprobs_mode, not on the TRL version (TRL
     >= 1.17 scores the same kept set by default). Raw / unknown logprobs would bias the ratio the other way.
     NVIDIA CUDA only (measured there). The off-policy mask alone does not count."""
     if not getattr(trainer, "use_vllm", False):
+        return False
+    if grpo_rollout_logprobs_untruncated(trainer):
         return False
     if support is None:
         support = grpo_sampling_support(trainer)
