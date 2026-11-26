@@ -20,6 +20,7 @@ aborts before a decoder-layer gradient exists and puts the other gradients back.
 (RAM and disk tiers): bitwise against standard accumulation and copies / reads per step divided by the micro-batch count."""
 
 import copy
+import functools
 import importlib.util
 import os
 import sys
@@ -551,8 +552,6 @@ def test_abort_on_in_place_writes_between_layers():
         assert "in place" in why or "changed between" in why, why
 
 
-@pytest.mark.skipif(not hasattr(torch._C._autograd, "_top_saved_tensors_default_hooks"),
-                    reason = "torch without the saved-tensor hooks query")
 def test_saved_tensor_hooks_are_refused():
     model = _model()
     batches, items = _batches(2)
@@ -561,6 +560,265 @@ def test_saved_tensor_hooks_are_refused():
                                          model = model)
     assert losses is None and "saved-tensor hooks" in why
     assert _grads(model) == {}
+
+
+# ---------------------------------------------------------------- review fixes (each fails without its fix)
+class _Toy(torch.nn.Module):
+    def __init__(self, w = 16):
+        super().__init__()
+        self.lin = torch.nn.Linear(w, w)
+
+    def forward(self, x, cache = None, **kwargs):
+        if cache is not None:
+            cache.n += 1
+        return torch.tanh(self.lin(x))
+
+
+def _toy_stack(cls = _Toy, n = 3, seed = 0):
+    torch.manual_seed(seed)
+    return torch.nn.ModuleList([cls() for _ in range(n)])
+
+
+def _toy_run(layers, fns):
+    for p in layers.parameters():
+        p.grad = None
+    return lm.run_layer_major(layers, fns, model = layers)
+
+
+def _toy_x(m):
+    return torch.randn(2, 5, 16, generator = torch.Generator().manual_seed(m))
+
+
+def test_nested_auxiliary_layer_outputs_abort():
+    class Aux(_Toy):
+        def forward(self, x, **kwargs):
+            h = torch.tanh(self.lin(x))
+            return h, {"aux": h.square().mean()}
+
+    layers = _toy_stack(Aux)
+
+    def fn(m):
+        x, aux = _toy_x(m), 0
+        for layer in layers:
+            x, extra = layer(x)
+            aux = aux + extra["aux"]
+        (x.sum() + aux).backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "not the hidden states" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_attention_recorder_aborts_or_matches():
+    """transformers' output_attentions capture inside the decoder (no-grad there): abort, never a silent drop.
+    Non-reentrant checkpointing: there standard accumulation differentiates the attentions."""
+    model = _model(reentrant = False)
+    batches, items = _batches(2)
+
+    def step(b):
+        out = model(**b, num_items_in_batch = items, output_attentions = True)
+        loss = out.loss + out.attentions[1].float().square().mean()
+        loss.backward()
+        return loss.detach()
+
+    model.zero_grad(set_to_none = True)
+    base = [step(b) for b in batches]
+    base_grads = _grads(model)
+    model.zero_grad(set_to_none = True)
+    losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
+    if losses is None:
+        assert "output_attentions" in why or "output recorders" in why or "not the hidden states" in why, why
+        assert _grads(model) == {}
+    else:
+        assert all(torch.equal(a, b) for a, b in zip(base, losses))
+        _assert_same(base_grads, _grads(model))
+
+
+@pytest.mark.parametrize("where", ["positional", "cache_params"])
+def test_positional_and_state_caches_abort(where):
+    class FakeCache:
+        n = 0
+
+    layers = _toy_stack()
+    cache = FakeCache()
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x, cache) if where == "positional" else layer(x, cache_params = cache)
+        x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "live KV cache" in why
+    assert cache.n == 0
+
+
+def test_a_second_window_is_refused_while_one_runs():
+    outer, inner = _toy_stack(seed = 0), _toy_stack(seed = 1)
+    seen = []
+
+    def fn(m):
+        if m == 0:
+            seen.append(_toy_run(inner, [lambda: None]))
+        x = _toy_x(m)
+        for layer in outer:
+            x = layer(x)
+        x.sum().backward()
+
+    losses, why = _toy_run(outer, [functools.partial(fn, m) for m in range(2)])
+    assert why is None
+    assert seen[0][0] is None and "another layer-major window" in seen[0][1]
+    assert "__call__" not in _Toy.__dict__
+
+
+def test_saved_tensor_hooks_inside_a_micro_batch_abort():
+    layers = _toy_stack()
+
+    def fn(m):
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+            x = _toy_x(m)
+            for layer in layers:
+                x = layer(x)
+            x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "inside the micro-batch" in why
+
+
+def test_saved_tensor_hooks_detected_without_the_private_query(monkeypatch):
+    monkeypatch.delattr(torch._C._autograd, "_top_saved_tensors_default_hooks", raising = False)
+    assert lm._saved_tensor_hooks_active() is False
+    with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+        assert lm._saved_tensor_hooks_active() is True
+
+
+def test_out_of_memory_saving_existing_gradients_is_a_refusal(monkeypatch):
+    layers = _toy_stack()
+    for p in layers.parameters():
+        p.grad = torch.ones_like(p)
+
+    def clone(self, *a, **k):
+        raise torch.OutOfMemoryError("simulated")
+
+    fns = [lambda: None, lambda: None]
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
+    losses, why = lm.run_layer_major(layers, fns, model = layers)
+    monkeypatch.undo()
+    assert losses is None and "out of memory" in why
+    assert all(torch.equal(p.grad, torch.ones_like(p)) for p in layers.parameters())
+
+
+def test_replay_output_mismatch_rolls_back():
+    class GradOnlyAux(_Toy):
+        def forward(self, x, **kwargs):
+            h = torch.tanh(self.lin(x))
+            return (h, h.sum()) if torch.is_grad_enabled() else h
+
+    layers = _toy_stack(GradOnlyAux)
+    head = torch.nn.Parameter(torch.ones(16))
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+            x = x[0] if isinstance(x, tuple) else x
+        (x * head).sum().backward()
+
+    head.grad = None
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "recompute" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_recompile_limit_in_the_backward_rolls_back():
+    exc = pytest.importorskip("torch._dynamo.exc")
+    kind = getattr(exc, "FailOnRecompileLimitHit", None) or getattr(exc, "RecompileLimitExceeded", None)
+    if kind is None:
+        pytest.skip("no recompile-limit exception in this torch")
+
+    class Limited(_Toy):
+        def forward(self, x, **kwargs):
+            if torch.is_grad_enabled():
+                raise kind("simulated")
+            return torch.tanh(self.lin(x))
+
+    layers = _toy_stack(Limited)
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "recompile limit" in why
+
+
+def test_abort_restores_the_rng_state():
+    """Draws made in an abandoned window (NEFTune noise) are not consumed: the retry draws the same numbers."""
+    layers = _toy_stack()
+
+    def fn(m):
+        torch.rand(3)
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+        layers[0](x)   # a second forward: protocol break in the loss part
+
+    torch.manual_seed(11)
+    expect = torch.rand(3)
+    torch.manual_seed(11)
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None
+    assert torch.equal(torch.rand(3), expect)
+
+
+def test_tied_trainable_embedding_and_head_are_refused():
+    torch.manual_seed(0)
+    cfg = transformers.LlamaConfig(hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                                   num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 64,
+                                   tie_word_embeddings = True)
+    model = transformers.LlamaForCausalLM(cfg)
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    losses, why = lm.run_layer_major(model.model.layers, [lambda: None, lambda: None], model = model)
+    assert losses is None and "share a trainable weight" in why
+
+
+def test_input_hooks_do_not_outlive_the_window():
+    layers = _toy_stack()
+    x0 = torch.randn(2, 5, 16, requires_grad = True)
+
+    def fn(m):
+        x = x0
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+
+    for _ in range(3):
+        losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+        assert why is None
+    assert not (x0._backward_hooks or {})
+
+
+def test_forward_input_keeps_requires_grad():
+    """A reentrant checkpoint hands its no-grad forward an input that requires grad; compiled guards see the same."""
+    layers = _toy_stack()
+    seen = []
+    h = layers[1].register_forward_pre_hook(lambda mod, args: seen.append((torch.is_grad_enabled(), args[0].requires_grad)))
+
+    def fn(m):
+        x = _toy_x(m).requires_grad_(True)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+
+    try:
+        losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    finally:
+        h.remove()
+    assert why is None
+    assert (False, True) in seen
 
 
 def test_boundary_bytes():
@@ -654,3 +912,79 @@ def test_gpu_block_swap_bitwise_and_fewer_fetches(_spill_dir, depth, disk):
     assert bc == 3 * (2 * 5 - 2 * depth) and hc == 2 * 5 - 2 * depth, (bc, hc)
     if disk:
         assert hr > 0 and br == 3 * hr, (br, hr)
+
+
+@_cuda
+def test_gpu_worker_uses_the_callers_stream_on_the_model_device():
+    """Model and inputs on card 1 produced on a side stream while card 0 is current: the workers run on that
+    stream, so they read the inputs after they are written (a race on card 1's default stream otherwise)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two GPUs")
+    dev = torch.device("cuda", 1)
+    model = _model(device = dev)
+    src, items = _batches(2, device = dev)
+    side = torch.cuda.Stream(dev)
+
+    def produce():
+        out = []
+        with torch.cuda.device(dev):
+            for b in src:
+                torch.cuda._sleep(200_000_000)
+                out.append({k: v.clone() for k, v in b.items()})
+        return out
+
+    with torch.cuda.stream(side), torch.cuda.device(0):
+        base_losses, base_grads = _standard(model, produce(), items)
+        model.zero_grad(set_to_none = True)
+        batches = produce()
+        losses, why = lm.run_layer_major(_layers(model), [lambda b = b: _step(model, b, items) for b in batches],
+                                         model = model)
+    torch.cuda.synchronize(dev)
+    assert why is None
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, _grads(model))
+
+
+@_cuda
+def test_gpu_block_swap_step_ends_once_per_window_and_resets_after_an_abort(_spill_dir):
+    bs = _block_swap()
+    model = _model(True, layers = 6, dtype = torch.bfloat16, device = "cuda")
+    for p in model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+    layers = _layers(model)
+    sw = bs.BlockSwap(layers, 5, prefetch_depth = 1, placement = "spread", model = model)
+    batches, items = _batches(3, device = "cuda")
+    try:
+        steps = []
+        for layer_major in (False, True):
+            model.zero_grad(set_to_none = True)
+            before = sw._steps
+            if layer_major:
+                assert lm.run_layer_major(layers, [lambda b = b: _step(model, b, items) for b in batches],
+                                          swapper = sw, model = model)[1] is None
+            else:
+                for b in batches:
+                    _step(model, b, items)
+            steps.append(sw._steps - before)
+        assert steps == [3, 1], steps
+
+        def oom(mod, args, out):
+            if torch.is_grad_enabled():
+                raise torch.OutOfMemoryError("simulated")
+
+        h = layers[3].register_forward_hook(oom)
+        try:
+            model.zero_grad(set_to_none = True)
+            losses, why = lm.run_layer_major(layers, [lambda b = b: _step(model, b, items) for b in batches],
+                                             swapper = sw, model = model)
+        finally:
+            h.remove()
+        assert losses is None and "out of memory" in why
+        assert not any(b.pending for b in sw.blocks)
+        assert _grads(model) == {}
+        model.zero_grad(set_to_none = True)
+        for b in batches:
+            _step(model, b, items)
+    finally:
+        sw.remove()

@@ -44,9 +44,10 @@ the standard way. UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
 
 import functools
 import os
+import sys
 import threading
 import traceback
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import torch
 
@@ -119,6 +120,66 @@ def boundary_bytes(num_tokens, hidden_size, num_layers, element_size = 2):
     """Device bytes a window holds for the layer inputs of micro-batches with `num_tokens` (rows x columns of
     each) tokens: every layer's input of every micro-batch, plus the last layer's output (the loss part's leaf)."""
     return sum(int(t) for t in num_tokens) * int(hidden_size) * (int(num_layers) + 1) * int(element_size)
+
+
+class _ReplayAbort(Exception):
+    """A decoder recompute that does not match its forward: the window rolls back."""
+
+
+def _saved_tensor_hooks_active():
+    """Whether saved-tensor hooks (activation offloading, save_on_cpu) are active on this thread. Torch without the
+    query: entering disable_saved_tensors_hooks raises while hooks are registered."""
+    try:
+        return torch._C._autograd._top_saved_tensors_default_hooks(False) is not None
+    except (AttributeError, TypeError):
+        pass
+    try:
+        with torch.autograd.graph.disable_saved_tensors_hooks("unsloth layer-major probe"):
+            return False
+    except RuntimeError:
+        return True
+
+
+def _is_cache(obj):
+    """A mutable KV / state cache object (transformers Cache, Mamba cache_params and the like)."""
+    if obj is None or isinstance(obj, (torch.Tensor, bool, int, float, str, tuple, list, dict)):
+        return False
+    cache_utils = sys.modules.get("transformers.cache_utils")
+    base = getattr(cache_utils, "Cache", None)
+    if isinstance(base, type) and isinstance(obj, base):
+        return True
+    return "Cache" in type(obj).__name__ or "cache" in type(obj).__name__
+
+
+def _recorders_beyond_hidden_states():
+    """transformers' active output collector (5.x) when it records more than hidden states (attentions, router
+    logits): those are captured inside the decoder, under the window's no-grad forward."""
+    mod = sys.modules.get("transformers.utils.output_capturing")
+    collector = getattr(mod, "_active_collector", None)
+    try:
+        active = collector.get() if collector is not None else None
+    except Exception:
+        return False
+    return bool(active) and bool(set(active.keys()) - {"hidden_states", "_hidden_states_layers"})
+
+
+def _recompile_limit(error):
+    exc = sys.modules.get("torch._dynamo.exc")
+    kinds = tuple(cls for name in ("FailOnRecompileLimitHit", "RecompileLimitExceeded", "CacheLimitExceeded")
+                  if isinstance(cls := getattr(exc, name, None), type))
+    return bool(kinds) and isinstance(error, kinds)
+
+
+def _all_rng_state():
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() and torch.cuda.is_initialized() else None
+    return torch.get_rng_state(), cuda
+
+
+def _set_all_rng_state(state):
+    cpu, cuda = state
+    torch.set_rng_state(cpu)
+    if cuda is not None:
+        torch.cuda.set_rng_state_all(cuda)
 
 
 def _autocast_state():
@@ -221,8 +282,9 @@ def _split_output(out):
     if isinstance(out, torch.Tensor):
         return out, lambda h: h
     if type(out) in (tuple, list) and out and isinstance(out[0], torch.Tensor):
-        # Attention weights / router logits computed without gradients would silently lose their gradient.
-        if any(isinstance(o, torch.Tensor) for o in out[1:]):
+        # Attention weights / router logits (also nested in containers) computed without gradients would silently
+        # lose their gradient: only plain metadata may follow the hidden states.
+        if any(type(o) not in (type(None), bool, int, float, str) for o in out[1:]):
             return None, None
         rest = tuple(out[1:])
         kind = type(out)
@@ -231,14 +293,15 @@ def _split_output(out):
 
 
 class _Window:
-    def __init__(self, layers, n, swapper, device, stream):
+    def __init__(self, layers, n, swapper, device, streams):
         self.layers = list(layers)
         self.L = len(self.layers)
         self.n = n
         self.index = {id(m): i for i, m in enumerate(self.layers)}
         self.swapper = swapper
         self.device = device
-        self.stream = stream
+        self.streams = streams
+        self.input_hooks = []
         self.cv = threading.Condition()
         self.turn = 0
         self.alive = [True] * n
@@ -317,6 +380,11 @@ class _Window:
             others = (args, {k: v for k, v in kwargs.items() if k != where})
         if _needs_grad(others):
             self._abort("a decoder layer input other than the hidden states needs gradients")
+        if _saved_tensor_hooks_active():
+            # Entered inside the micro-batch (a callback): the window's decoder replay would bypass them.
+            self._abort("saved-tensor hooks are active inside the micro-batch")
+        if _recorders_beyond_hidden_states():
+            self._abort("transformers is recording decoder outputs other than hidden states (output_attentions)")
         if self._call_signature(l) != self.signatures[l]:
             # Per-call output recorders (transformers' output_hidden_states / output_attentions capture wrappers,
             # hooks) would collect every interleaved micro-batch's outputs.
@@ -325,12 +393,15 @@ class _Window:
             self.h0[m] = h
             # The input-side graph is traversed once, after the layers: a loss part that backpropagates into it
             # directly (a loss on the embedding output) would consume it first.
-            h.register_hook(functools.partial(self._input_grad, m))
-        x = h.detach()
+            self.input_hooks.append(h.register_hook(functools.partial(self._input_grad, m)))
+        # Same requires_grad as the input a reentrant checkpoint passes its no-grad forward (compiled guards).
+        x = h.detach().requires_grad_(h.requires_grad)
         kwargs = _uncached(layer, dict(kwargs))
-        if not getattr(layer, "_can_checkpoint_with_cache", False) and any(
-                kwargs.get(k) is not None for k in _CACHE_KWARGS):
-            # A live KV cache (use_cache without checkpointing): the recompute would update it a second time.
+        if not getattr(layer, "_can_checkpoint_with_cache", False) and (
+                any(_is_cache(v) for v in (args[1:] if where == 0 else args))
+                or any(_is_cache(v) for k, v in kwargs.items() if k != where)):
+            # A live KV / state cache, positional or keyword (use_cache without checkpointing, cache_params):
+            # the recompute would update it a second time.
             self._abort("a decoder layer call with a live KV cache")
         args2, kwargs2 = _with_hidden(args, kwargs, where, x)
         devices = self.layer_devices[l] | ({x.device} if x.is_cuda else set())
@@ -369,9 +440,11 @@ class _Window:
             self._wait_turn(m)
             with ExitStack() as stack:
                 if self.device is not None and self.device.type == "cuda":
+                    # The caller's current stream on every device the model runs on (thread-local, like the
+                    # current device): inputs produced there are ordered before the micro-batch's kernels.
+                    for stream in self.streams:
+                        stack.enter_context(torch.cuda.stream(stream))
                     stack.enter_context(torch.cuda.device(self.device))
-                    if self.stream is not None:
-                        stack.enter_context(torch.cuda.stream(self.stream))
                 # Grad mode and autocast are thread-local: the caller's apply to its micro-batches.
                 stack.enter_context(torch.set_grad_enabled(self.caller_grad))
                 stack.enter_context(_autocast(self.caller_autocast))
@@ -429,6 +502,8 @@ class _Window:
                     with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng):
                         out = orig_call(layer, *args2, **kwargs2)
                     out_h, _ = _split_output(out)
+                    if out_h is None or not out_h.requires_grad:
+                        raise _ReplayAbort("a decoder recompute returned an output its forward did not")
                     torch.autograd.backward(out_h, g[m])
                     _STATS["recomputes"] += 1
                     g[m] = x.grad
@@ -510,11 +585,48 @@ def _intercept(window, layers):
                 del cls.__call__
 
 
+_WINDOW_LOCK = threading.Lock()
+
+
 def run_layer_major(layers, micro_fns, swapper = None, model = None):
     """Run `micro_fns` (one full training step per micro-batch: forward, loss, its scaling and backward) layer-major
-    over `layers`. Returns (results, None) with every gradient accumulated, or (None, reason) after a safe abort:
-    every trainable gradient of `model` (and of `layers`) is as it was, so the caller can run the same micro-batches
-    the standard way. A real error in a micro-batch is raised."""
+    over `layers`. Returns (results, None) with every gradient accumulated, or (None, reason) after a safe abort or
+    refusal: every trainable gradient of `model` (and of `layers`) and the RNG state are as they were, so the caller
+    can run the same micro-batches the standard way. A real error in a micro-batch is raised. One window per process
+    at a time: a concurrent caller is refused (the decoder classes and the worker pool are shared)."""
+    if not _WINDOW_LOCK.acquire(blocking = False):
+        return None, "another layer-major window is running in this process"
+    try:
+        scope = getattr(swapper, "layer_major_window", None)
+        with scope() if scope is not None else nullcontext():
+            results, why = _run_layer_major(layers, micro_fns, swapper, model)
+        if swapper is not None:
+            if results is not None and scope is not None:
+                swapper._end_step()   # the step's single end, once its whole backward is done
+            elif results is None and hasattr(swapper, "reset"):
+                swapper.reset()       # an interrupted window leaves blocks pending: release them all
+        return results, why
+    finally:
+        _WINDOW_LOCK.release()
+
+
+def _tied_trainable_io(model):
+    """A trainable parameter shared by the input embedding and the output head: the window adds the head's
+    contributions of every micro-batch before any embedding contribution (standard accumulation interleaves)."""
+    get_in, get_out = getattr(model, "get_input_embeddings", None), getattr(model, "get_output_embeddings", None)
+    if not (callable(get_in) and callable(get_out)):
+        return False
+    try:
+        emb, head = get_in(), get_out()
+    except (NotImplementedError, AttributeError):
+        return False
+    if emb is None or head is None:
+        return False
+    trainable = {id(p) for p in emb.parameters() if p.requires_grad}
+    return any(id(p) in trainable for p in head.parameters())
+
+
+def _run_layer_major(layers, micro_fns, swapper, model):
     n = len(micro_fns)
     if n < 1 or not len(layers):
         return None, "nothing to run"
@@ -522,6 +634,11 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
             torch.distributed.get_world_size() > 1:
         # DDP reduces in the loss parts' backwards, before the window's decoder backward exists.
         return None, "distributed training (gradient reduction would miss the decoder backward)"
+    if model is not None and _tied_trainable_io(model):
+        return None, "the input embedding and the output head share a trainable weight"
+    if _saved_tensor_hooks_active():
+        # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
+        return None, "saved-tensor hooks are active (activation offloading)"
     # A loss part can also write gradients directly (a regulariser on a decoder weight): an abort puts back all.
     params, seen = [], set()
     for owner in ([model] if model is not None else []) + list(layers):
@@ -529,19 +646,28 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
             if p.requires_grad and id(p) not in seen:
                 seen.add(id(p))
                 params.append(p)
-    outside = [(p, None if p.grad is None else p.grad.clone()) for p in params]
     try:
-        hooks = torch._C._autograd._top_saved_tensors_default_hooks(False)
-    except (AttributeError, TypeError, RuntimeError):   # torch < 2.7 has no query
-        hooks = None
-    if hooks is not None:
-        # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
-        return None, "saved-tensor hooks are active (activation offloading)"
-    device = stream = None
+        outside = [(p, None if p.grad is None else p.grad.clone()) for p in params]
+    except torch.OutOfMemoryError:
+        return None, "out of memory while saving the gradients a window would have to restore"
+    rng = _all_rng_state()
+
+    def roll_back(reason):
+        for p, g in outside:
+            p.grad = g
+        _set_all_rng_state(rng)   # draws made by the abandoned window (NEFTune noise, dropout) are not consumed
+        _STATS["aborts"] += 1
+        _STATS["last_abort"] = reason
+        return None, reason
+
+    device, streams = None, ()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         device = torch.device("cuda", torch.cuda.current_device())
-        stream = torch.cuda.current_stream(device)
-    w = _Window(layers, n, swapper, device, stream)
+        devices = {device} | {torch.device(d) for d in getattr(swapper, "_peak_devs", ())}
+        for owner in ([model] if model is not None else []) + list(layers):
+            devices.update(t.device for t in (*owner.parameters(), *owner.buffers()) if t.is_cuda)
+        streams = tuple(torch.cuda.current_stream(d) for d in sorted(devices, key = lambda d: d.index or 0))
+    w = _Window(layers, n, swapper, device, streams)
     w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
     try:
         with _intercept(w, layers) as orig_calls:
@@ -562,18 +688,18 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
                 w.abort_reason = ("a loss part backpropagated into the first decoder layer's input directly "
                                   "(a loss on the embedding output)")
     finally:
+        # The first-input hooks only watch the loss parts; a reused input tensor must not keep the window alive.
+        for handle in w.input_hooks:
+            handle.remove()
+        w.input_hooks.clear()
         if w.swapper is not None:
             for l in sorted(w.held):
                 w.swapper.unhold(l)
             w.held.clear()
     if w.abort_reason is not None:
-        for p, g in outside:
-            p.grad = g
         w.saved = w.outs = w.h0 = None
-        _STATS["aborts"] += 1
-        _STATS["last_abort"] = w.abort_reason
         error, w.error = w.error, None
-        if error is not None and not isinstance(error, torch.OutOfMemoryError):
+        if error is not None and not isinstance(error, torch.OutOfMemoryError) and not _recompile_limit(error):
             raise error
         if error is not None:
             # Its traceback's frames hold the failed forward's tensors (and the window): free them now, before
@@ -581,17 +707,21 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
             traceback.clear_frames(error.__traceback__)
             error.__traceback__ = None
         del error
-        return None, w.abort_reason
+        return roll_back(w.abort_reason)
     try:
         w.backward(orig_calls)
-    except torch.OutOfMemoryError:
-        # The recompute builds a graph the no-grad forward did not: it can run out where the forward fit.
+    except (torch.OutOfMemoryError, _ReplayAbort, Exception) as error:
+        # The recompute builds a graph the no-grad forward did not: it can run out where the forward fit, or hit
+        # a compiled block's recompile limit. Anything else is a real error.
+        if not isinstance(error, (torch.OutOfMemoryError, _ReplayAbort)) and not _recompile_limit(error):
+            raise
+        reason = ("out of memory in the decoder backward" if isinstance(error, torch.OutOfMemoryError)
+                  else str(error) if isinstance(error, _ReplayAbort)
+                  else "torch.compile recompile limit in the decoder backward")
+        traceback.clear_frames(error.__traceback__)
+        del error
         w.saved = w.outs = w.h0 = None
-        for p, g in outside:
-            p.grad = g
-        _STATS["aborts"] += 1
-        _STATS["last_abort"] = "out of memory in the decoder backward"
-        return None, _STATS["last_abort"]
+        return roll_back(reason)
     _STATS["windows"] += 1
     _STATS["micro_batches"] += n
     return w.results, None

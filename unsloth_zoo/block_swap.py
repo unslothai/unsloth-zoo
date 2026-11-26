@@ -1748,7 +1748,20 @@ class BlockSwap:
     def _clear_step_queued(self):
         self._step_queued = False
 
+    @contextmanager
+    def layer_major_window(self):
+        """A layer-major window splits one step's backward into several autograd graphs: the step ends once,
+        when the caller calls _end_step after the window, not at each graph's end."""
+        self._layer_major_active = True
+        try:
+            yield
+        finally:
+            self._layer_major_active = False
+
     def _end_step(self):
+        if self.__dict__.get("_layer_major_active", False):
+            self._step_queued = False
+            return
         # Backward is done: a wait sample whose forward hook never ran (a recompute that stopped early) is complete.
         for b in self.blocks:
             if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
