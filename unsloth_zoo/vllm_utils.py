@@ -8599,6 +8599,18 @@ def _fsdp2_merged_rollout_gather(model, scope = None):
 pass
 
 
+def _lora_tensors_for_vllm(model, reuse_gathered = False):
+    """_lora_state_dict with stacked expert LoRA as views of one clone per stack (vLLM only reads them)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from .temporary_patches.moe_grouped_modulelist import packed_stacked_state_dict
+    except Exception:
+        packed_stacked_state_dict = contextlib.nullcontext
+    with packed_stacked_state_dict():
+        return _lora_state_dict(model, reuse_gathered)
+pass
+
+
 def _build_lora_request(model, save_directory, load_tensors, lora_request_id, exclude = None, reuse_gathered = False):
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
@@ -8609,7 +8621,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = _strip_lora_adapter_name(_lora_state_dict(model, reuse_gathered), _lora_adapter_name(model))
+        state_dict = _strip_lora_adapter_name(_lora_tensors_for_vllm(model, reuse_gathered), _lora_adapter_name(model))
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}
