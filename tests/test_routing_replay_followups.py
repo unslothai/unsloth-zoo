@@ -320,3 +320,35 @@ def test_host_metadata_stays_on_cpu_under_a_default_device():
     assert sorted(addresses.tolist()) == sorted([0, a.data_ptr(), b.data_ptr()])
     assert mask.device.type == "cpu" and mask.tolist() == [True, False]
     assert all(t.device.type == "cpu" for t in fakes)
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_checkpointed_natural_forward_beside_a_replayed_one(monkeypatch, use_reentrant):
+    # Two same-length forwards before one backward, only the first with rollout routes (GRPO rows
+    # vLLM returned no routes for): the natural one's recompute must save what its forward saved.
+    from test_routing_replay import _model, _natural_ids, _request, PAD, NUM_EXPERTS
+
+    monkeypatch.setenv(rr.ROUTING_REPLAY_ENV, "1")
+    a, b = [5, 6, 7, 30, 31, 32, 33], [8, 9, 10, 40, 41, 42, 43]
+
+    def run(checkpointing):
+        rr.reset_routing_replay()
+        m = _model()
+        m.train()
+        if checkpointing:
+            m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
+        m.model.embed_tokens.weight.requires_grad_(True)
+        rr.install_routing_replay(m, None, SimpleNamespace(pad_token_id = PAD))
+        forced = (_natural_ids(m, a) + 2) % NUM_EXPERTS
+        rr.record_routed_experts([_request(a[:3], a[3:], forced.numpy())])
+        la = m(input_ids = torch.tensor([a])).logits
+        lb = m(input_ids = torch.tensor([b])).logits
+        (la.float().pow(2).mean() + lb.float().pow(2).mean()).backward()
+        grads = [p.grad.clone() for p in (m.model.embed_tokens.weight, m.model.layers[0].mlp.gate.weight)]
+        return la.detach(), lb.detach(), grads
+
+    plain = run(False)
+    gc = run(True)
+    for got, want in zip(gc[:2] + tuple(gc[2]), plain[:2] + tuple(plain[2])):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+    rr.reset_routing_replay()
