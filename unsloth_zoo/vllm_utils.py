@@ -8600,8 +8600,7 @@ pass
 
 
 def _lora_tensors_for_vllm(model, reuse_gathered = False):
-    """_lora_state_dict for the in-memory handoff (vLLM only reads the tensors): stacked expert LoRA goes out as
-    views of one detached clone per stack instead of one clone per expert."""
+    """_lora_state_dict with stacked expert LoRA as views of one clone per stack (vLLM only reads them)."""
     # All Unsloth Zoo code licensed under LGPLv3
     try:
         from .temporary_patches.moe_grouped_modulelist import packed_stacked_state_dict

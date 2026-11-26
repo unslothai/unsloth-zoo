@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The in-memory vLLM LoRA handoff takes one clone per stacked expert LoRA Parameter, not one per expert: same keys,
-bitwise same tensors, detached from the live stacks, disjoint per-expert slices. Every other state_dict keeps
-independent per-expert clones (safetensors refuses shared storage). CPU only."""
+"""vLLM LoRA handoff: one clone per expert stack (same keys and bits, detached, disjoint); other state_dicts unchanged."""
 import os
 
 import pytest

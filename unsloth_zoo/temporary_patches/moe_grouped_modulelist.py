@@ -556,18 +556,15 @@ def _stacked_state_dict_pre_hook(module, prefix, keep_vars):
     module.__dict__["_unsloth_keep_vars"] = keep_vars
 
 
-# stack -> its one detached clone, only inside packed_stacked_state_dict() (the in-memory vLLM handoff).
-_PACKED_CLONES = None
-# Host stacks keep per-expert clones: a fresh multi-MB host allocation per stack page-faults, which measured 2.6x
-# slower than the per-expert clones glibc recycles (CUDA's caching allocator has no such cost).
+_PACKED_CLONES = None  # id(stack) -> (stack, detached clone), only inside packed_stacked_state_dict()
+# Host stacks keep per-expert clones: a fresh multi-MB host allocation per stack measured 2.6x slower.
 _UNPACKED_DEVICE_TYPES = ("cpu",)
 
 
 @contextlib.contextmanager
 def packed_stacked_state_dict():
-    """state_dict() taken inside gives each stacked expert weight as a view of one clone per stack (same values,
-    detached from the live stack, disjoint slices), not a clone per expert (36,864 on Qwen3-30B-A3B). Only for
-    consumers that copy what they get: the views share storage, which safetensors refuses."""
+    """Stacked expert weights come out as views of one detached clone per stack, not a clone per expert. The views
+    share storage, which safetensors refuses: only for the in-memory vLLM handoff."""
     global _PACKED_CLONES
     outer = _PACKED_CLONES
     _PACKED_CLONES = {} if outer is None else outer
