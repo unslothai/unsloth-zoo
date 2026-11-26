@@ -1947,10 +1947,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             dim_offsets = [0, qweight.shape[0]]
 
         _fp8_method = getattr(proj, "quant_method", None)
-        if (
-            not qweight.dtype.is_floating_point
-            and "Fp8" in type(_fp8_method).__name__
-            and (getattr(_fp8_method, "use_marlin", False) or isinstance(getattr(proj, "weight_block_size", None), (list, tuple)))
+        if "Fp8" in type(_fp8_method).__name__ and (
+            type(getattr(_fp8_method, "fp8_linear", None)).__name__ in _VLLM_REPACKING_FP8_BLOCK_KERNELS
+            or (not qweight.dtype.is_floating_point and (
+                getattr(_fp8_method, "use_marlin", False) or isinstance(getattr(proj, "weight_block_size", None), (list, tuple))
+            ))
         ):
             raise _vllm_fp8_repacked_weight_error(prefix, proj, qweight)
 
@@ -3600,15 +3601,24 @@ def _get_vllm_online_fp8_quantization(fp8_mode, quantization_methods = None, dev
     return scheme
 
 
-# vLLM block-FP8 linear kernels that repack the weight out of its [N, K] float8 layout (Marlin packs it
-# into int32 tiles), so training can no longer share the tensor.
-_VLLM_REPACKING_FP8_BLOCK_KERNELS = ("MarlinFP8ScaledMMLinearKernel", "HummingFP8ScaledMMLinearKernel")
+# vLLM block-FP8 linear kernels that rewrite the weight or its scales in place, so training can no longer share them:
+# FP8 Marlin / Humming repack the weight into int32 tiles; DeepGEMM (and FlashInfer's DeepGEMM dispatch) turns the
+# [N / 128, K / 128] scales into its packed per-row layout (Qwen3-0.6B q_proj [4096, 2] on an RTX PRO 6000).
+_VLLM_REPACKING_FP8_BLOCK_KERNELS = (
+    "MarlinFP8ScaledMMLinearKernel", "HummingFP8ScaledMMLinearKernel",
+    "DeepGemmFp8BlockScaledMMKernel", "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
+)
+# Block-FP8 kernels that keep the checkpoint layout, fastest first, with their --linear-backend name.
+_VLLM_LAYOUT_KEEPING_FP8_BLOCK_BACKENDS = (
+    ("CutlassFp8BlockScaledMMKernel", "cutlass"), ("TritonFp8BlockScaledMMKernel", "triton"),
+)
 
 
-def _vllm_fp8_block_auto_kernel(device_capability = None):
-    """Name of the kernel vLLM's automatic selection gives a block-FP8 linear on this GPU, or None when
-    this vLLM has no such kernel list. vLLM >= 0.29 lists FP8 Marlin ahead of Triton for block FP8 and
-    no longer limits it to GPUs below sm89, so on an L4 (sm89, no CUTLASS block FP8) Marlin wins."""
+def _vllm_fp8_block_supported_kernels(device_capability = None):
+    """Block-FP8 linear kernels vLLM's automatic selection would consider on this GPU, in its priority order
+    (prioritize_humming, VLLM_DISABLED_KERNELS, then each kernel's is_supported), or None when this vLLM has
+    no such kernel list. vLLM >= 0.29 lists FP8 Marlin ahead of Triton and no longer limits it to GPUs below
+    sm89, so on an L4 (sm89: no CUTLASS block FP8, no DeepGEMM) Marlin wins."""
     try:
         import vllm.model_executor.kernels.linear as vllm_linear
         from vllm.platforms import current_platform
@@ -3631,16 +3641,23 @@ def _vllm_fp8_block_auto_kernel(device_capability = None):
         except Exception:
             pass
     disabled = getattr(vllm_envs, "VLLM_DISABLED_KERNELS", None) or ()
+    supported = []
     for kernel in kernels:
         if kernel.__name__ in disabled:
             continue
         try:
-            supported, _ = kernel.is_supported(device_capability)
+            ok, _ = kernel.is_supported(device_capability)
         except Exception:
             continue
-        if supported:
-            return kernel.__name__
-    return None
+        if ok:
+            supported.append(kernel.__name__)
+    return supported
+
+
+def _vllm_fp8_block_auto_kernel(device_capability = None):
+    """Name of the kernel vLLM's automatic selection gives a block-FP8 linear on this GPU, or None."""
+    supported = _vllm_fp8_block_supported_kernels(device_capability)
+    return supported[0] if supported else None
 
 
 def _kernel_config_get(kernel_config, key):
@@ -3652,14 +3669,19 @@ def _kernel_config_get(kernel_config, key):
 def _vllm_fp8_block_share_backend_args(engine_args, good_keys, device_capability = None):
     """Engine args that keep vLLM's block-FP8 linear weights in their checkpoint layout so training can share them.
 
-    On vLLM >= 0.29 an sm89 GPU runs block FP8 on FP8 Marlin, which repacks each weight into int32 tiles in place
-    (Qwen3-0.6B qkv [4096, 1024] float8 -> [64, 16384] int32). The training model is built from those same tensors,
-    so its forward then fails with "mat1 and mat2 shapes cannot be multiplied". vLLM <= 0.28 skipped Marlin on
-    sm89+ and ran Triton, which keeps the layout; this pins that Triton kernel for block FP8 only. Returns
-    (args to merge, message) or ({}, None) when the automatic pick already keeps the layout or the user chose a
+    The training model is built from vLLM's own weight tensors. On vLLM >= 0.29 an sm89 GPU runs block FP8 on FP8
+    Marlin, which repacks each weight into int32 tiles in place (Qwen3-0.6B qkv [4096, 1024] float8 -> [64, 16384]
+    int32), and the training forward fails with "mat1 and mat2 shapes cannot be multiplied". Where DeepGEMM is
+    installed (sm90, sm120), it rewrites the block scales into its own layout. This pins the fastest kernel that keeps
+    the layout, CUTLASS block FP8 (sm90+), else Triton (what vLLM <= 0.28 ran on sm89), for block FP8 only. Returns
+    (args to merge, message), or ({}, None) when the automatic pick already keeps the layout or the user chose a
     linear backend."""
-    picked = _vllm_fp8_block_auto_kernel(device_capability)
-    if picked not in _VLLM_REPACKING_FP8_BLOCK_KERNELS:
+    supported = _vllm_fp8_block_supported_kernels(device_capability)
+    if not supported or supported[0] not in _VLLM_REPACKING_FP8_BLOCK_KERNELS:
+        return {}, None
+    picked = supported[0]
+    backend = next((name for kernel, name in _VLLM_LAYOUT_KEEPING_FP8_BLOCK_BACKENDS if kernel in supported), None)
+    if backend is None:
         return {}, None
     user_kernel_config = engine_args.get("kernel_config")
     if engine_args.get("linear_backend", "auto") != "auto" or (
@@ -3670,8 +3692,8 @@ def _vllm_fp8_block_share_backend_args(engine_args, good_keys, device_capability
     ):
         return {}, None
     message = (
-        f"Unsloth: vLLM would run block FP8 linears on {picked}, which repacks the weights that training shares, "
-        "so vLLM uses its Triton block FP8 kernel instead."
+        f"Unsloth: vLLM would run block FP8 linears on {picked}, which rewrites the weights training shares, "
+        f"so vLLM uses its {backend} block FP8 kernel instead."
     )
     try:
         from vllm.config import KernelConfig
@@ -3690,29 +3712,29 @@ def _vllm_fp8_block_share_backend_args(engine_args, good_keys, device_capability
             import copy
             kernel_config = copy.deepcopy(user_kernel_config)
             per_quant = dict(getattr(kernel_config, "linear_backend_per_quant", None) or {})
-            per_quant["fp8_block_w8a8"] = "triton"
+            per_quant["fp8_block_w8a8"] = backend
             kernel_config.linear_backend_per_quant = per_quant
             return {"kernel_config": kernel_config}, message
         per_quant = dict(kernel_config.get("linear_backend_per_quant") or {})
-        per_quant["fp8_block_w8a8"] = "triton"
+        per_quant["fp8_block_w8a8"] = backend
         kernel_config["linear_backend_per_quant"] = per_quant
         return {"kernel_config": kernel_config}, message
     if "linear_backend" in good_keys:
-        # vLLM 0.29 has no per-quantization override; other layer types without a Triton kernel keep auto.
-        return {"linear_backend": "triton"}, message
+        # vLLM 0.29 has no per-quantization override; layer types without a kernel from that backend keep auto.
+        return {"linear_backend": backend}, message
     return {}, None
 
 
 def _vllm_fp8_repacked_weight_error(prefix, proj, qweight):
-    """A clear error for a block-FP8 layer whose weight vLLM repacked (FP8 Marlin), instead of a shape
-    mismatch deep inside the training forward."""
+    """A clear error for an FP8 layer whose weight or scales vLLM rewrote for its kernel (FP8 Marlin, DeepGEMM),
+    instead of a shape mismatch deep inside the training forward."""
     quant_method = getattr(proj, "quant_method", None)
     kernel = type(getattr(quant_method, "fp8_linear", None)).__name__
     return RuntimeError(
-        f"Unsloth: vLLM repacked the FP8 weight of {prefix} for its {kernel} kernel ({qweight.dtype} "
-        f"{tuple(qweight.shape)}), so training cannot share it. Use vLLM's Triton block FP8 kernel with "
-        "kernel_config = {'linear_backend_per_quant': {'fp8_block_w8a8': 'triton'}} (or linear_backend = "
-        "'triton' on vLLM 0.29), or set fast_inference = False."
+        f"Unsloth: vLLM rewrote the FP8 weight of {prefix} for its {kernel} kernel (weight {qweight.dtype} "
+        f"{tuple(qweight.shape)}), so training cannot share it. Use a block FP8 kernel that keeps the checkpoint "
+        "layout with kernel_config = {'linear_backend_per_quant': {'fp8_block_w8a8': 'cutlass'}} on sm90+ or "
+        "'triton' on sm89 (linear_backend = ... on vLLM 0.29), or set fast_inference = False."
     )
 
 

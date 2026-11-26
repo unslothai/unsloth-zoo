@@ -15,8 +15,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """vLLM >= 0.29 runs block FP8 linears on FP8 Marlin on sm89 (L4), which repacks the weight training shares into
-int32 tiles. load_vllm pins vLLM's Triton block FP8 kernel there, and get_vllm_state_dict refuses a repacked weight
-with a clear error instead of handing training an int32 tensor."""
+int32 tiles, and on DeepGEMM where it is installed (sm90, sm120), which rewrites the block scales. load_vllm pins a
+kernel that keeps the checkpoint layout (CUTLASS block FP8 on sm90+, else Triton), and get_vllm_state_dict refuses a
+rewritten weight with a clear error instead of handing training the wrong tensor."""
 
 import sys, os, types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -68,12 +69,13 @@ def _install_fake_vllm(monkeypatch, kernels, disabled = (), per_quant = True):
         monkeypatch.setitem(sys.modules, name, module)
 
 
-def _vllm_034_cuda_list(sm89):
-    # vLLM 0.34 _POSSIBLE_FP8_BLOCK_KERNELS[CUDA], with what each kernel's is_supported says on sm89 vs sm90 / sm100.
+def _vllm_034_cuda_list(sm, deep_gemm = False):
+    # vLLM 0.34 _POSSIBLE_FP8_BLOCK_KERNELS[CUDA], with what each kernel's is_supported says per GPU. DeepGEMM needs
+    # the deep_gemm package and VLLM_USE_DEEP_GEMM (load_vllm turns it off on sm100); CUTLASS block FP8 needs sm90+.
     return [
-        _kernel("FlashInferFp8DeepGEMMDynamicBlockScaledKernel", not sm89),
-        _kernel("DeepGemmFp8BlockScaledMMKernel", not sm89),
-        _kernel("CutlassFp8BlockScaledMMKernel", not sm89),
+        _kernel("FlashInferFp8DeepGEMMDynamicBlockScaledKernel", deep_gemm and sm == 100),
+        _kernel("DeepGemmFp8BlockScaledMMKernel", deep_gemm and sm >= 90),
+        _kernel("CutlassFp8BlockScaledMMKernel", sm >= 90),
         _kernel("B12xFp8BlockScaledMMKernel", False),
         _kernel("MarlinFP8ScaledMMLinearKernel", True),
         _kernel("HummingFP8ScaledMMLinearKernel", False),
@@ -82,27 +84,40 @@ def _vllm_034_cuda_list(sm89):
 
 
 def test_sm89_picks_marlin_and_pins_triton_for_block_fp8_only(vu, monkeypatch):
-    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(sm89 = True))
+    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(89))
     assert vu._vllm_fp8_block_auto_kernel(89) == "MarlinFP8ScaledMMLinearKernel"
     args, message = vu._vllm_fp8_block_share_backend_args({}, {"kernel_config", "linear_backend"}, 89)
     assert args == {"kernel_config": {"linear_backend_per_quant": {"fp8_block_w8a8": "triton"}}}
-    assert "MarlinFP8ScaledMMLinearKernel" in message and "Triton" in message
+    assert "MarlinFP8ScaledMMLinearKernel" in message and "triton" in message
 
 
-def test_hopper_and_blackwell_keep_automatic_selection(vu, monkeypatch):
-    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(sm89 = False))
-    assert vu._vllm_fp8_block_auto_kernel(100) == "FlashInferFp8DeepGEMMDynamicBlockScaledKernel"
-    assert vu._vllm_fp8_block_share_backend_args({}, {"kernel_config"}, 100) == ({}, None)
+@pytest.mark.parametrize("sm", [90, 120])
+def test_deep_gemm_picks_are_pinned_to_cutlass(vu, monkeypatch, sm):
+    # DeepGEMM rewrites the block scales (RTX PRO 6000: q_proj scale [4096, 2] instead of [32, 8]).
+    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(sm, deep_gemm = True))
+    assert vu._vllm_fp8_block_auto_kernel(sm) == "DeepGemmFp8BlockScaledMMKernel"
+    args, message = vu._vllm_fp8_block_share_backend_args({}, {"kernel_config"}, sm)
+    assert args == {"kernel_config": {"linear_backend_per_quant": {"fp8_block_w8a8": "cutlass"}}}
+    assert "DeepGemmFp8BlockScaledMMKernel" in message
+
+
+@pytest.mark.parametrize("sm", [90, 100, 120])
+def test_cutlass_picks_keep_automatic_selection(vu, monkeypatch, sm):
+    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(sm))
+    assert vu._vllm_fp8_block_auto_kernel(sm) == "CutlassFp8BlockScaledMMKernel"
+    assert vu._vllm_fp8_block_share_backend_args({}, {"kernel_config"}, sm) == ({}, None)
 
 
 def test_disabled_kernels_are_skipped_like_vllm(vu, monkeypatch):
-    kernels = _vllm_034_cuda_list(sm89 = False)
-    _install_fake_vllm(monkeypatch, kernels, disabled = [k.__name__ for k in kernels[:3]])
+    kernels = _vllm_034_cuda_list(100, deep_gemm = True)
+    _install_fake_vllm(monkeypatch, kernels, disabled = [k.__name__ for k in kernels[:4]])
     assert vu._vllm_fp8_block_auto_kernel(100) == "MarlinFP8ScaledMMLinearKernel"
+    args, _ = vu._vllm_fp8_block_share_backend_args({}, {"kernel_config"}, 100)
+    assert args == {"kernel_config": {"linear_backend_per_quant": {"fp8_block_w8a8": "triton"}}}
 
 
 def test_user_kernel_config_is_merged_and_an_explicit_choice_wins(vu, monkeypatch):
-    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(sm89 = True))
+    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(89))
     user = {"enable_flashinfer_autotune": False, "linear_backend_per_quant": {"nvfp4_w4a16": "humming"}}
     args, _ = vu._vllm_fp8_block_share_backend_args({"kernel_config": user}, {"kernel_config"}, 89)
     assert args["kernel_config"] == {
@@ -119,7 +134,7 @@ def test_user_kernel_config_is_merged_and_an_explicit_choice_wins(vu, monkeypatc
 
 
 def test_vllm_029_without_per_quant_override_uses_linear_backend(vu, monkeypatch):
-    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(sm89 = True), per_quant = False)
+    _install_fake_vllm(monkeypatch, _vllm_034_cuda_list(89), per_quant = False)
     args, _ = vu._vllm_fp8_block_share_backend_args({}, {"kernel_config", "linear_backend"}, 89)
     assert args == {"linear_backend": "triton"}
 
@@ -165,10 +180,10 @@ def _fp8_method(kernel):
     return method
 
 
-def _fake_llm(marlin):
+def _fake_llm(marlin, kernel = None):
     hidden, heads, kv_heads, head_dim, inter, vocab, block = 128, 2, 1, 64, 256, 64, [128, 128]
     q, kv = heads * head_dim, kv_heads * head_dim
-    kernel = "MarlinFP8ScaledMMLinearKernel" if marlin else "TritonFp8BlockScaledMMKernel"
+    kernel = kernel or ("MarlinFP8ScaledMMLinearKernel" if marlin else "TritonFp8BlockScaledMMKernel")
 
     def fp8(n, k, sizes = None):
         weight = torch.randn(n, k).to(torch.float8_e4m3fn)
@@ -216,5 +231,11 @@ def test_state_dict_shares_the_float8_weights_triton_keeps(vu):
 
 def test_state_dict_refuses_a_marlin_repacked_weight(vu):
     llm, config = _fake_llm(marlin = True)
-    with pytest.raises(RuntimeError, match = r"repacked the FP8 weight of model\.layers\.0\.self_attn\.q_proj.*MarlinFP8ScaledMMLinearKernel.*torch\.int32"):
+    with pytest.raises(RuntimeError, match = r"rewrote the FP8 weight of model\.layers\.0\.self_attn\.q_proj.*MarlinFP8ScaledMMLinearKernel.*torch\.int32"):
+        vu.get_vllm_state_dict(llm, config = config, load_in_fp8 = True)
+
+
+def test_state_dict_refuses_deep_gemm_scales(vu):
+    llm, config = _fake_llm(marlin = False, kernel = "DeepGemmFp8BlockScaledMMKernel")
+    with pytest.raises(RuntimeError, match = r"rewrote the FP8 weight of model\.layers\.0\.self_attn\.q_proj.*DeepGemmFp8BlockScaledMMKernel"):
         vu.get_vllm_state_dict(llm, config = config, load_in_fp8 = True)
