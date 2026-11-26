@@ -241,8 +241,10 @@ def simd_qmm(x, w, scales, biases, group_size, bits):
 
 
 # (bits, group size or None, fewest weights, widest N or None, fewest rows, most rows), first match wins; measured on
-# an M3 Max, used for every generation. Up to 16 rows stock's qmv_mma beats this route; from 17 rows stock leaves it.
-_SIMD_QMM_ROWS = ((4, None, 1 << 21, 65536, 17, 24), (8, None, 1 << 21, 4096, 17, 24))
+# an M3 Max, used for every generation.
+_SIMD_QMM_ROWS = ((4, None, 1 << 21, 65536, 3, 24), (8, None, 1 << 21, 4096, 3, 24), (4, None, 1 << 24, None, 3, 4))
+# Rows within those ranges that stay native: measured slower than stock end to end.
+SIMD_QMM_STOCK_ROWS = (5, 16)
 
 
 def simd_qmm_row_range(N, K, group_size, bits):

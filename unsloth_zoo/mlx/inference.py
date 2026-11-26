@@ -5881,6 +5881,7 @@ class _SmallRowRoute(NamedTuple):
     state: str = "nax_qmm"
     reader: str = None
     code_offset: bool = False   # the kernel may fold `s * (sum x (2^bits + q) - 2^bits * sum x)` out of each group
+    stock_rows: str = None   # names `module`'s (lowest, highest) rows within the kernel's range that stay native
 
     def call(self, suffix, *args):
         kernel = getattr(self.module, self.kernel + suffix)
@@ -5892,7 +5893,8 @@ class _SmallRowRoute(NamedTuple):
 _NAX_QMM_ROUTE = _SmallRowRoute(nax, None, "Nax", "NAX", None, None, None, True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
-                                 "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
+                                 "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False,
+                                 stock_rows = "SIMD_QMM_STOCK_ROWS")
 _LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane", "UNSLOTH_MLX_LANE_QMM", None,
                                  ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm", code_offset = True)
 
@@ -6171,12 +6173,14 @@ def _nax_qmm_classes(route, *cache_key):
     if bindings is None:
         return {}
 
-    # Calls no route takes (below every route, between small-row and the next, a native block) skip the checks.
+    # Calls no route takes (below every route, in a route's stock rows, between small-row and the next, a native block)
+    # skip the checks.
     def declined(self, x):
         if type(x) is not mx.array:
             return False
         n = x.size
-        if n < self._unsloth_nax_qmm_floor or self._unsloth_nax_qmm_ceiling < n < self._unsloth_nax_qmm_next:
+        if (n < self._unsloth_nax_qmm_floor or self._unsloth_nax_qmm_ceiling < n < self._unsloth_nax_qmm_next
+                or self._unsloth_nax_qmm_stock_low <= n <= self._unsloth_nax_qmm_stock_high):
             return True
         if route.takes_blocks or n > self._unsloth_nax_qmm_ceiling:
             return False
@@ -6206,6 +6210,7 @@ def _nax_qmm_classes(route, *cache_key):
         base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
                    {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
                     "_unsloth_nax_qmm_floor": 0, "_unsloth_nax_qmm_ceiling": 0, "_unsloth_nax_qmm_next": 0,
+                    "_unsloth_nax_qmm_stock_low": 0, "_unsloth_nax_qmm_stock_high": -1,
                     "_unsloth_nax_int8_prefill_rows": 0})
         for base, name, method in ((nn.QuantizedLinear, "__call__", linear),
                                    (nn.QuantizedEmbedding, "as_linear", as_linear))
@@ -6267,7 +6272,8 @@ def _nax_restore(module):
     if native is not None:
         module.__class__ = native
     for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
-                 "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
+                 "_unsloth_nax_qmm_next", "_unsloth_nax_qmm_stock_low", "_unsloth_nax_qmm_stock_high",
+                 "_unsloth_nax_int8_prefill_rows",
                  "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready",
                  "_unsloth_nax_owner"):
         module.__dict__.pop(name, None)
@@ -6501,6 +6507,9 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                     module._unsloth_nax_qmm_floor = min(after, rows[0] if rows else after) * K
                     module._unsloth_nax_qmm_ceiling = (rows[1] if rows else -1) * K
                     module._unsloth_nax_qmm_next = after * K
+                    if rows is not None and route.stock_rows:
+                        module._unsloth_nax_qmm_stock_low, module._unsloth_nax_qmm_stock_high = (
+                            row * K for row in getattr(route.module, route.stock_rows))
                     if int8_prefill_rows:
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
@@ -6547,7 +6556,12 @@ _DENSE_QMM_MIN_ROWS = 1024
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
-_DENSE_QMM_DISPATCH_MLX = ("0.32.5",)  # MLX's thin NAX case needs N <= 64, so M > 16384 here
+_DENSE_QMM_DISPATCH_MLX = ("0.32.5",)
+
+
+def _dense_prefill_serves():
+    # Where stock runs its NAX kernels, its staged qmm_t_nax beats dequantizing once.
+    return mx.__version__ in _DENSE_QMM_DISPATCH_MLX and not attention._stock_runs_nax()
 
 
 def _dense_qmm_rows(M, N, K):
@@ -6689,7 +6703,7 @@ def _dense_prefill_qmm(module, x, bindings):
     one-column output (matvec, kernel picked per row count) would need a check per prompt length: native.
     Calls it declines go to the tiled route when that is on, exact by construction and not compared.
     """
-    if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
+    if not _dense_prefill_serves():
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
@@ -6774,7 +6788,7 @@ def prefill_route(module, rows):
         return "int8"
     if not d.get("_unsloth_dense_qmm_scopes"):
         return "stock"
-    if (mx.__version__ in _DENSE_QMM_DISPATCH_MLX and rows >= _DENSE_QMM_MIN_ROWS and N != 1
+    if (_dense_prefill_serves() and rows >= _DENSE_QMM_MIN_ROWS and N != 1
             and -(-rows // 16) * -(-N // 16) > _DENSE_QMM_MIN_TILES and N * K <= _DENSE_QMM_MAX_WEIGHTS):
         biases = module.get("biases")
         family = (N, K, module.bits, module.group_size, module.mode, dtype, w.dtype, dtype,
@@ -6811,7 +6825,7 @@ def dense_prefill_linear(model, *, _modules = None):
     densely, bit-identical to the quantized matmul; smaller calls,
     training, and any shape that fails its first-use comparison keep the exact tiled route when eligible,
     otherwise the native call. A linear `nax_quantized_linear` already routes keeps its small-row route and
-    takes this one for the rest.
+    takes this one for the rest. Where stock MLX runs its NAX kernels, those beat this route and it stays off.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
 
     Where stock MLX runs no NAX kernels, affine calls this route leaves to stock's plain quantized matmul
