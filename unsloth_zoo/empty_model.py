@@ -53,6 +53,8 @@ _CLAMP_BOUND_SUFFIXES = (".input_min", ".input_max", ".output_min", ".output_max
 QWEN_VL_MERGED_QKV_TYPES = (
     "qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision",
     "qwen3_5", "qwen3_5_vision", "qwen3_5_moe", "qwen3_5_moe_vision",
+    # Qwen3.8-Flash-Next: the checkpoint's vision_config says qwen4_exp, transformers' default qwen4_exp_vision
+    "qwen4_exp", "qwen4_exp_vision",
 )
 
 

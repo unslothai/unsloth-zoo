@@ -349,3 +349,12 @@ def test_qwen4_exp_marked_as_3d_moe_lora_model():
     assert len(_mark_stacked_moe_lora(module)) == 2
     assert module.Qwen4ExpForConditionalGeneration.is_3d_moe_weight is True
     assert _mark_stacked_moe_lora(module) == []
+
+
+@pytest.mark.parametrize("vision_type", ["qwen4_exp", "qwen4_exp_vision"])
+def test_qwen4_exp_vision_tower_keeps_fused_qkv(vision_type):
+    # HF's Qwen4Exp vision attention keeps blocks.N.attn.qkv merged, like Qwen3-VL; splitting it into three shards
+    # under one name keeps only the last shard.
+    from unsloth_zoo.empty_model import QWEN_VL_MERGED_QKV_TYPES, get_model_type
+    config = types.SimpleNamespace(model_type = "qwen4_exp", vision_config = types.SimpleNamespace(model_type = vision_type))
+    assert get_model_type(config) in QWEN_VL_MERGED_QKV_TYPES
