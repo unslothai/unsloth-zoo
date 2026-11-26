@@ -582,8 +582,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                 if compute_gradients: _FUSED_CE_COMPILE_SUPPORTED = True
                 _probe_failed = None
             except Exception as _probe_error:
-                # An OOM (bare, or raised while compiling) is transient: this call runs eager, the next one
-                # probes the compiled chunk again, and no compiled graph is dropped. Anything else latches.
+                # An OOM is transient: this call runs eager, the next probes again, no graphs dropped.
                 _probe_failed = "oom" if _is_out_of_memory(_probe_error) else "error"
             if _probe_failed is not None:
                 # Retried outside the except, so the failed attempt's traceback no longer pins its tensors.

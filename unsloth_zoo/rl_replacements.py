@@ -491,8 +491,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
                 try:
                     return kernel(*args)
                 except Exception as error:
-                    # An OOM (bare, or raised while compiling) is transient: eager for this call only.
-                    # The eager retry runs after the except, so the traceback does not pin the failed tensors.
+                    # An OOM (bare or while compiling) is transient: eager for this call only, after the except.
                     if not (
                         isinstance(error, torch.OutOfMemoryError)
                         or isinstance(getattr(error, "inner_exception", None), torch.OutOfMemoryError)
