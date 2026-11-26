@@ -307,8 +307,7 @@ def get_torch_compile_options(
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,
         # "reorder_for_compute_comm_overlap"  : True, # Fails for single GPU
-        # cuda.compile_opt_level / cuda.enable_cuda_lto are not set: cuda.* only reaches CUTLASS templates,
-        # which Unsloth never selects, and on 2.16 cuda.* is a deprecated alias of cutlass.* that warns when set.
+        # No cuda.* knobs: CUTLASS only (never selected), and deprecated cutlass.* aliases that warn on 2.16.
         # cuda.use_fast_math is left off: it causes incompatible gradient sizes on 2.6 and TypeError: bad operand type for unary -: 'SymbolicCallArg'.
         "combo_kernels"                       : combo_kernels,
         "benchmark_combo_kernel"              : True,

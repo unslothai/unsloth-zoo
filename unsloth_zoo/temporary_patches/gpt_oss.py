@@ -3496,7 +3496,7 @@ def patch_GptOssAttention():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
 
-    # Process-wide: only raise, never lower zoo's 1024 (patching_utils) or a user's larger limit.
+    # Process-wide: never lower zoo's 1024 or a user's larger limit.
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
 
     def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -3866,7 +3866,7 @@ def patch_GptOssModel():
         raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel", e)
         DynamicCache = lambda *args, **kwargs: None
 
-    # Process-wide: only raise, never lower zoo's 1024 (patching_utils) or a user's larger limit.
+    # Process-wide: never lower zoo's 1024 or a user's larger limit.
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 256)
 
     # Disable mask creations since we don't need them for GPT-OSS

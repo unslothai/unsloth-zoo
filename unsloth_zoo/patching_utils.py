@@ -311,8 +311,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # "config.combo_kernel_foreach_dynamic_shapes = True",
         "config.freezing = False", # Freezes weights --> ** only useful for inference **
         # f"config.triton.multi_kernel = {O3}", # use tuning to pick between different subkernels
-        # cuda.* is not set: it only reaches CUTLASS, which the backends above leave out, and on 2.16
-        # cuda.* is a deprecated alias of cutlass.* that warns when written.
+        # No cuda.* knobs: CUTLASS only (left out above), and deprecated cutlass.* aliases that warn on 2.16.
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
