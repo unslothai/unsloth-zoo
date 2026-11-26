@@ -34,6 +34,7 @@ __all__ = [
     "mxfp8_experts_dequantize_torch",
     "packed_expert_grouped_linear",
     "quantize_experts_nvfp4",
+    "nvfp4_weight_quant_method",
     "quantize_experts_mxfp4",
     "quantize_experts_mxfp8",
     "PACKED_EXPERT_STATS",
@@ -692,9 +693,51 @@ def _pack_nibbles(codes):
     return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
 
 
-def quantize_experts_nvfp4(rows, dtype = torch.bfloat16, transposed = False, chunk_experts = 8):
-    """RTN NVFP4 of an (E, N, K) stack, one global scale per expert, compressed-tensors convention
-    (``global = 448 * 6 / amax``, ``scale = e4m3(amax_block / 6 * global)``, decode ``e2m1 * scale / global``)."""
+NVFP4_WEIGHT_QUANT_ENV = "UNSLOTH_NVFP4_WEIGHT_QUANT"   # same name and values as Studio's NVFP4 quantiser
+_E4M3_MAX_4OVER6 = 256.0   # 4over6 E4M3 top: the largest max/4 block scale (256 * 6 / 4 = 384) still fits 448
+_NVFP4_METHODS = {
+    "max6": "max6", "max/6": "max6", "rtn": "max6", "torchao": "max6", "off": "max6", "0": "max6",
+    "4over6": "4over6", "4/6": "4over6", "four_over_six": "4over6", "fouroversix": "4over6", "on": "4over6",
+    "1": "4over6",
+}
+
+
+def nvfp4_weight_quant_method(method = None):
+    """NVFP4 block-scale rule: ``max6`` (round to nearest, block max mapped to 6) or ``4over6`` (per 16-value block,
+    the lower-MSE of max mapped to 6 and max mapped to 4, arXiv 2512.02010). ``method`` beats
+    UNSLOTH_NVFP4_WEIGHT_QUANT; unset is ``4over6``, like Studio (Qwen3-0.6B: weight MSE -16%, wikitext-2
+    perplexity 26.14 -> 25.65 vs 23.19 in bf16)."""
+    raw = method if method is not None else os.environ.get(NVFP4_WEIGHT_QUANT_ENV, "")
+    value = str(raw).strip().lower().replace("-", "_").replace(" ", "")
+    if value == "":
+        return "4over6"
+    if value not in _NVFP4_METHODS:
+        raise ValueError(f"Unsloth: {NVFP4_WEIGHT_QUANT_ENV}={raw!r} is not one of max6, 4over6")
+    return _NVFP4_METHODS[value]
+
+
+def _nvfp4_block_candidate(blocks, bmax, g, top):
+    """codes, e4m3 scales and fp32 decode of blocks with the block max mapped to ``top`` (6 or 4)."""
+    s = (bmax / top * g[:, None, None]).clamp(max = _E4M3_MAX).to(torch.float8_e4m3fn)
+    decode = s.to(torch.float32) / g[:, None, None]
+    y = torch.where(decode[..., None] > 0, blocks / decode[..., None], torch.zeros_like(blocks))
+    return _round_e2m1(y), s, decode
+
+
+def _e2m1_codes_to_float(codes):
+    lut = torch.tensor(_E2M1, dtype = torch.float32, device = codes.device)
+    values = lut[(codes & 7).long()]
+    return torch.where((codes & 8).bool(), -values, values)
+
+
+def quantize_experts_nvfp4(rows, dtype = torch.bfloat16, transposed = False, chunk_experts = 8, method = None):
+    """NVFP4 of an (E, N, K) stack, one global scale per expert, compressed-tensors convention
+    (``global = top * 6 / amax``, ``scale = e4m3(amax_block / 6 * global)``, decode ``e2m1 * scale / global``).
+    ``max6``: top = 448, round to nearest. ``4over6`` (the default; ``method`` or UNSLOTH_NVFP4_WEIGHT_QUANT): top = 256
+    and each block also tries ``scale = e4m3(amax_block / 4 * global)``, keeping the lower squared error (ties keep /6). The
+    stored format is unchanged, so any compressed-tensors NVFP4 reader decodes either."""
+    method = nvfp4_weight_quant_method(method)
+    top = _E4M3_MAX_4OVER6 if method == "4over6" else _E4M3_MAX
     E, N, K = rows.shape
     if K % NVFP4_GROUP:
         raise ValueError(f"Unsloth: NVFP4 needs K divisible by {NVFP4_GROUP}, got {K}")
@@ -705,14 +748,19 @@ def quantize_experts_nvfp4(rows, dtype = torch.bfloat16, transposed = False, chu
         e1 = min(E, e0 + chunk_experts)
         w = rows[e0:e1].to(torch.float32)
         amax = w.abs().amax(dim = (1, 2))
-        g = torch.where(amax > 0, (_E4M3_MAX * _E2M1_MAX) / amax, torch.ones_like(amax))
+        g = torch.where(amax > 0, (top * _E2M1_MAX) / amax, torch.ones_like(amax))
         blocks = w.view(e1 - e0, N, K // NVFP4_GROUP, NVFP4_GROUP)
         bmax = blocks.abs().amax(dim = -1)
-        s = (bmax / _E2M1_MAX * g[:, None, None]).clamp(max = _E4M3_MAX).to(torch.float8_e4m3fn)
-        decode = s.to(torch.float32) / g[:, None, None]
-        y = torch.where(decode[..., None] > 0, blocks / decode[..., None], torch.zeros_like(blocks))
-        q = _round_e2m1(y).reshape(e1 - e0, N, K)
-        codes[e0:e1] = _pack_nibbles(q)
+        q, s, decode = _nvfp4_block_candidate(blocks, bmax, g, _E2M1_MAX)
+        if method == "4over6":
+            q4, s4, decode4 = _nvfp4_block_candidate(blocks, bmax, g, 4.0)
+            err6 = ((_e2m1_codes_to_float(q) * decode[..., None] - blocks) ** 2).sum(dim = -1)
+            err4 = ((_e2m1_codes_to_float(q4) * decode4[..., None] - blocks) ** 2).sum(dim = -1)
+            take4 = err4 < err6
+            q = torch.where(take4[..., None], q4, q)
+            s = torch.where(take4, s4.view(torch.uint8), s.view(torch.uint8)).view(torch.float8_e4m3fn)
+            del q4, s4, decode4, err6, err4, take4
+        codes[e0:e1] = _pack_nibbles(q.reshape(e1 - e0, N, K))
         scales[e0:e1] = s
         glob[e0:e1, 0] = g
     return Nvfp4ExpertParam(codes, packed_scales = scales, packed_global = glob, packed_transposed = transposed,
