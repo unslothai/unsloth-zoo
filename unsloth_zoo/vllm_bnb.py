@@ -62,7 +62,9 @@ def _keep_plugin_off():
         return False
     current = os.environ.get("VLLM_PLUGINS")
     if current is None:
-        names = sorted({ep.name for ep in importlib.metadata.entry_points() if ep.group.startswith("vllm.")})
+        # Per distribution: a bare entry_points() is a dict of groups on Python 3.9 to 3.11.
+        names = sorted({ep.name for dist in importlib.metadata.distributions()
+                        for ep in dist.entry_points if ep.group.startswith("vllm.")})
     else:
         names = current.split(",")
     os.environ["VLLM_PLUGINS"] = ",".join(name for name in names if name and name != _PLUGIN_NAME)

@@ -111,7 +111,8 @@ def test_builtin_bitsandbytes_takes_the_plugin_off_vllms_allow_list(monkeypatch)
     eps = [types.SimpleNamespace(name = n, group = g) for n, g in (
         ("bitsandbytes", "vllm.general_plugins"), ("lora_filesystem_resolver", "vllm.general_plugins"),
         ("cuda_alt", "vllm.platform_plugins"), ("other", "console_scripts"))]
-    monkeypatch.setattr(vb.importlib.metadata, "entry_points", lambda: eps)
+    dists = [types.SimpleNamespace(entry_points = eps[:2]), types.SimpleNamespace(entry_points = eps[2:])]
+    monkeypatch.setattr(vb.importlib.metadata, "distributions", lambda: dists)
     monkeypatch.delenv("VLLM_PLUGINS", raising = False)
     calls = _env(vb, monkeypatch, modules = set(vb._IN_TREE) | set(vb._PLUGIN), specs = {"vllm", "vllm_bnb_plugin"})
     assert vb.resolve()[2] == "vllm"
