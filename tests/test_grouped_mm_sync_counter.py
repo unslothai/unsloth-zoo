@@ -198,3 +198,38 @@ def test_compiled_site_keeps_group_count(monkeypatch):
     f(x, w)
     assert seen == [2048]
     torch._dynamo.reset()
+
+
+def _patched_transformers_module(monkeypatch, can_use):
+    import sys
+    import types
+    import transformers.integrations
+    from unsloth_zoo.temporary_patches import moe_experts_interface as MEI
+    tm = types.ModuleType("transformers.integrations.moe")
+    tm._grouped_mm = lambda i, w, o: i @ w[0]
+    tm._can_use_grouped_mm = can_use
+    monkeypatch.setitem(sys.modules, "transformers.integrations.moe", tm)
+    monkeypatch.setattr(transformers.integrations, "moe", tm, raising = False)
+    monkeypatch.setattr(MEI, "_moe_utils_module", lambda: M)
+    monkeypatch.setattr(M, "_triton_grouped_mm_wanted", lambda i, w: False)
+    monkeypatch.setattr(M, "_GROUPED_MM_TRITON_OP", object())
+    MEI._patch_transformers_grouped_mm()
+    return tm
+
+
+def test_transformers_own_fallback_counts_as_loop(monkeypatch):
+    # transformers' grouped_mm_fallback reads offs.tolist(): a sync whatever the card.
+    monkeypatch.setattr(M, "_torch_grouped_mm_takes_fallback", lambda *args: False)
+    tm = _patched_transformers_module(monkeypatch, lambda i, w, o: False)
+    x, w, offsets = _case()
+    before = M.grouped_mm_sync_calls()
+    tm._grouped_mm(x, w, offsets)
+    assert _delta(before) == {"torch_fallback": 0, "loop": 1, "compiled_sites": 0}
+
+    torch._dynamo.reset()
+    f = torch.compile(lambda x, w: tm._grouped_mm(x, w, offsets), fullgraph = True, backend = "eager")
+    before = M.grouped_mm_sync_calls()
+    f(x, w)
+    f(x, w)
+    assert _delta(before) == {"torch_fallback": 0, "loop": 0, "compiled_sites": 1}
+    torch._dynamo.reset()

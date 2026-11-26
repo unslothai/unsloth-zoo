@@ -435,8 +435,8 @@ _GROUPED_MM_RUNTIME_LATCHED = [False]
 # forwards that torch serves with _grouped_mm_fallback, a per-expert mm loop (GroupedBlas.cpp: off bf16 sm90 / sm100,
 # off cuBLASLt grouped on CUDA >= 13.3 sm9x-11x, and on ROCm without the opt-in CK kernels); torch's own backward adds
 # up to two more per forward. "loop": Unsloth's per-expert loop (forward, backward and the dW loop; it runs eagerly
-# even inside compiled code). "compiled_sites": such torch._grouped_mm calls traced into a compiled graph, counted once
-# per trace, since a graph cannot count its own runs. Read deltas around a step: grouped_mm_sync_calls().
+# even inside compiled code; also transformers' own fallback loop). "compiled_sites": such calls traced into a compiled
+# graph, counted once per trace, since a graph cannot count its own runs. Read deltas around a step: grouped_mm_sync_calls().
 GROUPED_MM_SYNC_CALLS = {"torch_fallback": 0, "loop": 0, "compiled_sites": 0}
 _GROUPED_MM_SYNC_LOGGED = [False]
 _TORCH_GROUPED_MM_FALLBACK_BY_KEY = {}
@@ -484,16 +484,26 @@ def _note_compiled_grouped_mm_site(device_type, device_index, dtype, weight_dtyp
     return True
 
 
+@_assume_constant_result
+def _note_compiled_loop_site():
+    # A traced call into an opaque per-expert loop op (transformers' grouped_mm_fallback), once per trace.
+    _record_grouped_mm_sync("compiled_sites")
+    return True
+
+
 def _count_grouped_mm_sync(kind, inputs = None, weight = None, groups = 0):
     if torch.compiler.is_compiling():
-        if kind == "torch_fallback":
+        if kind == "opaque_loop":
+            _note_compiled_loop_site()
+        elif kind == "torch_fallback":
             # A symbolic expert count is passed as 1: the cuBLASLt limit is 1024 groups, far above real expert counts.
             groups = groups if isinstance(groups, int) else 1
             _note_compiled_grouped_mm_site(inputs.device.type, inputs.device.index, inputs.dtype, weight.dtype, groups)
         return
     if kind == "torch_fallback" and not _torch_grouped_mm_takes_fallback(inputs.device, inputs.dtype, weight.dtype, groups):
         return
-    _record_grouped_mm_sync(kind)
+    # "opaque_loop": a caller's per-expert loop op (transformers' grouped_mm_fallback), a loop when run eagerly.
+    _record_grouped_mm_sync("loop" if kind == "opaque_loop" else kind)
 
 
 def _record_grouped_mm_sync(kind):
