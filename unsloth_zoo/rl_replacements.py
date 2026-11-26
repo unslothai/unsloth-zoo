@@ -4646,6 +4646,9 @@ def grpo_accumulated_loss(
         # result, and it fixes the padded path's left-pad RoPE error. Loss/gradients flow through it. Self-
         # verified against the per-row forward (shape/RoPE-aware, re-checked as T grows); falls back if a
         # backend ignores packed_seq_lengths. lm_head runs on completion positions only.
+        if _sc_ids is not None:
+            # Score centering gathers its head log-probs in the padded loop below.
+            _pg_skip_pack = True
         new_logprobs = None
         _pack_result = None
         _pack_use = False
@@ -4654,8 +4657,6 @@ def grpo_accumulated_loss(
         # is not read as a length limit
         _pack_in_packed = False
         _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
-        # Score centering gathers its head log-probs in the padded loop below.
-        _pack_enabled = _pack_enabled and _sc_ids is None
         _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
         # Collective forwards: the packed forward and its per-row verify are rank-local, like PG above.
         if (_pack_enabled and not _pg_skip_pack and not _collective_forwards and pixel_values is None
@@ -5408,7 +5409,8 @@ def grpo_accumulated_loss(
                     1,
                     kwargs,
                     upstream_scale,
-                    _sc_correction,
+                    # Only with score centering: the 13-argument call stays as it was.
+                    *(() if _sc_correction is None else (_sc_correction,)),
                 )
         _rollout_stats_args = None
         if _rollout_logps_as_old:
