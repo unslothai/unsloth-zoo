@@ -384,3 +384,53 @@ def test_slot_fences_only_ever_hold_submitted_decodes(monkeypatch):
     got, _ = _train(layers, sw)
     _equal(ref, got)
     sw.remove()
+
+
+@_codec_gpu
+def test_disk_blocks_stay_raw_without_gpu_room_for_the_decoders(monkeypatch):
+    base = _stack()
+    ref, _ = _train(copy.deepcopy(base), _NoSwap())
+    layers = copy.deepcopy(base)
+    # Host-loaded frozen weights: packing frees nothing on the card.
+    for layer in layers[1:]:
+        for name, p in layer.named_parameters():
+            if "lora_" not in name:
+                p.data = p.data.cpu()
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    total = torch.cuda.get_device_properties(0).total_memory
+    real_info, real_reserved = torch.cuda.mem_get_info, torch.cuda.memory_reserved
+    calls = []
+
+    def no_room(device = None):
+        calls.append(device)
+        return (0, total)
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", no_room)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device = None: torch.cuda.memory_allocated(device))
+    try:
+        sw = BlockSwap(layers, 9, prefetch_depth = 2, placement = "tail")
+    finally:
+        monkeypatch.setattr(torch.cuda, "mem_get_info", real_info)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", real_reserved)
+    assert calls and sw._disk_decoders == {}
+    assert not any(b.compressed() for b in sw.blocks)
+    got, _ = _train(layers, sw)
+    _equal(ref, got)
+    sw.remove()
+
+
+@_codec_gpu
+def test_spill_rewrite_needs_host_room_for_both_buffers(monkeypatch):
+    base = _stack()
+    layers = copy.deepcopy(base)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_COMPRESS", "0")
+    sw = BlockSwap(layers, 9, prefetch_depth = 2, placement = "tail")
+    b = next(b for b in sw.blocks if b.disk is not None and not b.resident)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    real = _mod._host_free
+    monkeypatch.setattr(_mod, "_host_free", lambda: (real()[0], b.nbytes()))
+    assert b.encode_disk(dev) is False and not b.compressed()
+    monkeypatch.setattr(_mod, "_host_free", real)
+    assert b.encode_disk(dev) is True and b.compressed()
+    sw.remove()

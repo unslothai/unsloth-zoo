@@ -632,6 +632,13 @@ class _Block:
         """Rewrite a raw spilled region (spilled at load) encoded, in place: the encoded region is never longer."""
         if not self.disk_compressible() or self.disk is None or self.compressed():
             return False
+        # The raw region read back plus its encoding (up to MAX_RATIO of it) are live together: only with that
+        # much host RAM free beyond the reserve, else the block stays raw.
+        try:
+            if _host_free()[1] < 2 * self.nbytes():
+                return False
+        except Exception:
+            return False
         with _no_inference_mode():
             raw, owner = _disk().read_bytes(self.disk_store, self.disk["base"], self.nbytes())
         try:
@@ -1343,6 +1350,25 @@ class BlockSwap:
                 d = torch.device(next(iter(b.sizes)))
                 if d.type == "cuda":
                     largest[d] = max(largest.get(d, 0), b.nbytes())
+        # The slot pool must still fit beside the decode buffers (counting what packing frees on that card), else
+        # the disk tier stays raw rather than failing the pool allocation later.
+        per_sig = {}
+        for b in self.blocks:
+            per_sig.setdefault(b.sig, [0, b.sizes])[0] += 1
+        for d, n in largest.items():
+            words = n // 2
+            dec_bytes = codec._RING * (min(codec.CHUNK, words) * 3 // 2) + 2 * codec.max_aux_nbytes(n)
+            slots = sum(min(self.depth + 1, k) * sizes.get(d, 0) for k, sizes in per_sig.values())
+            reclaim = sum(p.data.nbytes for b in self.blocks for p in b.params
+                          if p.data.device.type == "cuda" and torch.device(p.data.device) == d)
+            try:
+                free = torch.cuda.mem_get_info(d)[0] + torch.cuda.memory_reserved(d) - torch.cuda.memory_allocated(d)
+            except Exception:
+                free = None
+            if free is not None and free + reclaim < slots + dec_bytes:
+                print("Unsloth: offload_layers stores disk layers raw (no GPU room for the decode buffers next to "
+                      "the slot pool).")
+                return {}
         out = {}
         try:
             with _no_inference_mode():
