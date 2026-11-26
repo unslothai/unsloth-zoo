@@ -333,3 +333,41 @@ def test_token_advantages_follow_the_left_packed_layout():
     assert aligned.shape == mask.shape
     assert torch.equal(aligned[keep], packed[keep].to(torch.float32))
     assert torch.all(aligned[~keep] == 0)
+
+
+@pytest.mark.parametrize("estimator", ("k1", "k3"))
+def test_rollout_logps_as_old_skips_unscored_tokens(estimator):
+    # UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD: pi_old is the rollout with unscored (nan) tokens filled by the policy
+    # itself; grpo_accumulated_loss passes the rollout with its nan marks so the sampler KL skips those tokens.
+    new, rollout, adv, mask = _data(0.5)
+    rollout = rollout.clone()
+    rollout[3, 2] = float("nan")
+    old, unscored = rr.grpo_rollout_old_fill_unscored(rollout, new)
+    marks = old.masked_fill(unscored, float("nan"))
+    kw = _kwargs(mask, "dapo", sampler_kl_coef = 0.3, sampler_kl_estimator = estimator, rollout_logps_as_old = True)
+    zero = torch.zeros_like(adv)
+    loss = rr.grpo_compute_loss(None, new, old, marks, torch.zeros_like(mask), mask, 0.0, zero, **kw)[0]
+    (grad,) = torch.autograd.grad(loss, new)
+    keep = mask.clone()
+    keep[3, 2] = 0
+    new64 = new.detach().clone().requires_grad_(True)
+    log_r = new64 - old
+    kl = -log_r if estimator == "k1" else torch.exp(log_r) - 1 - log_r
+    want = 0.3 * (kl * keep).sum() / mask.sum()
+    (want_grad,) = torch.autograd.grad(want, new64)
+    torch.testing.assert_close(loss, want, rtol = 1e-12, atol = 1e-12)
+    torch.testing.assert_close(grad, want_grad, rtol = 1e-12, atol = 1e-12)
+    assert grad[3, 2] == 0
+    # The marks reach only the sampler KL: with the KL off the loss is the plain rollout-as-old loss.
+    off = _kwargs(mask, "dapo", rollout_logps_as_old = True)
+    a = rr.grpo_compute_loss(None, new, old, marks, torch.zeros_like(mask), mask, 0.0, adv, **off)[0]
+    b = rr.grpo_compute_loss(None, new, old, None, torch.zeros_like(mask), mask, 0.0, adv, **off)[0]
+    assert torch.equal(a, b)
+    on = dict(off, sampler_kl_coef = 0.3)
+    c = rr.grpo_compute_loss(None, new, old, marks, torch.zeros_like(mask), mask, 0.0, adv, **on)
+    # Same policy term and metrics; only the unscored token's KL differs (0 there with the marks).
+    assert c[3].numel() == 0 and c[4].numel() == 0
+    import inspect
+
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    assert "_loss_sampling_logps = old_logps.masked_fill(_rollout_unscored" in src

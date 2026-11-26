@@ -1554,6 +1554,12 @@ def grpo_compute_loss(
     # StableReinforce (Tinker): coef * KL(sampler || policy) on the sampled tokens, k1 or k3. 0 is off.
     sampler_kl_coef = kwargs.get("sampler_kl_coef", 0.0)
     sampler_kl_estimator = kwargs.get("sampler_kl_estimator", "k1")
+    # Rollout logps as pi_old: grpo_accumulated_loss hands the raw rollout logps here only to mark the tokens the
+    # engine left unscored (nan), so the sampler KL can skip them; pi_old already carries the filled values.
+    sampler_kl_valid = None
+    if sampler_kl_coef != 0.0 and kwargs.get("rollout_logps_as_old", False) and sampling_per_token_logps is not None:
+        sampler_kl_valid = ~torch.isnan(sampling_per_token_logps)
+        sampling_per_token_logps = None
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -1799,6 +1805,8 @@ def grpo_compute_loss(
             sampler_logps = new.detach()
         # Unscored vLLM tokens (nan) and masked columns add no value and no gradient; clamp keeps expm1 finite.
         sampler_valid = ~torch.isnan(sampler_logps)
+        if sampler_kl_valid is not None:
+            sampler_valid = sampler_valid & sampler_kl_valid
         if mask is not None:
             sampler_valid = sampler_valid & mask.to(torch.bool)
         sampler_logps = torch.where(sampler_valid, sampler_logps, new.detach())
@@ -5263,13 +5271,17 @@ def grpo_accumulated_loss(
                     torch.cuda.empty_cache()
                 new_logprobs, new_entropies = _score_deferred(_fused_items, _entropy_bonus_on)
             _fused_items = _fused_ent_w = None
+        _loss_sampling_logps = sampling_per_token_logps
+        if _rollout_logps_as_old and _sampler_kl_coef != 0.0 and _rollout_unscored is not None:
+            # Marks the tokens the rollout left unscored, so the sampler KL skips them (read only in that mode).
+            _loss_sampling_logps = old_logps.masked_fill(_rollout_unscored, float("nan"))
         if not _fused_done:
             with autocaster:
                 loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
                     new_logprobs,
                     old_logps,
                     ref_logps,
-                    sampling_per_token_logps,
+                    _loss_sampling_logps,
                     lm_head,
                     completion_input_ids,
                     completion_mask,
