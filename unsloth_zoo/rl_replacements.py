@@ -2246,6 +2246,50 @@ _PRE_TRUNCATION_OPTIONAL = (
 )
 
 
+# The vLLM penalties and bias the request carries; logit_bias is checked for being set at all.
+_UNREPLAYED_PENALTY_NEUTRAL = {"repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0}
+
+
+def grpo_warn_unreplayed_penalties(trainer):
+    """Warn once per trainer when the vLLM importance-sampling correction is on and the rollouts use a
+    repetition / presence / frequency penalty or a logit_bias. vLLM applies them to the logits before it
+    records the sampling logprobs (v1 Sampler.apply_logits_processors, ahead of both capture points), and the
+    trainer never replays them, so pi_train / pi_rollout carries the penalty as if it were a numerics mismatch."""
+    if getattr(trainer, "_unsloth_grpo_penalty_warned", False):
+        return
+    try:
+        trainer._unsloth_grpo_penalty_warned = True
+    except Exception:
+        pass
+    if not (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False)):
+        return
+    params = _grpo_rollout_sampling_params(trainer, tuple(_UNREPLAYED_PENALTY_NEUTRAL) + ("logit_bias",))
+    found = []
+    for key, neutral in _UNREPLAYED_PENALTY_NEUTRAL.items():
+        value = params[key]
+        try:
+            if value is not None and float(value) != neutral:
+                found.append(f"{key}={value}")
+        except (TypeError, ValueError):
+            found.append(f"{key}={value!r}")
+    if params["logit_bias"]:
+        found.append("logit_bias")
+    if not found:
+        return
+    message = (
+        "Unsloth: GRPO rollouts use " + ", ".join(found) + " with vllm_importance_sampling_correction on. "
+        "vLLM applies these before it records the sampling logprobs and the trainer does not replay them, so "
+        "the importance ratio also corrects for the penalty itself, not only for the train / rollout numerics."
+    )
+    try:
+        logger.warning(message)
+    except Exception:
+        import warnings as _warnings
+        _warnings.warn(message)
+pass
+RL_REPLACEMENTS["grpo_warn_unreplayed_penalties"] = grpo_warn_unreplayed_penalties
+
+
 def grpo_truncated_support_blockers(trainer):
     """Rollout settings under which the recomputed kept set cannot match vLLM's."""
     params = _grpo_rollout_sampling_params(
@@ -3320,6 +3364,54 @@ pass
 RL_REPLACEMENTS["grpo_rollout_mismatch_metrics"] = grpo_rollout_mismatch_metrics
 
 
+# Sampler probability buckets for the mismatch split: confident (p > 0.9), middle, tail (p < 0.1).
+_ROLLOUT_BUCKETS = ("p_gt_0.9", "p_0.1_0.9", "p_lt_0.1")
+
+
+def grpo_rollout_bucket_stats(train_logps, sampling_logps, mask):
+    """Sums that split the train / rollout mismatch by the sampled token's rollout probability
+    p = exp(sampling logp) into p > 0.9, 0.1 <= p <= 0.9 and p < 0.1, plus sampled-token entropy
+    estimates, so they pool over processes and micro-batches like grpo_rollout_mismatch_stats.
+    Float64 vector: [tokens, sum |dlogp|] per bucket, then sum -log pi_train(y), sum -log pi_rollout(y).
+    The entropies are the Monte-Carlo estimates over the sampled tokens (y ~ rollout): no vocabulary pass.
+    Computed on the host from per-token copies, so the training stream gets no extra kernels; the caller's
+    metric gather already waits for these logps, so the copies add no synchronisation of their own."""
+    with torch.no_grad():
+        train = train_logps.detach().to(device = "cpu", dtype = torch.float64)
+        sampling = sampling_logps.detach().to(device = "cpu", dtype = torch.float64)
+        keep = mask.detach().to(device = "cpu", dtype = torch.bool) & torch.isfinite(train) & torch.isfinite(sampling)
+        diff = torch.where(keep, (train - sampling).abs(), torch.zeros_like(train))
+        p = torch.where(keep, sampling.exp(), torch.zeros_like(sampling))
+        high, low = p > 0.9, p < 0.1
+        out = []
+        for inside in (keep & high, keep & ~high & ~low, keep & low):
+            out.append(inside.to(torch.float64).sum())
+            out.append(torch.where(inside, diff, torch.zeros_like(diff)).sum())
+        zero = torch.zeros_like(train)
+        out.append(torch.where(keep, -train, zero).sum())
+        out.append(torch.where(keep, -sampling, zero).sum())
+        return torch.stack(out)
+pass
+RL_REPLACEMENTS["grpo_rollout_bucket_stats"] = grpo_rollout_bucket_stats
+
+
+def grpo_rollout_bucket_metrics(stats):
+    """Metric dict from summed grpo_rollout_bucket_stats: per bucket the token share and the mean
+    |log pi_train - log pi_rollout|; share x mean over the buckets is the overall mean |dlogp|."""
+    stats = [float(x) for x in stats.tolist()]
+    counts = stats[0:6:2]
+    total = sum(counts)
+    metrics = {}
+    for name, count, abs_sum in zip(_ROLLOUT_BUCKETS, counts, stats[1:6:2]):
+        metrics[f"sampling/logp_abs_diff/{name}"] = abs_sum / count if count > 0 else 0.0
+        metrics[f"sampling/token_frac/{name}"] = count / total if total > 0 else 0.0
+    metrics["sampling/policy_entropy/mean"] = stats[6] / total if total > 0 else 0.0
+    metrics["sampling/rollout_entropy/mean"] = stats[7] / total if total > 0 else 0.0
+    return metrics
+pass
+RL_REPLACEMENTS["grpo_rollout_bucket_metrics"] = grpo_rollout_bucket_metrics
+
+
 def grpo_rollout_logps_as_old(sampling_logps, old_logps = None):
     """UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD (verl rollout_correction bypass_mode with loss_type
     ppo_clip, vime --use-rollout-logprobs): the rollout engine's logprobs are pi_old, so the PPO
@@ -3691,6 +3783,12 @@ def grpo_accumulated_loss(
         _warn_unsupported_grpo_options(trainer)
     except Exception:
         pass
+    if not getattr(trainer, "_unsloth_grpo_penalty_warned", False):
+        try:
+            from unsloth_zoo.rl_replacements import grpo_warn_unreplayed_penalties
+            grpo_warn_unreplayed_penalties(trainer)
+        except Exception:
+            pass
 
     # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.rl_replacements import (
@@ -5230,6 +5328,8 @@ def grpo_accumulated_loss(
                     upstream_scale,
                 )
         _rollout_stats_args = None
+        # (pi_train logps, rollout logps, mask) for the per-probability-bucket split of the mismatch.
+        _rollout_bucket_args = None
         if _rollout_logps_as_old:
             # Unclamped log(pi_theta / pi_rollout) for the KL diagnostics; the loss ratio is clamped to [-20, 20].
             _raw_log_ratio = new_logprobs.detach().to(torch.float64) - old_logps.detach().to(torch.float64)
@@ -5248,17 +5348,34 @@ def grpo_accumulated_loss(
                 # An overflowed ratio is capped (finite squares) so ESS tends to its 1 / N limit, not nan.
                 _ess_weights = torch.clamp(flat_is_ratio.to(torch.float64), max = 1e100)
                 _rollout_stats_args = (_log_ratio, torch.zeros_like(_log_ratio), completion_mask, _ess_weights)
+                if new_logprobs.shape == completion_mask.shape and old_logps.shape == completion_mask.shape:
+                    _bucket_mask = completion_mask.to(torch.bool)
+                    if _rollout_unscored is not None:
+                        _bucket_mask = _bucket_mask & ~_rollout_unscored
+                    _rollout_bucket_args = (new_logprobs, old_logps, _bucket_mask)
         elif (
             _rollout_metrics_on and old_logps is not None and sampling_per_token_logps is not None
             and flat_is_ratio is not None and flat_is_ratio.numel() > 0
         ):
             _rollout_stats_args = (old_logps, sampling_per_token_logps, completion_mask, flat_is_ratio)
+            if old_logps.shape == sampling_per_token_logps.shape == completion_mask.shape:
+                _rollout_bucket_args = (old_logps, sampling_per_token_logps, completion_mask)
         if _rollout_stats_args is not None:
             from unsloth_zoo.rl_replacements import (
                 grpo_rollout_mismatch_stats as _grpo_rollout_mismatch_stats,
                 grpo_rollout_mismatch_metrics as _grpo_rollout_mismatch_metrics,
+                grpo_rollout_bucket_stats as _grpo_rollout_bucket_stats,
+                grpo_rollout_bucket_metrics as _grpo_rollout_bucket_metrics,
             )
             _rollout_stats = _grpo_rollout_mismatch_stats(*_rollout_stats_args)
+            # Appended sums pool like the others below (only index 3 is a max). Zeros keep every rank's
+            # vector the same length for the gather when a micro-batch has no bucket inputs.
+            _n_mismatch = _rollout_stats.numel()
+            if _rollout_bucket_args is not None:
+                _bucket_stats = _grpo_rollout_bucket_stats(*_rollout_bucket_args)
+            else:
+                _bucket_stats = torch.zeros(8, dtype = torch.float64)
+            _rollout_stats = torch.cat([_rollout_stats, _bucket_stats.to(_rollout_stats.device)])
             _rollout_stats = trainer.accelerator.gather(_rollout_stats.reshape(1, -1)).reshape(-1, _rollout_stats.numel())
             _rollout_stats = torch.cat([_rollout_stats[:, :3].sum(0), _rollout_stats[:, 3:4].amax(0), _rollout_stats[:, 4:].sum(0)])
             _metrics = trainer._metrics
@@ -5280,7 +5397,9 @@ def grpo_accumulated_loss(
                     _prev[4:] + _rollout_stats[4:],
                 ])
             _rollout_acc[_bucket] = _rollout_stats.detach()
-            for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats).items():
+            for _name, _value in _grpo_rollout_mismatch_metrics(_rollout_stats[:_n_mismatch]).items():
+                _metrics[_name] = [_value]
+            for _name, _value in _grpo_rollout_bucket_metrics(_rollout_stats[_n_mismatch:]).items():
                 _metrics[_name] = [_value]
         if _entropy_bonus_on and not _fused_done:
             # (the fused loss already carries the entropy bonus)
