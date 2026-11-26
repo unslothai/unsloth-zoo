@@ -2104,6 +2104,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         layer = vllm_text_model.layers[kk]
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+            if hasattr(layer.self_attn, "kv_b_proj") or hasattr(layer.self_attn, "kv_a_proj_with_mqa"):
+                raise NotImplementedError(
+                    f"Unsloth: fast_inference = True does not support {type(layer.self_attn).__name__} yet "
+                    "(multi-head latent attention: DeepSeek-V2 / V3, Kimi, GLM-4.7-Flash, ...): its "
+                    "kv_a / kv_b projections cannot be shared with the training model. "
+                    "Load with fast_inference = False."
+                )
             # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only.
             qkv_proj = getattr(layer.self_attn, "qkv_proj", None)
             # LFM2 names the attention output projection out_proj
@@ -7578,6 +7585,9 @@ def _pad_lone_moe_expert_lora(model, state_dict):
 pass
 
 
+_MLA_KV_B_LORA_KEY = re.compile(r"(?:^|\.)kv_b_proj\.(?:base_layer\.)?lora_[AB]\.")
+
+
 def _check_lora_is_servable(model, keys, source, peft_config):
     """Refuse an adapter vLLM would accept and then silently ignore.
 
@@ -7610,6 +7620,17 @@ def _check_lora_is_servable(model, keys, source, peft_config):
     pass
 
     if os.environ.get("UNSLOTH_DISABLE_LORA_NAME_CHECK", "0") == "1": return
+    mla_keys = [k for k in keys if _MLA_KV_B_LORA_KEY.search(k)]
+    if mla_keys and _vllm_mla_layers(_get_vllm_lora_model(model)):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference=True cannot serve a LoRA on the MLA kv_b_proj ({len(mla_keys)} adapter "
+            f"tensors in {source}, e.g. '{sorted(mla_keys)[0]}'). vLLM's multi-head latent attention computes "
+            "through W_UK_T / W_UV derived from the base kv_b_proj weight and never applies a kv_b_proj LoRA, so "
+            "rollouts would sample the base model while training updates the adapter.\n"
+            "Remove kv_b_proj from target_modules, load the model in 16-bit so the merged-weight rollout folds "
+            "it into the shared weights (UNSLOTH_VLLM_MERGED_ROLLOUT unset or 1), or use fast_inference=False.\n"
+            "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
+        )
     unmatched = _unmatched_lora_keys(model, keys)
     if not unmatched: return
     examples = "\n".join(f"  {k}  ->  {n}" for k, n in sorted(unmatched)[:5])
@@ -7862,6 +7883,66 @@ class _MergedLoRARequest:
 pass
 
 
+def _vllm_mla_layers(vllm_model):
+    """[(kv_b_proj weight, {name: tensor})] per vLLM MLA layer: its decode reads W_UK_T / W_UV (AITER: W_K / W_V)
+    split off kv_b_proj.weight, held on the layer (vLLM >= 0.13) or its impl (0.11), never kv_b_proj itself."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    layers = []
+    if not isinstance(vllm_model, torch.nn.Module): return layers
+    for module in vllm_model.modules():
+        holders = [h for h in (module, getattr(module, "impl", None)) if h is not None]
+        if not any(isinstance(getattr(h, "kv_lora_rank", None), int) for h in holders): continue
+        derived, kv_b_proj = {}, None
+        for holder in holders:
+            if kv_b_proj is None: kv_b_proj = getattr(holder, "kv_b_proj", None)
+            names = set(getattr(holder, "__dict__", ()))
+            names.update(getattr(holder, "_parameters", None) or ())
+            names.update(getattr(holder, "_buffers", None) or ())
+            for name in names:
+                if not name.startswith(("W_U", "W_K", "W_V")): continue
+                value = getattr(holder, name, None)
+                if isinstance(value, torch.Tensor):
+                    derived[("impl." if holder is not module else "") + name] = value
+        if len(derived) == 0: continue
+        kv_b_proj = getattr(kv_b_proj, "base_layer", kv_b_proj)  # vLLM LoRA wrapper
+        W = getattr(kv_b_proj, "weight", None)
+        layers.append((W if isinstance(W, torch.Tensor) else None, derived))
+    return layers
+pass
+
+
+def _tensor_within(t, W):
+    """True when t is a view into W's own bytes (same storage, inside W's span)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if t.untyped_storage().data_ptr() != W.untyped_storage().data_ptr(): return False
+    if t.numel() == 0: return False
+    start = W.data_ptr()
+    end = start + W.numel() * W.element_size()
+    last = t.data_ptr() + sum((n - 1) * s for n, s in zip(t.shape, t.stride())) * t.element_size()
+    return start <= t.data_ptr() and last + t.element_size() <= end
+pass
+
+
+def _merged_rollout_mla_reason(name, W, mla_layers):
+    """None when every MLA decode weight derived from this kv_b_proj is a view of W (unquantized), so a fold is seen."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    consumers = [
+        derived for kv_W, derived in mla_layers
+        if kv_W is not None and kv_W.untyped_storage().data_ptr() == W.untyped_storage().data_ptr()
+        and kv_W.data_ptr() == W.data_ptr()
+    ]
+    if len(consumers) == 0:
+        return f"{name} is a kv_b_proj that no vLLM MLA layer could be confirmed to read in place"
+    for derived in consumers:
+        if not {"W_UK_T", "W_UV"} <= {key.rsplit(".", 1)[-1] for key in derived}:
+            return f"{name} is an MLA kv_b_proj that vLLM decodes through {sorted(derived)}, not W_UK_T / W_UV"
+        for key, value in derived.items():
+            if not _tensor_within(value, W):
+                return f"{name} is an MLA kv_b_proj whose vLLM decode weight {key} is a separate copy"
+    return None
+pass
+
+
 def _merged_rollout_targets(model):
     """(targets, None) when the adapter can be folded, else (None, reason)."""
     # All Unsloth Zoo code licensed under LGPLv3
@@ -7907,9 +7988,6 @@ def _merged_rollout_targets(model):
         leaf = name.rsplit(".", 1)[-1]
         if leaf in _MERGED_ROLLOUT_EMBEDDING_LEAVES:
             return None, f"{name} is an embedding or lm_head (possibly tied)"
-        if leaf == "kv_b_proj":
-            # MLA decodes via W_UK / W_UV copied from kv_b_proj at load, so a fold is unseen.
-            return None, f"{name} is an MLA kv_b_proj, which vLLM decodes through derived copies"
         if tuple(lora_A.keys()) != (adapter,):
             return None, f"{name} holds adapters {list(lora_A.keys())}"
         if len(getattr(module, "merged_adapters", None) or ()) != 0:
@@ -7970,6 +8048,12 @@ def _merged_rollout_targets(model):
     for name, module, W in targets:
         if W.untyped_storage().data_ptr() not in storages:
             return None, f"{name} does not share storage with the vLLM engine"
+    mla_layers = None
+    for name, module, W in targets:
+        if name.rsplit(".", 1)[-1] != "kv_b_proj": continue
+        if mla_layers is None: mla_layers = _vllm_mla_layers(vllm_model)
+        reason = _merged_rollout_mla_reason(name, W, mla_layers)
+        if reason is not None: return None, reason
     return targets, None
 pass
 
