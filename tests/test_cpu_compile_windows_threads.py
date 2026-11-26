@@ -28,7 +28,6 @@ import torch._inductor.config as inductor_config
 def windows(monkeypatch):
     from unsloth_zoo.cpu import loader
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(inductor_config, "compile_threads", 1)
     monkeypatch.setattr(os, "process_cpu_count", lambda: 4, raising = False)
     monkeypatch.setattr(os, "cpu_count", lambda: 4)
     for name in ("TORCHINDUCTOR_COMPILE_THREADS", "UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "TORCH_WARM_POOL"):
@@ -41,7 +40,9 @@ def windows(monkeypatch):
         return 2
     monkeypatch.setattr(loader, "_cpu_compile_unavailable", lambda: None)
     monkeypatch.setattr(loader, "_compile_layers", fake_compile_layers)
-    return loader, seen
+    # config.patch, not monkeypatch: pytest's undo deletes the entry from torch 2.15's config module.
+    with inductor_config.patch(compile_threads = 1):
+        yield loader, seen
 
 
 def _model():
@@ -63,7 +64,7 @@ def test_windows_user_choice_is_kept(windows, monkeypatch, setup):
     elif setup == "sentinel":
         monkeypatch.setenv("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "1")
     else:
-        monkeypatch.setattr(inductor_config, "compile_threads", 3)
+        inductor_config.compile_threads = 3
     loader.compile_cpu_layers(_model(), explicit = True)
     assert seen["threads"] == (3 if setup == "raised" else 1)
     assert seen["warm_pool"] is None
