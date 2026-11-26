@@ -132,7 +132,10 @@ def apply_inductor_correctness_workarounds():
     if _mix_order_reduction_is_buggy():
         try:
             import torch._inductor.config as inductor_config
-            inductor_config.triton.mix_order_reduction = False
+            from unsloth_zoo.torch_config import set_torch_config
+            # Every thread: torch >= 2.12 keeps config per thread, and a checkpoint recompute
+            # compiles on autograd's device thread.
+            set_torch_config(inductor_config, "triton.mix_order_reduction", False)
             active.append("mix_order_reduction")
         except Exception as error:
             if UNSLOTH_ENABLE_LOGGING:

@@ -214,6 +214,8 @@ def _launch_sites():
         func_of, tests_of = _enclosing(tree)
         options = _options_names(tree)
         aliases = _launcher_aliases(rel, tree, entry_points)
+        # The module's own launchers called by bare name are launches too.
+        aliases.update({f: f for f in entry_points.get(rel[: -len(".py")].replace("/", "."), ())})
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -226,6 +228,8 @@ def _launch_sites():
                 ):
                     continue
             elif isinstance(node.func, ast.Name) and node.func.id in aliases and node.args:
+                if _forwards_options(node, func_of.get(id(node)), options):
+                    continue
                 name = ast.get_source_segment(src, node.args[0])
             else:
                 continue
