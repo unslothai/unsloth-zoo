@@ -286,3 +286,71 @@ def test_load_time_spill_is_encoded_in_place_at_install(monkeypatch):
     got, _ = _train(layers, sw)
     _equal(ref, got)
     sw.remove()
+
+
+@_codec_gpu
+def test_install_under_inference_mode_encodes_disk_blocks(monkeypatch):
+    base = _stack()
+    with torch.no_grad():
+        h = torch.randn(4, 32, 256, device = "cuda", dtype = torch.bfloat16)
+        want = h
+        for layer in base:
+            want = layer(want)
+    layers = copy.deepcopy(base)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    with torch.inference_mode():
+        sw = BlockSwap(layers, 9, prefetch_depth = 2, placement = "tail")
+    assert sum(b.compressed() for b in sw.blocks if b.disk is not None) == 7
+    with torch.no_grad():
+        got = h
+        for layer in layers:
+            got = layer(got)
+    assert torch.equal(got, want)
+    sw.remove()
+
+
+@_codec_gpu
+def test_interrupted_step_with_encoded_disk_blocks_stays_bitwise(monkeypatch):
+    """Prefetched encoded blocks released mid-step (reset) leave their decode's event on the slot; the next fetch
+    into that slot waits for it, so later steps still match."""
+    base = _stack()
+    ref, _ = _train(copy.deepcopy(base), _NoSwap())
+    layers = copy.deepcopy(base)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    sw = BlockSwap(layers, 9, prefetch_depth = 2, placement = "tail")
+    with torch.no_grad():
+        h = torch.randn(4, 32, 256, device = "cuda", dtype = torch.bfloat16)
+        for layer in layers[:5]:
+            h = layer(h)
+    held = [b for b in sw.blocks if b.resident and b.compressed() and b.slot is not None]
+    sw.reset()
+    # Engagement: a released encoded block left a fence on its slot (consumed by the re-arm or still waiting).
+    assert held
+    got, _ = _train(layers, sw)
+    _equal(ref, got)
+    sw.remove()
+
+
+@_codec_gpu
+def test_host_codec_keeps_the_disk_decoders_on_disk_blocks(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
+    base = _stack()
+    ref, _ = _train(copy.deepcopy(base), _NoSwap())
+    layers = copy.deepcopy(base)
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    state = _mod._HostLoad(9, "tail")
+    state.layers, state.indices = layers, _mod.swap_indices(len(layers), 9, "tail")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    for i in state.indices:
+        state.evict(i)
+    for name, p in layers.named_parameters():
+        p.requires_grad_("lora_" in name)
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_HOST_LIMIT")
+    sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    disk = [b for b in sw.blocks if b.disk is not None]
+    assert disk and all(b.decoders is sw._disk_decoders for b in disk if b.compressed())
+    assert all(b.decoders is not sw._disk_decoders for b in sw.blocks if b.disk is None)
+    got, _ = _train(layers, sw)
+    _equal(ref, got)
+    sw.remove()

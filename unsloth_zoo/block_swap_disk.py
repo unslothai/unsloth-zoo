@@ -470,6 +470,11 @@ class DiskTier:
         for d, event in block.events.items():
             stream = block.streams[d]
             stream.wait_event(block.disk_ready[d])
+            # The slot may still be written by a decode into it from a block stolen or reset mid-step.
+            fences = getattr(block, "fences", None)
+            ev = fences.pop(bufs[d].data_ptr(), None) if fences else None
+            if ev is not None:
+                stream.wait_event(ev)
             c = codecs.get(d)
             with torch.cuda.stream(stream):
                 if block.t_copy is not None:

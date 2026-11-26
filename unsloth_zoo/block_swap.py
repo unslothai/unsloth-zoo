@@ -553,7 +553,8 @@ class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
                  "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
                  "t_copy", "copy_open", "copy_pending", "marks", "mark_open", "codec", "decoders",
-                 "disk", "disk_store", "disk_runs", "disk_state", "disk_ready", "disk_futs", "stage", "tier")
+                 "disk", "disk_store", "disk_runs", "disk_state", "disk_ready", "disk_futs", "stage", "tier",
+                 "fences")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -594,6 +595,7 @@ class _Block:
         self.sig = tuple((tuple(p.shape), p.dtype, d, off) for p, d, off in zip(self.params, self.devices, self.layout))
         self.disk, self.disk_store, self.disk_runs, self.disk_state = None, None, (), 0
         self.disk_ready, self.disk_futs, self.stage, self.tier = {}, None, None, None
+        self.fences = None
         refs = [_disk().disk_ref(p) if getattr(p, "_unsloth_disk", None) is not None else None for p in self.params]
         if any(r is not None for r in refs):
             if not all(r is not None for r in refs):
@@ -630,7 +632,8 @@ class _Block:
         """Rewrite a raw spilled region (spilled at load) encoded, in place: the encoded region is never longer."""
         if not self.disk_compressible() or self.disk is None or self.compressed():
             return False
-        raw, owner = _disk().read_bytes(self.disk_store, self.disk["base"], self.nbytes())
+        with _no_inference_mode():
+            raw, owner = _disk().read_bytes(self.disk_store, self.disk["base"], self.nbytes())
         try:
             return self._store_encoded(raw, encode_device, self.disk_store, self.disk["base"])
         finally:
@@ -689,8 +692,9 @@ class _Block:
         mod = _disk()
         store = mod._shared_spill(self.nbytes())
         if encode_device is not None and self.disk_compressible():
-            raw = torch.zeros(self.nbytes(), dtype = torch.uint8)
-            with torch.no_grad():
+            # Outside inference mode: the encoder writes its output over this scratch.
+            with _no_inference_mode(), torch.no_grad():
+                raw = torch.zeros(self.nbytes(), dtype = torch.uint8)
                 for p, off in zip(self.params, self.layout):
                     raw[off:off + p.data.nbytes].view(p.dtype).view(p.shape).copy_(p.data)
             if self._store_encoded(raw, encode_device, store, None):
@@ -831,12 +835,10 @@ class _Block:
                 if self.t_copy is not None:
                     self.t_copy[d].record(stream)
                 c = self.codec.get(d)
+                # The slot may still be written by a compressed block's decode that was stolen before compute
+                # waited for it (an interrupted step): order this fetch after it.
+                _wait_fence(self, bufs[d], stream)
                 if c is None:
-                    dec = (self.decoders or {}).get(d)
-                    if dec is not None:
-                        # The slot may still be written by a compressed block's decode that was stolen before
-                        # compute waited for it (an interrupted step): order this copy after it.
-                        stream.wait_stream(dec.stream)
                     bufs[d].copy_(self.host_buf[d], non_blocking = True)
                     event.record(stream)
             if c is not None:
@@ -876,6 +878,26 @@ class _Block:
             self.tier.complete(self)
         for d, event in self.events.items():
             torch.cuda.current_stream(d).wait_event(event)
+
+
+def _wait_fence(block, buf, stream):
+    """Order `stream` after the last decode into slot buffer `buf` that a released block left behind."""
+    fences = getattr(block, "fences", None)
+    ev = fences.pop(buf.data_ptr(), None) if fences else None
+    if ev is not None:
+        stream.wait_event(ev)
+
+
+def _leave_fence(block, slot):
+    """A compressed block gives its slot back: its decode may still be writing it (decoded on a codec stream)."""
+    fences = getattr(block, "fences", None)
+    if fences is None or slot is None or not getattr(block, "codec", None):
+        return
+    bufs = slot[0]
+    for d, c in block.codec.items():
+        ev = block.events.get(d) if c is not None else None
+        if ev is not None and d in bufs:
+            fences[bufs[d].data_ptr()] = ev
 
 
 def _to_device(obj, device):
@@ -1142,6 +1164,12 @@ class BlockSwap:
                 self._disk_decoders = {}
             if self._compress:
                 self._build_decoders()
+            # A slot can be reused while the last decode into it is still running (an interrupted step steals or
+            # resets a prefetched block): a released compressed block leaves its decode's event on the slot, and
+            # the next fetch into that slot waits for it, whichever codec stream did the decode.
+            fences = {}
+            for b in self.blocks:
+                b.fences = fences
             # What sits in host RAM: compressed regions are smaller than host_bytes() (the raw size).
             total = sum(b.wire_bytes() for b in self.blocks) if self._compress else self.ram_bytes()
             if self._disk_tier is not None:
@@ -1342,16 +1370,18 @@ class BlockSwap:
                 b.decoders = None
 
     def _build_decoders(self):
-        used = {d for b in self.blocks for d, c in b.codec.items() if c is not None}
+        # Host-tier blocks only: disk-tier blocks keep the decoders sized for them (_disk_decoders).
+        host = [b for b in self.blocks if b.disk is None]
+        used = {d for b in host for d, c in b.codec.items() if c is not None}
         self._decoders = {d: dec for d, dec in self._decoders.items() if d in used}
         if not self._decoders:
             self._compress = False
-        for b in self.blocks:
+        for b in host:
             b.decoders = self._decoders
-        raw = sum(b.nbytes() for b in self.blocks if b.compressed())
+        raw = sum(b.nbytes() for b in host if b.compressed())
         if raw:
-            stored = sum(b.wire_bytes() for b in self.blocks if b.compressed())
-            n = sum(b.compressed() for b in self.blocks)
+            stored = sum(b.wire_bytes() for b in host if b.compressed())
+            n = sum(b.compressed() for b in host)
             print(f"Unsloth: offload_layers stores {n} of {len(self.blocks)} swapped layers compressed (lossless), "
                   f"{stored / 2**30:.2f} of {raw / 2**30:.2f} GiB ({100 * stored / raw:.0f}%), so fetches copy fewer bytes.")
 
@@ -1454,6 +1484,7 @@ class BlockSwap:
     def _release(self, block):
         freed = block.evict()
         if freed is not None:
+            _leave_fence(block, freed)
             self.free[block.sig].append(freed)
 
     def _keep(self, block):
