@@ -6369,6 +6369,18 @@ def _triton_grouped_gemm_dims_supported(module, hidden_dim) -> bool:
     return hidden_dim % m == 0 and intermediate_dim % m == 0
 
 
+def _triton_moe_tensors_on_gpu(module, hidden_states) -> bool:
+    """The Triton grouped-GEMM kernels need CUDA / HIP tensors. The unsloth_triton backend is chosen once per process,
+    but a call's tensors can still live off the GPU (a CPU reference model, a CPU-offloaded expert stack)."""
+    if hidden_states.device.type != "cuda":
+        return False
+    for name in ("gate_up_proj", "down_proj"):
+        weight = getattr(module, name, None)
+        if isinstance(weight, torch.Tensor) and weight.device.type != "cuda":
+            return False
+    return True
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -6378,15 +6390,9 @@ def forward_triton_grouped_gemm(
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # The unsloth_triton backend is chosen once per process; this call's tensors can still live off the GPU (a CPU
-    # reference model, a CPU-offloaded expert stack). The Triton kernels need CUDA / HIP tensors: anything else runs the
-    # eager loop. Inline, not a helper: this function is also copied into the compiled cache.
-    _gate_up_w, _down_w = getattr(self, "gate_up_proj", None), getattr(self, "down_proj", None)
-    if (
-        hidden_states.device.type != "cuda"
-        or (isinstance(_gate_up_w, torch.Tensor) and _gate_up_w.device.type != "cuda")
-        or (isinstance(_down_w, torch.Tensor) and _down_w.device.type != "cuda")
-    ):
+    # Tensors off the GPU run the eager loop. moe_utils.py is installed into the compiled cache as a whole file, so the
+    # helper travels with this function, as _triton_grouped_gemm_dims_supported below does.
+    if not _triton_moe_tensors_on_gpu(self, hidden_states):
         return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     packed = any(is_mxfp4_expert_param(getattr(self, name, None)) for name in ("gate_up_proj", "down_proj"))
