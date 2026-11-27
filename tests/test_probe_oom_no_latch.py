@@ -174,7 +174,10 @@ def test_cpu_loader_out_of_memory_retry_recomputes_eagerly_in_its_checkpoint(mon
 
     torch.manual_seed(0)
     block = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8))
-    compiled_forward = torch.compile(block._call_impl, backend = "aot_eager")
+    # Stands in for the compiled forward without Dynamo: same values, but an extra op first saves different tensors,
+    # so a checkpoint that recomputes in the other mode raises CheckpointError.
+    scale = torch.ones(())
+    compiled_forward = lambda x: block._call_impl(x * scale)
     calls = []
 
     def compiled(*args, **kwargs):
@@ -187,14 +190,11 @@ def test_cpu_loader_out_of_memory_retry_recomputes_eagerly_in_its_checkpoint(mon
     loader._fall_back_to_eager_on_compile_error([block])
     x = torch.randn(4, 8)
     grads = []
-    try:
-        for _ in range(2):  # the out-of-memory step (eager forward and recompute), then a compiled one
-            block.zero_grad()
-            h = x.clone().requires_grad_(True)
-            checkpoint.checkpoint(block, h, use_reentrant = reentrant).square().sum().backward()
-            grads.append(torch.cat([p.grad.flatten() for p in block.parameters()]))
-    finally:
-        torch._dynamo.reset()
+    for _ in range(2):  # the out-of-memory step (eager forward and recompute), then a compiled one
+        block.zero_grad()
+        h = x.clone().requires_grad_(True)
+        checkpoint.checkpoint(block, h, use_reentrant = reentrant).square().sum().backward()
+        grads.append(torch.cat([p.grad.flatten() for p in block.parameters()]))
     torch.testing.assert_close(grads[0], grads[1])
     assert block._compiled_call_impl is not None
     assert "training eagerly" not in capsys.readouterr().out
@@ -209,7 +209,10 @@ def test_cpu_loader_checkpoints_sharing_an_input_after_an_oom_retry(monkeypatch,
 
     torch.manual_seed(0)
     block = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8))
-    compiled_forward = torch.compile(block._call_impl, backend = "aot_eager")
+    # Stands in for the compiled forward without Dynamo: same values, but an extra op first saves different tensors,
+    # so a checkpoint that recomputes in the other mode raises CheckpointError.
+    scale = torch.ones(())
+    compiled_forward = lambda x: block._call_impl(x * scale)
     calls = []
 
     def compiled(*args, **kwargs):
@@ -221,15 +224,12 @@ def test_cpu_loader_checkpoints_sharing_an_input_after_an_oom_retry(monkeypatch,
     block._compiled_call_impl = compiled
     loader._fall_back_to_eager_on_compile_error([block])
     x = torch.randn(4, 8, requires_grad = True)
-    try:
-        first = checkpoint.checkpoint(block, x, use_reentrant = False)
-        second = checkpoint.checkpoint(block, x, use_reentrant = False)
-        for out in (first, second) if eager_first else (second, first):
-            out.square().sum().backward()
-        # Both recomputed: the layer compiles again on the next step.
-        block.zero_grad()
-        checkpoint.checkpoint(block, x, use_reentrant = False).square().sum().backward()
-    finally:
-        torch._dynamo.reset()
+    first = checkpoint.checkpoint(block, x, use_reentrant = False)
+    second = checkpoint.checkpoint(block, x, use_reentrant = False)
+    for out in (first, second) if eager_first else (second, first):
+        out.square().sum().backward()
+    # Both recomputed: the layer compiles again on the next step.
+    block.zero_grad()
+    checkpoint.checkpoint(block, x, use_reentrant = False).square().sum().backward()
     assert len(calls) == 3  # the OOM, the next step's compiled forward and its compiled recompute
     assert "training eagerly" not in capsys.readouterr().out
