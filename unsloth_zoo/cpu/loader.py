@@ -599,8 +599,10 @@ def _fall_back_to_eager_on_compile_error(layers):
     # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
     # compiled (an eagerly retried one must recompute eagerly).
     pending = {}
-    # The same for checkpointed forwards rerun eagerly after an out-of-memory compiled call: they recompute eagerly.
-    eager_pending = {}
+    # id(layer) -> checkpointed forwards rerun eagerly after an out-of-memory compiled call, keyed like pending, until
+    # recomputed or their input is freed (a layer that was not really checkpointed). While any is outstanding the layer
+    # runs eagerly, as after a compile failure, so checkpoints sharing an input never mix modes; then it compiles again.
+    eager_window = {}
 
     def first_tensor(args):
         for value in args:
@@ -614,6 +616,12 @@ def _fall_back_to_eager_on_compile_error(layers):
         entries = pending.setdefault(key, [])
         entries.append(entry)
         del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
+
+    def window_open(key):
+        entries = eager_window.get(key)
+        if entries:
+            entries[:] = [entry for entry in entries if entry[0]() is not None]
+        return bool(entries)
 
     def take(key, args, pending = pending):
         entries = pending.get(key)
@@ -647,10 +655,9 @@ def _fall_back_to_eager_on_compile_error(layers):
             drop(layer)
 
     def eager_once(key, layer, args, kwargs):
-        # One eager call after an out-of-memory compiled one; its checkpoint (if any) must recompute eagerly too.
         out = layer._call_impl(*args, **kwargs)
-        if not _in_backward() and checkpointed(layer):
-            remember(key, args, eager_pending)
+        if not _in_backward() and checkpointed(layer) and first_tensor(args) is not None:
+            remember(key, args, eager_window)
         return out
 
     def checkpointed(layer):
@@ -673,9 +680,10 @@ def _fall_back_to_eager_on_compile_error(layers):
                 if state["eager"]:
                     drop(_layer)
                 return _compiled(*args, **kwargs)
-            if backward and take(key, args, eager_pending):
-                return _layer._call_impl(*args, **kwargs)  # an out-of-memory retry recomputes as it ran
-            if _layer.__dict__.pop("_unsloth_eager_once", False):
+            if backward and window_open(key) and take(key, args, eager_window):
+                # One of the eager out-of-memory retries recomputing: eagerly, as it ran.
+                return _layer._call_impl(*args, **kwargs)
+            if _layer.__dict__.pop("_unsloth_eager_once", False) or (not backward and window_open(key)):
                 return eager_once(key, _layer, args, kwargs)  # the restart after an out-of-memory compiled call
             if state["eager"] or _carries_cache(args, kwargs):
                 # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one

@@ -159,7 +159,7 @@ def test_cpu_loader_out_of_memory_in_training_restarts_eagerly_once(monkeypatch,
     x = torch.ones(2, 4, requires_grad = True)
     for _ in range(2):
         layer.zero_grad()
-        layer(x).square().sum().backward()
+        layer(x * 1).square().sum().backward()  # an activation, freed with the graph, as between real steps
         assert layer.weight.grad is not None
     assert len(calls) == 2  # the OOM call reran eagerly once, the second step compiled
     assert "_unsloth_eager_once" not in layer.__dict__
@@ -197,4 +197,39 @@ def test_cpu_loader_out_of_memory_retry_recomputes_eagerly_in_its_checkpoint(mon
         torch._dynamo.reset()
     torch.testing.assert_close(grads[0], grads[1])
     assert block._compiled_call_impl is not None
+    assert "training eagerly" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("eager_first", [True, False])
+def test_cpu_loader_checkpoints_sharing_an_input_after_an_oom_retry(monkeypatch, capsys, eager_first):
+    # Two outstanding checkpoints of one layer on the same input, the first retried eagerly after an OOM: neither may
+    # recompute in the other's mode, whichever is backpropagated first.
+    import torch.utils.checkpoint as checkpoint
+    from unsloth_zoo.cpu import loader
+
+    torch.manual_seed(0)
+    block = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8))
+    compiled_forward = torch.compile(block._call_impl, backend = "aot_eager")
+    calls = []
+
+    def compiled(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise MemoryError()
+        return compiled_forward(*args, **kwargs)
+
+    block._compiled_call_impl = compiled
+    loader._fall_back_to_eager_on_compile_error([block])
+    x = torch.randn(4, 8, requires_grad = True)
+    try:
+        first = checkpoint.checkpoint(block, x, use_reentrant = False)
+        second = checkpoint.checkpoint(block, x, use_reentrant = False)
+        for out in (first, second) if eager_first else (second, first):
+            out.square().sum().backward()
+        # Both recomputed: the layer compiles again on the next step.
+        block.zero_grad()
+        checkpoint.checkpoint(block, x, use_reentrant = False).square().sum().backward()
+    finally:
+        torch._dynamo.reset()
+    assert len(calls) == 3  # the OOM, the next step's compiled forward and its compiled recompute
     assert "training eagerly" not in capsys.readouterr().out
