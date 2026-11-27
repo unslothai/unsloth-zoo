@@ -134,13 +134,29 @@ def multiprocessing_start_method() -> Optional[str]:
 def _workers_unusable_reason() -> Optional[str]:
     """Non-fork workers cannot re-import the dynamically generated trainer module; macOS stays in-process by stated
     policy, not as a probe side effect, since fork can crash there (CPython moved its default to spawn in 3.8,
-    bpo-33725; multiprocess never copied that)."""
+    bpo-33725; multiprocess never copied that); a live offload_layers host tier stays in-process too."""
     start_method = multiprocessing_start_method()
     if start_method != "fork":
         return f"this process uses the {start_method!r} start method"
     if sys.platform == "darwin":
         return "'multiprocess' forks on macOS, which CPython documents as unsafe there (bpo-33725)"
-    return None
+    return _offload_reason()
+
+
+def _offload_reason() -> Optional[str]:
+    """offload_layers keeps layers page-locked in host RAM, which Linux copies into every forked worker at fork time
+    (not copy-on-write): a 120 GB host tier and 6 workers stalled map at 0 rows. Read only if block_swap is loaded."""
+    module = sys.modules.get("unsloth_zoo.block_swap")
+    probe = getattr(module, "offload_active", None)
+    if probe is None:
+        return None
+    try:
+        active = bool(probe())
+    except Exception:
+        return None
+    if not active:
+        return None
+    return "offload_layers holds model layers page-locked in host RAM, which every forked worker would copy"
 
 
 def _cgroup_cpu_quota() -> Optional[float]:
@@ -471,7 +487,7 @@ def get_dataset_num_proc(
         # message recommends) would inflate a config instead of removing workers.
         return _serial(serial_as_none) if env_value is None else env_value
 
-    # 2. Workers are unusable whatever was requested; see _workers_unusable_reason for the two refusals.
+    # 2. Workers are unusable whatever was requested; see _workers_unusable_reason for the refusals.
     unusable = _workers_unusable_reason()
     if unusable is not None:
         if isinstance(desired, int) and not isinstance(desired, bool) and desired > 1:

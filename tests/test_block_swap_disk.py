@@ -436,6 +436,46 @@ def test_load_time_spill_then_install(monkeypatch):
 
 
 @_cuda
+def test_load_time_spill_keeps_small_1d_weights_in_ram_for_a_later_cast(monkeypatch):
+    """A norm upcast to float32 after the load-time spill (a model's post-load dtype fixups) trains like the same
+    cast on an all-RAM copy: small 1-D weights are never spilled, so the cast is an ordinary in-memory one."""
+    base = _stack()
+    want = copy.deepcopy(base)
+    for layer in want:
+        layer.norm.data = layer.norm.data.float()
+    ref = _train(want)
+    layers = copy.deepcopy(base)
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    state = _mod._HostLoad(9, "tail")
+    state.layers, state.indices = layers, _mod.swap_indices(len(layers), 9, "tail")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    for i in state.indices:
+        state.evict(i)
+    assert state.disk
+    for i in state.disk:
+        assert layers[i].norm.device.type == "cpu" and getattr(layers[i].norm, "_unsloth_disk", None) is None
+        assert getattr(layers[i].base.weight, "_unsloth_disk", None) is not None
+    for layer in layers:
+        layer.norm.data = layer.norm.data.float()
+    for name, p in layers.named_parameters():
+        p.requires_grad_("lora_" in name)
+    store = _disk.live_spill()
+    spilled = store.size
+    sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    assert sw.stats()["disk_layers"] >= len(state.disk)
+    # RAM and disk blocks of identical layers share one slot signature (one pool).
+    assert len({b.sig for b in sw.blocks}) == 1
+    # The norms went into the tail their spill reserved: no layer was written to the file a second time.
+    assert store.size == spilled
+    # dataset_num_proc keeps map in-process while a controller is live.
+    assert _mod.offload_active()
+    _equal(ref, _train(layers))
+    sw.remove()
+    assert not _mod.offload_active()
+
+
+@_cuda
 def test_full_finetuning_is_refused_on_the_disk_tier(monkeypatch):
     base = _stack()
     layers = copy.deepcopy(base)

@@ -285,11 +285,13 @@ def _aligned_empty(nbytes, pin):
 class DiskRef:
     """Where one spilled weight lives: (file, byte offset, bytes) plus the shape and dtype it had, and the
     placeholder its parameter holds until BlockSwap takes it over (one element, expanded to the shape)."""
-    __slots__ = ("store", "offset", "nbytes", "shape", "dtype", "placeholder")
+    __slots__ = ("store", "offset", "nbytes", "shape", "dtype", "placeholder", "region")
 
-    def __init__(self, store, offset, nbytes, shape, dtype, placeholder = None):
+    def __init__(self, store, offset, nbytes, shape, dtype, placeholder = None, region = None):
         self.store, self.offset, self.nbytes = store, int(offset), int(nbytes)
         self.shape, self.dtype, self.placeholder = tuple(shape), dtype, placeholder
+        # Bytes of the region this weight was spilled in (a load-time spill), else None.
+        self.region = region
 
 
 def placeholder_like(t):
@@ -457,7 +459,7 @@ def spill_params(params, layout, region_bytes, need_bytes = None, store = None):
     with torch.no_grad():
         for p, off in zip(params, layout):
             hold = placeholder_like(p.data)
-            ref = DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype, hold)
+            ref = DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype, hold, region = region_bytes)
             p.data = hold
             p._unsloth_disk = ref
     return store, base
