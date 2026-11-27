@@ -373,9 +373,9 @@ def test_gpu_dropout_replayed_on_the_layers_device():
     _assert_same(base_grads, grads)
 
 
-def test_loss_on_intermediate_hidden_states():
-    """A loss term on an intermediate layer's output, collected from the decoder loop as Unsloth's fast forward
-    collects hidden states, reaches the layers below it."""
+def test_loss_on_intermediate_hidden_states_is_refused():
+    """A loss term on an intermediate layer's output: autograd interleaves its contribution with the decoder's, the
+    window would add it first (cancelling terms change the result), so it is refused."""
     model = _model()
     batches, _ = _batches(3)
 
@@ -393,13 +393,9 @@ def test_loss_on_intermediate_hidden_states():
         return loss.detach()
 
     model.zero_grad(set_to_none = True)
-    base = [step(b) for b in batches]
-    base_grads = _grads(model)
-    model.zero_grad(set_to_none = True)
     losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
-    assert why is None
-    assert all(torch.equal(a, b) for a, b in zip(base, losses))
-    _assert_same(base_grads, _grads(model))
+    assert losses is None and "intermediate decoder output" in why
+    assert _grads(model) == {}
 
 
 def test_output_recorder_hooks_abort_or_match():
@@ -420,7 +416,8 @@ def test_output_recorder_hooks_abort_or_match():
     model.zero_grad(set_to_none = True)
     losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
     if losses is None:
-        assert "output recorders" in why, why
+        # transformers 5.x keeps its recorders as forward hooks on the layers: refused up front.
+        assert "output recorders" in why or "forward hooks" in why, why
         assert _grads(model) == {}
     else:
         assert all(torch.equal(a, b) for a, b in zip(base, losses))
@@ -488,17 +485,19 @@ def test_out_of_memory_in_the_decoder_backward_is_an_abort():
     """The recompute runs out of memory after the loss parts wrote the head gradient: every gradient put back."""
     model = _model(train_head = True)
     batches, items = _batches(2)
-    layer = _layers(model)[1]
+    mlp = _layers(model)[1].mlp
+    real = mlp.forward
 
-    def oom(mod, args, out):
+    def oom(*args, **kwargs):   # inside the layer body (forward hooks are refused up front)
         if torch.is_grad_enabled():
             raise torch.OutOfMemoryError("simulated")
+        return real(*args, **kwargs)
 
-    h = layer.register_forward_hook(oom)
+    mlp.forward = oom
     try:
         why = _abort_case(model, batches, items)
     finally:
-        h.remove()
+        del mlp.forward
     assert "out of memory" in why
     assert _grads(model) == {}
 
@@ -511,17 +510,21 @@ def test_out_of_memory_in_the_forward_frees_its_tensors():
     batches, items = _batches(2)
     refs = []
 
-    def oom(mod, args, out):
+    mlp = _layers(model)[2].mlp
+    real = mlp.forward
+
+    def oom(*args, **kwargs):   # inside the layer body (forward hooks are refused up front)
         if not torch.is_grad_enabled():
             big = torch.empty(1 << 16)
             refs.append(weakref.ref(big))
             raise torch.OutOfMemoryError("simulated")
+        return real(*args, **kwargs)
 
-    h = _layers(model)[2].register_forward_hook(oom)
+    mlp.forward = oom
     try:
         why = _abort_case(model, batches, items)
     finally:
-        h.remove()
+        del mlp.forward
     assert "OutOfMemoryError" in why
     assert refs and all(r() is None for r in refs)
     assert _grads(model) == {}
@@ -644,7 +647,7 @@ def test_attention_recorder_aborts_or_matches():
     model.zero_grad(set_to_none = True)
     losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
     if losses is None:
-        assert "output_attentions" in why or "output recorders" in why or "not the hidden states" in why, why
+        assert any(k in why for k in ("output_attentions", "output recorders", "not the hidden states", "forward hooks")), why
         assert _grads(model) == {}
     else:
         assert all(torch.equal(a, b) for a, b in zip(base, losses))
@@ -820,9 +823,14 @@ def test_input_hooks_do_not_outlive_the_window():
 
 def test_forward_input_keeps_requires_grad():
     """A reentrant checkpoint hands its no-grad forward an input that requires grad; compiled guards see the same."""
-    layers = _toy_stack()
     seen = []
-    h = layers[1].register_forward_pre_hook(lambda mod, args: seen.append((torch.is_grad_enabled(), args[0].requires_grad)))
+
+    class Seen(_Toy):
+        def forward(self, x, **kwargs):
+            seen.append((torch.is_grad_enabled(), x.requires_grad))
+            return super().forward(x, **kwargs)
+
+    layers = _toy_stack(Seen)
 
     def fn(m):
         x = _toy_x(m).requires_grad_(True)
@@ -830,10 +838,7 @@ def test_forward_input_keeps_requires_grad():
             x = layer(x)
         x.sum().backward()
 
-    try:
-        losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
-    finally:
-        h.remove()
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
     assert why is None
     assert (False, True) in seen
 
@@ -1349,6 +1354,173 @@ def test_failed_interceptor_setup_restores_every_class():
     assert "__call__" not in A.__dict__ and "__call__" not in B.__dict__
 
 
+# ---------------------------------------------------------------- round 5 review fixes
+def _toy_fns(layers, n = 2, loss = None, call = None):
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x, **(call or {}))
+            x = x[0] if isinstance(x, tuple) else x
+        (loss(x) if loss is not None else x.sum()).backward()
+        return m
+    return [functools.partial(fn, m) for m in range(n)]
+
+
+def test_cancelling_intermediate_losses_are_refused():
+    layers = _toy_stack()
+
+    def fn(m):
+        x, mid = _toy_x(m), None
+        for k, layer in enumerate(layers):
+            x = layer(x)
+            mid = x if k == 0 else mid
+        (x.sum() + mid.sum() - mid.sum()).backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "intermediate decoder output" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_a_rebound_torch_checkpoint_is_refused(monkeypatch):
+    """An integration rebinding torch.utils.checkpoint.checkpoint to its own (functools.wraps) wrapper before the
+    layers bind it: provenance, not the live name, decides."""
+    stock = torch.utils.checkpoint.checkpoint
+
+    @functools.wraps(stock)
+    def scaled(function, *args, **kwargs):
+        return stock(lambda *a: function(*a) * 2, *args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", scaled)
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_CkptToy(functools.partial(torch.utils.checkpoint.checkpoint,
+                                                             use_reentrant = True)) for _ in range(3)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        losses, why = _toy_run(layers, _ckpt_fns(layers))
+    assert losses is None and "checkpoint wrapper" in why, why
+    monkeypatch.undo()
+    assert lm._stock_checkpoint(torch.utils.checkpoint.checkpoint)
+
+
+def test_a_nested_live_cache_aborts():
+    class DynamicCache:
+        n = 0
+
+    class Cached(_Toy):
+        def forward(self, x, caches = (), **kwargs):
+            for c in caches:
+                c.n += 1
+            return torch.tanh(self.lin(x))
+
+    layers = _toy_stack(Cached)
+    cache = DynamicCache()
+    losses, why = _toy_run(layers, _toy_fns(layers, call = {"caches": (cache,)}))
+    assert losses is None and "live KV cache" in why
+    assert cache.n == 0
+
+
+def test_a_window_needs_the_model():
+    layers = _toy_stack()
+    losses, why = lm.run_layer_major(layers, _toy_fns(layers))
+    assert losses is None and "full model" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_a_targeted_backward_that_skips_the_last_output_is_refused():
+    layers = _toy_stack()
+    weight = layers[0].lin.weight
+    losses, why = _toy_run(layers, _toy_fns(layers, loss = lambda x: x.sum()))   # sanity: plain backward runs
+    assert why is None
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward(inputs = [weight])
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "last decoder output" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_replayed_output_metadata_must_match():
+    class Flagged(_Toy):
+        def forward(self, x, **kwargs):
+            return torch.tanh(self.lin(x)), torch.is_grad_enabled()
+
+    layers = _toy_stack(Flagged)
+
+    def fn(m):
+        x, flag = _toy_x(m), None
+        for layer in layers:
+            x, flag = layer(x)
+        (x.sum() * (2 if flag else 1)).backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "metadata" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_decoder_forward_hooks_are_refused():
+    layers = _toy_stack()
+    h = layers[1].register_forward_hook(lambda mod, args, out: out * (2 if torch.is_grad_enabled() else 1))
+    try:
+        losses, why = _toy_run(layers, _toy_fns(layers))
+    finally:
+        h.remove()
+    assert losses is None and "forward hooks" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_shared_lists_between_layers_abort():
+    class Shared(_Toy):
+        def forward(self, x, shared = None, **kwargs):
+            if shared:
+                x = x + shared[0]
+            h = torch.tanh(self.lin(x))
+            shared.append(h * 0.5)
+            return h
+
+    layers = _toy_stack(Shared)
+
+    def fn(m):
+        x, shared = _toy_x(m), []
+        for layer in layers:
+            x = layer(x, shared = shared)
+        x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "mapping or list" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_parent_and_derived_layer_classes_are_intercepted_once():
+    class Parent(_Toy):
+        pass
+
+    class Child(Parent):
+        def __call__(self, *args, **kwargs):
+            return super().__call__(*args, **kwargs)
+
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([Parent(), Child(), Parent()])
+    fns = _toy_fns(layers)
+    for p in layers.parameters():
+        p.grad = None
+    base = [f() for f in fns]
+    base_grads = [p.grad.clone() for p in layers.parameters()]
+    losses, why = _toy_run(layers, fns)
+    assert why is None and losses == base
+    assert all(torch.equal(a, p.grad) for a, p in zip(base_grads, layers.parameters()))
+
+
+def test_the_worker_pool_is_not_reused_after_fork(monkeypatch):
+    layers = _toy_stack()
+    monkeypatch.setattr(lm, "_WINDOW_PID", -1, raising = False)
+    losses, why = _toy_run(layers, _toy_fns(layers))
+    assert losses is None and "fork" in why
+
+
 def test_boundary_bytes():
     assert lm.boundary_bytes([2 * 12, 2 * 17], 64, 4, 2) == (24 + 34) * 64 * 5 * 2
 
@@ -1497,17 +1669,21 @@ def test_gpu_block_swap_step_ends_once_per_window_and_resets_after_an_abort(_spi
             steps.append(sw._steps - before)
         assert steps == [3, 1], steps
 
-        def oom(mod, args, out):
+        mlp = layers[3].mlp
+        real = mlp.forward
+
+        def oom(*args, **kwargs):   # inside the layer body (forward hooks are refused up front)
             if torch.is_grad_enabled():
                 raise torch.OutOfMemoryError("simulated")
+            return real(*args, **kwargs)
 
-        h = layers[3].register_forward_hook(oom)
+        mlp.forward = oom
         try:
             model.zero_grad(set_to_none = True)
             losses, why = lm.run_layer_major(layers, [lambda b = b: _step(model, b, items) for b in batches],
                                              swapper = sw, model = model)
         finally:
-            h.remove()
+            del mlp.forward
         assert losses is None and "out of memory" in why
         assert not any(b.pending for b in sw.blocks)
         assert _grads(model) == {}

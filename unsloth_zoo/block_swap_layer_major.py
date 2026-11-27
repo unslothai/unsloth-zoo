@@ -284,13 +284,54 @@ def _needs_grad(obj, depth = 0):
 
 
 def _shared_state(obj, depth = 0):
-    """A mapping among a decoder layer's inputs: per-call state one layer can write and a later one read (Gemma 4's
-    shared key / value states). The window's no-grad forward would hand the later layer detached tensors."""
-    if isinstance(obj, Mapping):
+    """A mapping or list among a decoder layer's inputs: mutable per-call state one layer can write and a later one
+    read (Gemma 4's shared key / value states). The window's no-grad forward would hand the later layer detached
+    tensors. Tuples (position embeddings) are looked into."""
+    if isinstance(obj, (Mapping, list)):
         return True
-    if depth < 3 and isinstance(obj, (tuple, list)):
+    if depth < 3 and isinstance(obj, tuple):
         return any(_shared_state(o, depth + 1) for o in obj)
     return False
+
+
+def _contains_cache(values):
+    """A live cache anywhere in the call's arguments, nested in tuples / lists / mappings too."""
+    pending, seen = list(values), set()
+    while pending:
+        value = pending.pop()
+        if _is_cache(value):
+            return True
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, Mapping):
+            pending.extend(value.values())
+        elif isinstance(value, (tuple, list)):
+            pending.extend(value)
+    return False
+
+
+def _output_metadata(out):
+    """The container type and the plain values after the hidden states (floats by their bytes: -0.0 and NaN)."""
+    import struct
+
+    values = tuple(out[1:]) if type(out) in (tuple, list) else ()
+    return type(out), tuple((type(v), struct.pack("!d", v) if type(v) is float else v) for v in values)
+
+
+def _stock_checkpoint(fn):
+    """torch's own checkpoint function, by provenance (the module it was defined in), not by the current value of
+    torch.utils.checkpoint.checkpoint, which an integration can rebind to a wrapper: the function body must come
+    from torch.utils.checkpoint, and an outer wrapper may only be torch's own dynamo-disable decorator."""
+    ck = torch.utils.checkpoint
+    body = getattr(fn, "__wrapped__", fn)
+    code = getattr(body, "__code__", None)
+    if code is None or getattr(body, "__globals__", None) is not vars(ck) or code.co_name != "checkpoint":
+        return False
+    if fn is body:
+        return True
+    outer = getattr(fn, "__globals__", {}) or {}
+    return outer.get("__name__") == "torch._compile" and getattr(fn, "__wrapped__", None) is body
 
 
 def _kv_shared_layers(layers):
@@ -317,8 +358,6 @@ def _checkpoint_mode(layer, swapper = None):
     if not (getattr(layer, "gradient_checkpointing", False) and getattr(layer, "training", False)):
         return False, None
     fn, reentrant = getattr(layer, "_gradient_checkpointing_func", None), None
-    ck = torch.utils.checkpoint
-    torch_fns = {id(f) for f in (ck.checkpoint, getattr(ck, "_unsloth_pristine_checkpoint", None)) if f is not None}
     shims = sys.modules.get("unsloth_zoo.gradient_checkpointing")
     shim_fns = {id(f) for f in (getattr(shims, name, None) for name in _CKPT_SHIMS) if f is not None}
     for _ in range(4):
@@ -334,7 +373,7 @@ def _checkpoint_mode(layer, swapper = None):
             # They record and replay MoE routing / saved-attention frames around the recompute, which the window's
             # bypass would skip (a recompute could route differently from the forward that produced the loss).
             return False, "Unsloth's checkpoint shims replay routing / attention frames the window cannot"
-        if id(fn) in torch_fns:
+        if _stock_checkpoint(fn):
             return reentrant is None or reentrant is True, None
         attrs = getattr(fn, "__dict__", None) or {}
         if swapper is not None and attrs.get("_unsloth_block_swap") is swapper and \
@@ -476,7 +515,7 @@ class _Window:
         if _needs_grad(others):
             self._abort("a decoder layer input other than the hidden states needs gradients")
         if _shared_state(tuple(others[0]) + tuple(others[1].values())):
-            self._abort("a decoder layer input is a mapping (state shared between layers, such as shared KV)")
+            self._abort("a decoder layer input is a mapping or list (state shared between layers, such as shared KV)")
         if _operator_modes_active():
             self._abort("a TorchFunctionMode / TorchDispatchMode is active inside the micro-batch")
         if _saved_tensor_hooks_active():
@@ -495,7 +534,7 @@ class _Window:
             self.input_hooks.append(h.register_hook(functools.partial(self._input_grad, m)))
         # Same requires_grad as the input a reentrant checkpoint passes its no-grad forward (compiled guards).
         x = h.detach().requires_grad_(h.requires_grad)
-        if any(_is_cache(v) for v in (*others[0], *others[1].values())):
+        if _contains_cache((*others[0], *others[1].values())):
             # A live KV / state cache, positional or under any keyword (deprecated aliases included), checked on
             # the call as made: the recompute would update it a second time.
             self._abort("a decoder layer call with a live KV cache")
@@ -519,6 +558,7 @@ class _Window:
         out_h, rebuild = _split_output(out)
         if out_h is None:
             self._abort("a decoder layer output that is not the hidden states (or a tuple led by them)")
+        self.saved[l][m] += (_output_metadata(out),)
         if l in self.held and m == self.n - 1:
             self.held.discard(l)
             self.swapper.unhold(l)
@@ -609,7 +649,7 @@ class _Window:
                     if saved is None or g[m] is None:
                         del leaf
                         continue
-                    args2, kwargs2, where, ac, rng = saved
+                    args2, kwargs2, where, ac, rng, metadata = saved
                     x = args2[0] if where == 0 else kwargs2[where]
                     x.requires_grad_(True)
                     with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng):
@@ -618,6 +658,8 @@ class _Window:
                     if out_h is None or not out_h.requires_grad or leaf is None or \
                             (out_h.shape, out_h.dtype, out_h.device) != (leaf.shape, leaf.dtype, leaf.device):
                         raise _ReplayAbort("a decoder recompute returned an output its forward did not")
+                    if self.check_values[l] and _output_metadata(out) != metadata:
+                        raise _ReplayAbort("a decoder recompute changed the layer's output metadata")
                     if self.check_values[l]:
                         with torch.no_grad():
                             flag = _differs(out_h, leaf)
@@ -693,17 +735,17 @@ _WORKERS = _Workers()
 @contextmanager
 def _intercept(window, layers):
     """Route the decoder layers' calls through the window, for its worker threads only (class-level, undone after,
-    also when setting up fails halfway)."""
-    patched, orig_calls = [], {}
+    also when setting up fails halfway). Each interceptor handles instances of exactly its class, so a derived class
+    calling its parent's __call__ is intercepted once."""
+    orig_calls = {cls: cls.__call__ for cls in {type(layer) for layer in layers}}
+    patched = []
     try:
-        for cls in {type(layer) for layer in layers}:
-            orig = cls.__call__
-            orig_calls[cls] = orig
+        for cls, orig in orig_calls.items():
             patched.append((cls, "__call__" in cls.__dict__, orig))
 
-            def call(self, *args, _orig = orig, **kwargs):
+            def call(self, *args, _cls = cls, _orig = orig, **kwargs):
                 w = getattr(_TLS, "window", None)
-                if w is None:
+                if w is None or type(self) is not _cls:
                     return _orig(self, *args, **kwargs)
                 return w.layer_call(self, _orig, args, kwargs)
 
@@ -718,6 +760,8 @@ def _intercept(window, layers):
 
 
 _WINDOW_LOCK = threading.Lock()
+# The worker threads exist only in the process that started them: a fork child inherits their queues, not them.
+_WINDOW_PID = os.getpid()
 
 
 def run_layer_major(layers, micro_fns, swapper = None, model = None):
@@ -726,6 +770,11 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
     refusal: every trainable gradient of `model` (and of `layers`) and the RNG state are as they were, so the caller
     can run the same micro-batches the standard way. A real error in a micro-batch is raised. One window per process
     at a time: a concurrent caller is refused (the decoder classes and the worker pool are shared)."""
+    if os.getpid() != _WINDOW_PID:
+        return None, "layer-major workers cannot be reused after fork"
+    if model is None:
+        # Every trainable gradient the micro-batches can write must be snapshotted for a rollback.
+        return None, "layer-major accumulation needs the full model (gradient rollback)"
     if not _WINDOW_LOCK.acquire(blocking = False):
         return None, "another layer-major window is running in this process"
     try:
@@ -742,6 +791,20 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
         return results, why
     finally:
         _WINDOW_LOCK.release()
+
+
+def _decoder_forward_hooks(layers, swapper):
+    """Forward (pre-)hooks in the decoder layers other than the block swap's own, or global module forward hooks."""
+    from torch.nn.modules import module as nn_module
+
+    if getattr(nn_module, "_global_forward_pre_hooks", None) or getattr(nn_module, "_global_forward_hooks", None):
+        return True
+    own = {handle.id for handle in getattr(swapper, "handles", ()) if hasattr(handle, "id")}
+    for layer in layers:
+        for module in layer.modules():
+            if (set(module._forward_pre_hooks) | set(module._forward_hooks)) - own:
+                return True
+    return False
 
 
 def _tied_trainable_io(model):
@@ -775,6 +838,10 @@ def _run_layer_major(layers, micro_fns, swapper, model):
         return None, "decoder layers share key / value states (KV sharing)"
     if _operator_modes_active():
         return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
+    if _decoder_forward_hooks(layers, swapper):
+        # Standard training runs them once around a checkpointed forward; the window calls the layer twice (no-grad
+        # forward and grad-mode recompute).
+        return None, "a decoder layer has forward hooks the window cannot reproduce"
     if _saved_tensor_hooks_active():
         # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
         return None, "saved-tensor hooks are active (activation offloading)"
@@ -865,6 +932,13 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
                 for done in events:
                     done.wait()
                 raise
+            if w.abort_reason is None and any(out is not None and out.grad is not None
+                                              for row in w.outs[:-1] for out in row):
+                # Autograd would interleave those contributions with the decoder's; the window adds them first.
+                w.abort_reason = "a loss directly uses an intermediate decoder output"
+            if w.abort_reason is None and any(out is None or out.grad is None for out in w.outs[-1]):
+                # A targeted backward (inputs = ...) or a loss that never reaches the last decoder output.
+                w.abort_reason = "a micro-batch did not backpropagate into the last decoder output"
             if w.abort_reason is None and any(w.input_used):
                 w.abort_reason = ("a loss part backpropagated into the first decoder layer's input directly "
                                   "(a loss on the embedding output)")
