@@ -168,6 +168,22 @@ def test_row_that_differs_from_the_record_gets_no_head():
     assert matched.tolist() == [False] and (ids == -1).all()
 
 
+def test_eos_only_completion_keeps_its_head_when_pad_is_eos():
+    sc.reset_score_centering()
+    gen = torch.Generator().manual_seed(6)
+    V, k = 30, 4
+    single, tr = _output([5, 6], [PAD], V, k, gen)  # the model answered EOS at once (EOS id == pad id)
+    t1, tr1 = _output([7, 8], [11], V, k, gen)
+    t2, tr2 = _output([7, 8, 11, 21], [PAD], V, k, gen)  # a final turn that is EOS only
+    sc.record_rollout_topk([single, t1], k)
+    sc.record_rollout_topk([t2], k)
+    L = 4
+    ids, _, matched = sc.lookup_rollout_topk(_batch([([5, 6], [PAD]), ([7, 8], [11, 21, PAD])], 2, L), L, k, PAD)
+    ref_ids, _ = _reference_heads(2, L, k, [(0, 0, tr), (1, 0, tr1), (1, 2, tr2)])
+    assert matched.tolist() == [True, True]
+    assert torch.equal(ids, ref_ids)
+
+
 def test_store_is_bounded_without_a_lookup():
     sc.reset_score_centering()
     gen = torch.Generator().manual_seed(4)

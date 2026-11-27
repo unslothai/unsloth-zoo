@@ -485,13 +485,14 @@ def _hash_tokens(tokens):
 
 
 def _prompt_index(rollout, pad_token_id):
-    """{(len, hash) of the pad-stripped prompt: [full keys]} plus the sorted prompt lengths, built once per pad id."""
+    """{(len, hash) of the pad-stripped prompt: [(stripped prompt, full key)]} plus the sorted prompt lengths, built
+    once per pad id."""
     index = rollout["prompts"].get(pad_token_id, None)
     if index is None:
         by_prompt = {}
         for full, (head_ids, _) in rollout["raw"].items():
             prompt = _make_key(full[:len(full) - head_ids.shape[0]], pad_token_id)
-            by_prompt.setdefault((len(prompt), _hash_tokens(prompt)), []).append(full)
+            by_prompt.setdefault((len(prompt), _hash_tokens(prompt)), []).append((prompt, full))
         index = (by_prompt, sorted({m for m, _ in by_prompt}))
         rollout["prompts"][pad_token_id] = index
     return index
@@ -529,6 +530,7 @@ def lookup_rollout_topk(input_ids, logits_to_keep, k, pad_token_id = None):
     matched = torch.zeros(B, dtype = torch.bool)
     rows = input_ids.detach().cpu().tolist()
     indexes = [(rollout, _prompt_index(rollout, pad_token_id)) for rollout in reversed(_STATE.rollouts.values())]
+    longest = max((lengths[-1] for _, (_, lengths) in indexes if lengths), default = 0)
     for b, row in enumerate(rows):
         width = len(row)
         prompt_width = width - logits_to_keep
@@ -538,31 +540,39 @@ def lookup_rollout_topk(input_ids, logits_to_keep, k, pad_token_id = None):
         filled = [False] * logits_to_keep
         prefix_hash = None
         for rollout, (by_prompt, lengths) in indexes:
-            if not lengths or lengths[0] >= len(stripped) or lengths[-1] < p0:
+            # m == len(stripped): a generation of pad-id tokens only (pad == eos, an EOS-only completion).
+            if not lengths or lengths[0] > len(stripped) or lengths[-1] < p0:
                 continue
             if prefix_hash is None:
+                # Prefix hashes only as far as the longest recorded prompt.
                 prefix_hash, h = [0], 0
-                for t in stripped:
+                for t in stripped[:longest]:
                     h = (h * _HASH_BASE + int(t) + 1) % _HASH_MOD
                     prefix_hash.append(h)
             for m in lengths:
                 if m < p0:
                     continue
-                if m >= len(stripped):
+                if m > len(stripped):
                     break
-                for full in by_prompt.get((m, prefix_hash[m]), ()):
+                candidates = by_prompt.get((m, prefix_hash[m]), None)
+                if not candidates:
+                    continue
+                row_prompt = tuple(stripped[:m])
+                for prompt, full in candidates:
+                    if prompt != row_prompt:
+                        continue
                     head_ids, head_logps = rollout["raw"][full]
                     n_gen = head_ids.shape[0]
-                    if _make_key(full[:len(full) - n_gen], pad_token_id) != tuple(stripped[:m]):
-                        continue
                     start = _segment_start(row, kept, m, full, n_gen, pad_token_id)
                     if start is None or start < prompt_width or start >= width:
                         continue
                     generated = full[len(full) - n_gen:]
                     n = min(n_gen, width - start)
-                    j = 0
-                    while j < n and row[start + j] == generated[j]:
-                        j += 1
+                    j = n
+                    if tuple(row[start:start + n]) != generated[:n]:
+                        j = 0
+                        while j < n and row[start + j] == generated[j]:
+                            j += 1
                     # A shorter match is a row cut after j tokens: only padding may follow.
                     if j == 0 or (j < n and any(t != pad_token_id for t in row[start + j:])):
                         continue
