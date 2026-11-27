@@ -57,10 +57,10 @@ _PASSTHROUGH = {T.F32: torch.float32, T.F16: torch.float16, T.BF16: torch.bfloat
 _SPLIT_MM = frozenset((T.IQ2_XXS, T.IQ3_XXS, T.IQ4_XS, T.Q3_K, T.Q6_K))
 # The GEMV and dequantize kernels index group fields per group for every format.
 _NO_SPLIT_GEMV = frozenset()
-# Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights), from interleaved
-# sweeps at 17408 x 5120: on HBM datacenter parts (A100 / H100 / B200: sm80, sm90, sm100) dequantize + cuBLAS is
-# cheap, so 256-value formats leave the fused path above 8 rows and the rest above 64; elsewhere (T4 / L4 / consumer
-# cards) fused wins up to 128. UNSLOTH_GGUF_FUSED_MAX_ROWS overrides.
+# Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights), from A100 / L4 runs
+# at 17408 x 5120: on HBM datacenter parts (A100 / H100 / B200: sm80, sm90, sm100) dequantize + cuBLAS is cheap, so
+# 256-value formats leave the fused path above 8 rows and the rest above 16; elsewhere (T4 / L4 / consumer cards)
+# fused wins up to 128, except NVFP4 (16 everywhere). UNSLOTH_GGUF_FUSED_MAX_ROWS overrides.
 _FUSED_MAX_ROWS_ENV = os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS")
 _FUSED_MAX_ROWS = int(_FUSED_MAX_ROWS_ENV) if _FUSED_MAX_ROWS_ENV else None
 _HBM_ARCHS = frozenset(((8, 0), (9, 0), (10, 0)))
@@ -75,9 +75,9 @@ def _fused_max_rows(device, ggml_type):
     cap = _ROW_CAPS.get(key)
     if cap is None:
         hbm = torch.version.hip is None and torch.cuda.get_device_capability(device) in _HBM_ARCHS
-        cap = (8 if big_blocks else 64) if hbm else 128
+        cap = (8 if big_blocks else 16) if hbm else 128
         _ROW_CAPS[key] = cap
-    return cap
+    return min(cap, 16) if ggml_type == T.NVFP4 else cap
 
 
 def _env_on(name):
