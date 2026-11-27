@@ -58,6 +58,38 @@ def _gguf_dequantize_config():
     return GgufConfig(dequantize = True)
 
 
+# Files a tokenizer builds its vocabulary from (tokenizer_config.json alone gives transformers 5 an empty one).
+_TOKENIZER_VOCAB_FILES = (
+    "tokenizer.json", "tokenizer.model", "vocab.json", "vocab.txt", "spiece.model", "sentencepiece.bpe.model",
+    "tekken.json",
+)
+
+
+def _has_tokenizer_files(model_name, revision = None, token = None, cache_dir = None, subfolder = None,
+                         local_files_only = False):
+    """Whether a folder or Hub repo ships a tokenizer vocabulary. GGUF repos often ship only config.json next to
+    the .gguf files, whose metadata holds the tokenizer."""
+    names = [os.path.join(subfolder, f) if subfolder else f for f in _TOKENIZER_VOCAB_FILES]
+    if os.path.isdir(model_name):
+        return any(os.path.isfile(os.path.join(model_name, n)) for n in names)
+    if not local_files_only and os.environ.get("HF_HUB_OFFLINE", "0") in ("0", "", "false", "False"):
+        try:
+            from huggingface_hub import HfApi
+            files = set(HfApi().list_repo_files(model_name, revision = revision, token = token))
+            return any(n.replace(os.sep, "/") in files for n in names)
+        except Exception:
+            pass
+    # Offline or the Hub is unreachable: what the cache holds.
+    from huggingface_hub import try_to_load_from_cache
+    for name in names:
+        try:
+            if isinstance(try_to_load_from_cache(model_name, name, cache_dir = cache_dir, revision = revision), str):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # GPU-only kwargs never reach AutoModelForCausalLM.from_pretrained, whose __init__ rejects them.
 _GPU_LOADER_KWARGS_IGNORED = (
     "load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
@@ -803,6 +835,9 @@ def compile_cpu_layers(model, explicit = False):
             _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
         return 0
     _parallel_kernel_builds()
+    # CPU Inductor has the torch < 2.16 cat in-place bug too, and this path never imports temporary_patches.
+    from unsloth_zoo.inductor_nonowning_inplace import patch_inductor_nonowning_inplace
+    patch_inductor_nonowning_inplace()
     count = _compile_layers(model)
     model._unsloth_cpu_compiled = True
     _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
@@ -1077,6 +1112,11 @@ class FastCPUModel:
             model_max_length = max_seq_length, padding_side = "right",
             **{k: kwargs[k] for k in ("cache_dir", "local_files_only", "subfolder") if k in kwargs},
         )
+        if kwargs.get("gguf_file") and adapter_name is None and tokenizer_name == model_name \
+                and not _has_tokenizer_files(model_name, revision, token, **probe_kwargs):
+            # Without gguf_file transformers 5 builds an empty tokenizer (vocab 1) and 4.57 raises.
+            _print(f"{model_name} has no tokenizer files, so the tokenizer is read from {kwargs['gguf_file']}.")
+            tokenizer_kwargs["gguf_file"] = kwargs["gguf_file"]
         try:
             if adapter_name is not None and tokenizer_name == adapter_name:
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, **adapter_kwargs, "revision": adapter_revision})

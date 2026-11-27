@@ -227,19 +227,28 @@ def _replay_rng(state):
 @contextmanager
 def _checkpointing_off(layer):
     """The window is the checkpoint: the layer's own checkpoint wrapper must pass the call straight through."""
-    if not getattr(layer, "gradient_checkpointing", False):
+    value = getattr(layer, "gradient_checkpointing", False)
+    if not value:
         yield
         return
-    had = "gradient_checkpointing" in layer.__dict__
-    old = layer.__dict__.get("gradient_checkpointing")
+    # The flag can be a class property (Unsloth's skip-aware flag keeps its value under another instance key and has
+    # no deleter), so restore whatever instance keys the assignment wrote instead of deleting the attribute.
+    state = layer.__dict__
+    before = dict(state)
     layer.gradient_checkpointing = False
+    written = {k: (k in before, before.get(k)) for k, v in state.items() if k not in before or before[k] is not v}
     try:
         yield
     finally:
-        if had:
-            layer.gradient_checkpointing = old
+        if written:
+            for k, (had, old) in written.items():
+                if had:
+                    state[k] = old
+                else:
+                    state.pop(k, None)
         else:
-            del layer.gradient_checkpointing
+            # A setter that keeps the value outside the instance dict: assign the old value back through it.
+            layer.gradient_checkpointing = value
 
 
 def _uncached(layer, kwargs):
