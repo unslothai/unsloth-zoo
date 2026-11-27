@@ -18,6 +18,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 try:
@@ -281,14 +282,10 @@ def _bytes_identical(actual, expected):
             and bool(mx.all(mx.view(actual, mx.uint8) == mx.view(expected, mx.uint8))))
 
 
-@metal_only
-@pytest.mark.parametrize("model_type", ["inkling2", "inkling2_loop"])
-def test_inkling2_export_is_the_source_layout_mlx_vlm_sanitizes_back_bitwise(tmp_path, model_type):
-    """llama.cpp's Inkling 2 converter reads only the source checkpoint names, which mlx-vlm's sanitize maps from."""
+def _tiny_inkling2(model_type):
     ink = pytest.importorskip("mlx_vlm.models.inkling2.inkling2")
     from mlx.utils import tree_map
     from mlx_vlm.models.inkling2.config import ModelConfig
-    from unsloth_zoo.mlx.utils import _restore_mlx_gguf_source_layout
 
     loop = {"loop_config": {"core_start": 2, "core_end": 4, "num_passes": 2, "gate_rank": 8, "is_varloop": False}} if model_type == "inkling2_loop" else {}
     text = dict(model_type=f"{model_type}_text", vocab_size=256, hidden_size=128, num_hidden_layers=6, num_attention_heads=4,
@@ -302,11 +299,22 @@ def test_inkling2_export_is_the_source_layout_mlx_vlm_sanitizes_back_bitwise(tmp
         pytest.skip(reason="Inkling 2 Loop needs mlx-vlm >= 0.8.1")
     mx.random.seed(0)
     model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    return model, config, bool(loop)
+
+
+@metal_only
+@pytest.mark.parametrize("model_type", ["inkling2", "inkling2_loop"])
+def test_inkling2_export_is_the_source_layout_mlx_vlm_sanitizes_back_bitwise(tmp_path, model_type):
+    """llama.cpp's Inkling 2 converter reads only the source checkpoint names, which mlx-vlm's sanitize maps from."""
+    from unsloth_zoo.mlx.utils import _restore_mlx_gguf_source_layout
+
+    model, config, loop = _tiny_inkling2(model_type)
     params = dict(tree_flatten(model.parameters()))
 
     # Up, then everything else, then gate projections: the fused expert tensor lands in the last shard and reads the first.
-    shard = lambda k: 1 if "up_proj" in k else 3 if "gate_proj" in k else 2
-    shards = {f"model-0000{i}-of-00003.safetensors": {k: v for k, v in params.items() if shard(k) == i} for i in (1, 2, 3)}
+    def shard_of(k):
+        return 1 if "up_proj" in k else 3 if "gate_proj" in k else 2
+    shards = {f"model-0000{i}-of-00003.safetensors": {k: v for k, v in params.items() if shard_of(k) == i} for i in (1, 2, 3)}
     for shard, tensors in shards.items():
         mx.save_safetensors(str(tmp_path / shard), tensors)
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: s for s, t in shards.items() for k in t}}))
@@ -335,3 +343,38 @@ def test_inkling2_export_is_the_source_layout_mlx_vlm_sanitizes_back_bitwise(tmp
     assert restored.keys() == params.keys()
     for name, value in params.items():
         assert _bytes_identical(restored[name], value), name
+
+
+@metal_only
+def test_inkling2_save_pretrained_gguf_hands_the_converter_dense_source_tensors(monkeypatch, tmp_path):
+    """Through save_pretrained_gguf: a quantized Inkling 2 reached the converter in mlx-vlm names with packed experts."""
+    pytest.importorskip("torch")
+    import mlx.nn as nn
+    from unsloth_zoo import llama_cpp
+    from unsloth_zoo.mlx import utils
+
+    model, config, _ = _tiny_inkling2("inkling2")
+    shapes = {k: v.shape for k, v in tree_flatten(model.parameters())}
+    nn.quantize(model, group_size=64, bits=4,
+                class_predicate=lambda p, m: hasattr(m, "to_quantized") and "vision" not in p and m.weight.shape[-1] % 64 == 0)
+    assert any(type(m).__name__ == "QuantizedSwitchLinear" for _, m in model.named_modules())
+    model._config = config
+    seen = {}
+
+    def fake_convert_to_gguf(**kwargs):
+        seen.update({k: v for f in Path(kwargs["input_folder"]).glob("*.safetensors") for k, v in mx.load(str(f)).items()})
+        output = Path(f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf")
+        output.write_bytes(b"GGUF")
+        return [str(output)], False
+
+    converter = str(tmp_path / "convert_hf_to_gguf.py")
+    monkeypatch.setattr(llama_cpp, "check_llama_cpp", lambda folder: (str(tmp_path / "llama-quantize"), converter))
+    monkeypatch.setattr(llama_cpp, "_download_convert_hf_to_gguf", lambda: (converter, None, None))
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", fake_convert_to_gguf)
+    tokenizer = type("Tokenizer", (), {"save_pretrained": lambda self, path: None})()
+    utils.save_pretrained_gguf(model, tokenizer, tmp_path / "out", quantization_method="bf16")
+
+    assert not [k for k in seen if not k.startswith(("model.llm.", "model.visual."))]
+    assert not [k for k, v in seen.items() if v.dtype == mx.uint32 or k.endswith((".scales", ".biases"))]
+    restored = model.sanitize(seen)
+    assert {k: v.shape for k, v in restored.items()} == shapes
