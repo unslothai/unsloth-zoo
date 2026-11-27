@@ -364,15 +364,17 @@ def gemv_kernel(
 
 @triton.jit
 def mm_kernel(
-    X, P, OUT, BIAS, COUNTS, tab,
+    X, P, OUT, BIAS, COUNTS, SCHED, tab,
     M, N, K, E, R, row_bytes, stride_xm, stride_om,
     TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr,
     TRANS_B: tl.constexpr, GROUPED: tl.constexpr, E_POW2: tl.constexpr, HAS_BIAS: tl.constexpr,
+    HOST_SCHED: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT: tl.constexpr,
 ):
     """Packed weight ``W[e]`` is (R, C) with C values per packed row (R rows per expert).
     TRANS_B: out (M, N = R) = x (M, K = C) @ W[e]^T.  Else: out (M, N = C) = x (M, K = R) @ W[e].
-    GROUPED: rows of x sorted by expert, ``COUNTS[e]`` rows each. The packed-row axis of a tile is
+    GROUPED: rows of x sorted by expert, ``COUNTS[e]`` rows each. HOST_SCHED: the tile / row prefix sums come
+    precomputed in ``SCHED`` (2, E) instead of a tl.cumsum (Triton < 3.3 scans a replicated layout wrongly). The packed-row axis of a tile is
     BLOCK_N (TRANS_B) or BLOCK_K wide; the value axis is the other one, a whole number of blocks."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -380,11 +382,15 @@ def mm_kernel(
         e_offs = tl.arange(0, E_POW2)
         counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0)
         tiles = (counts + BLOCK_M - 1) // BLOCK_M
-        tile_end = tl.cumsum(tiles, 0)
+        if HOST_SCHED:
+            tile_end = tl.load(SCHED + e_offs, mask = e_offs < E, other = 1 << 30)
+            row_end_all = tl.load(SCHED + E + e_offs, mask = e_offs < E, other = 0)
+        else:
+            tile_end = tl.cumsum(tiles, 0)
+            row_end_all = tl.cumsum(counts, 0)
         e = tl.sum((tile_end <= pid_m).to(tl.int32), 0)
         if e >= E:
             return
-        row_end_all = tl.cumsum(counts, 0)
         row_end = tl.sum(tl.where(e_offs == e, row_end_all, 0), 0)
         row_start = row_end - tl.sum(tl.where(e_offs == e, counts, 0), 0)
         tile_start = tl.sum(tl.where(e_offs == e, tile_end - tiles, 0), 0)

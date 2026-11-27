@@ -69,6 +69,15 @@ def _triton_ok(t):
     return _HAS_TRITON and t.is_cuda and _env_on("UNSLOTH_GGUF_TRITON")
 
 
+def _old_triton():
+    try:
+        major, minor = (int(v) for v in triton.__version__.split(".")[:2])
+    except Exception:
+        return False
+    return (major, minor) < (3, 3)
+
+
+_OLD_TRITON = _HAS_TRITON and _old_triton()
 _TABLES = {}
 
 
@@ -191,11 +200,16 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
     BLOCK_N, BLOCK_K = (packed_rows, values) if trans_b else (values, packed_rows)
     tiles_m = (-(-M // BLOCK_M) + min(E, M)) if grouped else -(-M // BLOCK_M)
     grid = (tiles_m, -(-N // BLOCK_N))
+    host_sched = grouped and _OLD_TRITON
+    sched = None
+    if host_sched:
+        sched = torch.stack((torch.cumsum((counts + BLOCK_M - 1) // BLOCK_M, 0), torch.cumsum(counts, 0))).to(torch.int32)
     _tk.mm_kernel[grid](
-        x2, packed, out, x2 if bias is None else bias, x2 if counts is None else counts, _table(x2.device),
+        x2, packed, out, x2 if bias is None else bias, x2 if counts is None else counts,
+        x2 if sched is None else sched, _table(x2.device),
         M, N, K, E, R, row_bytes, x2.stride(0), out.stride(0),
         TYPE = ggml_type, QK = qk, BS = bs, TRANS_B = trans_b, GROUPED = grouped,
-        E_POW2 = 1 << max(E - 1, 0).bit_length(), HAS_BIAS = bias is not None,
+        E_POW2 = 1 << max(E - 1, 0).bit_length(), HAS_BIAS = bias is not None, HOST_SCHED = host_sched,
         BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, SPLIT = ggml_type in _SPLIT_MM,
         num_warps = warps, num_stages = 2,
     )

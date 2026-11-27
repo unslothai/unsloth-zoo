@@ -302,3 +302,26 @@ def test_group_split_both_layouts(ggml_type, split, monkeypatch):
         gy = torch.randn(M, N, device = "cuda", dtype = dtype)
         ok, _ = _fp64_bound_ok(gguf_linear_backward_input(gy, packed, ggml_type, (N, K)), gy, w32.t().contiguous(), gy @ w32.to(dtype))
         assert ok
+
+
+@cuda
+@pytest.mark.parametrize("host_sched", [True, False], ids = ["host_sched", "kernel_sched"])
+@pytest.mark.parametrize("ggml_type", [T.IQ4_XS, T.Q4_0, T.NVFP4], ids = _id)
+def test_grouped_schedules(ggml_type, host_sched, monkeypatch):
+    # the expert schedule (tile / row prefix sums) is computed in the kernel, or on device by torch on Triton < 3.3
+    monkeypatch.setattr(gguf_ops, "_OLD_TRITON", host_sched)
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    E, N = 7, 32
+    K = _row_length(ggml_type, 1 if GGML_BLOCK[ggml_type][0] == 256 else 8)
+    packed = random_packed(ggml_type, E * N, K, seed = 3, special = False).reshape(E, N, -1).cuda()
+    w32 = dequantize_reference(packed, ggml_type, (E, N, K))
+    for counts_l in ([2, 0, 4, 0, 0, 1, 0], [0, 0, 0, 0, 0, 0, 3], [40, 1, 0, 17, 0, 0, 2]):
+        counts = torch.tensor(counts_l, dtype = torch.int32, device = "cuda")
+        x = (torch.randn(sum(counts_l), K, device = "cuda") * 1e-2).to(dtype)
+        guard = torch.full((4096,), 7.0, device = "cuda")
+        y = gguf_grouped_mm(x, packed, ggml_type, (E, N, K), counts)
+        rows = torch.repeat_interleave(torch.arange(E, device = "cuda"), counts.long())
+        ref = torch.bmm(x.double().unsqueeze(1), w32.double()[rows].transpose(1, 2)).squeeze(1)
+        stock = torch.bmm(x.unsqueeze(1), w32.to(dtype)[rows].transpose(1, 2)).squeeze(1)
+        assert torch.isfinite(y).all() and (guard == 7.0).all()
+        assert (y.double() - ref).abs().mean() <= 1.5 * (stock.double() - ref).abs().mean() + 1e-12
