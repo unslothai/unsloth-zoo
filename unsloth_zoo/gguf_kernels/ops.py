@@ -52,6 +52,11 @@ except Exception:
     _HAS_TRITON = False
 
 _PASSTHROUGH = {T.F32: torch.float32, T.F16: torch.float16, T.BF16: torch.bfloat16}
+# Formats whose 8-value group fields (u32 aux words, sign bytes, sub-block scales) dominate the decode: the tile GEMM
+# indexes those per group (4-D tile); for the rest the cheaper reshape into a dot operand wins (L4 / A100 timings).
+_SPLIT_MM = frozenset((T.IQ2_XXS, T.IQ3_XXS, T.IQ4_XS, T.Q3_K, T.Q6_K))
+# The GEMV and dequantize kernels index group fields per group for every format except these.
+_NO_SPLIT_GEMV = frozenset((T.Q4_K, T.Q5_K))
 # Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights).
 _FUSED_MAX_ROWS = int(os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS", "128"))
 
@@ -122,7 +127,7 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
     with torch.cuda.device(packed.device):
         _tk.dequantize_kernel[grid](
             packed, out, _table(packed.device), rows, K, ggml_row_bytes(ggml_type, K),
-            TYPE = ggml_type, QK = qk, BS = bs, BLOCK_R = BLOCK_R, NB = NB,
+            TYPE = ggml_type, QK = qk, BS = bs, BLOCK_R = BLOCK_R, NB = NB, SPLIT = True,
             num_warps = 4, enable_fp_fusion = False,
         )
     return out if native else out.to(dtype)
@@ -191,7 +196,8 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
         M, N, K, E, R, row_bytes, x2.stride(0), out.stride(0),
         TYPE = ggml_type, QK = qk, BS = bs, TRANS_B = trans_b, GROUPED = grouped,
         E_POW2 = 1 << max(E - 1, 0).bit_length(), HAS_BIAS = bias is not None,
-        BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, num_warps = warps, num_stages = 2,
+        BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, SPLIT = ggml_type in _SPLIT_MM,
+        num_warps = warps, num_stages = 2,
     )
     return out
 
@@ -203,7 +209,7 @@ def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
     _tk.gemv_kernel[grid](
         x1, packed, out, x1 if bias is None else bias, _table(x1.device), N, K, ggml_row_bytes(ggml_type, K),
         TYPE = ggml_type, QK = qk, BS = bs, HAS_BIAS = bias is not None,
-        BLOCK_N = BLOCK_N, NB = NB, num_warps = 4,
+        BLOCK_N = BLOCK_N, NB = NB, SPLIT = ggml_type not in _NO_SPLIT_GEMV, num_warps = 4,
     )
     return out
 

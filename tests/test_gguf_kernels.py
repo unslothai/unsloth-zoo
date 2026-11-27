@@ -282,3 +282,23 @@ def test_fp32_activations_keep_fp32_accuracy(M):
     got = gguf_linear(x, packed, T.Q6_K, (40, 512))
     ref = x.double() @ w.double().t()
     assert ((got.double() - ref).norm() / ref.norm()).item() < 1e-5
+
+
+@cuda
+@pytest.mark.parametrize("ggml_type", QUANT_TYPES, ids = _id)
+@pytest.mark.parametrize("split", [True, False], ids = ["split8", "flat"])
+def test_group_split_both_layouts(ggml_type, split, monkeypatch):
+    # the per-format layout choice is a speed knob: both layouts must decode the same weights
+    monkeypatch.setattr(gguf_ops, "_SPLIT_MM", frozenset(QUANT_TYPES) if split else frozenset())
+    monkeypatch.setattr(gguf_ops, "_NO_SPLIT_GEMV", frozenset() if split else frozenset(QUANT_TYPES))
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    N, K = 40, _row_length(ggml_type, 2 if GGML_BLOCK[ggml_type][0] >= 256 else 4)
+    packed = random_packed(ggml_type, N, K, seed = 11, special = False).cuda()
+    w32 = dequantize_reference(packed, ggml_type, (N, K))
+    for M in (1, 6):
+        x = torch.randn(M, K, device = "cuda", dtype = dtype)
+        ok, _ = _fp64_bound_ok(gguf_linear(x, packed, ggml_type, (N, K)), x, w32, torch.nn.functional.linear(x, w32.to(dtype)))
+        assert ok
+        gy = torch.randn(M, N, device = "cuda", dtype = dtype)
+        ok, _ = _fp64_bound_ok(gguf_linear_backward_input(gy, packed, ggml_type, (N, K)), gy, w32.t().contiguous(), gy @ w32.to(dtype))
+        assert ok
