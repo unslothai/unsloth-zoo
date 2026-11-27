@@ -599,19 +599,21 @@ def _fall_back_to_eager_on_compile_error(layers):
     # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
     # compiled (an eagerly retried one must recompute eagerly).
     pending = {}
-    # id(layer) -> checkpointed forwards rerun eagerly after an out-of-memory compiled call, keyed like pending, until
-    # recomputed or their input is freed (a layer that was not really checkpointed). While any is outstanding the layer
-    # runs eagerly, as after a compile failure, so checkpoints sharing an input never mix modes; then it compiles again.
+    # id(layer) -> checkpointed forwards rerun eagerly after an out-of-memory compiled call, keyed like pending, kept
+    # until their input is freed (with the checkpoint, so retain_graph backwards replay eagerly too; a layer that was not
+    # really checkpointed frees it after its step). While any is outstanding the layer runs eagerly, as after a compile
+    # failure, so checkpoints sharing an input never mix modes; then it compiles again.
     eager_window = {}
 
-    def first_tensor(args):
-        for value in args:
+    def first_tensor(args, kwargs = None):
+        # Positional first, then keyword inputs (checkpoint(layer, hidden_states = x)).
+        for value in itertools.chain(args, (kwargs or {}).values()):
             if isinstance(value, torch.Tensor):
                 return value
         return None
 
-    def remember(key, args, pending = pending):
-        x = first_tensor(args)
+    def remember(key, args, pending = pending, kwargs = None):
+        x = first_tensor(args, kwargs)
         entry = (None, None, None) if x is None else (weakref.ref(x), x.data_ptr(), tuple(x.shape))
         entries = pending.setdefault(key, [])
         entries.append(entry)
@@ -623,11 +625,11 @@ def _fall_back_to_eager_on_compile_error(layers):
             entries[:] = [entry for entry in entries if entry[0]() is not None]
         return bool(entries)
 
-    def take(key, args, pending = pending):
+    def take(key, args, pending = pending, kwargs = None, consume = True):
         entries = pending.get(key)
         if not entries:
             return False
-        x = first_tensor(args)
+        x = first_tensor(args, kwargs)
         for index in range(len(entries) - 1, -1, -1):
             ref, ptr, shape = entries[index]
             alive = None if ref is None else ref()
@@ -638,7 +640,8 @@ def _fall_back_to_eager_on_compile_error(layers):
                 # reentrant checkpointing recomputes on detached copies: same storage and shape
                 or (alive is None and ptr == x.data_ptr() and shape == tuple(x.shape))
             ):
-                del entries[index]
+                if consume:
+                    del entries[index]
                 return True
         return False
 
@@ -656,8 +659,8 @@ def _fall_back_to_eager_on_compile_error(layers):
 
     def eager_once(key, layer, args, kwargs):
         out = layer._call_impl(*args, **kwargs)
-        if not _in_backward() and checkpointed(layer) and first_tensor(args) is not None:
-            remember(key, args, eager_window)
+        if not _in_backward() and checkpointed(layer) and first_tensor(args, kwargs) is not None:
+            remember(key, args, eager_window, kwargs)
         return out
 
     def checkpointed(layer):
@@ -675,12 +678,12 @@ def _fall_back_to_eager_on_compile_error(layers):
         def guarded(*args, _compiled = compiled, _layer = layer, **kwargs):
             key = id(_layer)
             backward = _in_backward()
-            if backward and take(key, args):
+            if backward and take(key, args, kwargs = kwargs):
                 # Checkpoint recomputation of a compiled forward: replay it compiled, as the forward saved it.
                 if state["eager"]:
                     drop(_layer)
                 return _compiled(*args, **kwargs)
-            if backward and window_open(key) and take(key, args, eager_window):
+            if backward and window_open(key) and take(key, args, eager_window, kwargs, consume = False):
                 # One of the eager out-of-memory retries recomputing: eagerly, as it ran.
                 return _layer._call_impl(*args, **kwargs)
             if _layer.__dict__.pop("_unsloth_eager_once", False) or (not backward and window_open(key)):
@@ -711,7 +714,7 @@ def _fall_back_to_eager_on_compile_error(layers):
                     raise _RestartEagerly() from error
                 return _layer._call_impl(*args, **kwargs)
             if not backward and checkpointed(_layer):
-                remember(key, args)
+                remember(key, args, kwargs = kwargs)
             return out
 
         layer._compiled_call_impl = guarded

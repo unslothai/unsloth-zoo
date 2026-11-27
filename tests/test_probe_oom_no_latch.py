@@ -224,12 +224,70 @@ def test_cpu_loader_checkpoints_sharing_an_input_after_an_oom_retry(monkeypatch,
     block._compiled_call_impl = compiled
     loader._fall_back_to_eager_on_compile_error([block])
     x = torch.randn(4, 8, requires_grad = True)
-    first = checkpoint.checkpoint(block, x, use_reentrant = False)
-    second = checkpoint.checkpoint(block, x, use_reentrant = False)
+    h = x.detach().clone().requires_grad_(True)  # this step's input, freed with it
+    first = checkpoint.checkpoint(block, h, use_reentrant = False)
+    second = checkpoint.checkpoint(block, h, use_reentrant = False)
     for out in (first, second) if eager_first else (second, first):
         out.square().sum().backward()
-    # Both recomputed: the layer compiles again on the next step.
+    del h, first, second, out
+    # The step's graph is gone: the layer compiles again on the next step.
     block.zero_grad()
-    checkpoint.checkpoint(block, x, use_reentrant = False).square().sum().backward()
+    checkpoint.checkpoint(block, x.detach().clone().requires_grad_(True), use_reentrant = False).square().sum().backward()
     assert len(calls) == 3  # the OOM, the next step's compiled forward and its compiled recompute
+    assert "training eagerly" not in capsys.readouterr().out
+
+
+class _KeywordBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up, self.down = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+
+    def forward(self, input):
+        return self.down(torch.relu(self.up(input)))
+
+
+def _oom_once_then(block, failures = 1):
+    scale = torch.ones(())
+    calls = []
+
+    def compiled(*args, **kwargs):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise MemoryError()
+        # Stand-in compiled forward: same values, different saved tensors (see above).
+        if args:
+            return block._call_impl(args[0] * scale)
+        return block._call_impl(input = kwargs["input"] * scale)
+
+    block._compiled_call_impl = compiled
+    return calls
+
+
+@pytest.mark.parametrize("keyword", [False, True])
+def test_cpu_loader_out_of_memory_retry_replays_eagerly_with_retain_graph_and_keyword_inputs(capsys, keyword):
+    import torch.utils.checkpoint as checkpoint
+    from unsloth_zoo.cpu import loader
+
+    torch.manual_seed(0)
+    block = _KeywordBlock()
+    calls = _oom_once_then(block)
+    loader._fall_back_to_eager_on_compile_error([block])
+    h = torch.randn(4, 8, requires_grad = True)
+    out = checkpoint.checkpoint(block, input = h, use_reentrant = False) if keyword else \
+        checkpoint.checkpoint(block, h, use_reentrant = False)
+    loss = out.square().sum()
+    loss.backward(retain_graph = True)
+    first = [p.grad.clone() for p in block.parameters()]
+    block.zero_grad()
+    loss.backward()  # the retained graph recomputes again: still eagerly, as the forward ran
+    for a, p in zip(first, block.parameters()):
+        torch.testing.assert_close(a, p.grad)
+    assert len(calls) == 1
+    del h, out, loss
+    block.zero_grad()
+    x = torch.randn(4, 8, requires_grad = True)
+    out = checkpoint.checkpoint(block, input = x, use_reentrant = False) if keyword else \
+        checkpoint.checkpoint(block, x, use_reentrant = False)
+    out.square().sum().backward()
+    assert len(calls) == 3  # compiled again: the forward and its recompute
     assert "training eagerly" not in capsys.readouterr().out
