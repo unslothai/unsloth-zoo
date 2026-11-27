@@ -13,6 +13,7 @@ import torch
 import unsloth_zoo.fp16_emulation as fe
 import unsloth_zoo.mxfp4_gemm as mg
 import unsloth_zoo.temporary_patches.moe_fp8_grouped as mfg
+from _torch_version_tag import drop_rocm_tag  # noqa: E402
 
 
 def _oom_once(result):
@@ -75,6 +76,7 @@ def test_fp8_w8a16_probe_oom_is_not_cached(monkeypatch):
     monkeypatch.setattr(mfg, "_capability", lambda device: (9, 0))
     monkeypatch.setattr(mfg, "_triton_too_old", lambda capability: False)
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
     monkeypatch.setattr(torch, "autocast", lambda *a, **k: contextlib.nullcontext())

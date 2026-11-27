@@ -12,6 +12,7 @@ import torch
 import unsloth_zoo.mxfp4_gemm as mg
 import unsloth_zoo.mxfp4_stacked_experts as mse
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
+from _torch_version_tag import drop_rocm_tag  # noqa: E402
 
 
 @pytest.fixture(autouse = True)
@@ -30,6 +31,8 @@ def gpu(monkeypatch):
         })
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: capability)
         monkeypatch.setattr(torch.version, "hip", hip)
+        if not hip:
+            drop_rocm_tag(monkeypatch, torch)
         # A traced call answers through _available_in_trace, which would run the real kernel self-check on a host
         # that has a GPU (under the faked capability, hip version and capture state above: the ROCm runner's
         # process died there). The verdict under test is the arch gate, so the self-check passes by fiat.
