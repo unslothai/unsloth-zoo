@@ -307,13 +307,23 @@ def _load_cached_moe_utils_module():
 
 
 def _select_moe_backend_eagerly(module):
-    # Selecting inside a trace sets a guarded global and recompiles the graph once.
-    if torch.compiler.is_compiling():
+    # Selecting inside a trace sets a guarded global and recompiles the graph once. While unsloth imports, a worker
+    # that picks its card afterwards would probe (and open a context on) GPU 0: warm_moe_backend_selection selects at
+    # model load instead.
+    if torch.compiler.is_compiling() or _unsloth_importing():
         return
     try:
         module.select_moe_backend()
     except Exception:
         pass
+
+
+def warm_moe_backend_selection():
+    """Probe and select the MoE backend at model load (a temporary patch), before any trace; never during import."""
+    module = _load_cached_moe_utils_module()
+    for target in (module, sys.modules[__name__]):
+        if target is not None and hasattr(target, "select_moe_backend"):
+            _select_moe_backend_eagerly(target)
 
 
 def get_forward_moe_backend():

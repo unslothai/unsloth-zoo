@@ -46,6 +46,7 @@ from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
     extract_moe_lora_weights_for_grouped_mm,
+    warm_moe_backend_selection,
 )
 
 
@@ -400,3 +401,10 @@ def patch_qwen3_moe():
 
 pass
 TEMPORARY_PATCHES.append(patch_qwen3_moe)
+
+
+def patch_moe_backend_selection():
+    # Imports select nothing (moe_utils._select_moe_backend_eagerly): probe here, at model load, before a trace.
+    warm_moe_backend_selection()
+pass
+TEMPORARY_PATCHES.append(patch_moe_backend_selection)
