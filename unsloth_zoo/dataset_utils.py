@@ -3026,25 +3026,67 @@ def _batched_columns(dataset):
 pass
 
 
-def _prompt_completion_boundary(prompt_ids, pc_ids):
+# Prompt ids that must continue pc_ids after a skipped span; a shorter unmatched prompt tail counts as a merge.
+_PROMPT_COMPLETION_ANCHOR = 4
+
+
+def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = _PROMPT_COMPLETION_ANCHOR):
     # "Answer: " + "two" tokenizes "Answer:", " two": start where the tokenizations diverge (huggingface/trl#7463).
-    n = min(len(prompt_ids), len(pc_ids))
-    if pc_ids[:n] == prompt_ids[:n]: return n
+    # GPT-OSS also drops the analysis of every tool-calling turn once a final answer follows: skip each deleted
+    # prompt span (the shortest one after which `anchor` prompt ids continue pc_ids) and start where the prompt ends.
+    p, q = list(prompt_ids), list(pc_ids)
+    n = min(len(p), len(q))
+    if q[:n] == p[:n]: return n
     shared = 0
-    while shared < n and prompt_ids[shared] == pc_ids[shared]: shared += 1
-    global _PROMPT_COMPLETION_BOUNDARY_WARNED
-    if not _PROMPT_COMPLETION_BOUNDARY_WARNED:
-        _PROMPT_COMPLETION_BOUNDARY_WARNED = True
-        print(
-            "Unsloth: Warning: the tokenized prompt is not a prefix of the tokenized prompt + completion, "
-            "usually because the prompt ends in a space or newline that merges with the completion's first "
-            "token, or because the chat template renders the prompt alone differently. The completion is "
-            "trained from where they diverge, as in TRL. To avoid it, end the prompt on a token boundary "
-            "and start the completion with the whitespace instead (\"Answer:\" + \" two\")."
-        )
-    return shared
+    while shared < n and p[shared] == q[shared]: shared += 1
+    i = j = shared
+    deleted = False
+    while i < len(p) and j < len(q):
+        d = next((k for k in range(1, len(p) - i - anchor + 1) if p[i + k : i + k + anchor] == q[j : j + anchor]), None)
+        if d is None:
+            break
+        i, deleted = i + d, True
+        while i < len(p) and j < len(q) and p[i] == q[j]:
+            i, j = i + 1, j + 1
+    kind = "deleted" if deleted else "diverge"
+    # A short unmatched tail is a merged token or prompt-only closing tokens (Gemma 4 "<turn|>\n", DeepSeek-R1
+    # "<think>\n"). A long one is a rewrite we cannot line up (Mistral v0.3 drops the system text and re-spaces the
+    # next word): start after the place in pc_ids that matches the most of the prompt's tail, so an earlier turn's
+    # header or a completion echoing the prompt's last ids is not picked.
+    tails = [r for r in range(j, len(q) - anchor + 1) if q[r : r + anchor] == p[-anchor:]] if len(p) - i >= anchor else []
+    # A template that drops or re-spaces text cannot grow the rest of the prompt, so prefer matches ending within it.
+    tails = [r for r in tails if r + anchor <= j + len(p) - i] or tails
+    if tails:
+        def tail_match(r):
+            k = anchor
+            while k < min(len(p), r + anchor) and p[-k - 1] == q[r + anchor - k - 1]: k += 1
+            return k
+        kind, j = "unaligned", max(tails, key = tail_match) + anchor
+    if kind not in _PROMPT_COMPLETION_BOUNDARY_WARNED:
+        _PROMPT_COMPLETION_BOUNDARY_WARNED.add(kind)
+        if kind == "deleted":
+            print(
+                "Unsloth: Warning: the chat template renders earlier turns of the prompt differently once the "
+                "completion is appended (for example GPT-OSS drops the analysis text of tool-calling turns when "
+                "a final answer follows). The deleted text is skipped and the completion is trained from the end "
+                "of the prompt's remaining tokens, so the prompt, tool calls and tool results stay masked."
+            )
+        elif kind == "unaligned":
+            print(
+                "Unsloth: Warning: the chat template renders earlier turns into different tokens once the completion "
+                "is appended; the completion is trained from where the prompt's last tokens end. Check these labels."
+            )
+        else:
+            print(
+                "Unsloth: Warning: the tokenized prompt is not a prefix of the tokenized prompt + completion, "
+                "usually because the prompt ends in a space or newline that merges with the completion's first "
+                "token, or because the chat template renders the prompt alone differently. The completion is "
+                "trained from where they diverge, as in TRL. To avoid it, end the prompt on a token boundary "
+                "and start the completion with the whitespace instead (\"Answer:\" + \" two\")."
+            )
+    return j
 pass
-_PROMPT_COMPLETION_BOUNDARY_WARNED = False
+_PROMPT_COMPLETION_BOUNDARY_WARNED = set()
 
 
 def _check_batch_lengths(batch_rows, *columns):
