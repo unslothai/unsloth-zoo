@@ -194,14 +194,40 @@ def test_a_correct_grouped_mm_still_selects_grouped_mm(fresh, capsys):
     assert "cannot run MoE training" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("defect", ["zeros", "dx", "empty_dw", "no_backward"])
+def test_fp32_residue_in_a_correct_grouped_mm_still_selects_grouped_mm(fresh):
+    # gfx1151 (ROCm, Linux and Windows wheels): forward, dX and dW are off the exact integer answer by 2**-19.
+    eps = 2.0 ** -19
+    class Residue(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w, offs):
+            ctx.save_for_backward(x, w, offs)
+            return _reference_grouped_mm(x, w, offs) + eps
+        @staticmethod
+        def backward(ctx, grad):
+            x, w, offs = ctx.saved_tensors
+            with torch.enable_grad():
+                x_, w_ = x.detach().requires_grad_(), w.detach().requires_grad_()
+                dx, dw = torch.autograd.grad(_reference_grouped_mm(x_, w_, offs), (x_, w_), grad)
+            return dx + eps, dw + eps, None
+    def grouped_mm(x, w, offs = None):
+        return Residue.apply(x, w, offs)
+    fresh.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+    assert mu._select_moe_backend() == "grouped_mm"
+    assert mu._GROUPED_MM_TRAINING_PROBE_FAILURE is None
+
+
+@pytest.mark.parametrize("defect", ["zeros", "dx", "empty_dw", "no_backward", "nan"])
 def test_the_probe_checks_forward_and_both_grads(fresh, defect):
     class Wrong(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x, w, offs):
             ctx.save_for_backward(x, w, offs)
-            return torch.zeros(x.shape[0], w.shape[-1], dtype = x.dtype) if defect == "zeros" else \
-                _reference_grouped_mm(x, w, offs)
+            if defect == "zeros":
+                return torch.zeros(x.shape[0], w.shape[-1], dtype = x.dtype)
+            out = _reference_grouped_mm(x, w, offs)
+            if defect == "nan":
+                out[0, 0] = float("nan")
+            return out
         @staticmethod
         def backward(ctx, grad):
             if defect == "no_backward":

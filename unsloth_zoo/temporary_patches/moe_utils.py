@@ -2309,7 +2309,7 @@ def _grouped_mm_on_device(device):
 
 def _grouped_mm_trains_on(device):
     """Training-shaped fwd + dX + dW vs per-expert matmuls; None when it runs, else why not. Windows CUDA wheels serve
-    one fp16 expert but refuse bf16 multi-expert. Integer operands make the comparison exact. OOM is no verdict."""
+    one fp16 expert but refuse bf16 multi-expert. Integer operands: a wrong result misses by 1 or more. OOM is no verdict."""
     if os.environ.get("UNSLOTH_MOE_GROUPED_MM_PROBE", "1") == "0": return None
     dtype = _grouped_mm_probe_dtype(device)
     counts = _GROUPED_MM_PROBE_COUNTS
@@ -2334,7 +2334,10 @@ def _grouped_mm_trains_on(device):
                 ("dW", dw, torch.stack([x[s:e].T @ dy[s:e] for s, e in spans])),
             )
             for name, got, ref in want:
-                if got.shape != ref.shape or not torch.equal(got.detach().double().cpu(), ref):
+                # The exact answers are small integers (at most 192, exact in bf16 / fp16), so a wrong kernel misses
+                # by 1 or more. A correct one can still carry fp32 accumulation residue: gfx1151's grouped_mm gives
+                # 2**-19 where the answer is 0. Half a unit tells the two apart; `not <=` also rejects a NaN.
+                if got.shape != ref.shape or not float((got.detach().double().cpu() - ref).abs().max()) <= 0.5:
                     raise RuntimeError(f"{name} differs from per-expert matmuls")
         return None
     except torch.OutOfMemoryError:
