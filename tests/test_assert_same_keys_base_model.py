@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression for PR 95: assert_same_keys must resolve inner_model with the guarded find_lora_base_model walk, since
-model.base_model.model raised AttributeError when base_model has no .model (Phi-3, Phi-4-mini); the same walk keeps
-key comparison like-for-like."""
+"""PR 95: guarded find_lora_base_model, since base_model.model raises on Phi-3 and Phi-4-mini."""
 import pytest
 import torch
 import torch.nn as nn
@@ -82,7 +80,6 @@ def test_assert_same_keys_normal_peft_layout_unchanged():
 
 
 def test_assert_same_keys_still_detects_real_mismatch():
-    # The guard must not mask genuine key mismatches.
     inner = _Inner()
     model = _PeftLike(_LoraModel(inner))
     bad = dict(inner.state_dict())

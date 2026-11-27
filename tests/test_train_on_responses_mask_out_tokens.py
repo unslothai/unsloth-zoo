@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""mask_out_tokens on train_on_responses_only (unslothai/unsloth issue 6695): every route to the masking closure must
-thread it, as a dropped one fails silently; covers list, tensor, vision-collator and MLX paths; CPU-only and offline."""
+"""Dropping mask_out_tokens on any route fails silently (unslothai/unsloth issue 6695)."""
 
 import sys
 import types
@@ -378,7 +377,6 @@ def test_the_collator_constructor_forwards_the_argument(mask):
         assert (at_closer == -100).all()
     else:
         assert (at_closer == think_id).all()
-    # the rest of the answer stays trained either way
     assert ((labels != -100) & (input_ids != think_id)).sum() > 0
 
 

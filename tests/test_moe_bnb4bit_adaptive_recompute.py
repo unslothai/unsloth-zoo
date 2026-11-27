@@ -165,8 +165,7 @@ def test_env_override_forces_pin(monkeypatch):
 
 
 def test_pre_dequantized_dense_is_never_recomputed(monkeypatch):
-    # Invariant: when the policy says pin, a pre-dequantized dense stack is never scheduled for backward recompute,
-    # which would re-hold it with no memory benefit.
+    # Pinned pre-dequantized stacks are never recomputed in backward; that would re-hold them.
     monkeypatch.setattr(mu, "_base_is_recomputable", lambda src, dtype = None: True)
     dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # requires_grad False
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")

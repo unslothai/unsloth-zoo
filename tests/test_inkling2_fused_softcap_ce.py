@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Inkling 2 applies its final logit softcap through a module (`logits = self.logit_softcap(logits)`); the fused
-LM-head CE must take it as `logit_softcapping` instead of declining and materialising the fp32 logits."""
+"""Inkling 2 softcap module: the fused LM-head CE takes it as logit_softcapping, not declining."""
 
 import importlib
 import inspect
@@ -59,8 +58,7 @@ def test_inkling_forwards_fuse_with_the_module_softcap(entry):
     mod, cls = entry
     src = inspect.getsource(cls.forward)
     if _VOCAB_SLICE.search(src):
-        # transformers 5.23 builds lm_head on the padded vocab and slices the logits after it. The fused kernel
-        # reads the vocab from lm_head.weight, so fusing would softmax over the padding columns: stay unfused.
+        # transformers 5.23 slices padded logits; fusing would softmax padding; stay unfused.
         assert "unsloth_fused_lm_head_loss(" not in src
         new, route, _ = compiler.fused_lm_head_forward(cls.__name__, cls, mod.__name__, src)
         assert route is None, route
@@ -222,8 +220,7 @@ def test_zero_softcap_takes_the_exact_path(monkeypatch):
 
 
 def _lora_head(base):
-    """A PEFT LoRA Linear around `base` with a nonzero adapter: PEFT 0.18 takes r / lora_alpha / init_lora_weights
-    as keywords, later releases also need the LoraConfig."""
+    """PEFT 0.18 takes r, lora_alpha, init_lora_weights as kwargs; newer PEFT needs LoraConfig."""
     peft = pytest.importorskip("peft")
     from peft.tuners.lora.layer import Linear as LoraLinear
 
@@ -273,10 +270,9 @@ class _disabled:
 
 
 def test_merged_then_disabled_peft_head_takes_the_exact_path(monkeypatch):
-    """PEFT unmerges a merged head inside its forward when the adapters are disabled; the fused kernel would read the
-    merged weight (the adapter's loss) and leave the head merged, so the loss calls the head's own forward
-    (lm_head_needs_module_forward). Merged and enabled runs base_layer alone on the merged weight, which the kernel
-    reads, so it stays fused."""
+    """PEFT unmerges a merged head in its forward when adapters are disabled; the fused kernel would
+    read the merged weight and leave it merged, so the loss calls the head's own forward
+    (lm_head_needs_module_forward); merged and enabled stays fused."""
     cls = _make_class("MergedHeadToyForCausalLM", _Softcap)
     assert forward_install.install_for_class(cls)
     torch.manual_seed(0)
@@ -357,8 +353,7 @@ def test_softcap_module_hooks_run_in_the_materialised_branches(monkeypatch):
 
 
 def test_fused_linear_kill_switch_keeps_the_stock_forward(monkeypatch):
-    """UNSLOTH_FUSED_LINEAR=0 runs fused CE behind torch.compiler.disable: the softcap forward is not rewritten, so it
-    stays as compilable as upstream. The default switch fuses and compiles in one graph."""
+    """UNSLOTH_FUSED_LINEAR=0: fused CE is behind torch.compiler.disable; forward stays stock."""
     from unsloth_zoo.fused_losses import chunked_logprob
 
     x = torch.randn(2, 8, 16)

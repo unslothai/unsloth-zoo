@@ -1,5 +1,4 @@
-"""Fused cross entropy chunk sizing stays active on big-memory GPUs: the per-chunk target is capped, since a very large
-free pool would round the chunk count to one, materializing full logits and their float32 upcast."""
+"""Fused CE chunking stays on for big GPUs; capped target avoids one chunk holding full logits."""
 import importlib
 import types
 
@@ -25,8 +24,7 @@ def _modules():
 
 def _load_module(monkeypatch, free_bytes):
     ce, tiled = _modules()
-    # _free_target_gb calls memory_budget._default_target_gb, so the backend is mocked there; one shared budget
-    # implementation avoids a CE copy that measures something else.
+    # Backend mocked in memory_budget, which _free_target_gb calls; CE shares one budget.
     monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising=False)
     fake_cuda = types.SimpleNamespace(
         is_available=lambda: True,
@@ -112,8 +110,7 @@ def test_cap_bounds_target_independent_of_free(monkeypatch):
 
 
 def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
-    """Fakes a device with no memory pool (CPU, MLX, torch built without CUDA) by replacing only mem_get_info and
-    is_available; a stand-in torch.cuda namespace breaks manual_seed, which reaches torch.cuda._is_in_bad_fork."""
+    """Only mem_get_info and is_available are faked; a stand-in torch.cuda breaks manual_seed."""
     ce, tiled = _modules()
     monkeypatch.setattr(tiled, "DEVICE_TYPE", device_type, raising = False)
 
@@ -137,8 +134,7 @@ def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
 
 @pytest.mark.parametrize("device_type", ["cpu", "mlx", "cuda"])
 def test_a_machine_with_no_gpu_still_gets_a_chunk_size(monkeypatch, device_type):
-    """mem_get_info raises on a torch built without CUDA, so a CPU or Apple Silicon forward must not die in a memory
-    query; a cuda device type with no GPU counts too."""
+    """mem_get_info raises without CUDA; CPU, Apple Silicon and no-GPU cuda must not die in it."""
     ce = _no_device_pool(monkeypatch, device_type)
     assert ce._free_target_gb() == ce._CE_TARGET_GB_CAP
     assert ce.get_chunk_size(1, 8, 32_000) >= 1

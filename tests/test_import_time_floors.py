@@ -36,8 +36,7 @@ def _strip_generated_globals(namespace, before):
 
 
 def test_a_generated_global_is_removed_rather_than_restored():
-    """The test strips generated globals itself: monkeypatch.delitem after the exec would record the generated object to
-    restore, leaving a stale merge_quantization_configs for the next call."""
+    """Strip generated globals by hand: monkeypatch.delitem would restore the stale object."""
     namespace = {"kept": 1}
     before = set(namespace)
     namespace[ATTRIBUTE] = lambda *a, **k: None       # as the exec would leave it
@@ -80,16 +79,13 @@ def unpatched_quantizer(monkeypatch):
     globals_before = set(misc.__dict__)
 
     def set_module_dir(returns):
-        """PEP 562 __dir__ must be set by hand: monkeypatch undo would put the inherited module __dir__ into the module
-        dict, and every later dir() on it recurses forever."""
+        """Set __dir__ by hand: monkeypatch undo would restore the inherited, recursing one."""
         auto.__dict__["__dir__"] = lambda: list(returns)
 
     try:
         yield auto, misc, recorded, set_module_dir
     finally:
-        # Strip every name the patch exec'd into the module globals: monkeypatch.delitem would reinstate the generated
-        # object at teardown, leaving a stale callable for later tests; restoring pre-existing names stays with
-        # monkeypatch.
+        # Strip exec'd names: monkeypatch.delitem would reinstate their objects at teardown.
         _strip_generated_globals(misc.__dict__, globals_before)
         auto.__dict__.pop("__dir__", None)
         for name in names:
@@ -107,11 +103,7 @@ def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_qua
     set_module_dir([])
     assert dir(auto) == []
 
-    # A module global shadows the builtin inside that module's functions, so
-    # this reads exactly what the patch asked to execute. Set by hand: the
-    # fixture takes back every global that was not there before it, and
-    # monkeypatch's undo would then try to remove an attribute that has already
-    # gone and fail the teardown.
+    # Set by hand: the fixture removes new globals, since monkeypatch undo would fail on them.
     execd = []
     def recording_exec(source, *args, **kwargs):
         execd.append(source)
@@ -241,8 +233,7 @@ def test_the_gate_reaches_has_cut_cross_entropy(monkeypatch, version, expected):
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
-    # device_count must be stubbed too since the gate enumerates visible devices; on a CPU-only runner it answers 0, so
-    # the 3.3.1 case would pass for the wrong reason.
+    # Stub device_count: a CPU-only runner would answer 0 and pass 3.3.1 for the wrong reason.
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(triton, "__version__", version)
 
@@ -289,8 +280,7 @@ def test_the_compiled_branch_consults_has_cut_cross_entropy():
 
 
 def test_fused_linear_cross_entropy_needs_the_symbol_the_gate_skips():
-    """With the gate false the symbol is really absent, so a branch that ignores the gate cannot work; guards against
-    the two flags quietly ceasing to be independent."""
+    """With the gate false the symbol must be absent; guards the two flags staying independent."""
     import inspect
 
     loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
@@ -324,8 +314,7 @@ def test_the_sm75_warning_does_not_recommend_a_torch_that_still_disables_cce():
 
 
 def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
-    """Negative control: reads the unsloth_zoo __init__ gate rather than the prose; fails if torch 2.8 stops
-    force-disabling CCE, letting the warning go back to recommending it."""
+    """Reads the unsloth_zoo __init__ gate; fails if torch 2.8 stops force-disabling CCE."""
     import inspect
     import re
 
@@ -348,7 +337,6 @@ def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
         ([(8, 0), (7, 5)], [1]),
         ([(7, 5), (8, 0)], [0]),
         ([(7, 5), (7, 5)], [0, 1]),
-        # Negative controls: a homogeneous host that is not sm_75, and a host with no devices at all, are both left untouched.
         ([(8, 0), (9, 0)], []),
         ([], []),
     ],
@@ -356,8 +344,7 @@ def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
 def test_every_visible_device_is_asked_not_just_the_current_one(
     monkeypatch, capabilities, affected_indices
 ):
-    """get_device_capability() with no argument only describes the current device, but device_map can put lm_head on
-    another GPU; guessing wrong aborts the process with an uncatchable LLVM error."""
+    """Ask every GPU: device_map can put lm_head on another, and a wrong guess aborts."""
     import torch
 
     loss_utils = importlib.import_module("unsloth_zoo.loss_utils")

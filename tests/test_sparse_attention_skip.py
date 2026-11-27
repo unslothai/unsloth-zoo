@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Exact full-selection skip for sparse-attention indexers (temporary_patches/sparse_attention.py): below the budget
-logits and every gradient match upstream bit for bit; above it the reference indexer runs; decoding past the budget
-reproduces upstream tokens, logits and indexer cache."""
+"""Sparse indexer skip: bit-exact vs upstream below budget; reference runs above; decode tokens match."""
 
 import importlib.util
 
@@ -201,7 +199,6 @@ def test_padded_and_packed_batches_are_exact(family, layout, device, monkeypatch
     attention_mask = torch.ones_like(input_ids)
     position_ids = None
     if layout == "packed_positions":
-        # Two documents per row, positions restarting at the boundary (no padding mask).
         attention_mask = None
         split = short_len // 2
         position_ids = torch.cat(

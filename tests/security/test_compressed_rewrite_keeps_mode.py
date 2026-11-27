@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dequantizing a compressed-tensors (int-packed / MXFP4-packed) shard rewrites it through `<shard>.unsloth_tmp`; that
-temp was created at the umask default and os.replace'd over the shard, so a re-export into a folder whose weights the
-user restricted (chmod 600) published them 0644. The T4 split pieces are likewise private while written."""
+"""Dequantizing compressed-tensors shards via <shard>.unsloth_tmp: the temp used the umask default,
+so a re-export of chmod 600 weights was published 0644; T4 split pieces are private too."""
 
 import ast, os, stat
 from pathlib import Path

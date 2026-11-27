@@ -137,9 +137,8 @@ def test_quantized_fused_expert_keeps_fp32_quant_metadata():
 
     from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import patch_bnb4bit_quantizer_param_needs_quantization
 
-    # As a real load leaves it: process_model_before_weight_loading swaps the fused expert for an unquantized
-    # Params4bit placeholder, which the patched param_needs_quantization claims. transformers >= 5.23 asks it
-    # before accepting a packed tensor whose shape differs from the model's.
+    # Real loads: transformers >= 5.23 asks param_needs_quantization before accepting a packed
+    # tensor.
     patch_bnb4bit_quantizer_param_needs_quantization()
     bnb_config = BitsAndBytesConfig(load_in_4bit = True)
 

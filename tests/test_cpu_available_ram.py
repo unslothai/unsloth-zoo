@@ -47,7 +47,6 @@ GiB = 1 << 30
 
 
 @pytest.mark.parametrize("files, expected", [
-    # Leaf unlimited, the enclosing job capped at 8 GiB with 6 GiB used: 2 GiB left.
     ({"jobs/memory.max": str(8 * GiB), "jobs/memory.current": str(6 * GiB),
       "jobs/train/memory.max": "max", "jobs/train/memory.current": str(GiB)}, 2 * GiB),
     # Leaf limit tighter than the ancestor's: the leaf wins.

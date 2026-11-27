@@ -78,39 +78,9 @@ def _own_torch_nn_forwards():
 
 @pytest.fixture(autouse = True)
 def _restore_torch_nn_forwards():
-    """Put ``torch.nn``'s own forwards back after the dtype loop rewrites them.
-
-    ``unsloth_compile_transformers`` patches ``torch.nn.<Module>.forward`` in
-    place, on the real ``torch.nn``, and nothing here undoes it. The wrappers
-    then outlive the test and every later test in the process sees a torch.nn
-    that is already patched.
-
-    That is not theoretical: it fails
-    ``test_compiled_cache_collective.py::test_repeated_dtype_patching_does_not_stack_the_source_rewrite``,
-    which opens by capturing ``pristine = torch.nn.Conv2d.forward`` and then
-    asserts the installed marker carries torch's own forward. Run after this
-    module in one process, what it captures is already a
-    ``_dtype_safe_forward.<locals>.forward``, so the assertion compares a
-    wrapper against the genuine original and fails on a contract that holds.
-    The two files are in different jobs today, `Core drift` and
-    `Repo tests (CPU)`, so CI does not currently put them in one process. That
-    is a scheduling accident and not a property worth relying on.
-
-    Two directions, because the loop patches by assignment and assignment does
-    not care whether the class had a forward of its own.
-
-    A class that owned one gets it put back by identity rather than deleted:
-    several of these legitimately define their own, and deleting would expose
-    an inherited one instead.
-
-    A class that owned none has to have the attribute deleted, not restored,
-    and this is the half worth stating. ``BatchNorm1d``, ``BatchNorm2d`` and
-    ``BatchNorm3d`` inherit ``forward`` from ``_BatchNorm``, so they are absent
-    from the snapshot; the loop then gives each one a real attribute it never
-    had. Restoring only the recorded names leaves those three rewritten, which
-    is exactly what an audit of what survives teardown found still leaking
-    after the first version of this fixture.
-    """
+    """Restore torch.nn forwards that unsloth_compile_transformers patches in place: classes with no
+    own forward are deleted, not restored (BatchNorm1d-3d inherit it); otherwise
+    test_compiled_cache_collective.py fails when run after this module in one process."""
     before = _own_torch_nn_forwards()
     try:
         yield
@@ -373,8 +343,7 @@ def test_fixup_fused_lm_head_full_module(gemma3_full_source):
 
 
 def test_fixup_fused_lm_head_walrus_dropped():
-    """Pins the gemma3n walrus rewrite in unsloth_zoo/compiler.py: the final_logit_softcapping := binding becomes a
-    plain `.final_logit_softcapping is not None` check."""
+    """Pins gemma3n walrus: `final_logit_softcapping :=` becomes plain `is not None` check."""
     src = (
         "def forward(self):\n"
         "    if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:\n"

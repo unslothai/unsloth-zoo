@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The patched Mllama vision encoder layer runs under the installed transformers' encoder call
-(`hidden_states=` on 5.x, `hidden_state=` before), so Llama 3.2 Vision images encode."""
+"""Patched Mllama vision layer: `hidden_states=` on transformers 5.x, `hidden_state=` before."""
 import pytest
 import torch
 

@@ -37,8 +37,7 @@ def _vllm_processed_logprobs(logits, temperature, top_k, top_p, min_p):
         probs = torch.softmax(logits, dim = -1)
         logits = logits.masked_fill(probs < min_p * probs.amax(dim = -1, keepdim = True), float("-inf"))
     rows = logits.shape[0]
-    # vLLM's apply_top_k_top_p_pytorch copied verbatim, with k as int32 and p as float32 tensors like vLLM's input batch
-    # holds; the top-p cutoff 1 - p is a float32 subtraction.
+    # Verbatim vLLM top-k/top-p: k int32, p float32 as in its input batch; 1 - p is float32.
     k = torch.full((rows,), top_k, dtype = torch.int32) if top_k > 0 else None
     p = torch.full((rows,), top_p, dtype = torch.float32) if top_p < 1.0 else None
     logits = apply_top_k_top_p_pytorch(logits, k, p)
@@ -69,7 +68,6 @@ def test_trainer_logps_are_biased_by_kept_mass(top_p, top_k, min_p):
 
     full = torch.log_softmax(logits / temperature, dim = -1)
     kept_mass = torch.logsumexp(full.masked_fill(~torch.isfinite(processed), float("-inf")), dim = -1)
-    # vLLM's logp exceeds the trainer's by exactly -log(kept mass) on every sampled token.
     torch.testing.assert_close(vllm_logps - trainer_logps, -kept_mass, atol = 1e-4, rtol = 0)
     assert (vllm_logps - trainer_logps).mean() > 0.01
 
@@ -288,8 +286,7 @@ def test_setting_parse(monkeypatch):
 
 
 def _grpo_loss_and_grad(logits, ids, sampling_logps, advantages, kwargs):
-    # Zoo scorer with the trainer's resolved support kwargs feeds the real GRPO loss with the vLLM IS correction on: the
-    # loss the default run optimises, and d loss / d logits.
+    # Real GRPO loss and grad, IS correction on, zoo scorer with the trainer's support kwargs.
     z = logits.clone().requires_grad_(True)
     new = rr.chunked_selective_log_softmax(z.unsqueeze(1), ids[:, None], 1.0, 1, **kwargs).reshape(-1, 1)
     loss, *_ = rr.grpo_compute_loss(
@@ -327,8 +324,7 @@ def test_kill_switch_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch,
     ([[4.0, 0.0, -1.0]], 0, 0.1),    # min_p leaves one token
 ], ids = ["top_k_1", "min_p_singleton"])
 def test_singleton_kept_set_gradient_per_setting(monkeypatch, logits, top_k, min_p):
-    # A kept set of one token renormalises to log 1 = 0, so scoring over it gives zero policy gradient whatever the
-    # advantage (as in TRL >= 1.17); =0 keeps the full-vocabulary signal.
+    # Singleton kept set: log 1 = 0, zero gradient (TRL >= 1.17); =0 keeps full-vocab signal.
     logits = torch.tensor(logits, dtype = torch.float64)
     ids = torch.tensor([0])
     processed = _vllm_processed_logprobs(logits, 1.0, top_k, 1.0, min_p)
@@ -357,8 +353,7 @@ def test_singleton_kept_set_gradient_per_setting(monkeypatch, logits, top_k, min
 
 @pytest.mark.parametrize("top_p, top_k, min_p", CASES)
 def test_opt_in_scores_the_kept_set_like_2084(monkeypatch, top_p, top_k, min_p):
-    # =1 binds the same kept-set scorer that 2084 enabled automatically: equal to the helper up to the compiled scorer's
-    # rounding, with IS ratio 1 against vLLM's processed logprobs of identical logits.
+    # =1 binds the kept-set scorer like 2084 (equal to the helper up to rounding; IS ratio 1).
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     g = torch.Generator().manual_seed(6)
@@ -399,8 +394,7 @@ def test_opt_in_returns_support_kwargs(monkeypatch):
 ], ids = ["gen_temperature", "vllm_temperature", "repetition_penalty", "presence_penalty",
           "logit_bias", "bad_words", "allowed_token_ids", "min_tokens", "structured_regex"])
 def test_opt_in_refuses_settings_vllm_applies_before_truncation(monkeypatch, caplog, overrides):
-    # vLLM v1 Sampler: apply_logits_processors (allowed ids, bad words, logit bias / min tokens, penalties), then
-    # temperature, then min_p, then top_k / top_p, at the rollout's own temperature.
+    # vLLM v1 Sampler order: processors, temperature, min_p, top_k/top_p; opt-in refuses those.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
     caplog.set_level(logging.WARNING)
     rr.logger.propagate = True
@@ -437,8 +431,7 @@ def test_loss_binds_the_raw_logits_helper_locally_so_the_support_partial_reaches
     (dict(top_k = 20), (20, 1.0, 0.0)),
 ])
 def test_cuda_opt_in_kwargs_score_the_kept_set(monkeypatch, sampling, triple):
-    # =1 with truncation and IS correction on: the kwargs the GRPO loss receives score the renormalised kept set on
-    # CUDA, so identical logits give IS ratio 1; full vocabulary would give the kept mass.
+    # =1 with truncation and IS on: CUDA kwargs score the renormalised kept set (IS ratio 1).
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     kwargs = rr.grpo_truncated_support_kwargs(_trainer(**sampling))

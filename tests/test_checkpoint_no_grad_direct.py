@@ -123,7 +123,6 @@ def test_torch_reentrant_checkpoint_routed_to_unsloth_function(gc_module, monkey
         out = pristine(_block(weight), hidden, use_reentrant = True)
     assert calls == []
     torch.testing.assert_close(out, torch.tanh(hidden.detach() @ weight), rtol = 0, atol = 0)
-    # Grad on: still the checkpoint Function, with a correct gradient.
     weight.requires_grad_(True)
     out = pristine(_block(weight), hidden, use_reentrant = True)
     assert len(calls) == 1

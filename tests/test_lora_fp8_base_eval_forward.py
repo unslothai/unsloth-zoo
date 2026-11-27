@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generated LoRA forward over an FP8 base: no-autocast eval must not cast x to float8, which RMSNorm rejects on FP8 MoE
-checkpoints ('Promotion for Float8 Types is not supported')."""
+"""FP8-base LoRA forward: no-autocast eval must not cast x to float8, which RMSNorm rejects."""
 
 from __future__ import annotations
 

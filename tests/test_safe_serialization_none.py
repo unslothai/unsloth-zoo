@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""safe_serialization = None must mean the safetensors default, never a pickle: Unsloth's warning tells callers to pass
-it to force safetensors, but forwarded verbatim None is falsy to peft and transformers and writes .bin
-(unslothai/unsloth issue 1792); CPU-only."""
+"""safe_serialization = None must mean the safetensors default, not a pickle: forwarded verbatim it
+is falsy to peft and transformers and writes .bin (unslothai/unsloth issue 1792); CPU-only."""
 
 import ast
 import inspect
@@ -52,8 +51,7 @@ def test_it_is_exported():
 
 
 def test_the_dequantizing_merge_normalises_before_it_writes():
-    """Checked on source since the merge needs a real model: merge_and_dequantize_lora forwards the value to two
-    save_pretrained calls, so normalise before either writer."""
+    """Source check: merge_and_dequantize_lora normalises before its two save_pretrained calls."""
     source = inspect.getsource(SU.merge_and_dequantize_lora)
     tree = ast.parse(source.lstrip())
     body = tree.body[0].body

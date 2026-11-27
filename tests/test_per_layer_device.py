@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""verify_and_set_device must publish a usable device for every layer (ref 3538): CPU and meta both have index None,
-which move_to_device rejects with Invalid target device: None."""
+"""verify_and_set_device needs a usable device; CPU/meta index None is rejected (ref 3538)."""
 
 from __future__ import annotations
 
@@ -28,9 +27,7 @@ from unsloth_zoo.patching_utils import verify_and_set_device
 
 
 def _an_accelerator_index_is_constructible() -> bool:
-    """A bare integer device needs a default accelerator: torch 2.10.0+cpu, which CI installs, raises on torch.device(2)
-    while cuda:3 strings build; hiding GPUs via CUDA_VISIBLE_DEVICES does not reproduce it, so the integer tests are
-    gated."""
+    """torch 2.10.0+cpu raises on torch.device(2), not cuda:3; CUDA_VISIBLE_DEVICES can't repro"""
     try:
         torch.device(0)
     except RuntimeError:
@@ -134,8 +131,7 @@ def test_real_module_on_cuda():
 
 
 def test_a_meta_layer_publishes_nothing_rather_than_meta():
-    """meta passes every reader's type check and propagates through matmul without raising, so publishing it would turn
-    the ref 3538 ValueError into a silent empty decode."""
+    """Publishing meta would turn the ref 3538 ValueError into a silent empty decode."""
     activation = torch.ones(2, 4)
     assert activation.to("meta").device.type == "meta"
     assert torch.matmul(activation.to("meta"), torch.ones(4, 4)).device.type == "meta"
@@ -173,8 +169,7 @@ def test_an_integer_execution_device_is_accepted_where_one_can_be_named():
     reason = "this build can name an accelerator index, so the refusal below cannot happen",
 )
 def test_an_integer_execution_device_publishes_nothing_without_an_accelerator():
-    """On a CPU-only build torch.device(2) raises; _execution_device_for_meta_layer treats that as no usable device so
-    nothing is published, since no device 2 exists; this is the integer path CI runs."""
+    """torch.device(2) raises with no accelerator, so nothing is published; CI runs this path."""
     layer = _FakeLayer("meta")
     layer._hf_hook = SimpleNamespace(execution_device = 2)
     verify_and_set_device(layer)
@@ -214,8 +209,7 @@ def test_the_non_meta_placements_are_untouched():
 
 def test_a_chained_hook_is_unwrapped_to_the_alignment_device():
     """append=True stores SequentialHook(old, new), which defines no execution_device, so the outer hook answered None and readers fell back to device 0."""
-    # Uses cuda:1 rather than a bare 1: the point is the search descending into the wrapper, and the string constructs
-    # on CPU-only builds where the integer does not, so it does not skip on CI.
+    # Uses cuda:1, not bare 1, which fails on CPU-only builds, so it does not skip on CI.
     outer = SimpleNamespace(
         hooks = (
             SimpleNamespace(),

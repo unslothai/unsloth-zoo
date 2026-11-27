@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""trl's token-entropy metric must not break SFT on Unsloth's EmptyLogits stand-in for logits; detect the object, not
-the message, since EmptyLogits.__getattr__ makes the error depend on the attribute touched; UNSLOTH_RETURN_LOGITS=1
-gives up the memory saving."""
+"""trl's entropy metric must not break SFT on EmptyLogits stand-in; detect the object, not the
+message, since __getattr__ varies the error; UNSLOTH_RETURN_LOGITS=1 gives up the memory saving."""
 
 import inspect
 import sys
@@ -51,8 +50,7 @@ class EmptyLogits:
 
 @pytest.fixture(autouse = True)
 def _pin_the_accelerate_device(monkeypatch):
-    """accelerate.PartialState is a process-global borg: an earlier Accelerator leaves the shared device set to cuda, so
-    the fallback scalar meets CPU tensors; pin it to CPU here."""
+    """PartialState is process-global: earlier cuda makes the scalar meet CPU tensors; pin CPU."""
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
 
@@ -63,14 +61,11 @@ def patched():
     import trl.trainer.sft_trainer as sft
     from unsloth_zoo.temporary_patches.misc import patch_trl_entropy_from_logits
 
-    # entropy_from_logits landed in trl 0.20.0 and pyproject allows >= 0.18.2, so an allowed build can lack it;
-    # production no-ops there, so skip rather than error.
+    # entropy_from_logits is trl 0.20.0+; pyproject allows >= 0.18.2, so skip there, not error.
     original = getattr(trl_utils, "entropy_from_logits", None)
     if original is None:
         pytest.skip("this trl predates entropy_from_logits (added in 0.20.0)")
-    # Importing unsloth_zoo applies TEMPORARY_PATCHES, so the name may already be the wrapper; functools.wraps records
-    # the real one on __wrapped__, and the unpatched control must unwrap it or it would call the wrapper and conclude
-    # the bug never existed.
+    # Unwrap __wrapped__ or the control calls the TEMPORARY_PATCHES wrapper and finds no bug.
     while getattr(original, "_unsloth_patched", False) and \
             getattr(original, "__wrapped__", None) is not None:
         original = original.__wrapped__
@@ -99,8 +94,7 @@ def test_other_unusable_logits_degrade_too(patched, logits):
 
 
 def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
-    """The caller uses sum(entropy * attention_mask) / sum(mask) in one branch and mean(entropy) in the other, so the
-    result must work with both; a shape that raises in either is no better than the original failure."""
+    """Caller uses sum(entropy * attention_mask) / sum(mask) and mean(entropy); both must work."""
     trl_utils, _, _ = patched
     e = trl_utils.entropy_from_logits(EmptyLogits())
     mask = torch.ones(2, 5)
@@ -110,9 +104,8 @@ def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
 def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
-    """trl passes the scalar to accelerator.gather_for_metrics, which NCCL rejects on CPU; the masked branch is saved by
-    a device-resident mask, but the padding-free bare mean() (plain packing=True reaches it) is not, so the scalar
-    must be on the accelerate device."""
+    """trl passes the scalar to accelerator.gather_for_metrics, which NCCL rejects on CPU; the
+    padding-free mean() path has no device mask, so the scalar must be on the accelerate device."""
     trl_utils, _, _ = patched
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cuda", 0))
@@ -125,8 +118,7 @@ def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
 def test_a_cpu_sentinel_tensor_does_not_drag_the_scalar_to_cpu(patched, monkeypatch):
-    """EMPTY_LOGITS (unsloth_zoo/fused_losses/forward_adapter.py) is built on cpu at import, so the fallback must not
-    follow the sentinel's device: NCCL would get a CPU scalar."""
+    """Scalar follows the accelerate device, not EMPTY_LOGITS (CPU-built); NCCL rejects CPU."""
     trl_utils, _, _ = patched
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cuda", 0))

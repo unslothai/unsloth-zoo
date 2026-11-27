@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Adapter dtype must never equal the vLLM hot-load dtype (model dtype, since unsloth never sets lora_dtype); equal
-dtypes alias training weights and optimize() scales them in place when lora_alpha != r; the fp32 upcast prevents
-that, so never drop it to save memory."""
+"""Adapter dtype must not equal the vLLM hot-load (model) dtype or it aliases training weights,
+which scale in place when lora_alpha != r; keep the fp32 upcast; never drop it to save memory."""
 import pytest
 import torch
 import torch.nn as nn
@@ -42,8 +41,7 @@ class _LoRALinear(nn.Module):
 
 
 class _TinyLoRA(nn.Module):
-    """Frozen base plus trainable adapter named as peft names it: the upcast keys on the substring .lora_A. with the
-    leading dot, so a flat lora_A.weight would not be upcast."""
+    """The upcast keys on '.lora_A.' (leading dot), so flat lora_A.weight would not be upcast."""
 
     def __init__(self, dtype, d_in = 16, d_out = 12, r = 4):
         super().__init__()
@@ -97,8 +95,7 @@ def test_adapter_dtype_never_matches_the_vllm_hot_load_dtype(
 
 @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
 def test_adapter_is_upcast_to_float32(model_dtype):
-    """The upcast alone, isolated from the mixed-precision default: float32_mixed_precision = False is deliberate, since
-    True makes the adapter fp32 via mixed_precision_dtype and the test would pin nothing."""
+    """Upcast alone: float32_mixed_precision=False, since True makes the adapter fp32 anyway."""
     model = _TinyLoRA(model_dtype)
     prepare_model_for_training(
         model, use_gradient_checkpointing = False, float32_mixed_precision = False,
@@ -128,7 +125,6 @@ def test_aliasing_is_what_the_dtype_gap_prevents():
     different = training_weight.to(device = None, dtype = torch.bfloat16)
     assert different.data_ptr() != training_weight.data_ptr()
 
-    # and the alias is writable straight through to the training weight
     before = training_weight.clone()
     same *= 2.0
     assert not torch.equal(training_weight, before), \

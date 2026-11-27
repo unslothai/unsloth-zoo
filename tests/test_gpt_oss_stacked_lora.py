@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Stacked expert LoRA (stack_expert_lora via auto_enable_grouped_moe) on gpt-oss NF4 experts, when the bf16 or fp16
-grouped path applies, must match UNSLOTH_MOE_STACKED_LORA=0 bitwise; saved adapters keep PEFT per-expert keys and
-load without Unsloth."""
+"""Stacked LoRA (stack_expert_lora via auto_enable_grouped_moe) matches UNSLOTH_MOE_STACKED_LORA=0
+bitwise on bf16/fp16; saved adapters keep PEFT per-expert keys, loadable without Unsloth."""
 import contextlib
 import json
 import os
@@ -493,8 +492,7 @@ def test_routed_decode_compile_fullgraph_and_cuda_graph_replay():
         ref1 = gr.routed_experts_forward(eu, x, idx, w)
         ref2 = gr.routed_experts_forward(eu, x, idx2, w2)
         assert torch.equal(gr.routed_experts_forward(es, x, idx, w), ref1)
-        # Inductor compiles no bfloat16 graph below sm80 (SkipFrame: "does not support bfloat16 compilation
-        # natively"), so a T4 has no fullgraph to check here; the CUDA graph replay below still runs.
+        # Inductor skips bfloat16 below sm80, so T4 has no fullgraph; CUDA graph still runs.
         if torch.cuda.get_device_capability(x.device) >= (8, 0):
             torch._dynamo.reset()
             from torch._dynamo.utils import counters

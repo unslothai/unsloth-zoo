@@ -156,7 +156,6 @@ def build_all() -> dict[str, Path]:
     _build_wheel(mal_whl, name = "malicious_fixture", payload_files = mal_payload)
     outputs["malicious_wheel"] = mal_whl
 
-    # Clean wheel: empty placeholder.
     clean_payload = {
         "clean_fixture/__init__.py": CLEAN_INIT_PY.encode(),
     }
@@ -164,7 +163,6 @@ def build_all() -> dict[str, Path]:
     _build_wheel(clean_whl, name = "clean_fixture", payload_files = clean_payload)
     outputs["clean_wheel"] = clean_whl
 
-    # Malicious sdist: same setup.py, tar.gz form.
     mal_sdist = HERE / "malicious_sdist.tar.gz"
     _build_sdist(mal_sdist, name = "malicious_fixture", payload_files = mal_payload)
     outputs["malicious_sdist"] = mal_sdist

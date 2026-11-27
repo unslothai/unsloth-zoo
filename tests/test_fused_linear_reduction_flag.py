@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_mm_into turns the process-wide reduced-precision reduction switch off around its GEMM. Overlapping threads must
-all see it off and the caller's setting (split-K included) must come back. The switch is settable without a GPU, so
-the real _mm_into runs on CPU with stand-in operands (only .is_cuda / .dtype are read before the patched torch.mm)."""
+"""_mm_into switches the process-wide reduced-precision reduction off around its GEMM; overlapping
+threads must see it off; the caller's setting (split-K too) is restored; runs on CPU."""
 
 import threading
 import types

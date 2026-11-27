@@ -37,16 +37,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
-# Newest transformers the version matrix was run against.
 TESTED_CEILING = Version("5.18.0")
 
 # Newest torch the matrix was run against, and the exclusive bound that admits it.
 TESTED_TORCH = Version("2.15.0")
 TORCH_BOUND = "<2.16.0"
 
-# Floor for every transformers line, since peft declares none: peft 0.18.0 imports GradientCheckpointingLayer from
-# transformers.modeling_layers (4.52.0+); on 4.51.3 import unsloth_zoo.saving_utils raised ModuleNotFoundError though
-# the resolve passed; 4.52.4 not 4.52.0 as 4.52.0-4.52.3 are REJECTED.
+# Floor since peft declares none: peft 0.18.0 needs transformers.modeling_layers (4.52.0+); 4.51.3
+# resolves but fails unsloth_zoo.saving_utils import; 4.52.4 floor, 4.52.0-4.52.3 rejected.
 DECLARED_FLOOR = Version("4.52.4")
 
 # Tested and rejected. A rewrite of the specifier must not drop one.
@@ -62,8 +60,7 @@ PUBLISHED_TORCH_MIRRORS = (
     "security-audit.yml",
 )
 
-# Lanes that hold an older torch window on purpose: the MLX lanes need the torch / torchvision ABI pair mlx-cpu was
-# built against, a different question from what is published.
+# Older torch window by design: torch / torchvision ABI pair that mlx-cpu was built against.
 OLDER_TORCH_WINDOW_BY_DESIGN = {
     "consolidated-tests-ci.yml": (
         "the interpreter, repo, MLX and core-drift lanes pin torch>=2.4.0,<2.11.0 for the "
@@ -76,9 +73,7 @@ LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
 
 def _requirement_lists() -> dict[str, list[str]]:
-    """Returns {where: [raw requirement, ...]} for the base list and every extra; tomllib is 3.11+ but requires-python
-    is >=3.9, so older interpreters skip rather than fail to collect and red the python-version-collect lane. Same
-    shape as _find_config in tests/test_wheel_top_level_packages.py."""
+    """Raw requirements per list; skips below 3.11 (tomllib), since requires-python is >=3.9."""
     if sys.version_info < (3, 11):
         pytest.skip("tomllib needs Python 3.11+")
     import tomllib
@@ -153,8 +148,7 @@ def test_each_platform_caps_transformers_at_the_tested_ceiling() -> None:
     for where, reqs in _transformers_lists().items():
         for platform, environment in (("off darwin", LINUX_X86), ("on darwin + arm64", DARWIN_ARM)):
             spec = _live(reqs, environment)[0].specifier
-            # Check admission too, not just the ceiling number: a second upper bound, or an exclusion of the tested
-            # release, can shut it out while the ceiling still reads right.
+            # Admission too: a second bound or exclusion can shut out the tested release.
             assert TESTED_CEILING in spec, (
                 f"{where} declares {spec} {platform}, which does not admit the "
                 f"{TESTED_CEILING} the matrix was run against."
@@ -204,8 +198,7 @@ def test_the_torch_ceiling_admits_what_the_matrix_ran() -> None:
             f"pyproject.toml bounds torch as {req.specifier}, which excludes the "
             f"{TESTED_TORCH} the matrix was run against."
         )
-        # Compare the exact bound, not just admission: widening <2.15.0 to <2.16.0 still admits the tested 2.14.0, so an
-        # admission-only check would let untested torch 2.15.x ship.
+        # Compare the exact bound: a widened bound still admits the tested torch version.
         assert _ceiling_bound(req.specifier) == _ceiling_bound(SpecifierSet(TORCH_BOUND)), (
             f"pyproject.toml bounds torch as {req.specifier}, not the {TORCH_BOUND} this "
             f"file declares. Moving the bound means running the matrix on the newly "
@@ -252,8 +245,7 @@ def test_no_workflow_mirror_of_the_torch_bound_drifted() -> None:
             f"{name} installs {drifted}, which excludes the {TESTED_TORCH} pyproject now "
             f"admits, so the lane tests a torch users do not get."
         )
-        # A mirror copies the published bound, so it must stop where that bound stops; a lane widened to <2.16.0 would
-        # install untested 2.15.x and still pass the check above.
+        # Mirrors must copy the published bound; a <2.16.0 widening installs untested 2.15.x.
         widened = sorted(
             raw
             for raw in mirrors[name]
@@ -315,9 +307,7 @@ def _sentinel_resolver_source() -> str:
     return textwrap.dedent(match.group(1))
 
 
-# Resolver needs tomllib (CPython 3.11+); CI pins 3.12, but these tests run on any pytest interpreter, and on 3.10 the
-# subprocess dies with ModuleNotFoundError: _RESOLVER_NEEDS holds the minimum; a negative control that fails on its
-# message has stopped testing.
+# Resolver needs tomllib (3.11+); _RESOLVER_NEEDS holds that minimum, since 3.10 would fail.
 _RESOLVER_NEEDS = (3, 11)
 
 
@@ -353,9 +343,8 @@ requires_tomllib = pytest.mark.skipif(
 
 
 def test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib() -> None:
-    """The job running the resolver must pin Python new enough for `tomllib`; this static check also holds on 3.10,
-    where the resolver tests cannot run; a 3.10 pin would make the only tests that run the resolver skip rather than
-    fail."""
+    """The resolver job must pin Python new enough for tomllib (3.11+); a 3.10 pin would skip the
+    only resolver tests instead of failing."""
     source = _sentinel_resolver_source()
     if "tomllib" not in source:
         pytest.skip("the resolver no longer imports tomllib, so there is no floor to hold")
@@ -448,8 +437,7 @@ def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
 
 
 def test_this_file_runs_in_an_executing_ci_step():
-    """Must run in an executing CI step (collect-only proves just imports); the inline gate checks only general <=
-    CEILING, so a lowered ceiling passes it but fails here."""
+    """Must run in an executing CI step; the inline gate passes a lowered ceiling."""
     import re
     from pathlib import Path
 
@@ -470,8 +458,7 @@ def test_this_file_runs_in_an_executing_ci_step():
 
 
 def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
-    """Negative control for _ceiling: upper bounds intersect so the tightest wins; reporting 5.17 for <=5.17.0,<5.16.0
-    (which excludes the tested release) is wrong, and nothing else in this file catches it."""
+    """Negative control: _ceiling reports the tightest of intersecting upper bounds."""
     assert _ceiling(SpecifierSet("<=5.17.0")) == Version("5.17.0")
     assert _ceiling(SpecifierSet(">=4.51.3,<=5.17.0")) == Version("5.17.0")
     assert _ceiling(SpecifierSet("<=5.17.0,<5.16.0")) == Version("5.16.0")
@@ -482,8 +469,7 @@ def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
 
 
 def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_release() -> None:
-    """Negative control for exact-bound checks: <2.17.0 still admits the tested 2.15.0, so admission alone passes it,
-    yet it would publish untested torch 2.16.x while TORCH_BOUND says <2.16.0."""
+    """Negative control: <2.17.0 admits 2.15.0 but would publish untested torch 2.16.x."""
     widened = SpecifierSet(">=2.4.0,<2.17.0")
     assert TESTED_TORCH in widened, "the premise: an admission-only check cannot see this"
     assert _ceiling_bound(widened) != _ceiling_bound(SpecifierSet(TORCH_BOUND))
@@ -496,8 +482,7 @@ def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_rele
 
 
 def test_every_transformers_line_declares_the_floor_that_peft_needs() -> None:
-    """Floor needs its own assertion, since no ceiling check covers it: a branch cut before the floor moved carried
-    >=4.51.3 onto a main already at 4.52.4, and lines-agree tests miss it."""
+    """No ceiling covers the floor, so a stale branch can carry >=4.51.3 onto main at 4.52.4."""
     lists = _transformers_lists()
     assert lists, "no requirement list names transformers"
     wrong = {}

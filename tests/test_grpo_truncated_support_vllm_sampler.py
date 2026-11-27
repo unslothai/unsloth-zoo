@@ -67,8 +67,7 @@ def _tied_rows():
 
 @pytest.mark.parametrize("top_p", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
 def test_top_p_cutoff_uses_vllm_float32_threshold(top_p):
-    # vLLM compares the sorted cumsum against 1 - p with p a float32 tensor; Python's double 1.0 - top_p rounds
-    # differently: ten tied logits at top_p = 0.8 keep 9 in vLLM, 8 with the double.
+    # vLLM's float32 1-p cutoff keeps 9 of 10 tied logits at top_p 0.8; Python double keeps 8.
     logits = _tied_rows()
     keep = rr._truncated_support_mask(logits, 0, top_p, 0.0)
     for fn in _references():
@@ -311,9 +310,7 @@ def _padded_engine_trainer(ids, bias = float("-inf"), **args):
 
 
 def test_engine_suppressed_padded_rows_leave_the_scored_support(sampler):
-    # zoo 1831: 61 real tokens and 64 alignment rows the engine biases to -inf; vLLM adds logit_bias before processed
-    # logprobs (apply_logits_processors), so a rollout token scores -log(61), not -log(125): a 0.488 ratio with
-    # identical weights.
+    # zoo 1831: vLLM adds logit_bias before processed logprobs, so -log(61), not -log(125).
     sampler("0.11.2")
     pad = list(range(61, 125))
     logits = torch.zeros(1, 2, 125)

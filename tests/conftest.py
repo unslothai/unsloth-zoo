@@ -237,8 +237,7 @@ def _apply_upstream_import_fixes_for_tests() -> None:
 _apply_upstream_import_fixes_for_tests()
 
 
-# Isolate Xet health state: the ladder persists per-machine verdicts beside the HF cache, so simulated failures would
-# demote the real machine and later tests would start on HTTP.
+# Xet verdicts persist beside HF cache; fake failures would demote the real machine to HTTP.
 
 import pytest as _pytest
 
@@ -264,8 +263,7 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
 import os as _os
 
 _HIDDEN_STATES_FLAG = "UNSLOTH_RETURN_HIDDEN_STATES"
-# Library code writes these process-wide (get_transformers_model_type records UNSLOTH_MODEL_NAME), and later tests
-# read them: the Gemma 3 patches skip or repatch by model name, and subprocess tests inherit the environment.
+# Library code sets these process-wide; Gemma 3 patches and subprocess tests read them later.
 _RESTORED_ENV = (_HIDDEN_STATES_FLAG, "UNSLOTH_MODEL_NAME")
 
 
@@ -304,8 +302,7 @@ _MOE_UTILS = "unsloth_zoo.temporary_patches.moe_utils"
 
 @_pytest.fixture(autouse = True)
 def _restore_selected_moe_backend():
-    """select_moe_backend() caches its pick per process; forcing UNSLOTH_MOE_BACKEND=grouped_mm or
-    spoofing CUDA leaks it to later CPU tests, raising 'torch._grouped_mm is not supported'."""
+    """Cached per process, so forcing UNSLOTH_MOE_BACKEND or CUDA spoofing leaks to CPU tests."""
     module = sys.modules.get(_MOE_UTILS)
     before = getattr(module, "_SELECTED_MOE_BACKEND", None)
     yield
@@ -380,8 +377,7 @@ def _enable_compile(monkeypatch):
     import importlib
     import sys
 
-    # Import first under the caller's environment: a module first imported after the switch is cleared would freeze its
-    # flags compile-on, and monkeypatch would restore those values.
+    # Import modules first: if imported after the switch is cleared, flags freeze compile-on.
     for name in _COMPILE_SWITCH_MODULES:
         importlib.import_module(name)
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
@@ -393,9 +389,8 @@ def _enable_compile(monkeypatch):
                 monkeypatch.setattr(module, flag, enabled)
 
 
-# A sys.modules swap left unrestored breaks later imports in the same process (test_vllm_to_hf_conversion's
-# bitsandbytes.functional stub broke QuantState under -n 4); the check watches only names swapped, since reloads are
-# legitimate; fix with monkeypatch.setitem.
+# A sys.modules swap left unrestored breaks later imports (bitsandbytes.functional stub, -n 4); only
+# swapped names are checked, since reloads are legitimate; use monkeypatch.setitem.
 _GUARDED_MODULES = ("bitsandbytes", "bitsandbytes.functional", "bitsandbytes.nn")
 
 # Top-level moe_utils resolves only via a compile-cache dir on sys.path; flagged only from pytest temp dirs, since a
@@ -409,8 +404,7 @@ def _is_from_pytest_tmp(mod):
     path = getattr(mod, "__file__", None)
     if not path:
         return False
-    # Match the pytest-of-<user> path element tmp_path_factory always creates, not the basetemp config: --basetemp
-    # overrides it, xdist gives each worker its own, and stale entries can outlive the fixture.
+    # Match the pytest-of-<user> element tmp_path_factory makes, not the --basetemp config.
     return any(
         part.startswith("pytest-of-") for part in pathlib.Path(path).parts
     )
@@ -423,9 +417,8 @@ def _is_module_stub(mod):
 
 
 def _is_unsloth_stub(mod):
-    """unsloth_zoo's bitsandbytes stub (stubs/bitsandbytes_stub.py, used where no wheel exists) is process-wide and
-    deliberate, so the first test importing bitsandbytes.nn is not a polluter; all stub modules carry
-    IS_UNSLOTH_STUB, finder-minted ones included."""
+    """unsloth_zoo's bitsandbytes stub (stubs/bitsandbytes_stub.py) is process-wide by design, so it
+    is not a leak; all stub modules carry IS_UNSLOTH_STUB, finder-minted ones included."""
     return bool(getattr(mod, "IS_UNSLOTH_STUB", False))
 
 
@@ -439,9 +432,7 @@ def pytest_runtest_setup(item):
     setattr(item, _CHECKPOINT_SNAPSHOT_KEY, _checkpoint_snapshot())
 
 
-# patch_unsloth_*_gradient_checkpointing swap these for the whole process. A test that patches without unpatching hands
-# the Unsloth checkpoint to every later test on its xdist worker, which then fails far from the cause (reentrant counts,
-# recompiles, grads, the set-once pristine capture), so each test gets back the checkpoint it started with.
+# patch_unsloth_*_gradient_checkpointing swap process-wide; each test restores its checkpoint.
 _CHECKPOINT_SNAPSHOT_KEY = "_unsloth_checkpoint_snapshot"
 _CHECKPOINT_ATTRS = (
     "checkpoint", "CheckpointFunction", "_old_checkpoint", "_old_CheckpointFunction", "_unsloth_pristine_checkpoint",
@@ -478,8 +469,7 @@ def _restore_checkpoint(snapshot):
 
 @_pytest.hookimpl(trylast = True)
 def pytest_runtest_teardown(item, nextitem):
-    """Leak check runs as a trylast teardown hook, not an autouse fixture: fixtures tear down in reverse setup order, so
-    a fixture check ran before monkeypatch restored sys.modules and flagged correct tests."""
+    """Trylast hook, not a fixture: teardown runs after monkeypatch restores sys.modules."""
     import sys as _sys
 
     # After every fixture, including monkeypatch, has finalized, so its own undo of these attributes is not disturbed.
@@ -495,14 +485,12 @@ def pytest_runtest_teardown(item, nextitem):
         if now is was:
             continue
         if name in _GUARDED_BARE_MODULES:
-            # See _GUARDED_BARE_MODULES: for these the import itself can be the swap, so the exemption below does not
-            # apply; narrowed to copies that go stale and mislead later tests.
+            # The import may itself be the swap; no exemption, flag only stale copies.
             if _is_from_pytest_tmp(now):
                 leaked.append(name)
             continue
         if was is None and (not _is_module_stub(now) or _is_unsloth_stub(now)):
-            # Nothing was there before and the test imported the real package or the zoo's bitsandbytes stub; that is an
-            # import, not a swap, and flagging it would fail every test touching it.
+            # Nothing was there before: an import of the real package or zoo stub, not a swap.
             continue
         leaked.append(name)
     if leaked:
@@ -520,9 +508,8 @@ def pytest_runtest_teardown(item, nextitem):
         )
 
 
-# With real mlx installed, it and the torch-backed shim would share sys.modules, making results depend on collection
-# order (unslothai/unsloth PR/issue 8138); each module runs under its own mlx modules, restored afterwards; inert
-# without real mlx.
+# Real mlx would share sys.modules with the torch shim, so results depend on collection order
+# (unslothai/unsloth PR/issue 8138); each module gets its own mlx modules; inert without real mlx.
 _PLATFORM_ATTRS = ("system", "machine", "_orig_system_for_mlx_shim", "_orig_machine_for_mlx_shim")
 _MISSING = object()
 
@@ -660,7 +647,6 @@ def pytest_configure(config):
 
 @_pytest.fixture(autouse = True)
 def _cpu_backend_compiles_only_when_asked(monkeypatch):
-    """The CPU backend compiles decoder layers by default for dense models; one Inductor build per test would dominate
-    the suite. Tests of that path set or delete UNSLOTH_CPU_COMPILE themselves."""
+    """Tests turn CPU compile off unless set: a build per test would dominate the suite."""
     if "UNSLOTH_CPU_COMPILE" not in _os.environ:
         monkeypatch.setenv("UNSLOTH_CPU_COMPILE", "0")

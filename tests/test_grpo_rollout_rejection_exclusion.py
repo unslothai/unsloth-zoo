@@ -108,8 +108,7 @@ def _data(seed, rows = 6, cols = 9, scale = 0.2, dtype = torch.float64):
 
 
 def test_overflowed_is_ratio_on_rejected_token_is_not_nan():
-    # Repro: token_mask with no clip and log ratios [0, 100] in float32; exp(100) overflows to inf, and a rejected token
-    # turned that into inf * 0 = nan in the loss and gradient.
+    # Repro: float32 log ratio 100 gives exp(100) = inf; a rejected token made inf * 0 = nan.
     new = torch.zeros(1, 2, dtype = torch.float32, requires_grad = True)
     old = torch.zeros(1, 2, dtype = torch.float32)
     sampling = torch.tensor([[0.0, -100.0]])
@@ -297,8 +296,7 @@ def test_rollout_rs_warning_follows_bypass_support(monkeypatch, as_old):
 @pytest.mark.parametrize("options,thresholds", RS)
 @pytest.mark.parametrize("bypass", [False, True])
 def test_reported_kl_leaves_out_rejected_tokens(options, thresholds, bypass):
-    # mean_kl: per-row sum of KL over kept tokens divided by all completion tokens of that row (the loss normaliser's
-    # count), averaged over rows that have tokens.
+    # mean_kl: per-row KL over kept tokens / all completion tokens (rejected still counted).
     ref, new, old, sampling, mask, adv = _data(5)
     parsed = rr.grpo_parse_rollout_rs(options, thresholds)
     if bypass:
@@ -338,7 +336,6 @@ def test_reported_kl_without_rejection_is_unchanged():
 @pytest.mark.parametrize("options,thresholds", RS)
 @pytest.mark.parametrize("bypass", [False, True])
 def test_keep_helper_matches_the_loss(options, thresholds, bypass):
-    # grpo_rollout_rs_keep (caller side) must reject exactly the tokens grpo_compute_loss rejects.
     ref, new, old, sampling, mask, adv = _data(9)
     parsed = rr.grpo_parse_rollout_rs(options, thresholds)
     if bypass:

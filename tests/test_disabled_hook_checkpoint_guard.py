@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Simulation suite for unsloth-zoo PR 1145, which routes the disabled-hook arm of
-_fall_back_to_eager_on_recompile_limit through _give_up_at_compile_time; before/after pairs (IS_FIX) check the shared
-path still works."""
+"""Simulation suite for unsloth-zoo PR 1145: the disabled-hook arm routes through
+_give_up_at_compile_time; before/after (IS_FIX) pairs check the shared path."""
 
 import sys
 from pathlib import Path
@@ -114,8 +113,7 @@ def test_an_unrelated_graph_break_still_raises():
 # R2: the new behaviour, only on the fix tree.
 
 def test_refusal_after_compiling_ok_inside_a_live_region():
-    """Bug: this label compiled ok so a compiled pack is outstanding; flipping to eager mid-region desynchronises pack
-    and recompute (corruption); main returns eager silently, the fix raises."""
+    """Compiled-ok label flipped to eager mid-region desyncs pack and recompute; fix raises."""
     U._COMPILED_OK_LABELS.add(LABEL)
     U._PACKED_COMPILED_IN_CHECKPOINT = True
     w = _wrap(_raiser())
@@ -148,7 +146,6 @@ def test_a_new_wrapper_with_a_latched_label_starts_eager():
         assert second() == "compiled-should-not-run"
 
 
-# R3: blast radius. Only THIS label may latch.
 
 def test_only_this_label_latches_not_every_borrower():
     """Budget exhaustion is process wide and takes other borrowers down; a compile-time refusal is one region's, so unrelated labels keep compiling."""
@@ -166,7 +163,6 @@ def test_only_this_label_latches_not_every_borrower():
             s.discard(other)
 
 
-# R4: the marker must be restored, not leaked.
 
 def test_marker_is_restored_to_what_it_was():
     """The arm captures the marker before the compiled call and restores it; left set, a later wrapper would see a compiled pack outstanding and end a fine step."""
@@ -203,7 +199,6 @@ def test_backend_refusal_arm_still_behaves():
     assert out == "eager"
 
 
-# Platform: the changed code has no platform branch. Prove it, do not say it.
 
 def test_changed_path_has_no_platform_or_device_branch():
     import inspect
@@ -217,8 +212,7 @@ def test_changed_path_has_no_platform_or_device_branch():
 
 
 def test_conservative_when_another_region_packed_compiled_this_step():
-    """Deliberately pessimistic: a label that compiled ok plus any compiled pack under a checkpoint this step raises,
-    even if this wrapper packed nothing; ending a fine step is cheap, wrong gradients are not."""
+    """A compiled-ok label raises on any compiled pack this step; wrong gradients cost more."""
     U._COMPILED_OK_LABELS.add(LABEL)          # compiled fine earlier
     U._PACKED_COMPILED_IN_CHECKPOINT = True   # some region packed compiled
     w = _wrap(_raiser())

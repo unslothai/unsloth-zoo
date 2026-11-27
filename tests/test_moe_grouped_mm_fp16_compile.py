@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compiled float16 grouped GEMM: the torch._grouped_mm fake impl rejects fp16, so the frame silently ran eager under
-suppress_errors; compiled fp16 now goes through an opaque custom op, bf16 untouched"""
+"""fp16 uses an opaque custom op as torch._grouped_mm's fake impl rejects it; bf16 untouched."""
 
 import json
 import os
@@ -168,8 +167,7 @@ print("RESULT " + json.dumps({"err": err, "grads": grads, "frames": dict(counter
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 def test_compiled_mixtral_expert_lora_traces(tmp_path, dtype_name):
-    """Mixtral expert LoRA step compiles with suppress_errors off (the fp16 fake impl of aten._grouped_mm rejected
-    float16); expert LoRA grads are finite and non-zero"""
+    """Mixtral expert LoRA compiles with suppress_errors off; grads are finite and non-zero."""
     _supported()
     script = tmp_path / "child.py"
     script.write_text(_CHILD)

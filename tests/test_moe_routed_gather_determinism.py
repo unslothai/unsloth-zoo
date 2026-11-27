@@ -66,7 +66,6 @@ def test_compiled_grouped_mm_backward_has_no_atomics_and_is_bitwise_reproducible
     for a, b, _ in lora.values():
         a.grad = b.grad = None
     torch._dynamo.reset()
-    # Block compile marks the sequence dim dynamic.
     compiled = torch.compile(mu.forward_native_grouped_mm, fullgraph = False, dynamic = dynamic)
 
     def step():

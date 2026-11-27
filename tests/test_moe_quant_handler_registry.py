@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Save-side MoE quant handler registry: FP8 dequant/requant lives in moe_utils_fp8.py, consulted by saving_utils via
-apply_moe_quant_load; pins the _MOE_QUANT_UNSAFE missing-scale path."""
+"""Save-side FP8 handlers in moe_utils_fp8.py; pins _MOE_QUANT_UNSAFE missing-scale path."""
 
 from __future__ import annotations
 
@@ -140,7 +139,6 @@ def test_fp8_handler_returns_none_for_non_fp8_keys():
         def get_tensor(self, key):
             return torch.randn(8, 8, dtype=torch.bfloat16)
 
-    # dtype hint is bf16 → handler bails without touching the file.
     header = {"Z.weight": {"dtype": "BF16"}}
     assert _fp8_save_handler(FakeFile(), header, "Z.weight") is None
 
@@ -174,8 +172,7 @@ class _FakeFile:
 
 
 def test_fp8_handler_partial_block_needs_block_size():
-    """Partial blocks (130 rows, 128x128 blocks, 2x2 grid) divide evenly (130 % 2 == 0), so inference picks bm=65 and
-    misapplies scales; the configured weight_block_size must win."""
+    """Partial 130-row blocks infer bm=65, misapply scales; configured weight_block_size wins."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         _fp8_save_handler,
         _fp8_dequant_blockwise,

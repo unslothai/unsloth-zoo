@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused 3D MoE experts via grouped LoRA target_parameters: orientation auto-detected from distinct dims (issue 779);
-gpt_oss runs on transformers 4.57.6 and 5.x; 5.x-only arches skip when a tiny config cannot exercise the fused path."""
+"""Fused 3D MoE orientation detected from distinct dims (issue 779); gpt_oss on 4.57.6 and 5.x."""
 
 from __future__ import annotations
 

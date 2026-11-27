@@ -33,8 +33,7 @@ class _Engine:
 
 @pytest.fixture
 def t4(monkeypatch):
-    # A T4 reports about 14.58 GiB, inside the <= 16 GiB band (width = approx_max_num_seqs // 5).
-    # setenv first so the variable is removed again after the test, even if the code under test sets it.
+    # T4 (14.58 GiB) is in the <= 16 GiB band; setenv first so the var is unset after the test.
     monkeypatch.setenv("UNSLOTH_VLLM_BATCHES", "0")
     monkeypatch.delenv("UNSLOTH_VLLM_BATCHES")
     monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (0, int(14.58 * 2**30)))

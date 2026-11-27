@@ -109,8 +109,7 @@ def routed_like_l4(monkeypatch):
                         if getattr(m, "_original_param_wrapper_forward", None) is not None)
         experts = wrapper.get_base_layer()
         saved = {k: experts.__dict__.pop(k) for k in list(experts.__dict__) if k.startswith("_unsloth_lora_")}
-        # The stand-in reaches the experts forward, which records a stash read the real kernel never makes: keep
-        # the read record as it was, else the probe sees a read and the test passes without the fix.
+        # Stand-in logs a stash read the kernel never makes; dropping the record hides the fix.
         reads = experts.__dict__.get(MU._MOE_LORA_STASH_READ_ATTR)
         reads = dict(reads) if reads is not None else None
         try:
@@ -152,7 +151,6 @@ def test_outer_expert_adapter_gets_grads_when_the_inner_wrapper_could_route(rout
     assert not missing, f"outer expert adapter got no grads: {missing}"
     for name in want:
         torch.testing.assert_close(got[name], want[name], rtol = 1e-4, atol = 1e-6)
-    # The outer adapter stays on the separated (stash) path, as without routing.
     experts = model.base_model.model.model.layers[0].mlp.experts.get_base_layer()
     assert MU.moe_lora_forward_applies_stash(experts, "down_proj") is True
     # Eval decode still routes at the outermost wrapper only.

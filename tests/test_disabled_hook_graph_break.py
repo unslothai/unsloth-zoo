@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Two fixes collide: a disabled gradient-checkpointing hook called inside a fullgraph region falls back to eager,
-matched on the disable signature only; other graph breaks must still raise."""
+"""Disabled checkpoint hook in fullgraph falls back to eager; other graph breaks still raise."""
 
 import sys
 from pathlib import Path
@@ -246,8 +245,7 @@ def test_it_degrades_to_the_compiled_function_when_torch_offers_none_of_them():
 
 
 def test_backend_errors_alone_are_enough_to_keep_the_wrapper():
-    """A torch with no recompile-limit or graph-break exception can still refuse codegen, so the wrapper must keep its
-    layer or the codegen fallback silently vanishes."""
+    """Codegen can refuse with no recompile or graph-break error, so keep the wrapper."""
     import unittest.mock as mock
     if not U._backend_compile_errors():
         pytest.skip("this torch exposes no backend compile exception")

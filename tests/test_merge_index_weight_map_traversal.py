@@ -165,8 +165,7 @@ def test_a_hostile_weight_map_entry_cannot_escape_the_save_directory(
             f"outside {save_directory!r}"
         )
 
-    # Shard names are checked by what they resolve to, not by a character set, so one rule covers both separators; a
-    # name is a traversal only where it resolves as one.
+    # Names are checked by resolved path, not character set: one rule covers both separators.
     for name in shard_names:
         joined = os.path.normpath(os.path.join(inside, name))
         assert joined.startswith(inside + os.sep), (
@@ -404,15 +403,13 @@ def test_two_nested_shards_sharing_a_basename_are_not_merged_into_one(
         f"{len(set(weight_map.values()))} distinct shards became {set(shard_names)!r}"
     )
 
-    # Both shards must sit where the index says and really hold the merge; without this the test passes on a run that
-    # kept two names but left half the tensors unmerged.
+    # Both shards must sit where the index says and really hold the merge, not just the names.
     output = os.path.join(str(tmp_path), base_rel)
     for relative in sorted(set(weight_map.values())):
         assert os.path.exists(os.path.join(output, relative)), (
             f"{relative!r} is missing from {output!r} after the merge"
         )
-    # _flattened cannot be used: both shards are named x.safetensors, so copying them flat would overwrite one and hide
-    # the loss under test; number them by parent instead.
+    # _flattened cannot be used: shards share one name, so flat copies overwrite; number by parent.
     flat = os.path.join(str(tmp_path), "flat")
     os.makedirs(flat, exist_ok = True)
     for relative in sorted(set(weight_map.values())):
@@ -819,9 +816,8 @@ def _symlinked_model(tmp_path, spec, *, link_the_parent = False):
 
 
 def test_a_symlinked_shard_is_not_written_through(monkeypatch, tmp_path):
-    """The in-place merge must not write through a shard symlink (os.path.exists follows it, so the r+b overwrite hit
-    the target); the shard is materialised rather than refused, as writing through would corrupt a blob other models
-    share."""
+    """In-place merge must not write through a shard symlink (os.path.exists follows it, so r+b hit
+    the target); materialise it: writing through would corrupt a blob other models share."""
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
     H.set_offline_cpu_env()
@@ -915,9 +911,8 @@ def test_a_symlink_that_stays_inside_the_output_is_left_alone(tmp_path):
 def test_a_dequantized_nested_singleton_still_gets_an_index(
     monkeypatch, tmp_path, quant_type,
 ):
-    """A dequant export skips the index copy, so regeneration is the only path; regenerate_index skipped a lone nested
-    singleton, and from_pretrained reads model.safetensors and its index only at the root (transformers 5.17.0);
-    dequant arithmetic is stubbed as irrelevant to the index."""
+    """Dequant export skips the index copy, so regeneration is the only path; regenerate_index
+    skipped a lone nested singleton; from_pretrained reads the root only (transformers 5.17.0)."""
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
     H.set_offline_cpu_env()
@@ -940,8 +935,7 @@ def test_a_dequantized_nested_singleton_still_gets_an_index(
         saving_utils, "check_model_quantization_status",
         lambda *a, **k: (True, quant_type), raising = True,
     )
-    # The shard rewrite runs for real as an ordinary 16bit merge; only the tensor-level dequant is stubbed, since this
-    # tiny model has no quantized weights and it has no bearing on the index.
+    # Real 16bit merge; dequant stubbed (tiny model, no quantized weights, index unaffected).
     _real_merge = saving_utils._merge_and_overwrite_lora
     def _merge_without_dequant(*a, **k):
         k["base_model_is_quantized"] = False
@@ -987,9 +981,8 @@ def test_a_dequantized_nested_singleton_still_gets_an_index(
     ("/tmp",  "/tmpfoo/model.safetensors",   False),
 ])
 def test_containment_holds_at_a_filesystem_root(directory, path, expected):
-    """A root + os.sep prefix check is wrong at a filesystem root: realpath('/') is '/', so the prefix '//' refuses
-    genuinely inside shards after configs are written; the /tmpfoo case keeps a sibling sharing the name prefix
-    refused."""
+    """A root + os.sep prefix check fails at a filesystem root (realpath('/') is '/', so '//'
+    refuses shards after configs are written); /tmpfoo, a name-prefix sibling, stays refused."""
     assert saving_utils._resolves_inside(path, directory) is expected
 
 
@@ -1002,9 +995,8 @@ def test_containment_holds_at_a_filesystem_root(directory, path, expected):
     ("a\\b\\model.safetensors",              True),
 ])
 def test_nesting_is_detected_under_both_separator_rules(name, nested):
-    """A name is admitted only if contained under both separator rules: checking only the native one lets a
-    backslash-nested name through on POSIX, leaving the export with neither a root model.safetensors nor an index
-    naming the file it has."""
+    """Names must be contained under both separator rules: checking only the native one lets a
+    backslash-nested name through on POSIX, leaving neither root model.safetensors nor an index."""
     assert saving_utils._shard_name_stays_inside(name) is True
     assert saving_utils._has_directory_component(name) is nested
 
@@ -1089,8 +1081,7 @@ def test_a_name_that_re_enters_a_same_named_sibling_is_refused(name):
 
 @pytest.mark.parametrize("name", COLLIDING_NAMES)
 def test_a_colliding_name_never_reaches_the_filesystem(monkeypatch, tmp_path, name):
-    """Nothing may be created outside the output directory: shard preparation runs makedirs and copy2 before the write
-    sinks refuse the name, so assert on the filesystem, not the exception."""
+    """Nothing may land outside the output dir: makedirs/copy2 run before the sinks refuse."""
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
     H.set_offline_cpu_env()
@@ -1137,8 +1128,7 @@ def test_a_colliding_name_never_reaches_the_filesystem(monkeypatch, tmp_path, na
     pytest.param("Z:..\\victim.safetensors",  id = "other-drive"),
 ])
 def test_a_drive_relative_name_is_refused(name):
-    """ntpath.isabs is False for a drive-relative name (a drive letter then ..) and normpath keeps the drive ahead of
-    .., so on Windows it joins relative to that drive's cwd and can escape the output tree."""
+    """Windows: ntpath.isabs is False for 'C:..' names, so the join can escape the output tree."""
     assert saving_utils._shard_name_stays_inside(name) is False
 
 
@@ -1180,8 +1170,7 @@ def test_a_symlinked_output_component_is_refused_before_the_copy(monkeypatch, tm
 
 
 def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
-    """Materialisation copies before unlinking the shard link: unlinking first would leave the user's checkpoint with
-    its link gone and a partial file on ENOSPC or interruption."""
+    """Copy before unlinking the link, so ENOSPC or interruption leaves the checkpoint intact."""
     output = os.path.join(str(tmp_path), "model_dir")
     os.makedirs(output, exist_ok = True)
     outside = os.path.join(str(tmp_path), "outside")
@@ -1218,8 +1207,7 @@ def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
     pytest.param(".. \\victim.safetensors",     id = "parent-plus-trailing-space"),
     pytest.param(".. /victim.safetensors",      id = "parent-plus-space-posix-sep"),
     pytest.param("   \\victim.safetensors",     id = "spaces-only-becomes-rooted"),
-    # Windows trims the trailing run of spaces and periods so each opens as '..'; stripping only spaces, or rstrip('
-    # .'), misses it or empties the name, and the traversal is accepted.
+    # Windows trims trailing spaces and periods, so strip both or '.. .' still opens as '..'.
     pytest.param(".. .\\victim.safetensors",    id = "parent-space-period"),
     pytest.param(".. ./victim.safetensors",     id = "parent-space-period-posix-sep"),
     pytest.param("...\\victim.safetensors",     id = "three-periods"),
@@ -1258,7 +1246,6 @@ def test_the_staging_path_is_never_written_through_a_symlink(tmp_path):
         assert f.read() == b"DO NOT TOUCH ME", (
             "the copy followed the planted staging symlink and overwrote its target"
         )
-    # The shard was still materialised correctly.
     assert not os.path.islink(shard)
     with open(shard, "rb") as f:
         assert f.read() == b"REAL SHARD BYTES"
@@ -1272,8 +1259,7 @@ def test_the_staging_path_is_never_written_through_a_symlink(tmp_path):
 
 
 def test_a_file_sitting_at_the_old_staging_name_is_not_deleted(tmp_path):
-    """Staging must not unlink a fixed '<shard>.unsloth-materializing' leftover before creating it: that deletes
-    whatever is there, possibly another shard the index lists in the user's own directory."""
+    """Don't pre-unlink a fixed '<shard>.unsloth-materializing' name: it may be another shard."""
     model_dir = os.path.join(str(tmp_path), "model")
     os.makedirs(model_dir, exist_ok = True)
     outside = os.path.join(str(tmp_path), "outside")
@@ -1339,7 +1325,6 @@ def test_a_linked_parent_and_linked_shard_leaves_the_external_directory_alone(tm
     assert sorted(os.listdir(outside_dir)) == before
     with open(victim, "rb") as f:
         assert f.read() == b"VICTIM BYTES"
-    # And the export still refuses, which is what should have happened all along.
     with pytest.raises(RuntimeError, match = "outside the output directory"):
         saving_utils._assert_shard_is_inside(file_path, save_directory)
 
@@ -1374,8 +1359,7 @@ def test_an_external_parent_with_a_leaf_pointing_back_inside_is_refused(tmp_path
 
 @pytest.mark.parametrize("length", [200, 223, 230, 250])
 def test_a_long_shard_basename_still_materializes(tmp_path, length):
-    """The staging prefix must not carry the whole basename: mkstemp adds 8 random characters, and a valid 230-char
-    shard name on ext4 failed with OSError Errno 36, File name too long."""
+    """Staging prefix must be short: mkstemp adds 8 chars; a valid 230-char name hit Errno 36."""
     output = os.path.join(str(tmp_path), "out")
     os.makedirs(output, exist_ok = True)
     outside = os.path.join(str(tmp_path), "outside")
@@ -1412,8 +1396,7 @@ def test_a_long_shard_basename_still_materializes(tmp_path, length):
 
 
 def test_a_linked_index_in_the_output_is_not_written_through(tmp_path):
-    """A linked index in the output must not be written through: open in wb mode and copy2 truncate the symlink target,
-    while os.replace swaps the directory entry without following it."""
+    """Linked index must not be written through: open(wb) and copy2 truncate the link target."""
     output = os.path.join(str(tmp_path), "out")
     os.makedirs(output, exist_ok = True)
     outside = os.path.join(str(tmp_path), "outside")
@@ -1438,8 +1421,7 @@ def test_a_linked_index_in_the_output_is_not_written_through(tmp_path):
     assert not os.path.islink(destination), "the link was left in place of the index"
     with open(destination, "rb") as f:
         assert f.read() == payload
-    # copystat applies to the staging file so the mode is never widened; the mode check is POSIX-only, since Windows
-    # os.chmod only toggles read-only and st_mode reads 0o666.
+    # copystat keeps mode from widening; POSIX-only, as Windows chmod only toggles read-only.
     if os.name != "nt":
         assert oct(os.stat(destination).st_mode & 0o777) == oct(0o600)
     leftovers = [n for n in os.listdir(output) if n.startswith(".unsloth-index-")]
@@ -1447,8 +1429,7 @@ def test_a_linked_index_in_the_output_is_not_written_through(tmp_path):
 
 
 def test_a_regenerated_index_does_not_follow_a_link_either(tmp_path):
-    """Regenerated index writes must not follow a destination symlink: open in w mode truncated the link target for a
-    dequantizing nested singleton, as the copy path did before staging."""
+    """Regenerated index writes must not follow a symlink: open(w) truncated the link target."""
     output = os.path.join(str(tmp_path), "out")
     os.makedirs(output, exist_ok = True)
     outside = os.path.join(str(tmp_path), "outside")
@@ -1476,8 +1457,7 @@ def test_a_regenerated_index_does_not_follow_a_link_either(tmp_path):
 
 
 def test_a_regenerated_index_takes_the_mode_of_the_shards_beside_it(tmp_path):
-    """A regenerated index takes its mode from a shard just written: reading the umask would need a process-wide toggle
-    another thread could race, and matching the weights is better."""
+    """Index mode comes from a nearby shard: reading umask needs a racy process-wide toggle."""
     output = os.path.join(str(tmp_path), "out")
     os.makedirs(output, exist_ok = True)
     donor = os.path.join(output, "model.safetensors")

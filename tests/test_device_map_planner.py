@@ -128,14 +128,12 @@ def test_refuses_instead_of_spilling_when_it_cannot_fit():
 
 
 def test_quantised_sizes_use_the_storage_dtype():
-    """preprocess_model leaves meta Params4bit at the full unpacked float32 shape, so sizes must use the quantiser's
-    storage dtype (as transformers does) or 4-bit models are overstated."""
+    """Meta Params4bit keep the unpacked float32 size, so sizes must use the storage dtype."""
     pytest.importorskip("accelerate")
     from accelerate.utils import CustomDtype
 
     class Q:
-        """Fake quantiser implementing both protocols: transformers' compute_module_sizes asks for param_element_size,
-        accelerate's takes a storage dtype and not-converted modules; the answer must match either way."""
+        """Fake quantiser for both protocols (param_element_size, dtype); answers must match."""
         modules_to_not_convert = ["lm_head"]
 
         def _skipped(self, name):
@@ -145,7 +143,6 @@ def test_quantised_sizes_use_the_storage_dtype():
         def param_element_size(self, model, name, param):
             return 2 if self._skipped(name) else 0.5
 
-        # accelerate
         def adjust_target_dtype(self, dtype):
             return CustomDtype.INT4
 
@@ -188,8 +185,7 @@ class _RootState(nn.Module):
 
 
 def test_state_owned_by_the_root_module_is_placed():
-    """Root-owned params or buffers have no module name and accelerate reads '' as a catch-all, so each tensor gets its
-    own entry, else coverage raises despite free memory."""
+    """Root-owned tensors have no module name, so each needs its own entry or coverage raises."""
     with torch.device("meta"):
         model = _RootState()
     plan = plan_device_map(model, max_memory = {0: "1GiB", 1: "1GiB"})
@@ -220,8 +216,7 @@ class _CompositeHeadModel(nn.Module):
 
 
 def test_a_composite_head_is_pinned_whole():
-    """_split_units descends into a head with children, so its own name is never a unit; an exact-name filter drops it
-    from the pinned list and the walk can place it off head_device."""
+    """A composite head is no unit; an exact-name filter drops it, so the walk can misplace it."""
     with torch.device("meta"):
         model = _CompositeHeadModel()
     plan = plan_device_map(model, max_memory = {0: "1GiB", 1: "1GiB"})
@@ -247,9 +242,8 @@ class _Bins(nn.Module):
 
 
 def test_differently_sized_units_still_find_a_packing():
-    """Next-fit with first-fit rescue builds loads of 9 and 9 from 7, 6, 3, 2, 2 in capacities 10 and 10 and rejects the
-    last unit though 7+3 and 6+2+2 fit; float32 makes each unit 4 bytes wide, and the pinned 4-byte head adds 4 bytes
-    to device 1."""
+    """Next-fit with first-fit rescue rejects the last unit (loads 9 and 9) though 7+3 and 6+2+2
+    fit; float32 makes each unit 4 bytes wide, pinned 4-byte head adds to device 1."""
     with torch.device("meta"):
         model = _Bins([7, 6, 3, 2, 2])
     plan = plan_device_map(
@@ -264,8 +258,7 @@ def test_differently_sized_units_still_find_a_packing():
 
 
 def test_in_order_layout_is_kept_when_it_fits():
-    """The repack is a last resort: while the in-order walk succeeds the layout stays in definition order, keeping
-    consecutive layers on one card with fewer cross-device hops."""
+    """The repack is a last resort: the in-order layout keeps consecutive layers on one card."""
     model = _meta(layers = 8)
     plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"})
     layers = [plan.device_map[f"layers.{i}"] for i in range(8)]
@@ -273,8 +266,7 @@ def test_in_order_layout_is_kept_when_it_fits():
 
 
 def test_an_explicit_reserve_is_a_hard_constraint():
-    """The relaxation loop must not lower an explicit, caller-measured reserve; doing so OOMs a card the plan still
-    reports as free, so an explicit reserve fits or is refused."""
+    """An explicit reserve is a hard limit: relaxing it OOMs a card the plan reports as free."""
     model = _meta(hidden = 16, vocab = 64, layers = 8)
     total = _compute_module_sizes(model)[""]
     reserve = 4096
@@ -300,8 +292,7 @@ def test_the_auto_reserve_is_still_relaxable():
 
 
 def test_remote_code_config_picks_the_auto_class_the_repo_registered():
-    """Dynamic configs are in no _model_mapping, so from_config falls to AutoModel and fails instead of honouring
-    trust_remote_code; use the Auto class the repo registered."""
+    """Dynamic configs skip _model_mapping; honour trust_remote_code via the repo's Auto class."""
     transformers = pytest.importorskip("transformers")
 
     class RemoteConfig:
@@ -353,8 +344,7 @@ def test_an_unusable_prefer_head_device_says_so():
 
 
 def test_each_backend_is_called_with_the_arguments_it_accepts(monkeypatch):
-    """transformers and accelerate compute_module_sizes take different kwargs, and a mismatched pair silently falls back
-    to the plain walk (4-bit sized several times too big), so dispatch on signature."""
+    """Mismatched backend kwargs silently fall back to the plain walk; dispatch on signature."""
     import types
 
     seen = {}
@@ -386,7 +376,6 @@ def test_each_backend_is_called_with_the_arguments_it_accepts(monkeypatch):
     assert _compute_module_sizes(model, Q())[""] == 1234
     assert isinstance(seen["transformers"], Q)
 
-    # Same call with only accelerate's older signature available.
     seen.clear()
     fake2 = types.ModuleType("transformers.integrations.accelerate")
     fake2.compute_module_sizes = accelerate_style
@@ -399,8 +388,7 @@ _MiB = 1024 ** 2
 
 
 def test_quantizer_budget_haircut_is_applied():
-    """transformers' _get_device_map calls hf_quantizer.adjust_max_memory first, and bitsandbytes quantisers hold 10% of
-    each budget back; an explicit map skips that, so the planner must apply it too."""
+    """Explicit maps skip the adjust_max_memory haircut, so the planner must apply it too."""
 
     class Q:
         def adjust_max_memory(self, max_memory):
@@ -475,8 +463,7 @@ class _FatBlockModel(nn.Module):
 
 
 def test_empty_no_split_override_is_honoured():
-    """`[]` (nothing atomic) differs from `None` (detect block classes); a truthiness test dropped `[]`, so a block
-    bigger than any card was wrongly reported infeasible."""
+    """`[]` differs from `None`; a truthiness test dropped `[]` and wrongly refused big blocks."""
     with torch.device("meta"):
         model = _FatBlockModel()
     budgets = {0: 7 * _MiB, 1: 7 * _MiB}
@@ -870,8 +857,7 @@ def test_fp32_loader_exceptions_apply_without_a_quantizer():
 
 
 def test_fp32_exceptions_survive_a_transformers_that_only_takes_a_quantizer(monkeypatch):
-    """Signature support must pick the order: transformers' compute_module_sizes takes only hf_quantizer, so using it
-    unquantised dropped fp32 exceptions and undercharged T5 `wo`."""
+    """Transformers that only takes hf_quantizer must get it, or fp32 exceptions are dropped."""
     import types
 
     pytest.importorskip("accelerate")
@@ -955,8 +941,7 @@ def test_runtime_quantization_options_build_a_quantizer(monkeypatch):
 
 
 def test_the_pretrained_helper_forwards_the_no_split_override(monkeypatch):
-    """Passing the no-split override via `**config_kwargs` sends it to AutoConfig, so the plan silently used detected
-    classes and refused a model the planner can place."""
+    """Override via **config_kwargs goes to AutoConfig, so a placeable model gets refused."""
     import unsloth_zoo.device_map_planner as planner
 
     with torch.device("meta"):
@@ -1088,8 +1073,7 @@ class _Wide(nn.Module):
 
 
 def test_the_relaxed_reserve_is_never_below_the_old_shared_cap():
-    """Non-head reserves relax from the top of the range in 5% steps, which on identical cards can fall below the old
-    shared cap; the relaxed reserve must stay at or above it."""
+    """5% steps relaxing the non-head reserve can dip below the old shared cap; it must not."""
     kw = dict(hidden = 4096, ffn = 16384, vocab = 152064, layers = 24)
     with torch.device("meta"):
         model = _Wide(**kw)
@@ -1181,8 +1165,7 @@ def test_the_smaller_card_of_an_asymmetric_pair_is_not_packed_to_zero():
 
 
 def test_identical_cards_still_get_the_flat_average_share():
-    """Proration must be an exact no-op on identical cards (Muse Glimmer arithmetic); both sides need ceiling division,
-    since a floored `total * b // (n * b)` drifts off `-(-total // n)`."""
+    """Identical cards must prorate exactly, so both sides need ceiling division, not floored."""
     with torch.device("meta"):
         model = _Wide(hidden = 2048, ffn = 8192, vocab = 32768, layers = 20)
     budget = int(14.56 * _GiB)
@@ -1194,7 +1177,6 @@ def test_identical_cards_still_get_the_flat_average_share():
         plan = plan_device_map(model, max_memory = {d: budget for d in range(n)})
         assert plan is not None, f"{n} x 14.56 GiB was refused"
 
-        # Pre-proration: one flat average share, pinned head as its floor.
         total = plan.total_weight_bytes
         headroom = plan.headroom_bytes
         value = max(0, (n * budget - total - headroom) // n)
@@ -1267,8 +1249,7 @@ def test_prorating_never_charges_the_head_card_more_than_the_flat_average():
 
 
 def test_the_relaxation_ladder_still_offers_the_flat_average_rungs():
-    """Relaxation rungs are 5% of the mapping they scale from, so a prorated start can step past a flat-average rung
-    that fits; walk both ladders to keep every old rung."""
+    """Walk both 5% ladders: a prorated start can step past a flat-average rung that fits."""
     with torch.device("meta"):
         model = _Bins([68, 192], head = 82)
     plan = plan_device_map(
@@ -1573,9 +1554,7 @@ def test_a_sub_config_left_as_a_dict_is_still_read():
 
 @pytest.mark.parametrize("model_type", ["aya_vision", "cohere2_vision"])
 def test_a_wrapper_that_re_heads_its_text_tower_claims_no_transform(model_type):
-    """Aya Vision and Cohere 2 Vision use their own unscaled nn.Linear lm_head and logit_scale is absent from their
-    modeling files; the Cohere 2 config declares it, but crediting it reserves nothing real, so no transform is
-    claimed."""
+    """Aya/Cohere 2 Vision: unscaled lm_head; declared logit_scale is unused, so no transform."""
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     config = CONFIG_MAPPING[model_type]()
@@ -1584,8 +1563,7 @@ def test_a_wrapper_that_re_heads_its_text_tower_claims_no_transform(model_type):
 
 
 def test_a_wrapper_that_reuses_the_causal_lm_head_keeps_its_transform():
-    """Granite Speech builds an AutoModelForCausalLM, so the logits_scaling divide happens inside the text model and the
-    reserve is still owed; the name is absent from its file."""
+    """Granite Speech's logits_scaling divide runs in the text model, so the reserve is owed."""
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     config = CONFIG_MAPPING["granite_speech"]()
@@ -1604,8 +1582,7 @@ def test_a_wrapped_model_still_reports_its_transforms(wrapper):
 
 
 def test_the_muse_glimmer_multiplier():
-    """Muse Glimmer pre-scales by `output_multiplier` before its soft cap, so it owes both buffers; the multiplier is
-    applied in the composite's own forward and is named in no other config."""
+    """Muse Glimmer pre-scales by `output_multiplier` before soft cap, so it owes both buffers."""
     config = _Cfg(text_config = _Cfg(output_multiplier = 0.19611613513818404,
                                      final_logit_softcapping = 20.0))
     found = detect_logit_transforms(config)
@@ -1614,8 +1591,7 @@ def test_the_muse_glimmer_multiplier():
 
 
 def test_logits_scaling_multiplies_for_hyperclovax_and_divides_for_granite():
-    """logits_scaling multiplies for HyperCLOVA X but divides for Granite (per transformers' MuP comment); bucketing
-    HyperCLOVA X as a divide reports the wrong magnitude."""
+    """HyperCLOVA X logits_scaling multiplies, Granite's divides; mixing them misreports size."""
     granite = _Cfg(model_type = "granite", logits_scaling = 8.0)
     assert detect_logit_transforms(granite)["logit_scale_divide"] == 8.0
     assert detect_logit_transforms(granite)["logit_scale_multiply"] == 0.0
@@ -1627,8 +1603,7 @@ def test_logits_scaling_multiplies_for_hyperclovax_and_divides_for_granite():
 
 @pytest.mark.parametrize("tied", [True, False])
 def test_falcon_h1_multiplies_whether_or_not_the_head_is_tied(tied):
-    """FalconH1ForCausalLM multiplies the head unconditionally, with no tie_word_embeddings branch, so gating on tied
-    drops the reserve; the mlx/utils.py tied gate is a different contract."""
+    """Falcon-H1 multiplies the head tied or not; a tie_word_embeddings gate drops the reserve."""
     config = _Cfg(model_type = "falcon_h1", lm_head_multiplier = 4.0,
                   tie_word_embeddings = tied)
     assert detect_logit_transforms(config)["logit_scale_multiply"] == 4.0

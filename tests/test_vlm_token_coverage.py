@@ -1,6 +1,4 @@
-"""Offline guard that image/video/audio placeholder tokens of the vision and omni families in unslothai/notebooks stay
-in vlm_tokens for the CUDA collator and MLX loss mask; live per-model id check is in the network sweep
-(test_notebook_chat_templates.py / manual)."""
+"""Offline guard: vision/omni image, video and audio placeholders stay in vlm_tokens for CUDA and MLX."""
 import os, sys, importlib.util
 
 # Load vlm_tokens.py by file path: importing unsloth_zoo runs __init__, which raises ImportError without the unsloth package; the file is pure data.

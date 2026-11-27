@@ -13,9 +13,8 @@ ENABLED = os.environ.get("UNSLOTH_TEST_NOTEBOOK_MODELS", "") not in ("", "0", "f
 # no atomic role markers (e.g. zephyr-sft, multi-piece <|assistant|>) are listed in KNOWN_NON_ATOMIC (substring match)
 # so regressions cannot hide as SKIP.
 KNOWN_NON_ATOMIC = ("zephyr-sft",)
-# ERNIE's '<|end_of_sentence|>User:' and 'Assistant:' share no token prefix and <|end_of_sentence|> is not eos_token_id,
-# so packed rows have nothing to stop at; role-based labels are the documented answer; listed so a boundary regression
-# cannot hide as a skip.
+# ERNIE's role markers share no token prefix and <|end_of_sentence|> is not eos_token_id; packed
+# rows have no stop, so role-based labels are the answer; listed so regressions cannot hide.
 KNOWN_NO_BOUNDARY = ("ernie-4.5",)
 CACHE = os.environ.get("UNSLOTH_NOTEBOOK_TOK_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_nb_tok"))
 ALLOW_PATTERNS = ["*.json", "*.model", "tokenizer*", "merges*", "vocab*", "*.jinja", "*.txt"]
@@ -80,11 +79,9 @@ USERS = ["Zebra question alpha", "Quokka inquiry bravo"]
 ASSTS = ["Penguin answer delta", "Dolphin reply echo"]
 PLAIN = [{"role": "user", "content": USERS[0]}, {"role": "assistant", "content": ASSTS[0]},
          {"role": "user", "content": USERS[1]}, {"role": "assistant", "content": ASSTS[1]}]
-# Reasoning probe: the final assistant turn carries a think block + answer.
 REASON = [{"role": "user", "content": "Reason user one"},
           {"role": "assistant", "content": "<think>HIDDENREASON</think>VISIBLEANSWER"}]
-# Second conversation concatenated after PLAIN to stand in for packing; it opens with a system message since, with no
-# user marker left in the first sample, the old scan's last span ran into the next sample's system prompt.
+# Packing stand-in that opens with a system message (old scan ran its last span into it).
 NEXT_SYS, NEXT_USER, NEXT_ASST = "Ibex directive golf", "Ocelot question charlie", "Macaw answer foxtrot"
 NEXT = [{"role": "system", "content": NEXT_SYS},
         {"role": "user", "content": NEXT_USER},

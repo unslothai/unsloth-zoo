@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Double-BOS detection in sft_prepare_dataset: Llama-3 templates have no literal BOS, so arm A was the only live
-detector, which read row[field][0], one character no multi-char BOS can match; assertions read tokenized output since
-forked children hide state."""
+"""Double-BOS detection in sft_prepare_dataset; Llama-3 has no literal BOS, so arm A (row[field][0],
+one char) was the only live arm; tests read tokenized output (forked children hide state)."""
 
 import pytest
 from datasets import Dataset

@@ -65,7 +65,6 @@ def test_flamingo_features_stay_full_length(model_type):
     batch = UnslothVisionDataCollator(_model(model_type), processor)(_rows())
     assert tuple(batch["input_features"].shape) == (2, 128, 3000)
     assert tuple(batch["input_features_mask"].shape) == (2, 3000)
-    # Text is still padded to the longest row, with labels masked on the padding.
     assert batch["input_ids"].shape == batch["labels"].shape == batch["attention_mask"].shape
     assert (batch["attention_mask"] == 0).any()
     assert ((batch["labels"] != -100) & (batch["attention_mask"] == 0)).sum() == 0

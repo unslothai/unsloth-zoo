@@ -147,7 +147,6 @@ def _sweep(device, count, after_kernels, hip = None, subset = None, strided = Fa
             return fired_after_kernels
         # Unsloth's restore: a target marked restoring means a retry would subtract the adapter twice.
         assert not any(t.restoring for t in unfold), f"allocation {k} poisoned the weights"
-        # The failed attempt keeps no device copy of a store it uploaded.
         assert all(s.dev is None for s in uploads), f"allocation {k} kept an uploaded store"
         fired_after_kernels += after_kernels
         with _hip(hip): ex.exact_unfold(ts)
@@ -203,8 +202,7 @@ _CASES = (
 
 
 def check_preparation(device):
-    # From the start of exact_unfold (after the first write the dispatch check below covers every op); a strided view
-    # on the per-target path, which addresses it by storage offsets.
+    # Failing from exact_unfold's start; per-target strided views address storage offsets.
     for count, hip, subset in _CASES:
         _sweep(device, count, False, hip, subset)
     _sweep(device, 1, False, strided = True)
@@ -221,8 +219,7 @@ def check_no_device_allocation_after_write(device):
 
 
 def check_failure_after_write_is_never_silent(device):
-    # Fail the k-th op after the first write with a corrupted adapter: the caller must see restoring targets (and
-    # give up) or the mismatch; never a clean state over wrong bits that a retry accepts.
+    # Failure after a corrupted write: never a clean state, only restoring targets or mismatch.
     for count, hip, subset in ((2, None, None), (1, None, None), (2, "7.0", None)):
         for k in range(1, 200):
             ws, ts, unfold, before, mode, error = _after_write(device, count, hip, subset, fail = k, corrupt = True)

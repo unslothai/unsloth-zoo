@@ -1,5 +1,4 @@
-"""Tests full-FT norm fp32 upcast (dangling else left bf16); norms claimed via _pre_set_compute_dtype are never
-overwritten; UNSLOTH_DISABLE_FLOAT32_UPCAST=1 reverts."""
+"""Full-FT norm fp32 upcast; pre-set norms untouched; UNSLOTH_DISABLE_FLOAT32_UPCAST=1 reverts."""
 import os
 from types import SimpleNamespace
 
@@ -61,7 +60,6 @@ class _Tiny(nn.Module):
     def __init__(self, dtype=torch.bfloat16, with_bias=False):
         super().__init__()
         self.model = _Inner(with_bias=with_bias)
-        # Tied lm_head: same Parameter object as embed_tokens.weight.
         self.lm_head = nn.Linear(8, 16, bias=False)
         self.lm_head.weight = self.model.embed_tokens.weight
         self.to(dtype)
@@ -175,7 +173,6 @@ def test_full_ft_defers_to_pre_set_compute_dtype_on_norm():
     m, p = _run(full_finetuning=True,
                 tag_pre_set_compute_dtype=("model.layers.0.input_layernorm",))
     assert p["model.layers.0.input_layernorm.weight"].dtype == torch.bfloat16
-    # Untagged norms still upcast.
     assert p["model.norm.weight"].dtype == torch.float32
     assert p["model.layers.0.self_attn.q_norm.weight"].dtype == torch.float32
 
@@ -710,8 +707,7 @@ def test_instance_forward_wrapper_rebinds_on_deepcopy():
 
 
 def test_instance_forward_wrapper_is_picklable():
-    """Instance-forward wrapper must stay picklable: no instance-bound function in __dict__ (torch.load cannot resolve
-    it by import path); forward must be a class attribute rebuilt by __reduce__."""
+    """Picklable: torch.load can't resolve an instance-bound forward; __reduce__ rebuilds it."""
     import io
     from unsloth_zoo.training_utils import _wrap_forward_in_bf16_autocast
     from _pickle_base import PickleBaseNet

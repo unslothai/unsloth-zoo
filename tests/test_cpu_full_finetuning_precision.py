@@ -213,11 +213,9 @@ def test_forced_float32_overrides_any_explicit_dtype(tiny, dtype, monkeypatch):
     loaded, printed = _load_dtype(monkeypatch, tiny, full_finetuning = True, dtype = dtype,
                                   float32_mixed_precision = True)
     assert loaded == torch.float32
-    # No float16 fallback warning for a dtype float32_mixed_precision = True replaces.
     assert "using torch.bfloat16 instead" not in printed
 
 
-# The fit check sizes the model that will train.
 
 @pytest.mark.usefixtures("bf16_cpu")
 def test_fit_check_counts_a_resized_vocabulary(tiny, monkeypatch):
@@ -329,8 +327,7 @@ def test_float32_master_weights_save_and_reload_as_float32(tiny, tmp_path):
 
 
 def _changed_fraction(model, lr):
-    """One bf16-autocast forward / backward and one fused AdamW step at ``lr``: the fraction of weights that moved,
-    and the dtypes of AdamW's states."""
+    """One bf16-autocast step at lr: returns the moved-weight fraction and AdamW state dtypes."""
     torch.manual_seed(0)
     ids = torch.randint(3, 100, (2, 16))
     before = [p.detach().clone() for p in model.parameters()]

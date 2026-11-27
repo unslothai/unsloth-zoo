@@ -83,7 +83,6 @@ def test_underflowed_forced_probabilities_keep_natural_routing(replay):
     assert ids[0].tolist() == [0, 1]
     natural = x[0].detach().softmax(-1)[[0, 1]]
     torch.testing.assert_close(weights[0], natural / natural.sum())
-    # Row 1 still replays.
     assert ids[1].tolist() == [1, 2]
     forced = x[1].detach().softmax(-1)[[1, 2]]
     torch.testing.assert_close(weights[1], forced / forced.sum())

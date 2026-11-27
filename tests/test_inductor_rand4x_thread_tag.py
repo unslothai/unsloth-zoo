@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The rand4x-off cache key tag must reach a compile on another thread (a reentrant checkpoint's
-recompute compiles on autograd's device thread; torch >= 2.12 keeps config per thread)."""
+"""rand4x-off cache tag must reach compiles on other threads; torch 2.12+ config is per-thread."""
 
 import json
 import os

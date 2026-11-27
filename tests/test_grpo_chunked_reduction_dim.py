@@ -115,8 +115,7 @@ def test_it_still_matches_a_plain_log_softmax(batch, seq, chunks, temperature):
 
 
 def test_a_mismatched_lm_head_fails_loudly():
-    """Wrong-width hidden states reshape cleanly when the element count divides (2x16x768 vs 1536-wide lm_head gives 16
-    rows, not 32), so the error must surface here."""
+    """Mismatched widths reshape silently when element count divides; error must surface."""
     torch, fn, dev, dtype, hidden, vocab, _ = _setup()
     hidden_states = torch.randn(2, 16, hidden // 2, device = dev, dtype = dtype)
     lm_head = torch.randn(vocab, hidden, device = dev, dtype = dtype)

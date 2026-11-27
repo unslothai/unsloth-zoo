@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A table's finalizer can run inside any allocation, including one made while _FILES_LOCK is held on the same
-thread (a cyclic GC pass inside _acquire_file). It must not block on that lock: the thread would wait on itself."""
+"""Finalizers can run in any allocation made under _FILES_LOCK; blocking there self-deadlocks."""
 
 import gc
 import threading
@@ -73,8 +72,7 @@ class _FakeMapping:
 
 
 def test_a_release_queued_during_another_drain_is_not_stranded(monkeypatch):
-    """Thread B queues a release while thread A holds the lock for its last drain: B's non-blocking acquire fails,
-    so A must recheck the queue after unlocking or B's mappings stay open until some later open or close."""
+    """Thread A must recheck the queue after unlocking, else B's queued release stays stranded."""
     early, late = _FakeMapping("early"), _FakeMapping("late")
     real_drain = fts._drain_releases
     arrived = []

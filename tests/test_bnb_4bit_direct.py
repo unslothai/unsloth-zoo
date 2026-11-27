@@ -22,8 +22,7 @@ import pytest
 import torch
 
 bnb = pytest.importorskip("bitsandbytes")
-# Not importorskip: on a CPU-only torch this module raises AttributeError at import
-# (torch._C has no _cuda_getCurrentRawStream), which importorskip lets through as a collection error.
+# Not importorskip: it lets the CPU-only torch AttributeError through as a collection error.
 try:
     from bitsandbytes.backends.cuda import ops as bops
 except Exception as exc:

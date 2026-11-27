@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 on the paths around the scoring helpers: tied top-p cutoffs, logprob
-recompute, entropy scoring and raw vllm.SamplingParams overrides."""
+"""Tests UNSLOTH_GRPO_TRUNCATED_SUPPORT=1: tied top-p, recompute, entropy, raw SamplingParams."""
 
 import inspect
 import os
@@ -132,7 +131,6 @@ def test_recompute_helper_takes_the_truncated_support(monkeypatch):
     full = _new_logps(monkeypatch, support = False)
     assert not torch.allclose(truncated, full)
     torch.testing.assert_close(_new_logps(monkeypatch, support = True, recompute = True), truncated)
-    # Off, the recompute helper is untouched.
     torch.testing.assert_close(_new_logps(monkeypatch, support = False, recompute = True), full)
 
 
@@ -163,8 +161,7 @@ class _RawSamplingParams:
                 setattr(self, key, value)
 
 
-# Verbatim copy of grpo_update_SamplingParams from unsloth after change 11595 (unsloth/models/rl_replacements.py); the
-# compiled trainer module defines it, so the trainer class's module carries it.
+# Verbatim unsloth grpo_update_SamplingParams after change 11595, for the compiled trainer.
 _UNSLOTH_UPDATE = '''
 import inspect
 def grpo_update_SamplingParams(
@@ -248,9 +245,8 @@ def test_raw_sampling_params_follow_unsloth_generation(monkeypatch):
 
 
 def test_raw_sampling_params_follow_zoo_generation_helper(monkeypatch):
-    # Without unsloth's copy (unsloth before change 11595), generation uses this module's grpo_update_SamplingParams,
-    # which copies only non-empty list / tuple fields: raw scalars never reach the rollout, so scoring must not use
-    # them.
+    # Without unsloth's copy (before change 11595), zoo grpo_update_SamplingParams copies only
+    # non-empty list/tuple fields, so raw scalars never reach rollouts; scoring must not use them.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
     # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
@@ -283,9 +279,8 @@ def test_boundary_tied_sampled_token_is_in_the_denominator():
 
 
 def test_raw_sampling_params_temperature_is_not_a_false_blocker(monkeypatch):
-    # Neither generation helper applies a raw SamplingParams temperature (unsloth skips it, this module copies list
-    # fields only): the rollout samples at the trainer temperature, so a raw temperature must not block truncated
-    # scoring.
+    # Rollouts sample at the trainer temperature: neither helper applies a raw SamplingParams
+    # temperature (unsloth skips it; zoo copies lists only), so it must not block truncated scoring.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
     # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")

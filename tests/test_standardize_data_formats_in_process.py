@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""In-memory datasets map in process unless num_proc or the env override asks for workers; cache-backed ones keep
-the pool. The output is the same either way."""
+"""In-memory maps run in process unless num_proc/env asks; cache-backed keep pool; same output."""
 
 import pytest
 from datasets import Dataset, load_from_disk

@@ -29,15 +29,13 @@ def _dtypes():
 
 
 def _staged(block, stages, head_dim, dtype):
-    """The formula the module shipped with, including its dtype rule: any dtype other than bf16 or fp16 counts as 4
-    bytes, four times a float8. Kept as the floor the estimate must not drop below."""
+    """Shipped formula kept as the floor: any dtype but bf16/fp16 counts as 4 bytes."""
     size = 2 if dtype in (torch.bfloat16, torch.float16) else 4
     return stages * block * head_dim * size * 2 + flex._SHMEM_OVERHEAD
 
 
 class TestTheEstimateIsNeverLowerThanItWas:
-    """The estimate must never drop below the shipped formula: correcting float8 to 1 byte lowered it and would have
-    closed the gate on a case that opens today, so each term keeps its own dtype rule."""
+    """Never below the shipped formula: float8 at 1 byte would close a gate that opens today."""
 
     @pytest.mark.parametrize("block", [16, 32, 64, 128])
     @pytest.mark.parametrize("stages", [1, 2, 3])
@@ -105,8 +103,7 @@ class TestTheLimitIsTheOneTritonEnforces:
 
 
 class TestTheFallbackLadder:
-    """The estimate only decides whether to intervene, not what survives: Inductor catches OutOfResources per candidate,
-    so an unfit config costs one discarded candidate."""
+    """Estimate gates intervention only; Inductor drops an unfit candidate (OutOfResources)."""
 
     class FakeConfig:
         def __init__(self, bm1, bn1, bm2, bn2, num_stages, num_warps):

@@ -191,8 +191,7 @@ def _tiny_llama():
 
 
 def test_plain_head_weight_disabled_adapters_and_hooks():
-    """The raw-weight projection must equal calling the head: PEFT's disable_adapter() runs the base head, and hooks
-    or an instance forward act on the module call."""
+    """Must equal the head call: PEFT disable_adapter() runs base head; hooks act on the call."""
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.cpu.ops import _plain_head_weight
     model = get_peft_model(_tiny_llama(), LoraConfig(r = 2, target_modules = ["q_proj"], modules_to_save = ["lm_head"]))
@@ -252,8 +251,7 @@ def test_head_off_cpu_keeps_trl_forward():
 
 
 def test_trainable_head_metrics_only_requested(monkeypatch):
-    """Trainable head: only the requested detached metrics are computed (ORPO asks for mean_logits alone), and the
-    values match an fp64 oracle."""
+    """Trainable head: only requested detached metrics (ORPO's mean_logits); values match fp64."""
     from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
     torch.manual_seed(0)
     hidden = torch.randn(13, 8, requires_grad = True)
@@ -356,9 +354,8 @@ def _ddp_step(tmp_path, chunked, model_dir):
 
 
 def test_ddp_trainable_head_grads_synced(tmp_path):
-    """CPU gloo DDP, 2 ranks with different rows, untied trainable lm_head, find_unused_parameters = True (the Trainer
-    default without gradient checkpointing): the head runs inside DDP's forward, so the step runs and the head
-    gradient is all-reduced across ranks, equal to TRL's own forward."""
+    """CPU gloo DDP (2 ranks), untied trainable lm_head, find_unused_parameters=True (Trainer
+    default w/o grad checkpointing): head runs in DDP's forward; grad all-reduced, equals TRL's."""
     if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
         pytest.skip("no gloo")
     model_dir = tiny_snapshot()

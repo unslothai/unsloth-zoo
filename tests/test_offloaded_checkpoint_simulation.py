@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU-only offloaded checkpoint shim tests, so they also run on macOS and Windows; the GPU counterpart with real
-pinned-buffer offload is test_offloaded_checkpoint_rng.py."""
+"""CPU-only so they run on macOS and Windows; the GPU twin is test_offloaded_checkpoint_rng.py."""
 import functools
 import inspect
 
@@ -244,8 +243,7 @@ def test_use_reentrant_false_is_accepted_and_ignored(gc_module):
 
 @pytest.mark.parametrize("initial", [None, []], ids = ["unpatched-to-None", "import-time-empty-list"])
 def test_buffers_are_reinitialised_when_absent(gc_module, monkeypatch, initial):
-    """unpatch nulls the buffers, so None - not [] - is the normal starting state; at import CPU_BUFFERS
-    is [] and GPU_BUFFERS None. GPU_BUFFERS is the sentinel (both reset it to None)."""
+    """Buffers reinit when absent: None (not []) is the normal starting state after unpatch."""
     monkeypatch.setattr(gc_module, "CPU_BUFFERS", initial, raising = False)
     monkeypatch.setattr(gc_module, "GPU_BUFFERS", None, raising = False)
     called = []
@@ -347,9 +345,7 @@ def test_public_signature_is_unchanged(gc_module):
 
 @pytest.fixture
 def restore_checkpoint_patches(monkeypatch):
-    """Patch rebinds transformers.modeling_utils.checkpoint and sets UNSLOTH_PATCHED; restoring only torch's checkpoint
-    left transformers on the offloaded shim for the whole worker, which made test_gemma4_unified_forced_float32's
-    backward die allocating pinned host memory on CPU runners."""
+    """Restores transformers' checkpoint too; a leftover shim broke test_gemma4_unified_forced_float32."""
     import transformers.modeling_utils
 
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", torch.utils.checkpoint.checkpoint)

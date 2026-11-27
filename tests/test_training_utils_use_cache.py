@@ -6,8 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU-pure tests for use_cache in prepare_model_for_training (unsloth_zoo/training_utils.py): it disables the KV cache,
-dead weight under gradient checkpointing, on every nested config; restore undoes it."""
+"""prepare_model_for_training disables use_cache on every nested config; restore undoes it."""
 
 from __future__ import annotations
 
@@ -257,8 +256,7 @@ def test_absent_marker_survives_copying_the_model(clone):
     copied.config.text_config.to_json_string()
 
 
-# A config first reached on a later disable_use_cache call must be recorded too: recording only on the first pass left
-# it disabled but unrecorded, so restore could not undo it.
+# Late-reached configs must be recorded by disable_use_cache too, or restore cannot undo them.
 
 _ABSENT_PARAM = object()
 

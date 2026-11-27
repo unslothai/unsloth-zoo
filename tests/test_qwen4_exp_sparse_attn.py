@@ -70,8 +70,7 @@ def _masks(kind, b, s):
 def _inputs(b, s, rotary, seed = 1):
     g = torch.Generator().manual_seed(seed)
     hidden = torch.randn(b, s, 64, generator = g, dtype = torch.float64)
-    # Text positions on all three mrope grids: older transformers' rotary indexes (3, batch, seq) and newer ones
-    # expand to it, so this is the one shape every supported version accepts.
+    # Text positions (3, batch, seq): the one shape all supported transformers versions accept.
     pos = torch.arange(s).unsqueeze(0).expand(3, b, -1)
     cos, sin = rotary(hidden.float(), pos)
     return hidden, (cos.double(), sin.double())
@@ -99,8 +98,7 @@ def _zero_index_keys(indexer):
 @pytest.mark.parametrize("ties", [False, True], ids = ["random", "all_tied"])
 @pytest.mark.parametrize("kind", ["causal", "right_pad", "packed"])
 def test_vectorised_selection_equals_reference_loop(monkeypatch, kind, ties, exact):
-    # UNSLOTH_QWEN4_EXP_EXACT_TIES=1: token identity with transformers' untouched per-query loop, ties included.
-    # Default (off): at a k-th / (k+1)-th score tie another, equally-scored block may be kept: same score multiset.
+    # UNSLOTH_QWEN4_EXP_EXACT_TIES=1: reference tokens; default: same score multiset at ties.
     monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1" if exact else "0")
     config, attention, rotary = _module()
     if ties:

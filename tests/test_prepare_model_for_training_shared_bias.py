@@ -57,7 +57,6 @@ def test_float16_shared_bias_owners(kind):
     # Before the fix this forward raised: decoder.bias is Float, decoder.weight Half.
     logits = model(input_ids=input_ids).logits
     torch.testing.assert_close(logits, expected, rtol=0, atol=0)
-    # Still one tied float32 Parameter under the same state_dict keys.
     assert master is head._parameters["bias"] is head.decoder._parameters["bias"]
     assert master.dtype == torch.float32
     assert sum(p is master for p in model.parameters()) == 1

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Inductor mix-order reduction (2.10-2.14) and rand4x dropout (2.13-2.14) are off on those releases only,
-fixed in torch 2.15, and left alone when the user opts back in."""
+"""Mix-order (2.10-2.14) and rand4x dropout (2.13-2.14) are off until 2.15 unless opted in."""
 
 import os
 import subprocess

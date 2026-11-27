@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""add_new_tokens skips transformers' mean_resizing (fp32 copies + a d x d covariance per matrix) when it overwrites
-every grown row anyway; the resulting embeddings and lm_head are bit-identical to the default call."""
+"""Skipping mean_resizing in add_new_tokens is bit-identical when new rows are overwritten."""
 
 import pytest
 import torch

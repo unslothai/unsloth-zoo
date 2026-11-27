@@ -230,9 +230,8 @@ def test_static_cache_left_pad_kill_switch_keeps_guard(monkeypatch):
 
 @pytest.mark.parametrize("floaty", [False, True])
 def test_static_cache_left_pad_rows_given_every_slot(floaty):
-    """Batched generate with a static cache: the mask spans max_cache_len, and Unsloth's sdpa_mask fix gives a left-pad
-    query row (which attends to nothing) every slot, unfilled ones included. The reference indexes the position table
-    by kv slot, so it read past it; real rows must select exactly what a mask cut to the filled slots selects."""
+    """Unsloth's sdpa_mask fix gives left-pad rows every slot, unfilled ones included; the reference
+    reads past its position table, so real rows must match a filled-slot mask."""
     from unsloth_zoo.temporary_patches.qwen4_exp import _make_fast_indexer_forward
     idx = make_indexer()
     reference = transformers_forward()

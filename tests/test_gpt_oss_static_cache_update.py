@@ -192,8 +192,7 @@ def test_static_cache_generation_is_bit_identical(tmp_path):
 
 
 def test_graphable_roll_wrapper_does_not_disable_the_fast_update(monkeypatch):
-    # Unsloth's CUDA-graph decode replaces StaticSlidingWindowLayer.update with a tagged graph-safe roll during its
-    # warm-up, which can be the first one-token step: the check must not cache a refusal from that wrapper.
+    # CUDA-graph warm-up's tagged roll can be the first step; check must not cache its refusal.
     sliding = cache_utils.StaticSlidingWindowLayer
     classes = (cache_utils.Cache, cache_utils.StaticLayer, sliding)
     for c in classes:  # verify whatever transformers this is

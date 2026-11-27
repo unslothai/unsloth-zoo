@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for unsloth_zoo.hf_xet_fallback (watchdog, Xet to HTTP policy, file/snapshot entrypoints, UNSLOTH_DISABLE_XET,
-HF_HUB_DISABLE_XET); CPU-only, no network, no real subprocess; imports unsloth_zoo_downloads to skip torch and GPU
-init."""
+"""Tests for hf_xet_fallback: CPU-only, no network, no real subprocess; skips torch and GPU init."""
 
 from __future__ import annotations
 
@@ -78,9 +76,8 @@ def _wait(predicate, timeout: float = 2.0, step: float = 0.02) -> bool:
 def _watch_while_growing(
     grown: Path, **watchdog_kwargs
 ) -> "tuple[list[str], float, float, list[int]]":
-    """Grows the file every 0.05 s past its stall timeout and returns (stall calls, longest write gap, stall_timeout,
-    sizes seen); the longest gap tells a starved grower, a real stall the watchdog should fire on, from one that kept
-    writing (issue 1349)."""
+    """Grows a file every 0.05 s past its stall timeout; the longest write gap tells a starved
+    grower or real stall from one still writing (issue 1349)."""
     grow_stop = threading.Event()
     writes: list[float] = []
 
@@ -114,8 +111,7 @@ def _watch_while_growing(
         time.sleep(stall_timeout + 0.5)
     finally:
         stop.set()
-        # Join the watchdog before taking the stop timestamp, not just signal it: a callback can still land after the
-        # signal, so the interval must follow the join.
+        # Join the watchdog before the stop timestamp: a callback can land after the signal.
         watchdog[0].join(timeout = 10)
         stopped = time.monotonic()
         grow_stop.set()
@@ -413,7 +409,6 @@ def test_get_state_absent_cache_root(tmp_path, monkeypatch):
 
 
 def test_get_state_skips_local_paths(hf_cache):
-    # Filesystem paths are not repo IDs and must be ignored without error.
     assert xf.get_hf_download_state(
         ["/abs/path", "./rel", "~user", "c:\\x", "c:/x"]
     ) == (0, False)
@@ -914,8 +909,7 @@ def test_is_retryable_download_error_classification():
 
 
 def test_local_entry_not_found_transient_is_retryable():
-    """A transient LocalEntryNotFoundError (HEAD connection error or timeout) is retryable; a genuine offline miss stays
-    deterministic, even on the Xet rung where the named set wins."""
+    """Transient LocalEntryNotFoundError is retryable; a genuine offline miss stays deterministic on Xet."""
     def f(exc):
         return xf._is_retryable_download_error(exc, on_xet = True)
 
@@ -1036,8 +1030,7 @@ def test_attempts_knob_rejects_junk_and_clamps(monkeypatch):
 
 
 def test_http_rung_retries_a_transient_error(monkeypatch):
-    """The Xet bridge CDN serves Xet blobs over plain HTTP too, so a degraded CDN 5xx fails both rungs; the HTTP rung
-    gets its own retry budget (unslothai/unsloth-zoo issue 1122)."""
+    """CDN 5xx fails both rungs; HTTP gets its own retries (unslothai/unsloth-zoo issue 1122)."""
     fake = _install(
         monkeypatch,
         [("retryable_error", "503 Service Unavailable"),
@@ -1096,8 +1089,7 @@ def test_http_attempts_knob_rejects_junk_and_clamps(monkeypatch):
 
 
 def test_http_retry_prepares_the_cache_exactly_once(monkeypatch):
-    """The purge runs once at the transport change; per HTTP child it would spare the fresh partial (younger than
-    active_grace), forcing force_download and restarting from zero."""
+    """Purge once at transport change; per child, sparing the fresh partial forces a restart."""
     prepared = []
     monkeypatch.setattr(
         xf, "_default_prepare_for_http",
@@ -1148,8 +1140,7 @@ def test_wait_before_http_retry_is_interruptible(monkeypatch):
 
 
 def test_transient_xet_error_is_charged_only_when_http_rescues_it(monkeypatch):
-    """A CDN fault failing both rungs is not evidence against this machine's Xet; charging it demoted a healthy machine
-    to HTTP for 24h. Only an HTTP rescue proves the Xet path alone was broken."""
+    """Only an HTTP rescue proves Xet broke; both-rung CDN faults must not demote Xet for 24h."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     err = ("retryable_error", "503 Service Unavailable")
@@ -1179,8 +1170,7 @@ def test_crash_on_xet_is_charged_only_when_http_rescues_it(monkeypatch):
 
 
 def test_offline_mode_is_deterministic_on_both_rungs(monkeypatch):
-    """OfflineModeIsEnabled is an OSError with no errno or builtin name; without an entry in _DETERMINISTIC_ERROR_NAMES,
-    a deliberately offline repo gets an HTTP child and a destructive purge."""
+    """OfflineModeIsEnabled needs a _DETERMINISTIC_ERROR_NAMES entry or purges offline repos."""
     from huggingface_hub.errors import OfflineModeIsEnabled
 
     assert "OfflineModeIsEnabled" in xf._DETERMINISTIC_ERROR_NAMES
@@ -1193,8 +1183,7 @@ def test_offline_mode_is_deterministic_on_both_rungs(monkeypatch):
 
 
 def test_deterministic_http_error_does_not_charge_a_held_transport_fault(monkeypatch):
-    """A held Xet fault followed by an unrelated deterministic HTTP failure (disk full) is not charged: the download
-    succeeded on neither rung, so Xet was never proven broken."""
+    """Deterministic HTTP failure (disk full) after a held Xet fault is not charged to Xet."""
     outcomes = []
     monkeypatch.setattr(xf, "_record_xet_outcome", lambda ok, reason = "": outcomes.append(ok))
     _install(
@@ -1221,8 +1210,7 @@ def test_a_stall_is_still_charged_when_a_later_error_ends_the_ladder(monkeypatch
 
 
 def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeypatch):
-    """An unsafe partial that cannot be cleared forces a clean re-download on the first HTTP child only; once gone,
-    later retries must resume rather than restart from zero."""
+    """Unclearable unsafe partial forces a clean re-download on the first HTTP child only; then resume."""
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     # Present at the transition and GONE once the forced child ran: that is what makes a resume safe.
@@ -1244,8 +1232,7 @@ def test_http_retry_resumes_instead_of_forcing_a_second_clean_redownload(monkeyp
 
 
 def test_http_retry_keeps_forcing_while_the_unsafe_partial_survives(monkeypatch):
-    """A failed forced HTTP child must keep forcing: one child having run is not proof, only the partial disappearing
-    is; huggingface_hub unlinks .incomplete only after HEAD, so resuming finalizes a corrupt blob."""
+    """Keep forcing until the partial is gone; hub unlinks .incomplete after HEAD, so resuming corrupts."""
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
     monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: True)
     monkeypatch.setattr(
@@ -5762,8 +5749,7 @@ def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeyp
     real = xf._incomplete_partial_names
 
     def _staged(*a, **k):
-        # Staged on the HTTP child, not the probe (the transition also probes the cache); gone by the second HTTP child
-        # (guard releases), then a sibling recreates it.
+        # Staged on HTTP children, not the probe; gone by the second, a sibling recreates it.
         http_children = len([c for c in fake.calls if c.disable_xet])
         if http_children == 1 and partial.exists():
             partial.unlink()

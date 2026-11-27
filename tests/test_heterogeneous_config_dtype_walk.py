@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A heterogeneous config must not kill the dtype walk in patch_model_and_tokenizer: transformers 5.15 raises
-AmbiguousGlobalPerLayerAttributeError, which getattr's default does not catch (seen loading unsloth/gemma-4-E2B-it on
-transformers 5.15.1); CPU-only synthetic test."""
+"""A heterogeneous config must not break the dtype walk in patch_model_and_tokenizer: transformers
+5.15 raises AmbiguousGlobalPerLayerAttributeError, which getattr's default does not catch."""
 
 import sys
 import types

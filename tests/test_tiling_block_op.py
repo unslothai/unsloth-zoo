@@ -214,7 +214,6 @@ def test_auto_inside_the_block_tiles_only_when_it_pays(in_unsloth_block, monkeyp
     x = torch.randn(1, 64, H, requires_grad = True)
     _, breaks = _run(block, x)
     assert seen == [] and breaks == 0
-    # Same rows once the estimated saving clears the floor: tiled, and still one graph.
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_MIB", 0)
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_FRACTION", 0.0)
     torch._dynamo.reset()
@@ -246,7 +245,6 @@ def test_shared_adapters_over_different_weights_keep_the_tile_frame_route(in_uns
 
 
 def test_parameter_hooks_run_once(in_unsloth_block):
-    # A register_hook on a parameter runs once, on the op's returned gradient, not once per tile as well.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     ref = copy.deepcopy(mlp)
@@ -358,8 +356,7 @@ _PartlyUsedMLP.__name__ = _PartlyUsedMLP.__qualname__ = "FooPartlyUsedMLP"
 
 
 def test_an_unused_parameter_keeps_the_tile_frame_route(in_unsloth_block):
-    # The op would return zeros for a parameter the forward never uses (Adam's moments and weight decay still move
-    # it); the install probe keeps such a module on the per-tile route (None gradient).
+    # The op would return zeros for an unused parameter; the probe keeps the module per-tile.
     torch.manual_seed(0)
     mlp = _PartlyUsedMLP()
     R.install_module(mlp, "rows:8")
@@ -418,8 +415,7 @@ def test_the_install_probe_leaves_buffers_alone(in_unsloth_block):
 
 
 def test_functional_call_keeps_the_tile_frame_route(in_unsloth_block):
-    # The op reads the live module's weights at run time, after functional_call has restored them, so a replaced
-    # frozen projection would be ignored.
+    # The op reads live weights after functional_call restores them; replacements are ignored.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")
@@ -448,8 +444,7 @@ _ScaledMLP.__name__ = _ScaledMLP.__qualname__ = "FooScaledMLP"
 
 @pytest.mark.parametrize("kind", ["frozen_parameter", "all_parameters", "buffer_only"])
 def test_functional_call_substitutions_keep_the_tile_frame_route(in_unsloth_block, kind):
-    # A replacement nn.Parameter or buffer would make the op run the live module after functional_call has restored
-    # it (wrong output), or fail to find the module (RuntimeError).
+    # Replacing a parameter or buffer breaks the op: wrong output or RuntimeError.
     torch.manual_seed(0)
     mlp = _ScaledMLP() if kind == "buffer_only" else _LoraMLP()
     R.install_module(mlp, "rows:8")

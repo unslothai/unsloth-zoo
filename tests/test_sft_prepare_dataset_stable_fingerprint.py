@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""sft_prepare_dataset fingerprints its tokenizing map the same way in every process, so a rerun loads the
-cached Arrow file, and any change to what the map produces still changes the fingerprint. CPU-only."""
+"""Fingerprints are stable across processes, so reruns hit the cache; output changes move them."""
 
 import json
 import os

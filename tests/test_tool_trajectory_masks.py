@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Label masks for multi-turn tool-calling SFT: assistant calls and answers trained, tool results, user and system turns
-masked; sft_prepare_dataset's messages path uses assistant_only_loss with TRL's training template, or
-train_on_responses_only when TRL has none."""
+"""Label masks: assistant calls and answers trained; tool results, user and system turns masked. The
+messages path uses assistant_only_loss with TRL's template, else train_on_responses_only."""
 
 from types import SimpleNamespace
 

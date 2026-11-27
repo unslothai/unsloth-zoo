@@ -88,8 +88,7 @@ except Exception:
 
 
 def test_pr690_runtime_blockmask_does_not_reach_eager_inference_path():
-    """Non-grad flex inputs must get a tensor or None from create_causal_mask, never a BlockMask (PR 690); otherwise
-    gpt-oss generate() raises Tensor += BlockMask TypeError."""
+    """Non-grad flex: tensor/None, never BlockMask (PR 690); else generate() raises TypeError."""
     import subprocess
     import sys as _sys
 

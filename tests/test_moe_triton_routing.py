@@ -252,7 +252,6 @@ def test_first_call_verification_disables_on_mismatch(monkeypatch):
 
 
 def test_negative_control_unstable_order_is_caught():
-    # The equality check must be able to fail: a swapped pair inside one expert is detected.
     ids = torch.zeros((8, 1), dtype = torch.int64, device = DEV)
     counts, order, offsets = mrt._launch(ids, 4)
     bad = order.clone()

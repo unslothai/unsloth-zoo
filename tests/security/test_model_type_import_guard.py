@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""model_type from a downloaded config.json is interpolated into imports and cache names, so get_transformers_model_type
-is the single choke point every caller passes through; tests are CPU-only and network-free."""
+"""Untrusted model_type reaches imports and cache names only via get_transformers_model_type."""
 
 import re
 
@@ -20,7 +19,6 @@ class _StubConfig:
         return {"model_type": self._model_type}
 
 
-# --- rejection ---------------------------------------------------------------
 
 @pytest.mark.parametrize("model_type", [
     "llama'); import os; os.system('touch /tmp/pwned",
@@ -45,7 +43,6 @@ def test_path_traversal_cannot_survive():
         assert all(re.fullmatch(r"[a-z0-9_]+", t) for t in result), result
 
 
-# --- no legitimate model_type may be rejected --------------------------------
 
 def test_every_shipped_model_type_accepted():
     """A false rejection breaks loading a real model, so the whole transformers set plus known remote-code model types must stay accepted."""

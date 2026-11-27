@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Mllama collation of mixed image and text-only batches and prompt-completion cross_attention_mask; the stub processor
-rejects batches where only some rows have images, like MllamaProcessor, and masks from the image token on."""
+"""Mllama mixed-batch collation and cross_attention_mask; stub rejects partial-image batches."""
 
 from __future__ import annotations
 
@@ -157,7 +156,6 @@ def test_prompt_completion_cross_attention_mask_covers_completion():
     assert cross.shape[:2] == out["input_ids"].shape
     m0 = out["attention_mask"][0].bool()
     ids0 = out["input_ids"][0][m0]
-    # Every token from the image token on, completion included, attends to the image
     assert ids0.tolist() == [IMG_ID, 1, 2, 3]
     assert (cross[0][m0][:, 0] == 1).all()
     assert (cross[1] == 0).all()

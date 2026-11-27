@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Inkling 2 experts (transformers >= 5.24) take `act_fn(gate, up)`, a softcapped SwiGLU, and accumulate in fp32: the
-MoE backends must run the experts' own `_apply_gate`, not `act_fn(gate) * up`."""
+"""Inkling 2 (transformers >= 5.24): MoE backends must run _apply_gate, not act_fn(gate) * up."""
 
 import pytest
 import torch
@@ -119,8 +118,7 @@ def _dense_nf4(p):
 @pytest.mark.parametrize("T", [1, 4])
 @pytest.mark.parametrize("use_lora", [False, True])
 def test_nf4_decode_routes_only_the_routed_experts(loop, T, use_lora, monkeypatch):
-    # Decode must route own-gate experts instead of dequantizing all experts per token, and match
-    # the dense softcapped reference on the same dequantized weights.
+    # Decode routes own-gate experts only; matches dense reference on dequantized weights.
     pytest.importorskip("triton")
     from unsloth_zoo.temporary_patches import moe_routed as MR
     from unsloth_zoo.temporary_patches import moe_utils as MU

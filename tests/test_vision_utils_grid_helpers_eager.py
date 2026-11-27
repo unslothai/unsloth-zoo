@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision grid helpers in transformers/vision_utils.py must never compile fullgraph: grid_thw.tolist() gives unbacked
-SymInt shapes that raise UserError; names are enumerated, not hard-coded."""
+"""Never compile grid helpers fullgraph: grid_thw.tolist() yields unbacked SymInt, raising UserError."""
 
 import inspect
 
@@ -77,8 +76,7 @@ def test_grid_helpers_are_discoverable():
 
 @pytest.mark.parametrize("name", sorted(_grid_helpers()))
 def test_uncompilable_grid_helpers_are_listed(name):
-    """Anything Dynamo cannot capture fullgraph must be in DISABLE_COMPILE_FUNCTIONS; the assert only runs inside
-    `except`, so an upstream-traceable helper cannot fail it."""
+    """Helpers Dynamo cannot capture fullgraph must be listed in DISABLE_COMPILE_FUNCTIONS."""
     fn, kwargs = _grid_helpers()[name]
 
     eager = fn(**kwargs)

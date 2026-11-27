@@ -1,5 +1,4 @@
-"""Adaptive pin-vs-recompute policy for the grouped MoE base GEMM: pin the bf16 expert stack only during
-gradient-checkpoint recompute, else recompute; UNSLOTH_MOE_RECOMPUTE overrides."""
+"""Adaptive: pin bf16 expert stack only during GC recompute; UNSLOTH_MOE_RECOMPUTE overrides."""
 
 import os
 
@@ -34,8 +33,7 @@ def test_marker_idempotent_nesting_and_exception_safe():
 
 
 def test_marker_true_only_during_gc_recompute():
-    # Forward runs under no_grad (marker False) and again in backward (marker True); the flag must fire only in that
-    # recompute and clear afterwards; other checkpoint runs stay undisturbed.
+    # Marker True only in backward recompute; cleared after; other checkpoint runs untouched.
     seen = []
 
     def fn(x, *args):

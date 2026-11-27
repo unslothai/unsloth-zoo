@@ -232,9 +232,7 @@ def test_compiled_and_uncompiled_agree():
     )
 
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    # Tolerance, not equality: mx.compile fuses elementwise chains and reassociates, so output matches only to
-    # precision; macos-15 differs by 5.96e-08 (2**-24); 1e-6 is ~8 fp32 ULP, while a real divergence would grow
-    # monotonically across steps.
+    # mx.compile reassociates ops, so 1e-6 (~8 fp32 ULP) tolerates rounding; real drift grows.
     assert worst <= 1e-6, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
 
 
@@ -288,8 +286,7 @@ def test_unsupported_group_size_is_rejected(group_size):
 
 
 def test_zero_gradient_coordinates_never_move():
-    """Zero-gradient coordinates keep v == 0 so the Adam denominator is eps alone and dequantization residue is
-    amplified ~1e8x; plain Adam moves them by exactly nothing and the quantized optimizer must too"""
+    """Zero-gradient coordinates must not move: v == 0, so dequant residue is amplified ~1e8x."""
     steps, lr = 500, 1e-3
     # Width is MIN_QUANTIZE_SIZE elements so the moment really is packed; a smaller parameter is ineligible and the test would never reach the residue.
     width = MIN_QUANTIZE_SIZE
@@ -439,8 +436,7 @@ def test_adamw_variant_also_quantizes():
     assert (DEFAULT_GROUP_SIZE, DEFAULT_BITS) == (opt.group_size, opt.bits)
 
 
-# Eligibility counts elements, not axes: the old 2-D divisible-last-axis rule skipped some LoRA shapes while packing
-# their partners, so a LoRA run saved half of what it reported.
+# Eligibility counts elements, not axes; the old 2-D rule split LoRA pairs, saving half.
 @pytest.mark.parametrize(
     "shape, eligible, why",
     [

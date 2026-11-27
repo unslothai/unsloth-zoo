@@ -6,8 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Signature pins for upstream symbols that unsloth_zoo patches, wraps or calls positionally; drift fails as DRIFT
-DETECTED, while missing optional deps skip via importorskip."""
+"""Pins upstream symbols zoo patches, wraps or calls; drift fails, missing optional deps skip."""
 
 from __future__ import annotations
 
@@ -38,15 +37,13 @@ def _skip_if_transformers_5x(reason: str) -> None:
 
 
 def _names_the_target(exc: ModuleNotFoundError, dotted_module: str) -> bool:
-    """exc.name is the deepest missing package (the parent for a removed model package), so any package prefix of the
-    target counts; the trailing dot keeps siglip from matching siglipx."""
+    """Any package prefix of the target counts; the dot stops siglip matching siglipx."""
     name = exc.name or ""
     return bool(name) and (dotted_module == name or dotted_module.startswith(name + "."))
 
 
 def _import_or_skip(dotted_module: str, *names):
-    """Imports names from dotted_module, skipping when an existing module fails on a dependency (e.g. timm in gemma3n)
-    rather than reporting drift; a genuinely removed module still raises, as drift."""
+    """Skip if an existing module fails on a dependency; a removed module raises as drift."""
     try:
         mod = importlib.import_module(dotted_module)
     except ModuleNotFoundError as exc:
@@ -120,15 +117,12 @@ def _assert_positional_arity_at_least(
         )
 
 
-# Module-level importorskip: one clean skip if transformers is missing.
 pytest.importorskip("transformers")
 
 
-# transformers.modeling_utils.checkpoint (gradient_checkpointing.py:232/234/246)
 
 def test_torch_checkpoint_function_first_positional_arg():
-    """gradient_checkpointing.py:222 assigns unsloth_gradient_checkpoint to torch.utils.checkpoint.checkpoint; upstream
-    must keep function as first positional and use_reentrant as kwarg."""
+    """Zoo replaces torch checkpoint: keep function first positional, use_reentrant as kwarg."""
     import torch.utils.checkpoint as tuc
     sig = inspect.signature(tuc.checkpoint)
     params = list(sig.parameters.keys())
@@ -147,8 +141,7 @@ def test_torch_checkpoint_function_first_positional_arg():
 
 
 def test_transformers_modeling_utils_checkpoint_symbol_present():
-    """gradient_checkpointing.py:234/246/924 sets transformers.modeling_utils.checkpoint; a removed re-export silently
-    no-ops the patch, causing a long-context VRAM bug."""
+    """transformers.modeling_utils.checkpoint: if absent, patch no-ops; long-context VRAM bug."""
     import transformers.modeling_utils as mu
     if not hasattr(mu, "checkpoint"):
         pytest.fail(
@@ -158,13 +151,9 @@ def test_transformers_modeling_utils_checkpoint_symbol_present():
         )
 
 
-# transformers.integrations.bitsandbytes._replace_with_bnb_linear
 
 def test_replace_with_bnb_linear_signature():
-    """patching_utils.py:682 ``inspect.getsource(_replace_with_bnb_linear)``
-    + source rewrite -> re-installed as ``_unsloth_replace_with_bnb_linear``.
-    Pins ``(model, modules_to_not_convert, current_key_name,
-    quantization_config, has_been_replaced)``."""
+    """Zoo re-installs a getsource-rewritten copy as _unsloth_replace_with_bnb_linear; pins its params."""
     pytest.importorskip("bitsandbytes")
     try:
         from transformers.integrations.bitsandbytes import (
@@ -194,7 +183,6 @@ def test_replace_with_bnb_linear_signature():
     )
 
 
-# transformers.modeling_utils.PreTrainedModel.loss_function (loss_utils.py:145)
 
 def test_pretrained_model_loss_function_exists():
     """loss_utils.py:143-146 unwraps PreTrainedModel.loss_function.fget.__wrapped__; removing the property silently aborts the patch, so no fused CE."""
@@ -233,7 +221,6 @@ def test_fixed_cross_entropy_signature():
     )
 
 
-# transformers Trainer (training_utils.py:354-355 and compiler.py:4040)
 
 def test_Trainer_get_optimizer_cls_and_kwargs_signature():
     """training_utils.py:354 calls Trainer.get_optimizer_cls_and_kwargs(training_args) with one positional argument."""
@@ -275,7 +262,6 @@ def test_Trainer_inner_training_loop_signature_preserved():
     )
 
 
-# transformers.set_seed / get_scheduler / seed_worker / DataCollator*
 
 def test_set_seed_signature():
     """training_utils.py:20 -- first positional must be ``seed``."""
@@ -332,7 +318,6 @@ def test_DataCollatorForSeq2Seq_signature():
     )
 
 
-# TrainingArguments (temporary_patches/misc.py:1334)
 
 def test_TrainingArguments_to_dict_signature():
     """temporary_patches/misc.py:1334-1343 wraps TrainingArguments.to_dict with _patched_to_dict(self) and does not forward args, so upstream must stay self-only."""
@@ -358,7 +343,6 @@ def test_TrainingArguments_get_warmup_steps_signature():
     )
 
 
-# PretrainedConfig (patching_utils.py:244-273)
 
 def test_PretrainedConfig_to_dict_signature():
     """patching_utils.py:256-259 wraps PretrainedConfig.to_dict with *args/**kwargs; to_dict and to_diff_dict must remain methods."""
@@ -378,7 +362,6 @@ def test_PretrainedConfig_to_dict_signature():
         )
 
 
-# PushToHubMixin.push_to_hub (saving_utils.py:76)
 
 def test_PushToHubMixin_push_to_hub_signature():
     """saving_utils.py:76 uses PushToHubMixin as a mixin base; pins the push_to_hub kwargs zoo expects (repo_id, commit_message, token, private, revision)."""
@@ -390,7 +373,6 @@ def test_PushToHubMixin_push_to_hub_signature():
     )
 
 
-# accelerate.init_empty_weights (empty_model.py:238, 322)
 
 def test_accelerate_init_empty_weights_signature():
     """empty_model.py:252 and 329 call init_empty_weights(include_buffers=False); pins that kwarg name."""
@@ -403,7 +385,6 @@ def test_accelerate_init_empty_weights_signature():
     )
 
 
-# Masking-utils + GPT-OSS overrides
 
 def test_masking_utils_create_causal_mask_signature():
     """gpt_oss.py:2178-2182 wraps transformers.masking_utils.create_causal_mask with *args/**kwargs, so only the symbol itself must exist."""
@@ -449,7 +430,6 @@ def test_masking_utils_create_masks_for_generate_signature():
         )
 
 
-# Gemma3 forward / norm / mlp overrides (temporary_patches/gemma.py)
 
 def test_gemma3_apply_rotary_pos_emb_signature():
     """gemma.py:399 calls apply_rotary_pos_emb(query_states, key_states, cos, sin) with 4 positionals."""
@@ -472,9 +452,7 @@ def test_gemma3_eager_attention_forward_signature():
 
 
 def test_gemma3_ALL_ATTENTION_FUNCTIONS_present():
-    """gemma.py:399 / ministral.py:39 -- ``from gemma3.modeling_gemma3
-    import ALL_ATTENTION_FUNCTIONS``. Zoo subscripts it via
-    ``ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]``."""
+    """Zoo subscripts ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation] (gemma.py, ministral.py)."""
     from transformers.models.gemma3.modeling_gemma3 import ALL_ATTENTION_FUNCTIONS  # noqa
     if not hasattr(ALL_ATTENTION_FUNCTIONS, "__getitem__"):
         pytest.fail(
@@ -495,8 +473,7 @@ def test_Gemma3Processor_call_signature():
 
 
 def test_Gemma3RMSNorm_forward_signature():
-    """gemma.py:361 / 628 patches ``Gemma3RMSNorm.forward(self,
-    hidden_states)`` with fullgraph=True. One-tensor forward."""
+    """gemma.py:361 / 628 patch Gemma3RMSNorm.forward(self, hidden_states) with fullgraph=True."""
     from transformers.models.gemma3.modeling_gemma3 import Gemma3RMSNorm
     sig = inspect.signature(Gemma3RMSNorm.forward)
     params = [p.name for p in sig.parameters.values() if p.name != "self"]
@@ -546,7 +523,6 @@ def test_Gemma3Attention_forward_signature():
     )
 
 
-# Gemma3n overrides (temporary_patches/gemma3n.py)
 
 def test_Gemma3nMultimodalEmbedder_forward_signature():
     """gemma3n.py:88 patches Gemma3nMultimodalEmbedder.forward(self, input_ids, inputs_embeds)."""
@@ -599,12 +575,10 @@ def test_Gemma3nModel_get_placeholder_mask_signature():
     )
 
 
-# Ministral overrides (temporary_patches/ministral.py)
 
 def test_MinistralAttention_forward_signature():
-    """ministral.py:99 patches MinistralAttention.forward (relaxed wrap hides its signature); probes hidden_states,
-    position_embeddings, attention_mask on the stashed _original_modeling_ministral_MinistralAttention_forward; if
-    absent, probe skipped, runtime still works via kwargs."""
+    """ministral.py:99 relaxed-wraps MinistralAttention.forward; probes its stashed original for
+    hidden_states, position_embeddings, attention_mask; else probe skipped; kwargs still work."""
     try:
         from transformers.models.ministral.modeling_ministral import (
             MinistralAttention,
@@ -630,9 +604,7 @@ def test_MinistralAttention_forward_signature():
 
 
 def test_MinistralModel_forward_signature():
-    """ministral.py:179 patches MinistralModel.forward with match_level='relaxed'; zoo forwards input_ids,
-    attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, cache_position by name; skipped on 5.x,
-    where cache_position moved into **kwargs."""
+    """ministral.py:179 patches forward; zoo passes 7 args by name; 5.x skips (cache_position)."""
     _skip_if_transformers_5x(
         "MinistralModel.forward moved cache_position into "
         "**kwargs: Unpack[TransformersKwargs]"
@@ -673,7 +645,6 @@ def test_ministral_apply_rotary_pos_emb_signature():
     )
 
 
-# GPT-OSS class-level monkey-patches (temporary_patches/gpt_oss.py)
 
 def test_GptOssExperts_class_present_and_init_takes_config():
     """gpt_oss.py:1060, 1070, 1849 and 1858 monkey-patch GptOssExperts; zoo's override defines __init__(self, config)."""
@@ -765,7 +736,6 @@ def test_GptOssPreTrainedModel_init_weights_signature():
     )
 
 
-# Mxfp4 integrations (temporary_patches/gpt_oss.py)
 
 def test_mxfp4_swizzle_mxfp4_signature():
     """gpt_oss.py:190 patches transformers.integrations.mxfp4.swizzle_mxfp4 with match_level='relaxed'."""
@@ -819,7 +789,6 @@ def test_mxfp4_mlp_forward_signature():
     )
 
 
-# AutoHfQuantizer.merge_quantization_configs (misc.py:153)
 
 def test_AutoHfQuantizer_merge_quantization_configs_signature():
     """misc.py:153 patches AutoHfQuantizer.merge_quantization_configs(quantization_config, quantization_config_from_args)."""
@@ -831,11 +800,9 @@ def test_AutoHfQuantizer_merge_quantization_configs_signature():
     )
 
 
-# Granitemoehybrid + CSM (misc.py:1061 / 770)
 
 def test_GraniteMoeHybridMambaLayer_cuda_kernels_forward_signature():
-    """misc.py:1061 patches GraniteMoeHybridMambaLayer.cuda_kernels_forward(self, hidden_states, cache_params,
-    cache_position, attention_mask, seq_idx); skipped on 5.x."""
+    """Skipped on 5.x, where cache_position moved into **kwargs; misc.py:1061 patch target."""
     _skip_if_transformers_5x(
         "GraniteMoeHybridMambaLayer.cuda_kernels_forward moved cache_position "
         "into **kwargs: Unpack[TransformersKwargs]"
@@ -869,7 +836,6 @@ def test_CsmForConditionalGeneration_merge_input_ids_signature():
     )
 
 
-# Mllama vision encoder layer (misc.py:1172)
 
 def test_MllamaVisionEncoderLayer_forward_signature():
     """misc.py:1146-1172 uses MllamaVisionEncoderLayer.forward(self, hidden_state, attention_mask=None); upstream's name is hidden_state, not hidden_states."""
@@ -889,11 +855,9 @@ def test_MllamaVisionEncoderLayer_forward_signature():
         )
 
 
-# Siglip encoder layer (misc.py:1228)
 
 def test_SiglipEncoderLayer_forward_signature():
-    """misc.py:1187-1228 patch body still references output_attentions, so removing it from
-    SiglipEncoderLayer.forward(self, hidden_states, attention_mask, output_attentions=False) breaks it."""
+    """misc.py:1187-1228 patch reads output_attentions; keep it in SiglipEncoderLayer.forward."""
     from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
     _assert_params_superset(
         SiglipEncoderLayer.forward,
@@ -902,7 +866,6 @@ def test_SiglipEncoderLayer_forward_signature():
     )
 
 
-# Qwen3 MoE (qwen3_moe / qwen3_vl_moe / qwen3_next_moe)
 
 def test_Qwen3MoeSparseMoeBlock_forward_signature():
     """qwen3_moe.py patches Qwen3MoeSparseMoeBlock.forward(self, hidden_states)."""
@@ -980,7 +943,6 @@ def test_Qwen3NextSparseMoeBlock_forward_signature():
     )
 
 
-# Deepseek-V3 MoE (deepseek_v3_moe.py)
 
 def test_DeepseekV3MoE_forward_signature():
     """deepseek_v3_moe.py:125 patches DeepseekV3MoE.forward(self, hidden_states)."""
@@ -998,8 +960,7 @@ def test_DeepseekV3MoE_forward_signature():
 
 
 def test_DeepseekV3ForCausalLM_forward_signature():
-    """deepseek_v3_moe.py:213 patches DeepseekV3ForCausalLM.forward; zoo forwards input_ids, attention_mask,
-    position_ids, past_key_values, inputs_embeds, labels, use_cache by name."""
+    """deepseek_v3_moe.py:213 patch; zoo forwards 7 kwargs (input_ids..use_cache) by name."""
     try:
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             DeepseekV3ForCausalLM,
@@ -1023,11 +984,9 @@ def test_DeepseekV3ForCausalLM_forward_signature():
     )
 
 
-# PEFT (temporary_patches/misc.py:1281 dispatch_bnb_4bit wrap)
 
 def test_peft_dispatch_bnb_4bit_signature():
-    """misc.py:1297 wraps peft.tuners.lora.bnb.dispatch_bnb_4bit with safe_dispatch_bnb_4bit(target, adapter_name,
-    **kwargs); upstream must keep the two positionals and **kwargs."""
+    """misc.py:1297 wraps dispatch_bnb_4bit; upstream must keep two positionals and **kwargs."""
     pytest.importorskip("peft")
     try:
         import peft.tuners.lora.bnb as peft_bnb
@@ -1067,7 +1026,6 @@ def test_peft_get_peft_model_signature():
     )
 
 
-# Cache utilities (gemma4.py, qwen3_moe etc)
 
 def test_DynamicCache_importable():
     """gemma4.py:308 and 460 import DynamicCache and StaticCache from transformers.cache_utils; zoo instantiates them with zero args."""
@@ -1078,7 +1036,6 @@ def test_DynamicCache_importable():
         pytest.fail("DRIFT DETECTED: StaticCache is no longer callable.")
 
 
-# Bitsandbytes patch (bitsandbytes.py:108)
 
 def test_bnb_Linear4bit_forward_signature():
     """bitsandbytes.py:108 patches bitsandbytes.nn.modules.Linear4bit.forward(self, x)."""
@@ -1096,11 +1053,9 @@ def test_bnb_Linear4bit_forward_signature():
     )
 
 
-# vllm (vllm_utils.py + temporary_patches/misc.py:1402)
 
 def test_vllm_SamplingParams_constructor():
-    """vllm_utils.py's grpo_update_SamplingParams filters kwargs by inspect.signature(vllm.SamplingParams).parameters;
-    an *args-only shape silently drops every kwarg."""
+    """kwargs are filtered by SamplingParams signature; an *args-only one silently drops them."""
     vllm = pytest.importorskip("vllm")
     SamplingParams = getattr(vllm, "SamplingParams", None)
     if SamplingParams is None:

@@ -151,8 +151,7 @@ def test_compiler_gqa_enable_gqa_dropout_pinned_string_self_dropout():
 
 
 def test_compiler_replace_gqa_finder_regex():
-    """compiler.py:262-282 grouped_query_attention_finder targets repeat_kv chains; transformers >=4.50 inlined
-    repeat_kv, so it may match 0 times and the rewrite stays dormant."""
+    """Finder targets repeat_kv; transformers >=4.50 inlined it, so it may match 0 times."""
     pytest.importorskip("transformers")
     import importlib
     head = re.compile(r"key_states\s*=\s*repeat_kv\(")
@@ -271,8 +270,7 @@ def test_compiler_self_config_ignore_index_replacement():
 
 
 def test_compiler_per_layer_projection_inplace_regex():
-    """compiler.py:1404-1407 rewrites Gemma 3N's in-place per_layer_projection *=
-    self.per_layer_projection_scale.to(...) to a non-inplace form; this test pins that pattern."""
+    """compiler.py:1404-1407 rewrites Gemma 3N in-place *= to non-inplace; this test pins it."""
     pytest.importorskip("transformers")
     try:
         import transformers.models.gemma3n.modeling_gemma3n as g3n
@@ -291,8 +289,7 @@ def test_compiler_per_layer_projection_inplace_regex():
 
 
 def test_compiler_cross_entropy_lm_head_pattern_present():
-    """cross_entropy_find_1 (compiler.py:1508-1525) expects logits = self.lm_head(hidden_states at the head of every
-    ForCausalLM loss block; reads on-disk source because the fused-forward installer rewrites cls.forward at import."""
+    """cross_entropy_find_1 expects lm_head logits; reads disk as import rewrites cls.forward."""
     pytest.importorskip("transformers")
     import importlib
     import pathlib
@@ -333,8 +330,7 @@ def test_compiler_cross_entropy_lm_head_pattern_present():
 
 
 def test_compiler_cross_entropy_find_2_loss_function_signature():
-    """cross_entropy_find_2 (compiler.py:1593-1600) pins loss = self.loss_function(...$LOGITS$, $LABELS$,
-    $VOCABSIZE$...); reads on-disk source because forward_install.py rewrites *ForCausalLM.forward at import."""
+    """cross_entropy_find_2 pins self.loss_function(...); reads disk as forward gets rewritten."""
     pytest.importorskip("transformers")
     import importlib
     import pathlib
@@ -368,8 +364,7 @@ def test_compiler_cross_entropy_find_2_loss_function_signature():
     )
 
 
-# Frozen 4.57.6 gemma3 VLM forward that cross_entropy_find_3 matches; upstream moved to self.loss_function in 5.17, and
-# without this fixture the shift-logits branch goes unexercised.
+# Frozen 4.57.6 gemma3 VLM forward for shift-logits coverage; 5.17 moved to self.loss_function.
 _LEGACY_VLM_SHIFT_FORWARD = '''
 def forward(self, input_ids = None, labels = None, **loss_kwargs):
     outputs = self.model(input_ids = input_ids)
@@ -416,9 +411,8 @@ def test_compiler_cross_entropy_find_3_still_matches_its_own_shape():
 
 
 def test_the_fused_cross_entropy_rewrite_still_reaches_gemma3():
-    """Asserts a cross_entropy finder matches gemma3's forward, not a literal; transformers 5.17's
-    self.loss_function(..., **lm_kwargs) was missed by find_2's $KWARGS$ (loss_kwargs/kwargs only), silently dropping
-    fused linear CE for Gemma 3."""
+    """Gemma3 forward must match a cross_entropy finder; upstream 5.17's self.loss_function(...,
+    **lm_kwargs) was missed by find_2 (loss_kwargs/kwargs only), silently dropping fused CE."""
     pytest.importorskip("transformers")
     apply_fused_lm_head = pytest.importorskip(
         "unsloth_zoo.compiler"
@@ -460,8 +454,7 @@ _QWEN2_VL_NEEDLE_4X = (
     "                **kwargs,\n"
     "            )"
 )
-# 4.53.1-4.53.3 pass attention_mask at the call site; compiler.py has its own entry for that spelling, and omitting it
-# here failed the guard on a supported version.
+# 4.53.1-4.53.3 pass attention_mask; compiler.py has an entry for it; omitting it fails them.
 _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK = (
     "hidden_states = blk(\n"
     "                hidden_states,\n"
@@ -587,8 +580,7 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
          "position_embeddings"],
         # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.9
         _QWEN2_VL_SIG_ROTARY,
-        # 4.53.1-4.53.3 add attention_mask as the fifth positional parameter and pass it at the call site; compiler.py's
-        # 4.x + attention_mask entry targets this; gone by 4.54.
+        # 4.53.1-4.53.3 add attention_mask as 5th param; compiler.py targets it; gone by 4.54.
         _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK,
         # transformers 5.10+ -- rotary_pos_emb dropped; from 5.15 max_seqlen
         # rides in kwargs
@@ -789,8 +781,7 @@ def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
     torch.manual_seed(0)
     attn = attn_cls(config)
 
-    # Two ragged images of 4 and 5 tokens: max_seqlen 5 differs from the total 9 and the first segment 4, so a recompute
-    # from the wrong tensor cannot match by chance.
+    # Ragged 4+5 token images: a recompute from the wrong tensor cannot match max_seqlen 5.
     grid_thw = torch.tensor([[1, 2, 2], [1, 1, 5]], dtype = torch.long)
     cu_seqlens, caller_max_seqlen = get_vision_attention_seqlens(
         grid_thw, config, kwargs = {},
@@ -839,9 +830,8 @@ def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
 
 
 def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed():
-    """Pins the VisionAttention max_seqlen recompute from cu_seqlens: the fallback making a lost or mis-bound max_seqlen
-    degrade to recompute, not wrong attention; re-added via functools.partial, since a positional slot or checkpoint
-    callable would reject it; see test_gc_rewriter_bound_keywords.py."""
+    """Pins max_seqlen recompute from cu_seqlens: lost or mis-bound values degrade to recompute, not
+    wrong attention; functools.partial avoids positional/checkpoint rejection."""
     pytest.importorskip("transformers")
     pytest.importorskip("torch")
     try:
@@ -856,8 +846,7 @@ def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recompute
 
 
 def test_compiler_moe_routing_weights_cast_pattern():
-    """compiler.py:2423-2425 MOE_ROUTING_WEIGHTS_CAST_PATTERN targets routing_weights =
-    routing_weights.to(hidden_states.dtype), needed for the bf16 router-logit dtype fix."""
+    """Pins compiler.py's MOE_ROUTING_WEIGHTS_CAST_PATTERN for the bf16 router-logit dtype fix."""
     _skip_if_transformers_5x(
         "MoE forwards refactored -- the explicit "
         "`routing_weights = routing_weights.to(hidden_states.dtype)` "
@@ -895,8 +884,7 @@ def test_compiler_moe_routing_weights_cast_pattern():
 
 
 def test_compiler_peft_lora_forward_pinned_strings():
-    """compiler.py:2542-2543 pins output = lora_B(lora_A(dropout(x))) * scaling and result = result +
-    lora_B(lora_A(dropout(x))) * scaling; if peft drops the parens or names, fast LoRA never installs."""
+    """Pins compiler.py's LoRA forward lines; if peft changes them, fast LoRA never installs."""
     pytest.importorskip("peft")
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
@@ -1049,8 +1037,7 @@ def test_compiler_causal_mask_find_regex_pattern():
 
 
 def test_compiler_trainer_running_training_logger_regex():
-    """compiler.py:3988-3990 re.search-matches the logger.info('***** Running training *****') line in
-    Trainer._inner_training_loop; the Unsloth banner is spliced before it."""
+    """The banner splice relies on re.search matching Trainer's 'Running training' log line."""
     pytest.importorskip("transformers")
     from transformers.trainer import Trainer
     try:
@@ -1278,8 +1265,7 @@ def test_unsloth_import_fixes_make_inputs_require_grads_inner_fn():
 
 
 def test_compiler_no_update_causal_mask_attribute_probe():
-    """compiler.py:3524, 3762 hasattr-probes _update_causal_mask; modern Llama/Mistral/Qwen3 dropped it while legacy
-    models like Bamba/Falcon still expose it; pass if any model has it."""
+    """Pins the _update_causal_mask hasattr probe; passes if any probed model still exposes it."""
     _skip_if_transformers_5x(
         "_update_causal_mask removed across all probed model classes -- "
         "mask construction moved into the central masking-utils path. "

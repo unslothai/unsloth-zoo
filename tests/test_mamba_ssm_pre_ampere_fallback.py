@@ -119,8 +119,7 @@ def env(monkeypatch):
     sys.modules["transformers.integrations"] = integrations
     sys.modules["transformers.integrations.hub_kernels"] = hk
 
-    # The config step imports these by name; empty stubs stop tests from permanently rewriting the real
-    # ZambaConfig.__init__, a module with no config class is skipped, and teardown restores them.
+    # Empty stubs stop tests rewriting the real ZambaConfig.__init__; teardown restores them.
     for cfg_mod_name in CONFIG_MODS:
         saved[cfg_mod_name] = sys.modules.get(cfg_mod_name)
         sys.modules[cfg_mod_name] = types.ModuleType(cfg_mod_name)
@@ -137,8 +136,7 @@ def env(monkeypatch):
             sys.modules[parent] = m
             saved.setdefault(parent, None)
     sys.modules["transformers"].utils = sys.modules["transformers.utils"]
-    # import a.b.c as x resolves through getattr, so this attribute outlives a sys.modules-only teardown and must be
-    # restored too, or later imports get the stub (test_vendor_fla.py, fla_vendor.py).
+    # import a.b.c as x uses getattr: restore the attribute or test_vendor_fla.py gets a stub.
     utils_mod = sys.modules["transformers.utils"]
     had_attr = hasattr(utils_mod, "import_utils")
     saved_attr = getattr(utils_mod, "import_utils", None)
@@ -236,9 +234,8 @@ def test_the_mixer_wrapper_is_applied_once(env):
 
 
 def _lazy_flag_mixer_module(mod_name, cls_name, weight_attr, hk):
-    """transformers >= 5.3 shape: kernel resolution moved into the mixer __init__, so the module has no
-    is_fast_path_available until a mixer is built; availability is read from _HUB_KERNEL_MAPPING like
-    lazy_load_kernel, so unregistering Hub kernels disables it."""
+    """transformers 5.3+ resolves kernels in the mixer __init__, so is_fast_path_available is absent
+    until a mixer exists; availability reads _HUB_KERNEL_MAPPING like lazy_load_kernel."""
     mod = types.ModuleType(mod_name)
 
     def _kernels_available():
@@ -349,8 +346,7 @@ def test_the_config_flag_is_cleared_for_jamba_5_5(env):
 
 
 def _fake_config_module(mod_name, cls_name):
-    """Stand-in for jamba/zamba config: use_mamba_kernels defaults to True and is written into every config.json, so
-    both the default and an explicit True must end up cleared."""
+    """use_mamba_kernels defaults to True and is in every config.json; both must be cleared."""
     mod = types.ModuleType(mod_name)
 
     class Config:
@@ -430,8 +426,7 @@ def test_the_mixer_scan_does_not_walk_sys_modules(env):
 
 
 def test_alias_modules_are_not_probed_through_getattr():
-    """transformers 5 registers image_processing_<m>_fast alias modules whose catch-all __getattr__ imports the real
-    processor; getattr can raise ImportError out of import unsloth, so the scan must read __dict__ instead."""
+    """Use __dict__, not getattr: transformers 5 alias modules' __getattr__ raises ImportError."""
     assert '_mod.__dict__.get("is_fast_path_available", False)' in _SRC
     assert 'getattr(_mod, "is_fast_path_available", False)' not in _SRC
 
@@ -475,8 +470,7 @@ def test_no_mamba_ssm_is_untouched(env):
     assert iu.is_mamba_ssm_available() is True
 
 
-# lazy_load_kernel resolves mamba-ssm from kernels-community when the `kernels` package is installed; it needs no local
-# wheel and never calls is_mamba_ssm_available, so the predicates above cannot reach it.
+# lazy_load_kernel never calls is_mamba_ssm_available, so the predicates cannot reach it.
 
 def test_pre_ampere_unregisters_the_hub_kernels(env):
     _model_mod, _iu, hk = env
@@ -786,8 +780,7 @@ def test_two_ampere_gpus_keep_the_fast_path(env, monkeypatch):
 
 # Keep last: it checks what the `env` fixture left behind after teardown.
 def test_the_fixture_leaves_no_stub_bound_on_transformers_utils():
-    """The stub must not outlive the fixture: import a.b.c as x resolves via getattr, so a leaked transformers.utils
-    attribute reaches later import_utils imports (tests/test_vendor_fla.py, fla_vendor.py)."""
+    """Stub must not leak: import a.b.c as x resolves via getattr, so later imports see it."""
     utils_mod = sys.modules.get("transformers.utils")
     if utils_mod is None or getattr(utils_mod, "__file__", None) is None:
         pytest.skip("real transformers.utils was never imported in this session")
@@ -915,8 +908,7 @@ def _scan_args():
 
 
 def test_the_forced_reference_refuses_packed_calls(monkeypatch):
-    # The reference scan ignores seq_idx, so a packed call would mix documents: transformers 5.22+ refuses
-    # it on its own reference path, and the forced reference must keep doing so on every version.
+    # Reference scan ignores seq_idx; 5.22+ refuses packed calls and the forced path must too.
     hk = pytest.importorskip("transformers.integrations.hub_kernels")
     if getattr(hk, "use_kernel_func_from_hub_with_fallback", None) is None:
         # Skip because transformers < 5.15 has no hub factory to patch (is_fast_path_available gates it there).

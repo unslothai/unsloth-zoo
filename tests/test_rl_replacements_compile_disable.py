@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Makes UNSLOTH_COMPILE_DISABLE reach the three bare @torch.compile helpers in rl_replacements.py, which ran at import
-before the compiler's gates; compiler.py and temporary_patches/utils.py already consult it; does not fix the shape
-bug."""
+"""UNSLOTH_COMPILE_DISABLE must reach the three bare @torch.compile helpers in rl_replacements.py,
+which ran at import before the compiler's gates; the shape bug is not fixed."""
 
 import re
 import os
@@ -36,8 +35,7 @@ FUNCS = [
 
 
 def _probe(value):
-    """Import rl_replacements in a subprocess with the flag set and report whether each helper came out compiled; a
-    subprocess is needed since the flag is read at import and the module is then cached in sys.modules."""
+    """Subprocess needed: the flag is read at import and sys.modules then caches the module."""
     script = textwrap.dedent("""
         import json, torch
         import unsloth_zoo.rl_replacements as R

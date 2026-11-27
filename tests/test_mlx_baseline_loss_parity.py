@@ -72,8 +72,7 @@ def test_no_safe_targets_where_in_fast_path():
 
 
 def test_no_safe_token_denominator_in_fast_path():
-    """Fast path must divide by raw ntoks (int) like mlx-lm default_loss to keep the autodiff graph;
-    _safe_token_denominator adds an fp32 cast and maximum() that changes MLX rounding"""
+    """Divide by raw ntoks like mlx-lm to keep autodiff graph; fp32 casts change MLX rounding."""
     block = _labels_none_block()
     assert "_safe_token_denominator" not in block, (
         "labels=None fast path must divide by raw ntoks for mlx-lm parity. "

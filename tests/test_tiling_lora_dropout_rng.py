@@ -77,7 +77,6 @@ def test_lora_dropout_added_after_patch_gets_matching_grads(target_arctic):
     x = torch.randn(2, 32, HIDDEN)
     grad_out = torch.randn(2, 32, HIDDEN)
 
-    # Reference: same tiles, same RNG order, ordinary autograd (no recompute).
     torch.manual_seed(3)
     x_ref = x.clone().requires_grad_(True)
     tiles = [reference.mlp(t.unsqueeze(0)) for t in torch.tensor_split(x_ref.view(-1, HIDDEN), 4, dim = 0)]
@@ -124,7 +123,6 @@ def test_dropout_cache_survives_layer_slicing():
     assert not tiled_mlp.needs_rng_state(block.mlp)
     assert block.mlp.__dict__["_unsloth_tiled_dropouts"] is cached
 
-    # LoRA added after the first forward, on the original and on a deepcopy, is still seen.
     clone = copy.deepcopy(block)
     block = _lora(block, 0.1)
     assert tiled_mlp.needs_rng_state(block.mlp)

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX Laya (decision) saves copy the source encoder / tokenizer folders with copytree. A re-save must not reopen a
-folder the user restricted (copytree copies the source folder's mode onto it last), and a first save of restricted
-source files must not leave them readable at the umask default while they are written."""
+"""MLX decision saves use copytree (which copies the source mode last): re-saves must not reopen a
+restricted folder; first saves must not expose restricted files at the umask default."""
 
 import ast, json, os, shutil, stat
 from pathlib import Path

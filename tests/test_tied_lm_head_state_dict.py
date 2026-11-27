@@ -67,7 +67,6 @@ def test_a_new_only_tied_head_is_checked_against_its_embedding(head, embed):
 
 
 def test_a_new_only_head_with_no_embedding_to_check_against_is_not_a_failure():
-    # Nothing to compare it to, so this must stay silent rather than invent a failure.
     sd = {"model.layers.0.q_proj.weight": w()}
     assert_same_state_dict(dict(sd), {**sd, "lm_head.weight": w(1.0)})
 

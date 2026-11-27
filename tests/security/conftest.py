@@ -1,5 +1,4 @@
-"""Shared fixtures for security tests: an autouse, function-scoped network blocker refusing non-loopback
-socket.connect(); function scope because a session-scoped socket.socket swap broke network tests elsewhere."""
+"""Autouse blocker refuses non-loopback socket.connect(); function scope, session broke tests."""
 
 from __future__ import annotations
 
@@ -62,8 +61,7 @@ class _BlockedSocket(socket.socket):
 
 @pytest.fixture(scope = "function", autouse = True)
 def network_blocker():
-    """Swaps socket.socket for a blocker and restores it at teardown; function scope because session scope leaked the
-    patch into every network-using test in the parent tests/ tree."""
+    """Function-scoped: session scope leaked the socket patch into every network-using test."""
     original = socket.socket
     socket.socket = _BlockedSocket  # type: ignore[assignment]
     try:

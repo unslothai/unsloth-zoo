@@ -40,8 +40,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "unsloth_zoo"
 
-# Eagerly imported by unsloth_zoo/__init__.py, so they must work on the floor though the rest of mlx/ is lazy; paths are
-# package-relative since mlx/cce/__init__.py shares a basename.
+# Eagerly imported, so must work on the floor; package-relative paths avoid a basename clash.
 MLX_IMPORT_TIME = {"mlx/__init__.py", "mlx/runtime.py"}
 
 
@@ -140,8 +139,7 @@ def union_operands(node):
 
 
 def looks_like_a_type_alias(node, known_typing_names):
-    """Needs name-shaped operands and one recognisable type (str | Path yes; defaults | extra, re.A | re.M no): a bare |
-    between plain names may be a PEP 584 dict merge valid on 3.9."""
+    """Needs a type operand: a bare | of plain names may be a valid 3.9 PEP 584 dict merge."""
     operands = union_operands(node)
     if not operands:
         return False
@@ -275,8 +273,7 @@ def _is_floor_version_check(node):
 
 
 def test_vendored_fla_stays_gated_below_310():
-    """Excluding _vendored/fla is only sound while the guard bails out below Python 3.10; checked structurally, since a
-    commented-out or dead check would still satisfy a text search."""
+    """Excluding _vendored/fla is sound only while its guard bails below 3.10; checked by AST."""
     path = PACKAGE_ROOT / "temporary_patches" / "fla_vendor.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     guard = next((n for n in ast.walk(tree)
@@ -333,9 +330,8 @@ def strict_patch_calls(tree):
 
 
 def test_modules_with_strict_patches_do_not_defer_annotations():
-    """Do not defer annotations in patching modules: can_safely_patch compares inspect.signature annotations with no
-    get_type_hints, so a stringified one never matches at the default strict level and patch_function declines with
-    only a log; use typing.Optional or typing.Union."""
+    """Patching modules must not defer annotations: can_safely_patch compares inspect.signature (no
+    get_type_hints), so strings never match at strict level; use typing.Optional or Union."""
     offenders = []
     for path in scoped_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

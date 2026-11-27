@@ -95,8 +95,7 @@ def test_packed_probe_flips_with_mask_support(monkeypatch):
 
 
 def test_small_logit_model_that_attends_across_examples_is_refused():
-    """OPT's decoder builds its mask without position_ids, so packed examples see each other. With a tiny init its
-    logits are small: the probe must still refuse it (no absolute pass from a scale floor)."""
+    """OPT's mask ignores position_ids; the probe must refuse it even with small logits."""
     from unsloth_zoo.cpu import trainer
     from transformers import OPTConfig, OPTForCausalLM
     torch.manual_seed(0)
@@ -108,8 +107,7 @@ def test_small_logit_model_that_attends_across_examples_is_refused():
 
 
 def test_padding_free_token_loss_matches_padded():
-    """Same examples, padded vs padding-free: the summed token loss and its gradient agree (the mean's divisor is
-    TRL's count, which in padded mode also counts each row's unshifted first label)."""
+    """Summed loss and grads agree padded vs padding-free; padded divisor counts first labels."""
     from unsloth_zoo.cpu import trainer
     if not trainer.cpu_packing_supported():
         pytest.skip("transformers / torch too old for packed SDPA masks")

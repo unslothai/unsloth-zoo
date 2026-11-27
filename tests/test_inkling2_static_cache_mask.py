@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""generate with a StaticCache on hybrid_sliding models past the sliding window, on a tiny Inkling 2 Loop CPU fake,
-after the real startup (import unsloth, or every registered temporary patch in order) in a fresh process."""
+"""Inkling 2 CPU fake: StaticCache past sliding window after real startup in a fresh process."""
 
 import os
 import subprocess
@@ -80,8 +79,7 @@ _CHILD = textwrap.dedent("""
 """ % (SKIP, SKIP))
 
 
-# unsloth_cpu: the native CPU backend (unsloth_zoo.cpu startup). unsloth_cuda: the accelerator startup, which on a
-# driverless host is the UNSLOTH_ALLOW_CPU spoof. temporary_patches: the registered patch order without unsloth.
+# unsloth_cuda: UNSLOTH_ALLOW_CPU spoof on driverless hosts; temporary_patches run without unsloth.
 @pytest.mark.parametrize("startup", ["unsloth_cpu", "unsloth_cuda", "temporary_patches"])
 def test_static_cache_past_window_matches_dynamic_after_startup(startup):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

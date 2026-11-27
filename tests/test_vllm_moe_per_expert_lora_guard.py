@@ -108,9 +108,7 @@ def test_per_expert_adapter_still_goes_through_the_name_check(engine):
         vu._check_lora_is_servable(_model(), PER_EXPERT_KEYS, "the training model", {"r": 16})
 
 
-# Unstubbed name check: vLLM's manager builds packed_modules_mapping with process_packed_modules_mapping, mapping
-# experts to every experts.<i>.<proj> from get_expert_mapping on 2D MoE; with no reachable manager the check must
-# rebuild that or every per-expert key looks missing.
+# Unstubbed: real process_packed_modules_mapping needs get_expert_mapping or keys look missing.
 import sys
 
 import torch.nn as nn
@@ -305,7 +303,6 @@ def test_per_expert_keys_resolve_through_the_real_name_check(monkeypatch, fake_v
     assert vu._unmatched_lora_keys(model, keys) == []
     vu._check_lora_is_servable(model, keys, "the training model", {"r": 16})
 
-    # and the check still bites: an expert index or projection vLLM does not have is caught
     parent, projs = ARCHS[arch]
     bad = [
         f"base_model.model.model.layers.0.{parent}.experts.{NUM_EXPERTS}.{projs[0]}.lora_A.weight",
@@ -319,9 +316,7 @@ def test_per_expert_keys_resolve_through_the_real_name_check(monkeypatch, fake_v
         vu._check_lora_is_servable(model, keys + bad, "the training model", {"r": 16})
 
 
-# LoRAModelManager passes force_2d_moe = enable_mixed_moe_lora_format, so a 3D model in mixed mode also gets the
-# per-expert expansion; with no reachable manager the fallback must pass the same flag, else the refusal check admits
-# the adapter and the name check rejects every expert key.
+# No-manager path must pass force_2d_moe = enable_mixed_moe_lora_format, or names are rejected.
 @pytest.mark.parametrize("arch", sorted(ARCHS))
 def test_mixed_mode_3d_model_without_manager_expands_per_expert_names(monkeypatch, fake_vllm, arch):
     vllm_model, _, _ = _build_engine(arch, "main")
@@ -335,7 +330,6 @@ def test_mixed_mode_3d_model_without_manager_expands_per_expert_names(monkeypatc
     assert vu._unmatched_lora_keys(model, keys) == []
     vu._check_lora_is_servable(model, keys, "the training model", {"r": 16})
 
-    # without mixed mode the same 3D model still refuses per-expert keys
     lora_config.enable_mixed_moe_lora_format = False
     with pytest.raises(NotImplementedError, match = "per-expert"):
         vu._check_lora_is_servable(model, keys, "the training model", {"r": 16})
@@ -353,7 +347,6 @@ def test_v0112_builder_without_flag_parameters_is_called_with_the_model_only(mon
 def test_per_expert_keys_are_not_lone_stacked_expert_halves():
     keys = [k for k in _per_expert_keys("qwen3_moe") if "experts" in k]
     assert vu._moe_lone_expert_lora_prefixes(keys) == []
-    # a real lone stacked half is still found
     lone = ["base_model.model.model.layers.0.mlp.experts.lora_A.weight",
             "base_model.model.model.layers.0.mlp.experts.lora_B.weight"]
     assert vu._moe_lone_expert_lora_prefixes(keys + lone) == ["base_model.model.model.layers.0.mlp.experts"]
