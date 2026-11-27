@@ -1619,6 +1619,8 @@ class BlockSwap:
             return inner(run, *args, **kw)
 
         run_in_checkpoint._unsloth_block_swap = self
+        # Identity marker (functools.wraps copies attributes, not this self-reference's target).
+        run_in_checkpoint._unsloth_block_swap_wrapper = run_in_checkpoint
         run_in_checkpoint.__wrapped__ = inner
         if hasattr(inner, "_unsloth_replay_checkpoint"):   # routing replay then sees it as wrapped, not rewrapping
             run_in_checkpoint._unsloth_replay_checkpoint = inner._unsloth_replay_checkpoint

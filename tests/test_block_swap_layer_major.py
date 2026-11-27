@@ -1123,10 +1123,16 @@ def test_checkpoint_wrappers_the_window_cannot_reproduce_are_refused(how):
     assert all(p.grad is None for p in layers.parameters())
 
 
-def test_unsloth_checkpoint_shims_count_as_reentrant():
+def test_unsloth_checkpoint_shims_count_as_reentrant(monkeypatch):
+    import types
+
     def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
         return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant = True)
-    unsloth_gradient_checkpoint.__module__ = "unsloth_zoo.gradient_checkpointing"
+    shims = sys.modules.get("unsloth_zoo.gradient_checkpointing")
+    if shims is None:
+        shims = types.ModuleType("unsloth_zoo.gradient_checkpointing")
+        monkeypatch.setitem(sys.modules, "unsloth_zoo.gradient_checkpointing", shims)
+    monkeypatch.setattr(shims, "unsloth_gradient_checkpoint", unsloth_gradient_checkpoint, raising = False)
     layer = _CkptToy(functools.partial(unsloth_gradient_checkpoint, use_reentrant = False))
     assert lm._checkpoint_mode(layer) == (True, None)
     layer.gradient_checkpointing = False
@@ -1237,6 +1243,107 @@ def test_an_interrupted_submission_leaves_no_worker_waiting():
     t.start()
     t.join(30)
     assert out and out[0][1] is None and out[0][0] == [0, 1]
+
+
+# ---------------------------------------------------------------- round 4 review fixes
+def test_wrapped_checkpoint_functions_are_refused():
+    """functools.wraps copies torch's checkpoint name, module and __wrapped__: identity decides."""
+    @functools.wraps(torch.utils.checkpoint.checkpoint)
+    def scaled(function, *args, **kwargs):
+        return torch.utils.checkpoint.checkpoint(lambda *a: function(*a) * 2, *args, use_reentrant = True)
+
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_CkptToy(scaled) for _ in range(3)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        losses, why = _toy_run(layers, _ckpt_fns(layers))
+    assert losses is None and "checkpoint wrapper" in why, why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_reentrant_checkpoint_without_a_grad_input_is_refused():
+    """A reentrant checkpoint gives the layers no gradient when no positional input needs one; the window would."""
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_CkptToy() for _ in range(3)])
+    head = torch.nn.Parameter(torch.ones(16))
+    owner = torch.nn.ModuleList(list(layers))
+    owner.head = torch.nn.Module()
+    owner.head.w = head
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        (x * head).sum().backward()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        losses, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], model = owner)
+    assert losses is None and "reentrant checkpoint" in why, why
+    assert head.grad is None and all(p.grad is None for p in layers.parameters())
+
+
+class _Scale(torch.overrides.TorchFunctionMode):
+    def __torch_function__(self, func, types, args = (), kwargs = None):
+        out = func(*args, **(kwargs or {}))
+        return out * 2 if func is torch.nn.functional.linear else out
+
+
+@pytest.mark.parametrize("where", ["caller", "micro-batch"])
+def test_operator_modes_are_refused(where):
+    layers = _toy_stack()
+
+    def fn(m):
+        with _Scale() if where == "micro-batch" else contextlib.nullcontext():
+            x = _toy_x(m)
+            for layer in layers:
+                x = layer(x)
+            x.sum().backward()
+
+    fns = [functools.partial(fn, m) for m in range(2)]
+    with _Scale() if where == "caller" else contextlib.nullcontext():
+        losses, why = _toy_run(layers, fns)
+    assert losses is None and "TorchFunctionMode" in why, why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_a_micro_batch_raising_layer_major_abort_rolls_back():
+    layers = _toy_stack()
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+        if m == 1:
+            raise lm.LayerMajorAbort("raised by the micro-batch")
+        return m
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "raised by the micro-batch" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_failed_interceptor_setup_restores_every_class():
+    """An interrupt while patching the second decoder class: the first one's __call__ is put back too."""
+    class Meta(type(_Toy)):
+        calls = 0
+
+        def __setattr__(cls, name, value):
+            if name == "__call__":
+                Meta.calls += 1
+                if Meta.calls == 2:
+                    raise KeyboardInterrupt
+            super().__setattr__(name, value)
+
+    A = Meta("A", (_Toy,), {})
+    B = Meta("B", (_Toy,), {})
+    layers = torch.nn.ModuleList([A(), B(), A()])
+    with pytest.raises(KeyboardInterrupt):
+        with lm._intercept(None, layers):
+            pass
+    assert Meta.calls >= 2
+    assert "__call__" not in A.__dict__ and "__call__" not in B.__dict__
 
 
 def test_boundary_bytes():

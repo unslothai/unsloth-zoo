@@ -305,35 +305,55 @@ def _kv_shared_layers(layers):
 _CKPT_SHIMS = ("unsloth_checkpoint", "unsloth_gradient_checkpoint", "unsloth_offloaded_gradient_checkpoint")
 
 
-def _checkpoint_mode(layer):
-    """(no_grad_forward, problem) for the layer's own checkpoint wrapper, which the window bypasses.
-    no_grad_forward: standard training runs this layer's forward without gradients, a reentrant checkpoint (torch's
-    checkpoint with use_reentrant True or unset, or Unsloth's shims, autograd Functions whatever use_reentrant says).
-    The window's no-grad forward and grad-mode recompute are then exactly standard accumulation's, also where the two
-    differ in the last bit (a compiled block's inference and training graphs). problem: a wrapper the window cannot
-    reproduce (checkpoint options such as a context_fn, an unrecognised wrapper), refused."""
+def _checkpoint_mode(layer, swapper = None):
+    """(no_grad_forward, problem) for the layer's own checkpoint wrapper, which the window bypasses. Only these
+    function objects (identity, not names: functools.wraps copies those) are known: torch's checkpoint (current or
+    the pristine one Unsloth keeps), optionally a functools.partial binding nothing but use_reentrant; Unsloth's
+    checkpoint shims; and the checkpoint wrapper this block swap installed around one of them. Anything else is
+    refused. no_grad_forward: standard training runs the layer's forward without gradients (reentrant: torch with
+    use_reentrant True or unset, which torch resolves to True; Unsloth's shims are autograd Functions either way), so
+    the window's no-grad forward and grad-mode recompute are exactly standard accumulation's, also where the two
+    differ in the last bit (a compiled block's inference and training graphs)."""
     if not (getattr(layer, "gradient_checkpointing", False) and getattr(layer, "training", False)):
         return False, None
     fn, reentrant = getattr(layer, "_gradient_checkpointing_func", None), None
-    pristine = getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
-    for _ in range(8):
+    ck = torch.utils.checkpoint
+    torch_fns = {id(f) for f in (ck.checkpoint, getattr(ck, "_unsloth_pristine_checkpoint", None)) if f is not None}
+    shims = sys.modules.get("unsloth_zoo.gradient_checkpointing")
+    shim_fns = {id(f) for f in (getattr(shims, name, None) for name in _CKPT_SHIMS) if f is not None}
+    for _ in range(4):
         if fn is None:
             break
         if isinstance(fn, functools.partial):
-            if fn.args or set(fn.keywords) - {"use_reentrant"}:
+            if reentrant is not None or fn.args or set(fn.keywords) - {"use_reentrant"}:
                 return False, "a decoder layer's checkpoint has custom options (context_fn and the like)"
-            if reentrant is None and "use_reentrant" in fn.keywords:
-                reentrant = fn.keywords["use_reentrant"]
+            reentrant = fn.keywords.get("use_reentrant")
             fn = fn.func
             continue
-        name, module = getattr(fn, "__name__", ""), getattr(fn, "__module__", "") or ""
-        if name in _CKPT_SHIMS and module.startswith("unsloth_zoo"):
+        if id(fn) in shim_fns:
             return True, None
-        if fn is torch.utils.checkpoint.checkpoint or fn is pristine or \
-                (name == "checkpoint" and module == "torch.utils.checkpoint"):
-            return reentrant is None or reentrant is True, None   # torch: unset means reentrant
-        fn = getattr(fn, "__wrapped__", None)   # block swap's checkpoint wrapper, torch's dynamo-disable wrapper
+        if id(fn) in torch_fns:
+            return reentrant is None or reentrant is True, None
+        attrs = getattr(fn, "__dict__", None) or {}
+        if swapper is not None and attrs.get("_unsloth_block_swap") is swapper and \
+                attrs.get("_unsloth_block_swap_wrapper") is fn and reentrant is None:
+            fn = fn.__wrapped__   # block swap's own residency wrapper around the layer's checkpoint
+            continue
+        break
     return False, "a decoder layer's checkpoint wrapper is not one the window can reproduce"
+
+
+def _operator_modes_active():
+    """TorchFunctionMode / TorchDispatchMode on this thread: thread-local, so workers would run without them."""
+    for probe in (getattr(torch._C, "_len_torch_function_stack", None),
+                  getattr(torch._C, "_len_torch_dispatch_stack", None),
+                  getattr(getattr(torch, "_ops", None), "_len_torch_dispatch_stack_pre_dispatch", None)):
+        try:
+            if probe is not None and probe():
+                return True
+        except Exception:
+            return True
+    return False
 
 
 _INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
@@ -455,6 +475,8 @@ class _Window:
             self._abort("a decoder layer input other than the hidden states needs gradients")
         if _shared_state(tuple(others[0]) + tuple(others[1].values())):
             self._abort("a decoder layer input is a mapping (state shared between layers, such as shared KV)")
+        if _operator_modes_active():
+            self._abort("a TorchFunctionMode / TorchDispatchMode is active inside the micro-batch")
         if _saved_tensor_hooks_active():
             # Entered inside the micro-batch (a callback): the window's decoder replay would bypass them.
             self._abort("saved-tensor hooks are active inside the micro-batch")
@@ -475,9 +497,13 @@ class _Window:
             # A live KV / state cache, positional or under any keyword (deprecated aliases included), checked on
             # the call as made: the recompute would update it a second time.
             self._abort("a decoder layer call with a live KV cache")
-        no_grad_forward, problem = _checkpoint_mode(layer)
+        no_grad_forward, problem = _checkpoint_mode(layer, self.swapper)
         if problem is not None:
             self._abort(problem)
+        if no_grad_forward and (where != 0 or not h.requires_grad):
+            # A reentrant checkpoint only produces gradients from a positional input that needs them: without
+            # one, standard training gets no decoder gradient at all here.
+            self._abort("a reentrant checkpoint without a positional hidden state that needs gradients")
         self.check_values[l] = self.check_values[l] or not no_grad_forward
         kwargs = _uncached(layer, dict(kwargs))
         args2, kwargs2 = _with_hidden(args, kwargs, where, x)
@@ -529,8 +555,11 @@ class _Window:
             if self.next_layer[m] != self.L and self.abort_reason is None:
                 with self.cv:
                     self.abort_reason = (f"micro-batch {m} ran {self.next_layer[m]} of {self.L} decoder layers")
-        except LayerMajorAbort:
-            pass
+        except LayerMajorAbort as e:
+            # Also one a micro-batch raised itself (not through _abort): the window must not count as complete.
+            with self.cv:
+                if self.abort_reason is None:
+                    self.abort_reason = str(e) or f"micro-batch {m} aborted the window"
         except RuntimeError as e:
             # The model writes in place into a layer output between layers (a leaf here): no window.
             inplace = "leaf Variable that requires grad" in str(e)
@@ -661,28 +690,28 @@ _WORKERS = _Workers()
 
 @contextmanager
 def _intercept(window, layers):
-    """Route the decoder layers' calls through the window, for its worker threads only (class-level, undone after)."""
+    """Route the decoder layers' calls through the window, for its worker threads only (class-level, undone after,
+    also when setting up fails halfway)."""
     patched, orig_calls = [], {}
-    for cls in {type(layer) for layer in layers}:
-        orig = cls.__call__
-        orig_calls[cls] = orig
-        had = "__call__" in cls.__dict__
-
-        def call(self, *args, _orig = orig, **kwargs):
-            w = getattr(_TLS, "window", None)
-            if w is None:
-                return _orig(self, *args, **kwargs)
-            return w.layer_call(self, _orig, args, kwargs)
-
-        cls.__call__ = call
-        patched.append((cls, had, orig))
     try:
+        for cls in {type(layer) for layer in layers}:
+            orig = cls.__call__
+            orig_calls[cls] = orig
+            patched.append((cls, "__call__" in cls.__dict__, orig))
+
+            def call(self, *args, _orig = orig, **kwargs):
+                w = getattr(_TLS, "window", None)
+                if w is None:
+                    return _orig(self, *args, **kwargs)
+                return w.layer_call(self, _orig, args, kwargs)
+
+            cls.__call__ = call
         yield orig_calls
     finally:
-        for cls, had, orig in patched:
+        for cls, had, orig in reversed(patched):
             if had:
                 cls.__call__ = orig
-            else:
+            elif "__call__" in cls.__dict__:
                 del cls.__call__
 
 
@@ -742,6 +771,8 @@ def _run_layer_major(layers, micro_fns, swapper, model):
     if _kv_shared_layers(layers):
         # A consumer layer replays before its producer and would read the producer's no-grad key / value states.
         return None, "decoder layers share key / value states (KV sharing)"
+    if _operator_modes_active():
+        return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
     if _saved_tensor_hooks_active():
         # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
         return None, "saved-tensor hooks are active (activation offloading)"
