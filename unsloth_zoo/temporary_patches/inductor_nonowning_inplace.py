@@ -34,9 +34,14 @@ _FLAG = "_unsloth_nonowning_inplace_guard"
 
 
 def _torch_below_2_16():
+    # 2.16 dev builds count: nightlies from before the fix still have the bug, and the source check skips fixed ones.
     import torch
-    found = re.match(r"(\d+)\.(\d+)", torch.__version__)
-    return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 16)
+    version = str(torch.__version__)
+    found = re.match(r"(\d+)\.(\d+)", version)
+    if found is None:
+        return False
+    major_minor = (int(found.group(1)), int(found.group(2)))
+    return major_minor < (2, 16) or (major_minor == (2, 16) and ".dev" in version)
 
 
 def _tag_inductor_cache():
@@ -46,19 +51,29 @@ def _tag_inductor_cache():
         import torch.compiler.config as config
     except Exception:
         return
-    if not hasattr(config, "cache_key_tag"):
+    current = getattr(config, "cache_key_tag", None)
+    if not isinstance(current, str):
         return
-    tags = [t for t in config.cache_key_tag.split(",") if t]
+    tags = [t for t in current.split(",") if t]
     if NONOWNING_INPLACE_CACHE_TAG in tags:
         return
+    tag = ",".join(tags + [NONOWNING_INPLACE_CACHE_TAG])
     from unsloth_zoo.torch_config import set_torch_config
-    set_torch_config(config, "cache_key_tag", ",".join(tags + [NONOWNING_INPLACE_CACHE_TAG]))
+    set_torch_config(config, "cache_key_tag", tag)
+    # Inductor compile workers read the tag from the environment at startup.
+    os.environ["TORCH_COMPILE_CACHE_KEY_TAG"] = tag
+
+
+def _insert_nonowning(source):
+    """The upstream one-line change, or None when the anchor is not alone on its own line."""
+    match = re.search(r"(?m)^([ \t]*)" + re.escape(_ANCHOR) + r"[ \t]*$", source)
+    if match is None:
+        return None
+    return source[:match.end()] + "\n" + match.group(1) + "ir.NonOwningLayout," + source[match.end():]
 
 
 def patch_inductor_nonowning_inplace():
     """Returns True when the guard is active (installed now or before), False when torch is fixed or unpatchable."""
-    if os.environ.get("UNSLOTH_INDUCTOR_NONOWNING_GUARD", "1") == "0":
-        return False
     try:
         from torch._inductor import ir, scheduler
     except Exception:
@@ -69,6 +84,8 @@ def patch_inductor_nonowning_inplace():
         return False
     if getattr(original, _FLAG, False):
         return True
+    if os.environ.get("UNSLOTH_INDUCTOR_NONOWNING_GUARD", "1") == "0":
+        return False
     if not _torch_below_2_16():
         return False
     try:
@@ -78,8 +95,9 @@ def patch_inductor_nonowning_inplace():
     # Already fixed (2.16, or a backport), or the tuple moved: leave it alone.
     if "NonOwningLayout" in source or source.count(_ANCHOR) != 1 or "super(" in source:
         return False
-    indent = re.search(r"\n([ \t]*)" + re.escape(_ANCHOR), source).group(1)
-    source = source.replace(_ANCHOR, _ANCHOR + "\n" + indent + "ir.NonOwningLayout,")
+    source = _insert_nonowning(source)
+    if source is None:
+        return False
     namespace = {}
     # Annotations stay strings, as in a module with `from __future__ import annotations`.
     flags = __future__.annotations.compiler_flag

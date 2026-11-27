@@ -73,13 +73,58 @@ def test_guard_installed_exactly_below_2_16():
 
 
 def test_patched_source_adds_only_nonowning_layout():
-    if not guard.patch_inductor_nonowning_inplace():
-        pytest.skip("torch already excludes NonOwningLayout")
+    import difflib
     import inspect
-    original = inspect.getsource(scheduler.BaseSchedulerNode.decide_inplace_update._unsloth_original).splitlines()
-    assert "NonOwningLayout" not in "\n".join(original)
-    i = next(k for k, line in enumerate(original) if guard._ANCHOR in line)
-    assert original[i - 1].strip() == "ir.MultiOutputLayout,"
+    import textwrap
+    node = scheduler.BaseSchedulerNode
+    plain = getattr(node.decide_inplace_update, "_unsloth_original", node.decide_inplace_update)
+    source = textwrap.dedent(inspect.getsource(plain))
+    if "NonOwningLayout" in source:
+        pytest.skip("torch already excludes NonOwningLayout")
+    patched = guard._insert_nonowning(source)
+    changed = [line for line in difflib.ndiff(source.splitlines(), patched.splitlines()) if line[:1] in "+-"]
+    assert [(line[0], line[2:].strip()) for line in changed] == [("+", "ir.NonOwningLayout,")]
+
+
+def test_inline_anchor_is_refused():
+    inline = "def f(self):\n    return (ir.NoneLayout, ir.MutationLayoutSHOULDREMOVE,)\n"
+    assert guard._insert_nonowning(inline) is None
+
+
+def test_version_gate(monkeypatch):
+    for version, below in (("2.6.0", True), ("2.15.0+cu132", True), ("2.16.0.dev20261122+cpu", True),
+                           ("2.16.0", False), ("2.17.0.dev20270101", False)):
+        monkeypatch.setattr(torch, "__version__", version)
+        assert guard._torch_below_2_16() is below, version
+
+
+def test_kill_switch_and_installed_state(monkeypatch):
+    node = scheduler.BaseSchedulerNode
+    current = node.decide_inplace_update
+    installed = getattr(current, guard._FLAG, False)
+    monkeypatch.setenv("UNSLOTH_INDUCTOR_NONOWNING_GUARD", "0")
+    # An installed guard still reports itself; a fresh install is refused.
+    assert guard.patch_inductor_nonowning_inplace() is installed
+    monkeypatch.setattr(node, "decide_inplace_update", getattr(current, "_unsloth_original", current))
+    assert guard.patch_inductor_nonowning_inplace() is False
+    assert not getattr(node.decide_inplace_update, guard._FLAG, False)
+
+
+def test_cache_tag_is_set_once_and_reaches_workers():
+    import os
+    import threading
+    if not guard.patch_inductor_nonowning_inplace():
+        pytest.skip("guard not installed on this torch")
+    config = torch.compiler.config
+    guard._tag_inductor_cache()
+    tags = config.cache_key_tag.split(",")
+    assert tags.count(guard.NONOWNING_INPLACE_CACHE_TAG) == 1
+    assert guard.NONOWNING_INPLACE_CACHE_TAG in os.environ.get("TORCH_COMPILE_CACHE_KEY_TAG", "").split(",")
+    seen = []
+    thread = threading.Thread(target = lambda: seen.append(config.cache_key_tag))
+    thread.start()
+    thread.join()
+    assert guard.NONOWNING_INPLACE_CACHE_TAG in seen[0].split(",")
 
 
 @needs_cpp
