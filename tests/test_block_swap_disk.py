@@ -179,6 +179,26 @@ def test_host_limit_caps_the_host_fit(monkeypatch):
         _mod._check_host_fit([400_000] * 3)
 
 
+def test_host_limit_refusal_names_the_cap_not_the_system_reserve(monkeypatch):
+    # Plenty of free RAM: only UNSLOTH_OFFLOAD_HOST_LIMIT can refuse, so the message must name it.
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 << 30, 32 << 30))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "1MB")
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([400_000] * 3)
+    msg = str(e.value)
+    assert "UNSLOTH_OFFLOAD_HOST_LIMIT caps the offloaded layers at 1.0 MiB" in msg
+    assert "free for the system" not in msg and "At most 2 layers" in msg
+
+
+def test_free_ram_refusal_under_a_looser_cap_still_names_the_reserve(monkeypatch):
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 << 30, 1 << 20))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "1GB")
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([400_000] * 3)
+    msg = str(e.value)
+    assert "free for the system" in msg and "caps the offloaded layers" not in msg
+
+
 def test_auto_swap_indices_names_the_disk_tier():
     # CPU layers: auto_swap_indices plans CUDA cards only, so its picks go through the helper directly.
     layers = nn.ModuleList([nn.Linear(64, 64, bias = False).requires_grad_(False) for _ in range(10)])
