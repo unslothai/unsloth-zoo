@@ -528,8 +528,10 @@ def _cvt_ok(index, eager = False):
             _decode_probe_kernel[(1024,)](blocks, scales, got, CVT = True, enable_fp_fusion = True)
             _decode_probe_kernel[(1024,)](blocks, scales, want, CVT = False, enable_fp_fusion = True)
         return bool(torch.equal(got.view(torch.int16), want.view(torch.int16)))
-    except Exception:
-        return False
+    except Exception as error:
+        from .utils import _is_out_of_memory
+        # Out of memory says nothing about the convert: None, decided on a later eager launch.
+        return None if _is_out_of_memory(error) else False
 
 
 def _gemv_rows(M, E, transpose_b):
