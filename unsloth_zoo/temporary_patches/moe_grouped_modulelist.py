@@ -76,14 +76,17 @@ LAST_DECLINE = {"reason": None}
 
 
 def _grouped_mm_supported() -> bool:
-    """Cached probe: reuse unsloth's check, else a local tiny torch._grouped_mm call."""
+    """Cached probe: reuse unsloth's check, else a local tiny torch._grouped_mm call. An out-of-memory probe is no
+    verdict: this call keeps the loop and the next one probes again."""
     global _GROUPED_MM_SUPPORTED
     if _GROUPED_MM_SUPPORTED is not None:
         return _GROUPED_MM_SUPPORTED
     ok = False
     try:
-        from .moe_utils import _check_torch_grouped_mm_supported
-        ok = bool(_check_torch_grouped_mm_supported())
+        from . import moe_utils
+        ok = bool(moe_utils._check_torch_grouped_mm_supported())
+        if not ok and moe_utils._TORCH_GROUPED_MM_SUPPORTED is None:
+            return False  # moe_utils recorded no verdict (out of memory): do not latch it here either
     except Exception:
         try:
             if torch.cuda.is_available():
@@ -97,7 +100,10 @@ def _grouped_mm_supported() -> bool:
                 w = torch.ones((1, 8, 8), device=dev, dtype=torch.bfloat16)
                 torch._grouped_mm(x, w, offs=torch.tensor([1], device=dev, dtype=torch.int32))
                 ok = True
-        except Exception:
+        except Exception as exc:
+            oom = getattr(torch, "OutOfMemoryError", None)
+            if (isinstance(oom, type) and isinstance(exc, oom)) or "out of memory" in str(exc).lower():
+                return False
             ok = False
     _GROUPED_MM_SUPPORTED = ok
     return ok
@@ -112,6 +118,12 @@ try:
     from .moe_utils import _triton_grouped_mm, _triton_grouped_mm_wanted
 except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
+
+try:
+    from .moe_utils import _count_grouped_mm_sync
+except Exception:
+    def _count_grouped_mm_sync(*args, **kwargs):
+        return None
 
 try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
@@ -167,6 +179,7 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     x = x.contiguous()
     if not _view_weight_ok(w):
         w = w.contiguous()
+    _count_grouped_mm_sync("torch_fallback", x, w, offs.shape[0])
     try:
         return torch._grouped_mm(x, w, offs=offs)
     except RuntimeError as e:

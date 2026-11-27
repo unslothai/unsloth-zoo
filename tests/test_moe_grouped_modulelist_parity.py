@@ -1,6 +1,5 @@
-"""Parity tests for the transformers<5 ModuleList grouped-GEMM MoE path: synthetic Qwen3-MoE/Mixtral/OLMoE blocks
-(transformers>=5 stacks experts) vs a per-expert loop in default/cache/recompute modes, forward and backward; skipped
-without torch._grouped_mm."""
+"""Parity tests for the transformers<5 ModuleList grouped MoE path (transformers>=5 stacks experts)
+vs per-expert loop, forward/backward, default/cache/recompute; skipped without torch._grouped_mm."""
 import types
 import torch
 import torch.nn as nn
@@ -198,9 +197,8 @@ def test_wrap_loader_idempotent_and_enables():
 
 
 def test_auto_enable_reevaluates_after_adapter_attaches():
-    """Re-running auto_enable after an adapter attaches restores a block whose expert LoRA the grouped path cannot run
-    (only one expert wrapped) to the loop; frozen blocks stay grouped (leaf-wrap safe); supported expert LoRA stays
-    grouped, see tests/test_moe_grouped_modulelist_lora.py."""
+    """Re-running auto_enable after an adapter attaches reverts partly wrapped expert-LoRA blocks to
+    the loop; frozen blocks stay grouped (leaf-wrap safe), as do supported LoRA blocks."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
     model = nn.Module()
     model.layers = nn.ModuleList(
@@ -212,7 +210,6 @@ def test_auto_enable_reevaluates_after_adapter_attaches():
     assert frozen_blk.forward.__func__ is grouped_moe_forward
     assert lora_blk.forward.__func__ is grouped_moe_forward
 
-    # Simulate an adapter that wraps one expert of the second block only.
     getattr(lora_blk.experts[0], spec[0]).lora_A = nn.Identity()
 
     auto_enable_grouped_moe(model)  # exactly what loader.py calls after patch_peft_model
@@ -254,8 +251,7 @@ def test_experts_grouped_ready_checks_every_expert():
 
 
 def test_frozen_only_contract_for_experts():
-    """Frozen bnb 4-bit experts are eligible; an unfrozen expert bails, since a real Params4bit is uint8 and cannot
-    require grad, so the trainable case is a plain bf16 expert."""
+    """Frozen bnb 4-bit experts qualify; trainable ones bail: Params4bit cannot require grad."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
 
     if HAS_BNB:
@@ -285,8 +281,7 @@ if __name__ == "__main__":
 
 
 def test_enable_warms_the_probes_on_each_card_holding_experts(monkeypatch):
-    """A compiled first forward on a second GPU model must not open an eager probe region (graph break or Unsupported
-    under fullgraph); enabling warms each card's support and view probes."""
+    """Enable warms each card's probes, so a compiled first forward opens no eager probe."""
     from unsloth_zoo.temporary_patches import moe_utils
 
     seen = []

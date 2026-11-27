@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests patch_datasets_map_worker_death_retry (temporary_patches/misc.py): retries only the 'abruptly died during map'
-error from an OOM-killed dataset_num_proc worker; real map errors propagate."""
+"""Tests patch_datasets_map_worker_death_retry: only OOM-killed worker map errors are retried."""
 
 import ast
 import inspect
@@ -148,8 +147,7 @@ def test_positional_num_proc_is_retried():
 
 
 def test_the_retry_disables_multiprocessing_rather_than_asking_for_one_worker():
-    """datasets >= 4.1.0 gates its pool on `num_proc is not None and num_proc >= 1` (arrow_dataset.py, changed from > 1
-    in 4.1.0, same in 4.4.1), so a retry at num_proc = 1 forks a killable worker; only None is in-process."""
+    """datasets >= 4.1 pools num_proc >= 1, so retry with None: 1 forks a killable worker."""
     calls = []
 
     def original(self, fn, num_proc = None, **kw):

@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fp16 full finetune of an MoE on GPUs without bf16 (T4, V100): fp32 expert masters under fp16 autocast, which does not
-cast torch._grouped_mm inputs, hit a dtype mismatch; equal-dtype paths (LoRA, bf16) must stay bit-for-bit unchanged,
-tested on CPU"""
+"""fp16 (no bf16): autocast skips torch._grouped_mm; fp32 masters mismatch, equal dtypes exact."""
 
 import pytest
 import torch
@@ -61,11 +59,9 @@ def test_fp16_activation_meets_fp32_master_under_fp16_autocast():
     x, w, offsets = _case(torch.float16, torch.float32)
     with torch.autocast("cpu", dtype = torch.float16):
         out = moe_utils._grouped_mm_with_backward_fix(x, w, offsets)
-    # Autocast semantics, as F.linear: the GEMM runs in fp16.
     assert out.dtype == torch.float16
     torch.testing.assert_close(out.float(), _reference(x, w.detach(), offsets, torch.float16).float(), rtol = 2e-2, atol = 2e-2)
     out.float().sum().backward()
-    # The fp32 master still receives its gradient, in float32.
     assert w.grad is not None and w.grad.dtype == torch.float32 and torch.isfinite(w.grad).all()
 
 

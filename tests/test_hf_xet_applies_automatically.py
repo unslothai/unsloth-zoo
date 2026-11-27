@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks that importing unsloth_zoo tunes hf_xet in a clean subprocess env that spawned workers inherit; hf_xet reads
-env once at runtime build, so late settings are no-ops."""
+"""Import tunes hf_xet for spawned workers; it reads env once, so late sets are no-ops."""
 
 from __future__ import annotations
 
@@ -39,8 +38,7 @@ _BASE_ENV["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
 
 
 def _run(tmp_path: Path, body: str, extra_env: "dict[str, str] | None" = None) -> dict:
-    """Run body as a FILE, not with -c: multiprocessing spawn re-imports __main__ in the child, which a -c script cannot
-    provide; the failure looks like an unrelated pickling error."""
+    """Use a file, not -c: spawn re-imports __main__ in the child; -c gives a pickling error."""
     script = tmp_path / "probe.py"
     script.write_text(textwrap.dedent(body))
     env = dict(_BASE_ENV, PYTHONPATH = ZOO_ROOT + os.pathsep + _BASE_ENV.get("PYTHONPATH", ""))
@@ -126,8 +124,7 @@ def test_a_fresh_vm_with_an_empty_xet_log_dir_does_not_import_into_high_performa
         }))
     """, {"HF_XET_CACHE": str(xet_cache), "HF_HOME": str(tmp_path / "hf")})
 
-    # Judge the flag with the tuning code's _is_true parser: it strips and lowercases, so a raw membership test would
-    # let "True" or " on " reintroduce the regression.
+    # _is_true strips and lowercases; a raw check lets 'True' or ' on ' bring back the bug.
     from unsloth_zoo.hf_xet_tuning import _is_true
 
     assert not _is_true(result["hp"]), (

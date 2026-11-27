@@ -692,9 +692,6 @@ def test_training_attention_differentiates_short_queries_and_sinks(T, mask, sink
     assert mx.allclose(got, mx.grad(reference)(q), atol=1e-4)
 
 
-STAGED = ("staged", "staged_below_floor", "staged_reference", "staged_off")
-
-
 @metal_only
 @pytest.mark.parametrize("case,shape,N,bits,route,value", [
     ("8bit_batched", (2, 768, 256), 1024, 8, "dense", 1), ("bias", (1, 1536, 256), 1024, 4, "dense", 3),
@@ -702,33 +699,24 @@ STAGED = ("staged", "staged_below_floor", "staged_reference", "staged_off")
     ("2bit", (1, 1536, 256), 1024, 2, None, 0), ("eval_policy", (1, 1536, 256), 1024, 4, "dense", 1),
     ("eval_reference", (1, 1536, 256), 1024, 4, "dense", 1), ("trainable_scales", (1, 1536, 256), 1024, 4, None, 0),
     ("at_cap", (1, 1536, 256), 1024, 4, "dense", 1), ("over_cap", (1, 1536, 256), 1024, 4, None, 0),
-    ("other_context", (1, 1536, 256), 1024, 4, None, 0), ("dense_off", (1, 1536, 2048), 2048, 4, None, 0),
-    ("staged", (1, 1024, 2048), 2048, 4, "staged", 1), ("staged_below_floor", (1, 1023, 2048), 2048, 4, None, 0),
-    ("staged_reference", (1, 1024, 2048), 2048, 4, "staged", 1), ("staged_off", (1, 1024, 2048), 2048, 4, None, 0)])
+    ("other_context", (1, 1536, 256), 1024, 4, None, 0), ("dense_off", (1, 1536, 2048), 2048, 4, None, 0)])
 def test_training_route_takes_large_frozen_projections(monkeypatch, case, shape, N, bits, route, value):
     (*rows, K), calls, native, x = shape, [], nn.QuantizedLinear.__call__, mx.zeros(shape, mx.bfloat16)
     for target, name in ((matmul, "simd_qmm_available"), (matmul, "_train_dequantize_kernel"),
                          (matmul.nax, "kernel_probe_passed")):
         monkeypatch.setattr(target, name, lambda *args: True)
-    # "dense_off" is staged-eligible but has no staged route
-    monkeypatch.setattr(matmul, "staged_train_qmm_available", lambda: case in STAGED)
-    for name in ("UNSLOTH_MLX_DENSE_TRAIN_QMM", "UNSLOTH_MLX_STAGED_TRAIN_QMM"):   # the defaults must route
-        monkeypatch.delenv(name, raising = False)
-    if case == "dense_off" or case in STAGED:
+    monkeypatch.delenv("UNSLOTH_MLX_DENSE_TRAIN_QMM", raising = False)   # the default must route
+    if case == "dense_off":
         monkeypatch.setenv("UNSLOTH_MLX_DENSE_TRAIN_QMM", "0")
-    if case == "staged_off":
-        monkeypatch.setenv("UNSLOTH_MLX_STAGED_TRAIN_QMM", "0")
     monkeypatch.setattr(matmul, "_DENSE_TRAIN_QMM_MAX_WEIGHTS", K * N + {"at_cap": 0, "over_cap": -1}.get(case, 1))
-    for owner, attr, kind in ((matmul, "_dense_train_qmm", "dense"),
-                              (matmul, "differentiable_staged_train_qmm", "staged")):
-        monkeypatch.setattr(owner, attr, lambda group_size, bits, kind = kind: lambda x, w, s, b: (
-            calls.append((kind, x.shape, bits)) or mx.ones((x.shape[0], w.shape[0]), x.dtype)))
+    monkeypatch.setattr(matmul, "_dense_train_qmm", lambda group_size, bits: lambda x, w, s, b: (
+        calls.append(("dense", x.shape, bits)) or mx.ones((x.shape[0], w.shape[0]), x.dtype)))
     base = nn.QuantizedLinear(K, N, bias = case == "bias", bits = bits)
     base.set_dtype(mx.bfloat16)
     base.update({"bias": mx.full((N,), 2, mx.bfloat16)} if case == "bias" else {})
     base.unfreeze(keys = ["scales"] if case == "trainable_scales" else [])
-    layer = base if case in ("eval_reference", "staged_reference") else LoRALinear.from_base(base, r = 8)
-    layer.train(case not in ("eval_policy", "eval_reference", "staged_reference"))
+    layer = base if case == "eval_reference" else LoRALinear.from_base(base, r = 8)
+    layer.train(case not in ("eval_policy", "eval_reference"))
     mlx_utils.acquire_mlx_training_patches()
     try:   # inference contracts on the native call hold while the route is installed
         assert inference._resolved_bindings(inference._DENSE_QMM_CONTRACT) is not None
@@ -742,7 +730,7 @@ def test_training_route_takes_large_frozen_projections(monkeypatch, case, shape,
 
 @metal_only
 def test_training_route_keeps_a_rebound_quantized_linear_call(monkeypatch):
-    monkeypatch.setattr(matmul, "available_train_qmm_routes", lambda: ("dense",))
+    monkeypatch.setattr(matmul, "dense_train_qmm_available", lambda: True)
     native, custom = nn.QuantizedLinear.__call__, lambda self, x: native(self, x) * 2
     for call, routed in ((custom, False), (native, True)):
         monkeypatch.setattr(nn.QuantizedLinear, "__call__", call)
@@ -770,35 +758,6 @@ def test_output_and_input_gradient_are_no_further_from_fp32_than_stock(bits):
         gaps = [mx.abs(got.astype(mx.float32) - ref) for got, ref in zip((y, dx), (want[0][0], want[1][0]))]
         errors[name] = [value.item() for gap in gaps for value in (gap.max(), gap.mean())]
     assert all(d <= 1.1 * s for d, s in zip(errors["dense"], errors["stock"])), errors
-
-
-@metal_only
-@pytest.mark.parametrize("M,N,K,group_size,ok", [
-    (1024, 2048, 2048, 64, True), (1023, 2048, 2048, 64, False), (1024, 1984, 2048, 64, False),
-    (1024, 2048, 1984, 64, False), (1024, 32768, 2048, 64, True), (1024, 32832, 2048, 64, False),
-    (1024, 2048, 32768, 64, True), (1024, 2048, 32832, 64, False), (1024, 16384, 16384, 64, True),
-    (1024, 16384, 16448, 64, False), (1024, 2080, 2048, 64, False), (1024, 2048, 2080, 32, False),
-    (1024, 2048, 2112, 128, False)])
-def test_staged_route_shape_limits(M, N, K, group_size, ok):
-    assert matmul.staged_train_qmm_supported(M, N, K, group_size) is ok
-
-
-@metal_only
-def test_staged_route_is_available_only_on_nax():
-    assert bool(matmul.staged_train_qmm_available()) is (
-        matmul.nax.nax_available() and matmul.nax.gap_open("staged_train_qmm"))
-
-
-@pytest.mark.skipif(not (_METAL and matmul.nax.nax_available()), reason = "needs NAX")
-def test_staged_forward_and_dx_are_stock_bit_for_bit():
-    matmul.probe_staged_qmm()
-    w, scales, biases = mx.quantize((mx.random.normal((4096, 2048), key = mx.random.key(3)) * 0.02).astype(
-        mx.bfloat16), group_size = 64, bits = 4)
-    x, r = (mx.random.normal((1024, n), key = mx.random.key(k)).astype(mx.bfloat16) for k, n in ((1, 2048), (2, 4096)))
-    stock, staged = (mx.vjp(f, [x], [r]) for f in (
-        lambda x: mx.quantized_matmul(x, w, scales, biases, group_size = 64, bits = 4),
-        lambda x: matmul.differentiable_staged_train_qmm(64, 4)(x, w, scales, biases)))
-    assert all(mx.array_equal(a, b).item() for a, b in zip(stock[0] + stock[1], staged[0] + staged[1]))
 
 
 def _causal(T, S):
@@ -1101,6 +1060,32 @@ def test_gelu_approx_keeps_stock_forward_with_finite_half_gradient(dtype):
         for c in (1.0, 1000.0):
             g = grad(gelu, mx.array([1.0, 150.0, -150.0, 300.0, -60000.0], dtype=dt), c)
             assert g.tolist() == [grad(stock, mx.array([1.0], dtype=dt), c).item(), c, 0.0, c, 0.0]
+
+
+@metal_only
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_gelu_approx_keeps_shapes_when_first_traced_inside_a_gradient(dtype):
+    mlx_utils.apply_gelu_approx_finite_grad()
+    dt = getattr(mx, dtype)
+    geglu = mx.compile(lambda gate, x: nn.gelu_approx(gate) * x, shapeless=True)
+    for ndim, f in ((5, nn.gelu_approx), (3, lambda x: geglu(x, x))):
+        big, small = mx.ones((4,) + (2,) * (ndim - 1), dt), mx.ones((2,) * ndim, dt)
+        # A constant input: no tracer. The float16 branch keeps mlx's clipped body and with it this failure.
+        mx.grad(lambda w: (w * f(big).astype(mx.float32)).sum())(mx.array(1.0))
+        assert f(small).shape == small.shape
+
+
+@metal_only
+def test_trainer_installs_gelu_approx_for_a_caller_built_model(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    activations = importlib.import_module("mlx.nn.layers.activations")
+    other = mx.compile(lambda x: x, shapeless=True)
+    monkeypatch.setattr(nn, "gelu_approx", other)
+    monkeypatch.setattr(activations, "gelu_approx", other)
+    MLXTrainer(nn.Linear(4, 4), None, [{"text": "a"}],
+               args=MLXTrainingConfig(output_dir=str(tmp_path), report_to="none", max_steps=1))
+    assert nn.gelu_approx is activations.gelu_approx is mlx_utils._MLX_GELU_APPROX_FINITE_GRAD
 
 
 @metal_only
@@ -4394,6 +4379,7 @@ from mlx_vlm.models.gemma4.config import TextConfig
 from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 from unsloth_zoo.mlx import utils as mlx_utils
 
+mlx_utils.apply_gelu_approx_finite_grad()   # as from_pretrained does
 seq_len = 512
 mx.random.seed(0)
 ids = mx.random.randint(0, 64, (1, seq_len))
@@ -4465,8 +4451,9 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         return max(kept)
 
     shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
-    assert shared_peak < 1.25 * unshared_peak, (
-        f"shared {shared_peak} >= 1.25 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
+    # mlx 0.32.5 cuts the unshared peak more than the shared: tied reads 1.20-1.28 by chip; untied read 1.68 on 0.32.4.
+    assert shared_peak < 1.3 * unshared_peak, (
+        f"shared {shared_peak} >= 1.3 x unshared {unshared_peak}; per interpreter: {json.dumps(per_run)}"
     )
 
     # Checkpointing must not change what the shared model computes.
@@ -4676,9 +4663,8 @@ def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, re
 @pytest.mark.parametrize("B", [32, 1])
 @pytest.mark.parametrize("site", ["vlm_baseline", "preference", "grpo"])
 def test_sliced_vlm_logits_differentiate_like_contiguous_ones(site, B, head, monkeypatch):
-    """mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686): looped to catch
-    it. A vocabulary-sliced head (Inkling's unpadded_vocab_size) is strided even at one row; a one-row sequence slice of
-    a full head is not, and must not pay a copy."""
+    """mlx before 0.32.5 raced in the fused cross-entropy VJP on non-row-contiguous logits (ml-explore/mlx#4686):
+    looped to catch it. A vocabulary-sliced head (Inkling's unpadded_vocab_size) is strided even at one row."""
     from unsloth_zoo.mlx import grpo, preference
     L, V = 129 if B > 1 else 4097, 8192  # as many rows at B=1 as at B=32: a short VJP finishes before the race window
     W = V - 64 if head == "vocab_sliced" else V
@@ -4708,20 +4694,6 @@ def test_sliced_vlm_logits_differentiate_like_contiguous_ones(site, B, head, mon
     assert mx.abs(expected).max().item() > 0
     for _ in range(400):
         assert mx.array_equal(grad(), expected).item()
-    if B == 1 and head == "full":
-        def peak():
-            mx.eval(grad())
-            mx.synchronize()
-            mx.reset_peak_memory()
-            mx.eval(grad())
-            mx.synchronize()
-            return mx.get_peak_memory()
-
-        with monkeypatch.context() as patch:
-            for module in (mlx_utils, preference, grpo):
-                patch.setattr(module, "_row_contiguous_cross_entropy", lambda x, t, **kw: stock(x, t, **kw))
-            uncopied = peak()
-        assert peak() - uncopied < (L - 1) * V * 4 // 2
 
 
 @metal_only

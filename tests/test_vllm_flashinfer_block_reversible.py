@@ -167,8 +167,7 @@ def test_the_unblock_is_conditional_on_the_opt_out_being_clear():
     import textwrap
 
     def _tests_the_opt_out_is_clear(test):
-        """Recognises `not _no_flashinfer` as the opt-out test, alone or as an `and` conjunct; the re-probe unblock adds
-        a narrowing owner check (test_the_reprobe_unblock_also_respects_owners)."""
+        """Recognises `not _no_flashinfer` as the opt-out test, alone or inside an `and`."""
         if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
             return any(_tests_the_opt_out_is_clear(v) for v in test.values)
         return (
@@ -210,9 +209,8 @@ def test_a_preset_opt_out_still_blocks_flashinfer():
 
 
 def test_only_the_import_blocker_is_guarded_on_flashinfer_being_installed():
-    """Only the import blocker is guarded on FlashInfer being installed: forced env vars must still clear, since an
-    inherited VLLM_USE_FLASHINFER_SAMPLER=1 makes TopKTopPSampler's unguarded import raise when the package is
-    absent."""
+    """Forced env vars clear without FlashInfer; inherited VLLM_USE_FLASHINFER_SAMPLER=1 raises at
+    import."""
     import ast
 
     node = _flashinfer_chain()
@@ -302,8 +300,7 @@ def test_the_block_is_not_hoisted_above_the_model_support_check():
 
 
 def test_patch_vllm_graph_capture_returns_early_without_vllm(monkeypatch):
-    """patch_vllm_graph_capture reads vllm.__version__ and vllm is bound only inside the find_spec guard; both the
-    module global and the import block must be faked or the test passes for the wrong reason."""
+    """Fake the vllm global and the import block, or the test passes for the wrong reason."""
     monkeypatch.delattr(vllm_utils, "vllm", raising = False)
     monkeypatch.setitem(sys.modules, "vllm", None)
     assert vllm_utils.patch_vllm_graph_capture() is None

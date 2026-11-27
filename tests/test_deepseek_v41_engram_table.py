@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 engram tables stream from the checkpoint; disk mode never reads a table tensor and
-matches the reference bit for bit; the port reference uses UNSLOTH_FROZEN_TABLE=gpu."""
+"""Disk mode never reads table tensors, is bit-exact; port ref uses UNSLOTH_FROZEN_TABLE=gpu."""
 
 import json
 import os
@@ -205,8 +204,7 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     with torch.no_grad():
         for k in tables:
             assert torch.equal(tables[k](ids), ref.model.engram_tables[k](ids)), k
-    # Training: logits, loss and every gradient bitwise equal. The model gathers each table once per forward, outside
-    # the decoder layers, so a layer recompute never reads it again.
+    # Bitwise-equal training; tables gather outside the layers, so recompute never reads them.
     x = torch.randint(0, 8, (2, 24))
     reset_frozen_table_stats()
     for m in (ref, model):
@@ -226,9 +224,7 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     if NATIVE:
         assert not [k for k in model.state_dict() if "engram_tables" in k]
         return
-    # Outside a full save nothing is exported (adapter saves never decode the table); inside one,
-    # bf16 is zero-copy and fp8 exports decoded rows equal to the port dequantized table, since fp8
-    # rows plus scales would reload raw.
+    # Full saves only; bf16 zero-copy; fp8 decoded, as raw fp8 plus scales would reload raw.
     sd = model.state_dict()
     if kind == "bf16":
         assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}
@@ -244,7 +240,6 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
         assert fts._prepare_full_table_save(model, (), {"state_dict": supplied})
         for t in TABLES:
             assert torch.equal(supplied[t + ".weight"], ref.state_dict()[t + ".weight"]), t
-        # An adapter-only save (transformers' PEFT integration) never decodes the tables.
         calls = []
         monkeypatch.setattr(UnslothFrozenTableEmbedding, "_decode_all", lambda self, *a, **k: calls.append(1))
         monkeypatch.setattr(model, "_hf_peft_config_loaded", True, raising=False)

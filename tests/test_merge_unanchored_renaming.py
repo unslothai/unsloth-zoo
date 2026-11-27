@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Maps LoRA keys of natively loaded Ling 3.0 (bailing_hybrid) to checkpoint keys per shard; transformers 5.20's
-unanchored .attention. rename made shards lacking model.word_embeddings read as new-format, so attention LoRAs were
-never merged (unslothai/unsloth issue 13948)."""
+"""Maps Ling 3.0 (bailing_hybrid) LoRA keys to checkpoint keys per shard; transformers 5.20's
+unanchored .attention. rename left attention LoRAs unmerged (unslothai/unsloth issue 13948)."""
 from collections import defaultdict
 
 import pytest

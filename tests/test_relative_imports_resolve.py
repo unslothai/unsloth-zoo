@@ -70,8 +70,7 @@ def test_every_relative_import_transformers_sees_resolves_to_a_file(path):
 
 
 def test_resolvable_relative_imports_are_left_alone():
-    """The guard is not 'no relative imports': sibling imports resolve to a real file and are the normal spelling, so
-    removing them all would be a far larger change than the bug."""
+    """Not 'no relative imports': resolvable siblings are the normal spelling and stay."""
     sources = "\n".join(p.read_text(encoding = "utf-8") for p in _modules())
     assert len(re.findall(r"^\s*from \.\w+ import", sources, re.MULTILINE)) > 100
 

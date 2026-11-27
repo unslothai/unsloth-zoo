@@ -53,8 +53,7 @@ def _fit_in_subprocess(extra, cores = None):
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-# "user": the count torch derived from the user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept as is. Newer torch builds
-# cap those to the CPUs it sees (a 2-vCPU CI runner reports 2 for OMP_NUM_THREADS=8), so compare with torch's own count.
+# user: torch's count from OMP_NUM_THREADS/MKL_NUM_THREADS; newer torch caps it to CPUs seen.
 _USER = "user"
 
 
@@ -85,15 +84,13 @@ def test_fit_cpu_threads_default_drops_smt_siblings_never_raises():
     assert fitted == 1 and (before == 1 or reason == "physical cores")
     big = 10 ** 6
     before, fitted, reason, _, _ = _fit_in_subprocess({}, big)
-    assert fitted == before  # more cores than torch's default: left alone
+    assert fitted == min(before, 16)  # more cores than torch's default: never raised, only the default cap applies
 
 
 @pytest.mark.parametrize("variable", ["LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE",
                                       "MV2_COMM_WORLD_LOCAL_SIZE"])
 def test_fit_cpu_threads_splits_across_local_ranks_without_launcher_marker(variable):
-    # Every local-size variable Accelerate's get_cpu_distributed_information reads (MVAPICH included) ends at one
-    # thread per rank on two cores. Intel / Open MPI runtimes may already start torch at one thread from their own
-    # variables, in which case there is nothing to fit.
+    # Local-size vars (MVAPICH too) give 1 thread/rank on 2 cores; Intel/Open MPI may preset 1.
     _, fitted, reason, _, _ = _fit_in_subprocess({variable: "2"}, 2)
     assert fitted == 1 and ("local ranks" in reason or reason == "default")
 
@@ -181,8 +178,7 @@ def test_fit_threads_names_the_cgroup_quota(monkeypatch):
 
 
 def test_user_thread_env_kept_when_torch_caps_it(monkeypatch):
-    """Spoof of a small CI runner: torch already capped OMP_NUM_THREADS=8 to 2; the fit keeps torch's 2 and never
-    swaps in its own count, whatever cores it would pick."""
+    """Torch already capped OMP_NUM_THREADS=8 to 2; the fit keeps 2, never its own count."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("_zoo_cpu_runtime_spoof", _ROOT / "unsloth_zoo" / "cpu" / "runtime.py")
     runtime = importlib.util.module_from_spec(spec)

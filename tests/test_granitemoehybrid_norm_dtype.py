@@ -38,7 +38,6 @@ def _set_stock(monkeypatch):
 
 
 def _apply_granite_patches(monkeypatch):
-    # Every patch this module registers, applied through the registry rather than by name.
     _set_stock(monkeypatch)
     monkeypatch.setattr(gm.GraniteMoeHybridDecoderLayer, "forward", gm.GraniteMoeHybridDecoderLayer.forward)
     for fn in TEMPORARY_PATCHES:
@@ -46,8 +45,7 @@ def _apply_granite_patches(monkeypatch):
 
 
 def _norm(cls, hidden_size):
-    # transformers 5.23 normalises the gated norm per group (`group_size` is required); two groups per row make the
-    # rewritten forward match stock only if it keeps the grouping.
+    # transformers 5.23 gated norm needs group_size; two groups per row, so keep grouping.
     if "group_size" in inspect.signature(cls.__init__).parameters:
         return cls(hidden_size, group_size = hidden_size // 2)
     return cls(hidden_size)

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma-4 vision pooler fp16 overflow fix: buggy transformers <= 5.9.x scales by sqrt(hidden_size) in input dtype and
-overflows to inf; pooler runs in fp32 (matches upstream >= 5.10.1); last_hidden_state cast back to encoder dtype"""
+"""fp16 sqrt-scale overflow: transformers <= 5.9.x; fp32 pooler + cast back matches >= 5.10.1."""
 
 import types
 
@@ -139,7 +138,6 @@ def test_patched_fp16_finite_and_matches_fp32_reference():
     TinyPooler, TinyVisionModel = make_buggy_classes()
     x = fp16_overflow_input()
 
-    # fp32 reference on the UNPATCHED classes.
     _, RefVisionModel = make_buggy_classes()
     ref = make_model(RefVisionModel, torch.float32)(x.float()).last_hidden_state
 
@@ -329,8 +327,7 @@ def test_real_transformers_source_canary():
 
 
 def test_real_transformers_patch_applies_or_skips():
-    """Wrapper patches buggy installs, skips fixed, no-ops without gemma4; it mutates process-global classes, but other
-    tests use per-test synthetic classes, so ordering does not matter"""
+    """Mutates process-global classes; order is safe since other tests use per-test synthetic classes."""
     try:
         import transformers.models.gemma4.modeling_gemma4 as modeling
     except ImportError:

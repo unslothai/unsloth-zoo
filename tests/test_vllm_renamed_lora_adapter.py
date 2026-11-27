@@ -74,3 +74,32 @@ def test_load_tensors_serves_the_active_adapter(lora_request, tmp_path, names):
     q = model.base_model.model.model.layers[0].self_attn.q_proj
     assert torch.equal(request.lora_tensors[keys[0]], q.lora_A[names[0]].weight)
     assert torch.equal(request.lora_tensors[keys[1]], q.lora_B[names[0]].weight)
+
+
+def test_default_adapter_drops_other_adapters(lora_request, tmp_path):
+    # DPO adds a frozen "ref" adapter next to the trained "default" one: only "default" may reach vLLM.
+    model = _peft_model("default", "ref")
+    model.set_adapter("default")
+    request = vu._build_lora_request(model, str(tmp_path), True, 1)
+    keys = sorted(request.lora_tensors)
+    assert keys == [
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+    ], keys
+    q = model.base_model.model.model.layers[0].self_attn.q_proj
+    assert torch.equal(request.lora_tensors[keys[0]], q.lora_A["default"].weight)
+    assert torch.equal(request.lora_tensors[keys[1]], q.lora_B["default"].weight)
+
+
+@pytest.mark.parametrize("name", ["default", "a1"])
+def test_strip_keeps_module_names_that_contain_the_adapter_name(name):
+    sd = {
+        f"m.layers.0.{name}_mlp.up.lora_A.{name}.weight": 1,
+        f"m.layers.0.{name}_mlp.up.lora_B.{name}.weight": 2,
+        f"m.layers.0.q_proj.lora_A.{name}x.weight": 3,
+        "m.layers.0.q_proj.lora_A.ref.weight": 4,
+    }
+    assert vu._strip_lora_adapter_name(sd, name) == {
+        f"m.layers.0.{name}_mlp.up.lora_A.weight": 1,
+        f"m.layers.0.{name}_mlp.up.lora_B.weight": 2,
+    }

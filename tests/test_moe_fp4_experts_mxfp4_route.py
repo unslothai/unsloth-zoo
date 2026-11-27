@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers' FP8Experts with expert_dtype="fp4" (DeepSeek-V4 / V4.1 releases on transformers 5.x) store MXFP4 experts:
-the grouped_mm backend decodes them in its GEMM instead of rebuilding both bf16 stacks every pass."""
+"""expert_dtype="fp4" (transformers 5.x): grouped_mm decodes MXFP4 in-GEMM, no bf16 rebuilds."""
 
 import os
 import types

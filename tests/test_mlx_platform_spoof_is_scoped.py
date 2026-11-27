@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The MLX platform spoof must stay scoped to the two gate modules: a process-wide arm64 platform.machine() empties
-inductor's vec ISA list, so later torch.compile builds fail."""
+"""Scope spoof to the two gate modules; process-wide arm64 breaks compiles via inductor's ISAs."""
 
 import platform
 
@@ -70,8 +69,7 @@ def test_inductor_observes_the_real_machine(monkeypatch):
 
 
 def test_other_modules_in_the_same_package_still_see_the_real_host():
-    """Allow-list exact module names, not packages: unsloth_zoo.llama_cpp picks its archive from the real host, and a
-    package-wide spoof once selected the macOS build on Linux."""
+    """Exact names only: a package-wide spoof made unsloth_zoo.llama_cpp pick the macOS build."""
     _spoof_apple_silicon_platform()
 
     for module in ("unsloth_zoo.llama_cpp", "unsloth_zoo.device_type",

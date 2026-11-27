@@ -99,8 +99,7 @@ def _uses_hub_kernel_fallback(model_type):
 
 
 def test_nemotron_h_hub_kernel_functions_are_not_compiled(tmp_path):
-    # Skip only before transformers 5.5, which has no hub-kernel wrappers to keep uncompiled; keyed on its own source,
-    # not on hub being empty, so 5.17+ still fails if discovery breaks.
+    # Skip only pre-5.5 transformers, keyed on source; 5.17+ must fail if discovery breaks.
     if not _uses_hub_kernel_fallback("nemotron_h"):
         pytest.skip("nemotron_h has no hub-kernel wrappers in this transformers")
     payload = _compile(tmp_path, "nemotron_h")

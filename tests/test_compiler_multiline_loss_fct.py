@@ -85,8 +85,7 @@ GRANITE_SPEECH = """    def forward(self, input_ids=None, attention_mask=None, l
 """
 
 
-# Generous bound that only catches the exponential backtracking fixed in issue 1571; counts process CPU time since
-# shared-runner wall time includes descheduling.
+# CPU time, not wall (runners deschedule); bounds the exponential backtracking of issue 1571.
 _REWRITE_CPU_BUDGET_S = 5.0
 
 
@@ -144,8 +143,7 @@ def test_installed_forwards_are_fused(module, cls):
         pytest.skip(f"{cls} has no local lm_head in this transformers")
     _, fused = _fused(source, cls)
     if "self.lm_head(" not in source:
-        # transformers 4.57 and Qwen2-Audio 5.4 - 5.9 take `logits = outputs[0]` from the inner model, leaving no local
-        # hidden state to fuse; the rewriter must decline.
+        # Inner-model logits (transformers 4.57, Qwen2-Audio 5.4-5.9): rewriter must decline.
         assert not fused, f"{cls} has no local lm_head call, yet its forward was rewritten"
     else:
         assert fused

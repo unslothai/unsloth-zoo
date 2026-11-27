@@ -161,9 +161,8 @@ def test_gradient_pass_forwards_the_whole_chunk():
 
 
 def test_released_unsloth_can_still_see_num_images_in_this_function():
-    """Released unsloth 2026.9.4 gates multi-image GRPO on num_images in grpo_accumulated_loss's signature or source
-    (else RuntimeError); moving it out would make released users with two images in a sample upgrade the zoo; the
-    test runs that probe verbatim."""
+    """Released unsloth 2026.9.4 gates multi-image GRPO on num_images in grpo_accumulated_loss's
+    signature or source (else RuntimeError); keep it there so released users skip a zoo upgrade."""
     from unsloth_zoo.rl_replacements import grpo_accumulated_loss
 
     source = inspect.getsource(grpo_accumulated_loss)
@@ -190,8 +189,7 @@ def test_released_unsloth_can_still_see_num_images_in_this_function():
     )
 
 
-# The gate keeping both logprob passes on the same inputs while the installed unsloth still has its own hard coded
-# no-grad key list; see grpo_companion_vision_keys.
+# Both logprob passes share inputs; installed unsloth has a hard-coded no-grad key list.
 
 import sys
 import types
@@ -213,8 +211,7 @@ _RELEASED_KEYS = (
 
 
 def _install_companion(monkeypatch, tmp_path, body, name = "companion_rl"):
-    """Registers a module named like unsloth's in sys.modules with real source on disk, since inspect.getsource needs a
-    file: the patcher cannot be built with exec or a lambda."""
+    """inspect.getsource needs a real file, so the patcher cannot be built with exec or lambda."""
     path = tmp_path / f"{name}.py"
     path.write_text(textwrap.dedent(body))
     module = types.ModuleType(name)
@@ -355,8 +352,7 @@ def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
 def test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys(
     monkeypatch, tmp_path
 ):
-    """Companion source unreadable (stripped, frozen or wrapped): fall back to the released keys, since the full tuple
-    would forward keys that released unsloth omits."""
+    """Unreadable source falls back to released keys; the full tuple would forward extra keys."""
     module = _install_companion(
         monkeypatch,
         tmp_path,
@@ -428,8 +424,7 @@ class _ReachedTheVisionBranch(Exception):
 
 
 def _which_branch(monkeypatch, vision_kwargs):
-    """Reports the branch grpo_accumulated_loss takes by running it: a None pixel_values left-packs input_ids, rebuilds
-    completion_mask and turns on sequence packing."""
+    """None pixel_values left-packs input_ids and enables sequence packing (the text branch)."""
     def _no_packing(*_a, **_k):
         raise _TookTheTextBranch
 
@@ -485,9 +480,8 @@ def test_the_branch_harness_tells_the_two_apart(monkeypatch):
 def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
     monkeypatch, tmp_path
 ):
-    """Key-name intersection cannot express shape: a companion without the chunker appends None pixels unless
-    image_grid_thw exists, so gridless VLMs (Gemma 3, InternVL, LFM2-VL) must get no pixels on the gradient side
-    alone."""
+    """Key names cannot express shape: without the chunker, a companion appends None pixels unless
+    image_grid_thw exists; gridless VLMs get none on the gradient side."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -546,8 +540,7 @@ def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
 
 
 def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_path):
-    """Narrowing applies only to a companion with its own slicing loop; one that shares the chunker keeps the pixels, as
-    both passes then run the same chunker with nothing to disagree about."""
+    """Only a companion with its own slicing loop narrows; a shared chunker keeps the pixels."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -568,8 +561,7 @@ def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_p
 
 
 def test_a_padded_image_tensor_stays_on_the_sample_axis():
-    """SmolVLM and Idefics pad to the widest sample instead of flattening by image: with num_images = [2, 0] only tensor
-    rank tells the two layouts apart, which counts cannot express."""
+    """SmolVLM and Idefics pad per sample; tensor rank, not counts, tells the layouts apart."""
     padded = torch.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4)
     sizes = torch.arange(2 * 2 * 2).reshape(2, 2, 2)
     chunks = grpo_vision_chunks(
@@ -607,8 +599,7 @@ def test_a_flattened_image_tensor_is_still_sliced_by_image():
 
 
 def test_a_patch_padded_image_tensor_outranks_the_flat_form_and_is_still_sliced_by_image():
-    """LLaVA-NeXT and LLaVA-OneVision pad on the patch axis: rank-5 [n_images, max_patches, C, H, W] is still one row
-    per image, so when the image count differs from the sample count, length decides, not rank."""
+    """LLaVA-NeXT: rank-5 is still one row per image, so when counts differ, length decides."""
     # Row i is filled with i, so a row landing on the wrong sample is visible rather than inferred.
     flat = torch.stack([torch.full((5, 3, 2, 2), float(image)) for image in range(3)])
     sizes = torch.stack([torch.full((2,), float(image)) for image in range(3)])

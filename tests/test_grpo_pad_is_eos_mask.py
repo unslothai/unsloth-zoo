@@ -174,8 +174,7 @@ def test_trl_eos_token_ids_count_as_eos(monkeypatch):
 
 
 def test_other_eos_terminator_with_pad_id_padding_gets_no_extra_slot(monkeypatch):
-    # pad 9 is one of TRL 1.x's eos_token_ids [8, 9]; a row that stopped on 8 is then padded with 9.
-    # Only a row whose first EOS-set token is the pad id needs the extra slot.
+    # Pad 9 is in eos_token_ids [8, 9]; only rows whose first EOS is the pad id need a slot.
     trainer = types.SimpleNamespace(
         processing_class = types.SimpleNamespace(pad_token_id = EOS, eos_token_id = EOS), eos_token_ids = [8, EOS],
     )
@@ -191,8 +190,7 @@ def test_other_eos_terminator_with_pad_id_padding_gets_no_extra_slot(monkeypatch
 
 
 def test_right_padding_after_a_completion_without_eos_stays_out(monkeypatch):
-    # A completion that stopped without an EOS (a stop string) is right padded with the pad id too.
-    # TRL's completion_mask (from the sampled lengths) leaves that padding out; so must the loss.
+    # Stop-string rows are right padded with the pad id; the loss excludes it like TRL's mask.
     ids = _batch(EOS)
     ids[1, PROMPT_LEN:] = torch.tensor([5, 6, EOS, EOS, EOS])
     completion_mask = _trl_completion_mask(ids[:, PROMPT_LEN:], EOS)
@@ -256,7 +254,7 @@ def test_packed_forward_scores_the_kept_eos(monkeypatch):
         "chunked_hidden_states_selective_log_softmax": _rl.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": _rl.chunked_selective_log_softmax,
         "_refresh_lm_head": lambda: None, "_fp32_bind": lambda entropy = False: None, "lm_head_bias": None,
-        "_fused_route": False, "_fused_pack": None, "_pg_layout": None,
+        "_fused_route": False, "_fused_pack": None, "_pg_layout": None, "_sc_ids": None,
         "create_completion_attention_mask": _rl.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None, "UNSLOTH_ENABLE_LOGGING": False,
         "trainer": trainer, "unwrapped_model": model, "lm_head": lm_head,
@@ -287,8 +285,6 @@ def test_packed_forward_scores_the_kept_eos(monkeypatch):
 
 
 def test_stored_old_logps_keep_the_eos_on_later_iterations(monkeypatch):
-    # num_iterations = 2, beta = 0, old logps kept from the first pass (store_old_logps): the second
-    # pass over the same rollout must keep the same mask, EOS slot included.
     input_ids = _batch(EOS)
     store = {"old_logps_from_new": True, "store_old_logps": True}
     trainers = []

@@ -47,7 +47,6 @@ def patched(monkeypatch):
 
 @pytest.fixture(params = ["0.27.1", "0.27.2"])
 def patched_as_trl(request, monkeypatch):
-    # Fake the installed TRL version the patch reads from package metadata.
     real_version = importlib.metadata.version
     monkeypatch.setattr(
         importlib.metadata,

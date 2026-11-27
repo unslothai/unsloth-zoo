@@ -27,8 +27,7 @@ metal_only = pytest.mark.skipif(not _HAS_METAL, reason=_SKIP_REASON)
 
 
 def _tiny_text_config(full_attention_interval=2):
-    """Tiny qwen3_5 TextConfig: layer 0 is GatedDeltaNet and layer 1 full attention (full_attention_interval=2);
-    head_dim 128 * partial_rotary_factor 0.25 = 32 = sum([11, 11, 10])."""
+    """Layer 0 GatedDeltaNet, layer 1 full attention; 128 * 0.25 = 32 = sum([11, 11, 10])."""
     from mlx_vlm.models.qwen3_5.config import TextConfig
 
     return TextConfig(
@@ -186,8 +185,7 @@ def test_disable_fused_mrope_fixes_rotary_grad():
     fused_q, fused_k = rot.apply_rotary(q, k, pos, unsqueeze_dim=1)
     mx.eval(fused_q, fused_k)
 
-    # Before the flip, grad through fused apply raises the VJP error on mlx releases whose fused rotary kernel has no
-    # VJP; mlx 0.32.0 added one, so only the message is asserted.
+    # Fused rotary has no VJP before mlx 0.32.0, so only the VJP error message is asserted.
     def loss(q_, k_):
         oq, ok = rot.apply_rotary(q_, k_, pos, unsqueeze_dim=1)
         return (oq.astype(mx.float32).sum() + ok.astype(mx.float32).sum())
@@ -206,7 +204,6 @@ def test_disable_fused_mrope_fixes_rotary_grad():
     assert bool(mx.all(mx.isfinite(dq))) and bool(mx.all(mx.isfinite(dk)))
     assert float(mx.abs(dq).max()) > 0
 
-    # Fallback forward should match the fused forward.
     fb_q, fb_k = rot.apply_rotary(q, k, pos, unsqueeze_dim=1)
     mx.eval(fb_q, fb_k)
     assert mx.allclose(
@@ -454,8 +451,7 @@ def test_gradients_match_autodiff_over_the_same_recurrence(case):
 
 @metal_only
 def test_backward_is_causal_and_reaches_non_first_positions():
-    """Backward is causal: perturbing dy at one late step changes d_q only at that step and head, and d_v back to
-    earlier steps; other positions stay at atomic-reduction noise."""
+    """Backward is causal: dy at a late step changes d_q only there and d_v for earlier steps."""
     import unsloth_zoo.gated_delta_vjp as gdv
 
     q, k, v, g, beta, state = _inputs(1, 40, 4, 8, 128, 128, mx.float32, False)
@@ -552,8 +548,7 @@ def test_backward_checkpoints_block_boundaries_not_steps(T):
 @metal_only
 @pytest.mark.parametrize("stack", ["mlx_lm", "mlx_vlm"])
 def test_a_training_continuation_from_a_given_state_takes_the_kernel(monkeypatch, stack):
-    """A shared-prompt row continuing from its recorded state takes the fused kernel in training and
-    matches the replaced route, d_state included; stateful inference keeps its route."""
+    """Training continuation takes the kernel (d_state checked); stateful inference does not."""
     import importlib
     import unsloth_zoo.gated_delta_vjp as gdv
     from unsloth_zoo.mlx.utils import acquire_mlx_training_patches, release_mlx_training_patches

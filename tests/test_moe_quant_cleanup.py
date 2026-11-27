@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Structural pins for PR 659 cleanup: unused FP8 scale reattach is gone; _call_with_temporary_moe_weights lives only in
-moe_utils; PEFT bnb4bit MoE patches moved from misc.py to moe_utils_bnb4bit."""
+"""PR 659 cleanup: FP8 scale reattach gone; _call_with_temporary_moe_weights only in moe_utils."""
 
 from __future__ import annotations
 

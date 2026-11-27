@@ -55,8 +55,6 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOMOGENEOUS", False, raising = False)
         monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
-        # A warm-up on the spoofed host selects grouped_mm; restoring _SELECTED_MOE_BACKEND on teardown stops later
-        # tests inheriting that backend for absent cards.
         monkeypatch.setattr(moe_utils, "_SELECTED_MOE_BACKEND", None, raising = False)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
                      "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
@@ -83,9 +81,9 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "ones", ones)
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
-        # The view probe builds real tensors on the card, which on a GPU host would run on the real device and log extra
-        # _grouped_mm calls; answer from failing instead (view-probe tests override it)
+        # Answer from failing: real probe tensors on a GPU host log extra _grouped_mm calls.
         monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
+        monkeypatch.setattr(moe_utils, "_grouped_mm_trains_on", lambda d: None, raising = False)
         return probed
     return make
 
@@ -136,7 +134,6 @@ def test_a_current_device_switch_does_not_borrow_the_first_cards_answer(spoof, m
 
 
 def test_first_callers_on_different_cards_agree_on_the_home_card(spoof, monkeypatch):
-    # Two first callers on different-model cards, neither probed yet: the second must not also claim "home".
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     assert moe_utils._grouped_mm_foreign_kind(cuda(0)) is None
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
@@ -347,7 +344,6 @@ def test_view_probe_runs_on_the_input_card(spoof, monkeypatch):
     probed = []
     monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: probed.append(d.index) or d.index == 1)
     assert moe_utils._grouped_mm_supported_on(cuda(1)) is True
-    # Probed with support, in the same eager region: the view check opens no second one.
     assert probed == [1]
     def no_second_region(fn): raise AssertionError("second compiler-disabled region")
     monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_second_region)
@@ -434,7 +430,6 @@ def test_eager_warmup_lets_a_trace_on_the_other_model_read_its_own_answer(spoof,
     monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: views.append(d.index) or True)
     # Even where torch would fall back internally, a warmed card answers for itself.
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
-    # The eager warm-up with the experts split across both models (device_map).
     _warm_moe_backend(monkeypatch, [cuda(0), cuda(1)])
     assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is True
     assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is True
@@ -452,7 +447,6 @@ def test_eager_warmup_lets_a_trace_on_the_other_model_read_its_own_answer(spoof,
 
 
 def _warm_moe_backend(monkeypatch, expert_devices):
-    # The real eager entry point on a model whose stacked expert weights sit on `expert_devices`.
     from unsloth_zoo.temporary_patches import moe_experts_interface as mei
     monkeypatch.setattr(moe_utils, "get_forward_moe_backend", lambda: moe_utils.forward_moe_backend)
     experts = [types.SimpleNamespace(_parameters = {"gate_up_proj": types.SimpleNamespace(device = d)}) for d in expert_devices]
@@ -473,7 +467,6 @@ def _distributed(monkeypatch):
 
 
 def test_a_rank_never_probes_a_card_its_experts_do_not_use(spoof, monkeypatch):
-    # Only the home card and the experts' cards are probed, never another rank's card.
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     _distributed(monkeypatch)
     views = []
@@ -629,8 +622,7 @@ def _split_model(*devices, others = ()):
 
 
 def test_loader_warms_a_foreign_expert_card_before_compile(spoof, monkeypatch):
-    # H100 home with an A100 holding later layers: the loader resolves the A100 eagerly, so the compiled forward's first
-    # A100 query traces under fullgraph=True, not the disabled probe
+    # Loader resolves A100 eagerly; first query traces fullgraph=True, not the disabled probe.
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     seen = spoof(3, models = ["H100", "A100", "L4"])
     assert moe_utils._check_torch_grouped_mm_supported() is True
@@ -661,8 +653,7 @@ def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypa
 
 
 def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
-    # One CUDA plus one XPU card: each backend counts 1 device, yet the XPU is foreign to the CUDA home and its first
-    # traced query would hit the compiler-disabled resolver.
+    # Device counts match; a foreign XPU's first traced query would hit the disabled resolver.
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     seen = spoof(1, models = ["H100"])
     real_xpu = getattr(torch, "xpu", None)
@@ -682,3 +673,79 @@ def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
     assert kind is not None and moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind) is True
     monkeypatch.setattr(torch, "xpu", real_xpu, raising = False)   # Dynamo itself reads the real backend
     assert _fullgraph_gate(monkeypatch, xpu).tolist() == [1.0, 1.0]
+
+
+
+def _oom_on_first_probe(monkeypatch):
+    # The spoofed grouped_mm, but its first call runs out of memory (a nearly full card at the first MoE forward).
+    real, calls = torch._grouped_mm, []
+
+    def grouped_mm(x, w, offs = None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 MiB")
+        return real(x, w, offs = offs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+    return calls
+
+
+def test_out_of_memory_home_probe_records_no_verdict(spoof, monkeypatch):
+    # One out-of-memory probe must not turn grouped_mm off for the process: the next call probes again.
+    seen = spoof(1)
+    calls = _oom_on_first_probe(monkeypatch)
+    assert moe_utils._check_torch_grouped_mm_supported() is False
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is None
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is None
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is True
+    assert len(calls) == 2 and seen == [0]
+
+
+def test_out_of_memory_foreign_probe_records_no_verdict(spoof, monkeypatch):
+    seen = spoof(2, models = ["H100", "RTX 4090"])
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is True
+    calls = _oom_on_first_probe(monkeypatch)
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND == {}
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is True
+    assert len(calls) == 2 and seen == [0, 1]
+
+
+def test_out_of_memory_probe_is_not_latched_by_the_modulelist_patch(spoof, monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+    spoof(1)
+    monkeypatch.setattr(ML, "_GROUPED_MM_SUPPORTED", None)
+    _oom_on_first_probe(monkeypatch)
+    assert ML._grouped_mm_supported() is False
+    assert ML._GROUPED_MM_SUPPORTED is None
+    assert ML._grouped_mm_supported() is True
+    assert ML._GROUPED_MM_SUPPORTED is True
+
+
+def test_out_of_memory_local_fallback_probe_is_not_latched(monkeypatch):
+    # moe_utils unavailable: the modulelist patch's own tiny probe must not latch an out-of-memory either.
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+    from unsloth_zoo.temporary_patches import moe_utils as MU
+
+    def broken():
+        raise ImportError("no moe_utils")
+
+    monkeypatch.setattr(MU, "_check_torch_grouped_mm_supported", broken)
+    monkeypatch.setattr(ML, "_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    real_ones, real_tensor = torch.ones, torch.tensor
+    monkeypatch.setattr(torch, "ones", lambda *a, device = None, **k: real_ones(*a, **k))
+    monkeypatch.setattr(torch, "tensor", lambda *a, device = None, **k: real_tensor(*a, **k))
+    calls = []
+
+    def grouped_mm(x, w, offs = None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 MiB")
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+    assert ML._grouped_mm_supported() is False
+    assert ML._GROUPED_MM_SUPPORTED is None
+    assert ML._grouped_mm_supported() is True
+    assert ML._GROUPED_MM_SUPPORTED is True

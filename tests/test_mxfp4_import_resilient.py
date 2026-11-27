@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The mxfp4 converter import must survive a missing convert_moe_packed_tensors_cpu (absent from stock transformers): a
-combined import nulled both names and tripped the is-None guard."""
+"""Stock transformers lacks convert_moe_packed_tensors_cpu; import must not null both names."""
 import subprocess
 import sys
 import textwrap

@@ -108,7 +108,6 @@ def _check_cycle(W, A, B, scale, d = None):
     folded = W.clone()
     ex.exact_unfold([t])
     assert torch.equal(_bits(W), _bits(W0)), "unfold is not bit exact"
-    # Escapes keep original bits, once per element.
     assert store.numel() == torch.unique(store).numel() <= stats["bad"]
     assert torch.equal(_bits(vals), _bits(W0.reshape(-1).cpu()[store]))
     # The CPU interpreter has no bf16: it converts fp32 -> bf16 by truncation and flushes subnormals, so only the
@@ -203,7 +202,6 @@ def run_random(device, cycles = 30, rows = 256):
             B = torch.randn(rows, 16, device = device, generator = g).to(dtype)
             scale = rel * 0.02 / (B.float() @ A.float()).abs().mean().item()
             _check_cycle(W, A, B, scale)
-        # The patterns themselves under a random adapter: arbitrary fp32 deltas on every bit pattern.
         W = _all_patterns(dtype, 4, device)
         A = torch.randn(8, W.shape[1], device = device, generator = g).to(dtype)
         B = torch.randn(4, 8, device = device, generator = g).to(dtype)
@@ -254,8 +252,7 @@ def test_random_adapters_and_cycles_restore_exactly():
             run_random("cuda", cycles = 200)
 
 
-# The interpreter proof takes about 3 minutes on a quiet 2-CPU box and well past a 300s per-test hang backstop on a
-# shared CI runner, so it carries its own limit; the child's timeout sits under it so a hang reports the child's output.
+# Runs well past the 300s per-test hang backstop on shared CI, so it carries its own limit.
 @pytest.mark.timeout(900)
 @pytest.mark.skipif(_cuda() or ex.triton is None, reason = "CUDA runs the proof directly; this is the CPU interpreter")
 def test_cpu_interpreter_proof():

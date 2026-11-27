@@ -248,9 +248,7 @@ def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
     common = (ZOO / "temporary_patches" / "common.py").read_text(encoding = "utf-8")
     assert "def _compile_or_fall_back" in common
     assert "torch_compile_with_fallback" in common
-    # Match by line, not substring: `_torch_compile = ` occurs inside `_raw_torch_compile = `, which deliberately does
-    # partial torch.compile; compile_with_eager_fallback applies that wrapper itself, and wrapping a wrapper leaves the
-    # inner one swallowing exhaustion.
+    # Match by line: _torch_compile is a substring of _raw_torch_compile; do not re-wrap it.
     lines = common.split("\n")
     for name in ("torch_compile", "_torch_compile"):
         starts = [i for i, ln in enumerate(lines)

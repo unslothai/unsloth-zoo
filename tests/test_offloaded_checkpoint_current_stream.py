@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Offloaded checkpointing on a non-default current stream, as an in-process vLLM engine sets (vllm/utils/torch_utils.py
-current_stream): offload copies must wait on it."""
+"""Offload copies must wait on a non-default current stream, as an in-process vLLM engine sets."""
 import pytest
 import torch
 

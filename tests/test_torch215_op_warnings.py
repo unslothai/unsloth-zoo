@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch 2.15 routes op TORCH_WARN into Python warnings from torch/_ops.py; importing unsloth_zoo must neither
-silence them (an ignore filter on module "torch" matches torch._ops) nor escalate them to errors."""
+"""Importing unsloth_zoo must not silence or escalate torch 2.15 op warnings (torch/_ops.py)."""
 
 import warnings
 

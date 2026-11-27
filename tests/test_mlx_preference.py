@@ -1024,8 +1024,9 @@ def _assert_reported_stats(kind, stats, expected, counts, over):
 
     names = preference.PREFERENCE_EVAL_METRICS[kind]
     for metric, value in expected.items():
+        # Logit sums cancel to well below their terms, so float32 reduction order needs an absolute floor.
         assert float(stats[names.index(metric)]) == pytest.approx(
-            float(value), rel=1e-5), metric
+            float(value), rel=1e-5, abs=1e-5), metric
     assert [float(stats[len(names) + at]) for at in range(len(counts))] == [
         pytest.approx(float(value)) for value in counts]
     named = preference._PREFERENCE_DENOMINATOR_NAMES[kind]

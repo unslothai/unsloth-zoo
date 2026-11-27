@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks which moe_utils the conftest sys.modules leak gate flags: pytest tmp_path copies (directory deleted later) are
-leaks, the CI .lanes compile folder is not; both directions broke tests."""
+"""Leak gate flags pytest tmp_path copies (deleted later), not the CI .lanes compile folder."""
 
 from __future__ import annotations
 
@@ -42,8 +41,7 @@ def test_a_copy_from_a_pytest_temp_directory_is_a_leak(tmp_path_factory):
 
 
 def test_the_ci_lane_compile_folder_is_not_a_leak():
-    # consolidated-tests-ci.yml sets UNSLOTH_COMPILE_LOCATION to $PWD/.lanes/compiled-$id; that copy stays valid for the
-    # whole job, so flagging it fails every MoE compile test.
+    # UNSLOTH_COMPILE_LOCATION copy stays valid all job; flagging it fails MoE compile tests.
     assert not _is_from_pytest_tmp(
         _module("/home/runner/work/unsloth-zoo/unsloth-zoo/.lanes/compiled-pyproject/moe_utils.py")
     )

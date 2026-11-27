@@ -24,8 +24,10 @@ sampler's tail mass, so only the k head log-probs of the trainer are needed. Sam
 `score_centering_correction` and miles `score_centering_loss`.
 
 Rows are matched to their rollout by content (prompt + completion token ids, pad ids dropped), as
-routing replay does, so any batch reordering still finds its head. A row with no record gets no
-correction (plain IS REINFORCE) and is counted in `score_centering_stats()`.
+routing replay does, so any batch reordering still finds its head. Each generate call's head is placed
+at its own generated tokens: a multi-turn tool row (or a carried partial rollout) holds several calls,
+each one keyed by its own prompt (the row up to that turn). A token with no record gets no correction
+(plain IS REINFORCE); a row with none at all is counted in `score_centering_stats()`.
 """
 
 __all__ = [
@@ -40,6 +42,7 @@ __all__ = [
     "align_topk_with_mask",
     "score_centering_stats",
     "reset_score_centering",
+    "pause_score_centering_record",
 ]
 
 import functools
@@ -54,6 +57,9 @@ SCORE_CENTERING_ENV = "UNSLOTH_GRPO_SCORE_CENTERING"
 _DEFAULT_TOP_K = 32
 # Rollouts kept for lookup: the current one plus one older (a late consumer of a split rollout).
 _MAX_ROLLOUTS = 2
+# Generate calls one rollout takes before a new one starts (tool turns, chunked generation). With no training
+# lookup in between (centering refused, plain inference) the store would otherwise grow without bound.
+_MAX_RECORD_CALLS = 32
 
 
 def score_centering_top_k():
@@ -129,9 +135,12 @@ def _head_projection(lm_head, lm_head_bias):
     logits under UNSLOTH_VLLM_FP32_LM_HEAD=1, or by default for a 16-bit CUDA head; otherwise the head's own
     dtype under the caller's autocast. Returns (mode, lm_head, lm_head_bias)."""
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    from unsloth_zoo.rocm_build import is_rocm_torch
     flag = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower()
+    # is_rocm_torch, not torch.version.hip: ROCm SDK wheels leave hip unset, and the fp32 default would then copy
+    # the whole head to float32 on every call (fp32_out_linear_ok is off on ROCm).
     fp32_cuda_default = (
-        flag == "" and torch.version.hip is None and torch.cuda.is_available()
+        flag == "" and not is_rocm_torch(torch) and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
     )
@@ -192,8 +201,20 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
     n_rows = flat_x.shape[0]
     if n_rows == 0:
         return hidden_states.new_zeros((R, T, k), dtype = torch.float32)
-    chunks = max(1, min(int(chunks), n_rows))
-    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    # Skip headless positions (all slots < 0, masked by the caller); keep rows per chunk so the peak does not grow.
+    # Hidden states only: gathering [rows, V] raw logits would copy the whole input outside the checkpoints.
+    rows = None
+    keep = (flat_ids >= 0).any(dim = -1) if from_hidden else None
+    n_keep = int(keep.sum()) if from_hidden else n_rows
+    if n_keep < n_rows:
+        rows = keep.nonzero().squeeze(1)
+        chunks = -(-int(chunks) * n_keep // n_rows)
+        flat_x, flat_ids = flat_x.index_select(0, rows), flat_ids.index_select(0, rows)
+        if n_keep == 0:
+            return hidden_states.new_zeros((R, T, k), dtype = torch.float32) + 0 * flat_x.sum()
+    n = flat_x.shape[0]
+    chunks = max(1, min(int(chunks), n))
+    bounds = [(i * n) // chunks for i in range(chunks + 1)]
     needs_grad = torch.is_grad_enabled() and (
         flat_x.requires_grad or (from_hidden and lm_head.requires_grad)
         or (lm_head_bias is not None and lm_head_bias.requires_grad)
@@ -206,11 +227,14 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
         args = (flat_x[a:b], lm_head, lm_head_bias, flat_ids[a:b], logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature, from_hidden, mode)
         if needs_grad:
-            from torch.utils.checkpoint import checkpoint
-            outs.append(checkpoint(_head_chunk_logps, *args, use_reentrant = False))
+            from .gradient_checkpointing import _torch_checkpoint
+            outs.append(_torch_checkpoint()(_head_chunk_logps, *args, use_reentrant = False))
         else:
             outs.append(_head_chunk_logps(*args))
-    return torch.cat(outs, dim = 0).reshape(R, T, k)
+    out = torch.cat(outs, dim = 0)
+    if rows is not None:
+        out = out.new_zeros((n_rows, k)).index_copy(0, rows, out)
+    return out.reshape(R, T, k)
 
 
 class _TopKState:
@@ -218,6 +242,9 @@ class _TopKState:
         self.rollouts = OrderedDict()
         self.rollout_id = 0
         self.consumed_since_record = True
+        self.calls_in_rollout = 0
+        # Set when the loss does not use centering: the generate wrapper then neither asks for k logprobs nor records.
+        self.paused = False
         self.stats = dict(recorded = 0, rows_matched = 0, rows_unmatched = 0, tokens_short_head = 0)
         self.warned_unmatched = False
 
@@ -232,6 +259,17 @@ def reset_score_centering():
 
 def score_centering_stats():
     return dict(_STATE.stats)
+
+
+def pause_score_centering_record():
+    """The GRPO loss calls this when it does not center (refused, or another loss_type): drop the stored heads and
+    stop recording until a centering lookup runs again. Returns True when it was recording."""
+    was = not _STATE.paused
+    _STATE.paused = True
+    _STATE.rollouts.clear()
+    _STATE.consumed_since_record = True
+    _STATE.calls_in_rollout = 0
+    return was
 
 
 def _make_key(token_ids, pad_token_id):
@@ -284,27 +322,82 @@ def record_rollout_topk(request_outputs, k):
             _STATE.stats["recorded"] += 1
     if store:
         # A training lookup closes the rollout; generate calls before the next one join it.
-        if _STATE.consumed_since_record or not _STATE.rollouts:
+        if _STATE.consumed_since_record or not _STATE.rollouts or _STATE.calls_in_rollout >= _MAX_RECORD_CALLS:
             _STATE.rollout_id += 1
-            _STATE.rollouts[_STATE.rollout_id] = {"raw": {}, "index": {}}
+            _STATE.rollouts[_STATE.rollout_id] = {"raw": {}, "index": {}, "prompts": {}}
             _STATE.consumed_since_record = False
+            _STATE.calls_in_rollout = 0
+        _STATE.calls_in_rollout += 1
         rollout = next(reversed(_STATE.rollouts.values()))
         rollout["raw"].update(store)
         rollout["index"].clear()
+        rollout["prompts"].clear()
         while len(_STATE.rollouts) > _MAX_ROLLOUTS:
             _STATE.rollouts.popitem(last = False)
     return len(store)
 
 
 def _raise_logprobs(params, k):
-    # TRL asks for logprobs=0 (the sampled token); a larger request is left alone.
+    """Raise logprobs to k; returns each params' prior value (False = no logprobs field)."""
     items = params if isinstance(params, (list, tuple)) else [params]
+    asked = []
     for p in items:
         if p is None or not hasattr(p, "logprobs"):
+            asked.append(False)
             continue
         current = getattr(p, "logprobs", None)
+        asked.append(current)
         if current is None or current < k:
             p.logprobs = k
+    return asked
+
+
+def _lower_logprobs(params, asked, k):
+    items = params if isinstance(params, (list, tuple)) else [params]
+    for p, before in zip(items, asked):
+        if before is not False and (before is None or before < k) and getattr(p, "logprobs", None) == k:
+            p.logprobs = before
+
+
+def _as_requested(completion, asked):
+    """Keep only the sampled token plus ranks <= asked: TRL >= 1.x reads rank-sorted entry 0 as the sampled logprob."""
+    positions = getattr(completion, "logprobs", None)
+    if positions is None:
+        return
+    if asked is None:
+        completion.logprobs = None
+        return
+    token_ids = list(getattr(completion, "token_ids", None) or [])
+    cut = []
+    for j, position in enumerate(positions):
+        if position is None or j >= len(token_ids):
+            cut.append(position)
+            continue
+        sampled = int(token_ids[j])
+        kept = {}
+        for token_id, logprob in position.items():
+            rank = getattr(logprob, "rank", None)
+            if int(token_id) == sampled or (rank is not None and rank <= asked):
+                kept[token_id] = logprob
+        cut.append(kept)
+    completion.logprobs = cut
+
+
+def _restore_requested(outputs_list, asked, k):
+    asked = [a for a in asked if a is not False]
+    if not asked:
+        return 0
+    if len(asked) != 1 and len(asked) != len(outputs_list):
+        return 0
+    done = 0
+    for i, request_output in enumerate(outputs_list):
+        want = asked[0] if len(asked) == 1 else asked[i]
+        if want is not None and want >= k:
+            continue
+        for completion in getattr(request_output, "outputs", None) or []:
+            _as_requested(completion, want)
+            done += 1
+    return done
 
 
 def _lift_engine_max_logprobs(llm, k):
@@ -330,16 +423,32 @@ def wrap_vllm_generate_topk(llm, k):
 
     @functools.wraps(generate)
     def generate_with_topk_record(*args, **kwargs):
+        if _STATE.paused:
+            return generate(*args, **kwargs)
+        asked, params = [], None
         if "sampling_params" in kwargs:
-            _raise_logprobs(kwargs["sampling_params"], k)
+            params = kwargs["sampling_params"]
         elif len(args) > 1:
-            _raise_logprobs(args[1], k)
-        outputs = generate(*args, **kwargs)
+            params = args[1]
+        if params is not None:
+            asked = _raise_logprobs(params, k)
         try:
-            outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+            outputs = generate(*args, **kwargs)
+        finally:
+            if params is not None:
+                _lower_logprobs(params, asked, k)
+        outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+        try:
             record_rollout_topk(outputs_list, k)
         except Exception as error:
             warnings.warn(f"Unsloth: score centering could not record the sampler top-k head: {error}")
+        try:
+            _restore_requested(outputs_list, asked, k)
+        except Exception as error:
+            warnings.warn(
+                "Unsloth: score centering could not cut vLLM's logprobs back to the sampled token, so TRL may "
+                f"read the top-1 token's logprob as the sampled one: {error}"
+            )
         return outputs
 
     generate_with_topk_record._unsloth_score_centering = True
@@ -364,31 +473,135 @@ def _lookup(key, pad_token_id):
     return None
 
 
+_HASH_MOD = (1 << 61) - 1
+_HASH_BASE = 1000003
+
+
+def _hash_tokens(tokens):
+    h = 0
+    for t in tokens:
+        h = (h * _HASH_BASE + int(t) + 1) % _HASH_MOD
+    return h
+
+
+def _prompt_index(rollout, pad_token_id):
+    """{(len, hash) of the pad-stripped prompt: [(stripped prompt, full key)]} plus the sorted prompt lengths, built
+    once per pad id."""
+    index = rollout["prompts"].get(pad_token_id, None)
+    if index is None:
+        by_prompt = {}
+        for full, (head_ids, _) in rollout["raw"].items():
+            prompt = _make_key(full[:len(full) - head_ids.shape[0]], pad_token_id)
+            by_prompt.setdefault((len(prompt), _hash_tokens(prompt)), []).append((prompt, full))
+        index = (by_prompt, sorted({m for m, _ in by_prompt}))
+        rollout["prompts"][pad_token_id] = index
+    return index
+
+
+def _segment_start(row, kept, m, full, n_gen, pad_token_id, prompt_width):
+    """Row column where a record's generated tokens start (its prompt being the row's first m kept tokens), or None
+    when the row does not hold that generation there."""
+    if m == 0:
+        # A prompt of pad ids only (BOS == EOS == pad): no kept token to anchor on, so use the row's prompt boundary.
+        return prompt_width
+    prompt = full[:len(full) - n_gen]
+    trailing = 0
+    if pad_token_id is not None:
+        while trailing < len(prompt) and prompt[len(prompt) - 1 - trailing] == pad_token_id:
+            trailing += 1
+    start = kept[m - 1] + 1 + trailing
+    if pad_token_id is not None and any(t != pad_token_id for t in row[kept[m - 1] + 1:start]):
+        return None
+    return start
+
+
 def lookup_rollout_topk(input_ids, logits_to_keep, k, pad_token_id = None):
     """Sampler heads for a TRL batch laid out as [left-padded prompt | right-padded completion].
 
     Returns (ids [B, logits_to_keep, k] long, -1 = missing; logps [B, logits_to_keep, k] float32;
     matched [B] bool), column j holding completion token j's head, on input_ids' device.
+
+    Every recorded generate call whose prompt is a prefix of the row (pad ids dropped) and whose generated
+    tokens follow it in the completion is placed at those columns, so each turn of a multi-turn row gets
+    its own head. A row cut short (max_completion_length) keeps the heads of the tokens it still has.
     """
     B = input_ids.shape[0]
     ids = torch.full((B, logits_to_keep, k), -1, dtype = torch.int32)
     logps = torch.full((B, logits_to_keep, k), -math.inf, dtype = torch.float32)
     matched = torch.zeros(B, dtype = torch.bool)
     rows = input_ids.detach().cpu().tolist()
+    indexes = [(rollout, _prompt_index(rollout, pad_token_id)) for rollout in reversed(_STATE.rollouts.values())]
+    longest = max((lengths[-1] for _, (_, lengths) in indexes if lengths), default = 0)
     for b, row in enumerate(rows):
-        found = _lookup(_make_key(row, pad_token_id), pad_token_id)
-        if found is None:
-            continue
-        head_ids, head_logps = found
-        n = min(head_ids.shape[0], logits_to_keep)
-        kk = min(head_ids.shape[1], k)
-        ids[b, :n, :kk] = head_ids[:n, :kk]
-        logps[b, :n, :kk] = head_logps[:n, :kk]
-        matched[b] = True
+        width = len(row)
+        prompt_width = width - logits_to_keep
+        kept = [i for i, t in enumerate(row) if pad_token_id is None or t != pad_token_id]
+        stripped = [row[i] for i in kept]
+        p0 = sum(1 for i in kept if i < prompt_width)
+        segments = []
+        prefix_hash = None
+        for rank, (rollout, (by_prompt, lengths)) in enumerate(indexes):
+            # m == len(stripped): a generation of pad-id tokens only (pad == eos, an EOS-only completion).
+            if not lengths or lengths[0] > len(stripped) or lengths[-1] < p0:
+                continue
+            if prefix_hash is None:
+                # Prefix hashes only as far as the longest recorded prompt.
+                prefix_hash, h = [0], 0
+                for t in stripped[:longest]:
+                    h = (h * _HASH_BASE + int(t) + 1) % _HASH_MOD
+                    prefix_hash.append(h)
+            for m in lengths:
+                if m < p0:
+                    continue
+                if m > len(stripped):
+                    break
+                candidates = by_prompt.get((m, prefix_hash[m]), None)
+                if not candidates:
+                    continue
+                row_prompt = tuple(stripped[:m])
+                for prompt, full in candidates:
+                    if prompt != row_prompt:
+                        continue
+                    head_ids, head_logps = rollout["raw"][full]
+                    n_gen = head_ids.shape[0]
+                    start = _segment_start(row, kept, m, full, n_gen, pad_token_id, prompt_width)
+                    if start is None or start < prompt_width or start >= width:
+                        continue
+                    generated = full[len(full) - n_gen:]
+                    n = min(n_gen, width - start)
+                    j = n
+                    if tuple(row[start:start + n]) != generated[:n]:
+                        j = 0
+                        while j < n and row[start + j] == generated[j]:
+                            j += 1
+                    # A shorter match is a row cut after j tokens: only padding may follow.
+                    if j == 0 or (j < n and any(t != pad_token_id for t in row[start + j:])):
+                        continue
+                    # Whole matches first (a prefix match may be a sibling that shares the first tokens), then the
+                    # newest rollout, then the longest.
+                    segments.append((j < n, rank, -j, start - prompt_width, len(segments), head_ids, head_logps))
+        filled = [False] * logits_to_keep
+        for _, _, neg_j, c, _, head_ids, head_logps in sorted(segments, key = lambda x: x[:5]):
+            kk = min(head_ids.shape[1], k)
+            # Every column of a segment was checked against the row, so a partly covered one fills the rest.
+            i, j = 0, -neg_j
+            while i < j:
+                if filled[c + i]:
+                    i += 1
+                    continue
+                e = i
+                while e < j and not filled[c + e]:
+                    e += 1
+                ids[b, c + i:c + e, :kk] = head_ids[i:e, :kk]
+                logps[b, c + i:c + e, :kk] = head_logps[i:e, :kk]
+                filled[c + i:c + e] = [True] * (e - i)
+                matched[b] = True
+                i = e
     n_matched = int(matched.sum())
     _STATE.stats["rows_matched"] += n_matched
     _STATE.stats["rows_unmatched"] += B - n_matched
     _STATE.consumed_since_record = True
+    _STATE.paused = False
     if n_matched < B and not _STATE.warned_unmatched:
         _STATE.warned_unmatched = True
         warnings.warn(

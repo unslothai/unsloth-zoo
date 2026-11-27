@@ -83,7 +83,6 @@ def test_a_plain_checkpoint_still_loads_in_4bit(tmp_path, monkeypatch):
 
 
 def test_the_subfolder_the_load_reads_decides(tmp_path, monkeypatch):
-    # The subfolder the load reads decides: a plain one under an FP8 root loads 4-bit.
     root = _write(tmp_path / "a", FP8)
     _write(tmp_path / "a" / "child")
     seen, _ = _load_kwargs(monkeypatch, root, subfolder = "child")

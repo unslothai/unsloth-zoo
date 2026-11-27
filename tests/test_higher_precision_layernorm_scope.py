@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""higher_precision_layernorms reads only the norm class it found when picking UNSLOTH_HIGH_PRECISION_LAYERNORM from
-markers like self.weight.float(); a neighbour's markers must not decide."""
+"""higher_precision_layernorms reads only its own class's markers; neighbours must not decide."""
 
 import os
 
@@ -137,6 +136,49 @@ def test_the_flag_is_never_downgraded(precision_flag, monkeypatch):
     assert precision_flag() == "1"
 
 
+# Nemotron-H shape (transformers >= 5.18): a float32-marked norm whose block casts its input to the norm weight's dtype.
+FLOAT32_NORM = FLOAT16_NORM.replace("return output * self.weight", "return self.weight.to(torch.float32) * output")
+BLOCK_TAKES_NORM_DTYPE = """
+
+class NemotronHBlock(nn.Module):
+    def forward(self, hidden_states):
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
+        return residual + self.mixer(hidden_states)
+"""
+
+
+def test_block_that_takes_the_norm_dtype_keeps_16bit_norms(precision_flag):
+    # A float32 weight there would make the residual stream float32 and the next bf16 Linear raise.
+    higher_precision_layernorms(FLOAT32_NORM + BLOCK_TAKES_NORM_DTYPE + TRAILING_CLASS)
+
+    assert precision_flag() == "0"
+
+
+def test_a_cast_back_after_the_norm_still_upcasts(precision_flag):
+    # `self.k_norm(x.to(self.k_norm.weight.dtype)).to(x.dtype)` returns to the activation dtype: keep the upcast.
+    cast_back = BLOCK_TAKES_NORM_DTYPE.replace(
+        "self.norm(hidden_states.to(dtype=self.norm.weight.dtype))",
+        "self.norm(hidden_states.to(self.norm.weight.dtype)).to(residual.dtype)",
+    )
+    higher_precision_layernorms(FLOAT32_NORM + cast_back + TRAILING_CLASS)
+
+    assert precision_flag() == "1"
+
+
+def test_float32_norm_without_the_block_cast_still_upcasts(precision_flag):
+    higher_precision_layernorms(FLOAT32_NORM + TRAILING_CLASS)
+
+    assert precision_flag() == "1"
+
+
+def test_block_cast_does_not_downgrade_an_inherited_flag(precision_flag, monkeypatch):
+    monkeypatch.setitem(os.environ, "UNSLOTH_HIGH_PRECISION_LAYERNORM", "1")
+    higher_precision_layernorms(FLOAT32_NORM + BLOCK_TAKES_NORM_DTYPE + TRAILING_CLASS)
+
+    assert precision_flag() == "1"
+
+
 @pytest.mark.parametrize(
     "model, expected",
     [
@@ -149,6 +191,9 @@ def test_the_flag_is_never_downgraded(precision_flag, monkeypatch):
         ("llama", "0"),
         ("gemma3", "1"),
         ("olmo2", "1"),  # (self.weight * hidden_states).to(...): weight used in float32
+        # Block casts its input to norm.weight.dtype; transformers >= 5.18 marks the norm float32.
+        ("nemotron_h", "0"),
+        ("mamba2", "0"),
     ],
 )
 def test_real_transformers_sources(precision_flag, model, expected):

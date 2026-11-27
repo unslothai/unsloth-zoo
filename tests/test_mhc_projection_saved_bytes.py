@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The eager mHC mixer saves its bf16 input for backward, not the FP32 upcast that plain autograd keeps (twice the bf16
-streams per mixer site); MODULE_FORWARD_EAGER_REWRITES routes input_norm and the fn projection through
-unsloth_mhc_projection, which reruns them in backward."""
+"""Eager mHC mixer saves bf16, not FP32; unsloth_mhc_projection reruns norm and fn in backward."""
 
 import importlib
 import textwrap

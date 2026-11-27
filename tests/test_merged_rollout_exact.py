@@ -142,8 +142,7 @@ def test_fixup_store_is_small_for_small_deltas():
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_store_needs_no_positions(dtype):
-    # Trained-size adapter (|d| about 10% of |W|): the old store took 6 B per inexact element; the stream takes a few bits.
-    # The per-weight choice keeps the stream for it on its own.
+    # Trained-size adapter (|d| ~10% of |W|) takes the stream: a few bits per element, not 6 B.
     W, A, B, scale = _dense(1024, 4096, 16, 1e-1, dtype)
     W0 = W.clone()
     t = _target(W, A, B, scale)

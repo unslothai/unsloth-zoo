@@ -1094,6 +1094,18 @@ def train_on_responses_only(
     if sample_start:  boundary_first.add(sample_start[0])
     inner_stop_ids = tuple(boundary_first | {Q_first})
 
+    # Gemma 4 and FunctionGemma render a tool result inside the model's own turn. Generation stops at the
+    # opening marker and the tool writes the rest, so a response span must not train past it.
+    token_ids = {getattr(t, "content", None): i for i, t in added_tokens.items()}
+    tool_result_ids = [
+        (token_ids[opener], token_ids[closer], token_ids.get(turn))
+        for opener, closer, turn in (
+            ("<|tool_response>", "<tool_response|>", "<|turn>"),
+            ("<start_function_response>", "<end_function_response>", "<start_of_turn>"),
+        )
+        if opener in token_ids and closer in token_ids
+    ]
+
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -1292,6 +1304,22 @@ def train_on_responses_only(
                     labels[assistant_k : user_j] = input_ids [assistant_k : user_j]
                 else:
                     labels[assistant_k : user_j] = old_labels[assistant_k : user_j]
+
+            # A result runs through its closing marker, or up to the next turn when the call was never
+            # answered. The model emits only the first opener: one directly after a result's closer is the
+            # tool's next result (several calls in one turn), so it is masked as well.
+            for opener, closer, turn in tool_result_ids:
+                if opener not in input_ids: continue
+                row = input_ids if is_list else list(input_ids)
+                starts = [i for i, t in enumerate(row) if t == opener]
+                stop = -1
+                for start, limit in zip(starts, starts[1:] + [n]):
+                    first = start if start == stop else start + 1
+                    try: stop = row.index(closer, start + 1, limit) + 1
+                    except ValueError:
+                        try: stop = row.index(turn, start + 1, limit)
+                        except ValueError: stop = limit
+                    labels[first : stop] = [-100] * (stop - first)
 
             # Outside kept spans labels are already -100, so masking everywhere is safe.
             if mask_out_lookup:

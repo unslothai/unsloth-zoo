@@ -17,6 +17,10 @@ def _load():
     return module
 
 
+class _Calls(list):
+    pass
+
+
 class _Mapper028:
     def get_unstacked_mapper(self):
         return "unstacked"
@@ -28,12 +32,14 @@ class _Mapper029:
 
 
 def _env(vb, monkeypatch, *, modules, specs, mapper = _Mapper029):
-    calls = []
+    calls = _Calls()
     utils = types.SimpleNamespace(WeightsMapper = mapper)
+
+    plugin = types.SimpleNamespace(register = lambda: calls.append("register"))
 
     def fake_import(name):
         if name == "vllm_bnb_plugin":
-            return types.SimpleNamespace(register = lambda: calls.append("register"))
+            return plugin
         if name == "vllm.model_executor.models.utils":
             return utils
         if name not in modules:
@@ -43,6 +49,7 @@ def _env(vb, monkeypatch, *, modules, specs, mapper = _Mapper029):
     monkeypatch.setattr(vb, "_import", fake_import)
     monkeypatch.setattr(vb, "_find_spec", lambda name: object() if name in specs else None)
     monkeypatch.setattr(vb, "_RESOLVED", None)
+    calls.plugin = plugin
     return calls
 
 
@@ -96,3 +103,62 @@ def test_newer_vllm_mapper_is_untouched(monkeypatch):
 def test_missing_plugin_message_names_the_install_command():
     src = open(os.path.join(ROOT, "unsloth_zoo", "vllm_utils.py")).read()
     assert "pip install vllm-bnb-plugin" in src and "_vllm_bnb_error" in src
+
+
+def test_builtin_bitsandbytes_takes_the_plugin_off_vllms_allow_list(monkeypatch):
+    # vLLM <= 0.27.1 still loads an installed plugin's entry point; importing it double-registers the bnb op.
+    vb = _load()
+    eps = [types.SimpleNamespace(name = n, group = g) for n, g in (
+        ("bitsandbytes", "vllm.general_plugins"), ("lora_filesystem_resolver", "vllm.general_plugins"),
+        ("cuda_alt", "vllm.platform_plugins"), ("other", "console_scripts"))]
+    dists = [types.SimpleNamespace(entry_points = eps[:2]), types.SimpleNamespace(entry_points = eps[2:])]
+    monkeypatch.setattr(vb.importlib.metadata, "distributions", lambda: dists)
+    monkeypatch.delenv("VLLM_PLUGINS", raising = False)
+    calls = _env(vb, monkeypatch, modules = set(vb._IN_TREE) | set(vb._PLUGIN), specs = {"vllm", "vllm_bnb_plugin"})
+    assert vb.resolve()[2] == "vllm"
+    assert vb.os.environ["VLLM_PLUGINS"] == "cuda_alt,lora_filesystem_resolver"
+    assert calls == []  # never imported, never registered
+
+
+def test_a_user_allow_list_only_loses_the_plugin(monkeypatch):
+    vb = _load()
+    monkeypatch.setenv("VLLM_PLUGINS", "bitsandbytes,mine")
+    _env(vb, monkeypatch, modules = set(vb._IN_TREE), specs = {"vllm", "vllm_bnb_plugin"})
+    vb.resolve()
+    assert vb.os.environ["VLLM_PLUGINS"] == "mine"
+
+
+def test_no_plugin_leaves_vllm_plugins_alone(monkeypatch):
+    vb = _load()
+    monkeypatch.delenv("VLLM_PLUGINS", raising = False)
+    _env(vb, monkeypatch, modules = set(vb._IN_TREE), specs = {"vllm"})
+    vb.resolve()
+    assert "VLLM_PLUGINS" not in vb.os.environ
+
+
+def test_install_plugin_uses_no_deps_and_the_pinned_spec(monkeypatch):
+    vb = _load()
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return types.SimpleNamespace(returncode = 0, stdout = "ok", stderr = "")
+
+    monkeypatch.setattr(vb.subprocess, "run", fake_run)
+    monkeypatch.setattr(vb, "_find_spec", lambda name: object())
+    ok, _ = vb.install_plugin()
+    assert ok and seen["cmd"][-2:] == ["--no-deps", "vllm-bnb-plugin==0.0.3"]
+    assert seen["cmd"][:4] == [vb.sys.executable, "-m", "pip", "install"]
+
+
+def test_install_plugin_reports_a_failed_install(monkeypatch):
+    vb = _load()
+    monkeypatch.setattr(vb.subprocess, "run", lambda cmd, **kw: types.SimpleNamespace(returncode = 1, stdout = "", stderr = "no network"))
+    monkeypatch.setattr(vb, "_find_spec", lambda name: object() if name == "pip" else None)
+    ok, text = vb.install_plugin()
+    assert not ok and "no network" in text
+
+
+def test_load_vllm_tries_the_first_use_install_before_raising():
+    src = open(os.path.join(ROOT, "unsloth_zoo", "vllm_utils.py")).read()
+    assert "and not _ensure_vllm_bnb():" in src and "UNSLOTH_VLLM_BNB_AUTO_INSTALL" in src

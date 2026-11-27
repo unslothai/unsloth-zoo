@@ -55,18 +55,6 @@ def _gpu_generation():
 
 
 @functools.cache
-def _gpu_core_count():
-    """The IORegistry `gpu-core-count`, which `mx.device_info()` does not report; None if unreadable."""
-    try:
-        result = subprocess.run(["/usr/sbin/ioreg", "-rc", "AGXAccelerator", "-d", "1", "-k", "gpu-core-count"],
-                                capture_output = True, text = True, timeout = 5)
-    except Exception:
-        return None
-    match = re.search(r'"gpu-core-count" = (\d+)', result.stdout) if result.returncode == 0 else None
-    return int(match.group(1)) if match else None
-
-
-@functools.cache
 def _nax_gpu():
     if platform.system() != "Darwin" or not mx.metal.is_available():
         return False
@@ -104,16 +92,12 @@ class Gap(NamedTuple):
 # A gap stays open only while MLX main has not closed it; releases absent from `open_in`, including the first fixed one
 # and older unmeasured ones, turn the route off.
 _GAPS = {
-    # A few rows of a transposed quantized matmul run qmv/qmv_wide below the qmv batch limit, then qmm_t_splitk until the output is wide enough for qmm_nax.
-    "small_m_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
-    # Without NAX the same rows run qmv_wide (plain qmv before generation 15), then qmm_t_splitk.
-    "small_m_qmm_simd": Gap(open_in = ("0.32.4",), closed_on_main = False),
+    # Without NAX, 0.32.5 runs qmv_mma up to 16 rows on large aligned layers (4787), then qmv_wide or qmm_t_splitk.
+    "small_m_qmm_simd": Gap(open_in = ("0.32.5",), closed_on_main = False),
     # MLX's sorted gather kernel runs 32-row tiles below 64 rows per expert, with two barriers per K step.
-    "sorted_gather_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
+    "sorted_gather_qmm": Gap(open_in = ("0.32.5",), closed_on_main = False),
     # Without NAX, training-sized qmm runs 32x32 tiles; 64x64 ones (open PR 4826) or a dense GEMM run faster.
-    "dense_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
-    # On NAX, training-sized qmm_t loads each weight tile only after the last multiplied; staged loads (4682) overlap.
-    "staged_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = True),
+    "dense_train_qmm": Gap(open_in = ("0.32.5",), closed_on_main = False),
 }
 
 
@@ -208,256 +192,12 @@ def kernel_probe_passed(key: str, module: str, function: str, available = None) 
         return False
 
 
-# Small-row affine `x @ W^T` on matmul2d reading stock packed codes in place; each group folds `acc += P * scale +
-# sum(x) * bias` in fp32 like stock qmv, so only summation order differs; K is split across threadgroups so few rows
-# still fill the GPU, partials added in fixed order.
-_QMM_BITS = (4, 8)
-_QMM_GROUP_SIZES = (32, 64, 128)
-_QMM_MAX_ROWS = 16
-# Threadgroups per call by row tile: a kernel in a dependent projection chain runs alone, so its grid must fill the GPU
-# (sized on the 16-core M5 Pro, scaled by core count).
-_QMM_THREADGROUPS = {8: 1400, 16: 700}
-_QMM_MEASURED_CORES = 16
-_QMM_THREADGROUP_MEMORY = 32768
-
 _QMM_HEADER = """
 #include <metal_tensor>
 #include <metal_type_traits>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
 """
-
-_QMM_SOURCE = """
-    constexpr int G = K / GS;
-    constexpr int SG = TN / 16;
-    constexpr int E = TM * TN / (SG * 32);
-    constexpr uint STEPS = (G + U - 1) / U;
-    constexpr uint SPLIT_GROUPS = (STEPS + KSPLIT - 1) / KSPLIT * U;
-    using W = metal::conditional_t<BITS == 4, uint4b_format, uchar>;
-    const int M = x_shape[0];
-    const int N = w_shape[0];
-    const uint n0 = threadgroup_position_in_grid.x * TN;
-    const uint split = threadgroup_position_in_grid.y;
-    const uint simd = simdgroup_index_in_threadgroup;
-    const uint lane = thread_index_in_simdgroup;
-    const uint g0 = split * STEPS / KSPLIT * U;
-    const uint g1 = min((split + 1) * STEPS / KSPLIT * U, uint(G));
-
-    threadgroup float sums[SPLIT_GROUPS * TM];
-    threadgroup float out[TM * TN];
-    // At group size 32 a ragged tile's dynamic slices are slow: stage the split's rows, zero past M.
-    constexpr uint SK = SPLIT_GROUPS * GS;
-    constexpr bool STAGE = EDGE && GS == 32 && TM * (SK * sizeof(T) + SPLIT_GROUPS * 4 + TN * 4) <= 32768;
-    threadgroup T xs[STAGE ? TM * SK : 1];
-    if constexpr (STAGE) {
-        for (uint e = (simd * 32 + lane) * 4; e < TM * SK; e += SG * 128) {
-            const uint r = e / SK, k = e % SK;
-            vec<T, 4> v = vec<T, 4>(0);
-            if (int(r) < M && k < (g1 - g0) * GS) v = *(const device vec<T, 4>*)(x + ulong(r) * K + g0 * GS + k);
-            *(threadgroup vec<T, 4>*)(xs + e) = v;
-        }
-    }
-    for (uint i = simd; i < (g1 - g0) * TM; i += SG) {
-        const uint r = i % TM;
-        float v = 0.0f;
-        if (int(r) < M) {
-            const device T* xr = x + ulong(r) * K + (g0 + i / TM) * GS;
-            for (uint j = lane; j < GS; j += 32) v += float(xr[j]);
-            v = simd_sum(v);
-        }
-        if (lane == 0) sums[i] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    auto a = tensor((device T*)x, dextents<int, 2>{K, M}, array<int, 2>{1, K});
-    tensor<device W, dextents<int, 2>, tensor_inline> b(
-        (device uchar*)w + ulong(n0) * K * BITS / 8, dextents<int, 2>{K, TN}, array<int, 2>{1, K});
-    constexpr auto desc = matmul2d_descriptor(TM, TN, GS, false, true, false);
-    matmul2d<desc, execution_simdgroups<SG>> op;
-    auto staged = tensor((threadgroup T*)xs, dextents<int, 2>{int(SK), TM}, array<int, 2>{1, int(SK)});
-    // Static-extent tiles are not bounds-checked; with fewer than TM rows the dynamic ones keep reads within M.
-    auto a_tile = [&](int k0) {
-        if constexpr (STAGE) return staged.template slice<GS, TM>(k0 - int(g0 * GS), 0);
-        else if constexpr (EDGE) return a.slice(k0, 0);
-        else return a.template slice<GS, TM>(k0, 0);
-    };
-    auto a0 = a_tile(int(g0 * GS));
-    auto b0 = b.template slice<GS, TN>(0, 0);
-    auto acc = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-    uint col[E], row[E];
-    bool ok[E];
-    for (ushort i = 0; i < E; ++i) {
-        acc[i] = 0.0f;
-        ok[i] = acc.is_valid_element(i);
-        auto idx = acc.get_multidimensional_index(i);
-        col[i] = ok[i] ? uint(idx[0]) : 0u;
-        row[i] = ok[i] ? uint(idx[1]) : 0u;
-    }
-    const device T* sp = scales + ulong(n0) * G;
-    const device T* bp = biases + ulong(n0) * G;
-
-    // U (2, 4 or 8) matmuls are issued before any is folded, so their latencies overlap.
-    uint g = g0;
-    for (; g + U <= g1; g += U) {
-        float s[U][E], c[U][E];
-        for (ushort j = 0; j < U; ++j) {
-            for (ushort i = 0; i < E; ++i) {
-                s[j][i] = float(sp[col[i] * G + g + j]);
-                c[j][i] = float(bp[col[i] * G + g + j]);
-            }
-        }
-        // Cooperative tensors cannot form an array.
-        decltype(acc) p0, p1, p2, p3, p4, p5, p6, p7;
-        auto run = [&](ushort j, thread decltype(acc)& p) {
-            auto as = a_tile((g + j) * GS);
-            auto bs = b.template slice<GS, TN>((g + j) * GS, 0);
-            op.run(as, bs, p);
-        };
-        auto fold = [&](ushort j, thread decltype(acc)& p) {
-            for (ushort i = 0; i < E; ++i) {
-                acc[i] += p[i] * s[j][i] + sums[(g + j - g0) * TM + row[i]] * c[j][i];
-            }
-        };
-        run(0, p0);
-        run(1, p1);
-        if constexpr (U > 2) { run(2, p2); run(3, p3); }
-        if constexpr (U > 4) { run(4, p4); run(5, p5); run(6, p6); run(7, p7); }
-        fold(0, p0);
-        fold(1, p1);
-        if constexpr (U > 2) { fold(2, p2); fold(3, p3); }
-        if constexpr (U > 4) { fold(4, p4); fold(5, p5); fold(6, p6); fold(7, p7); }
-    }
-    for (; g < g1; ++g) {
-        decltype(acc) p;
-        auto as = a_tile(g * GS);
-        auto bs = b.template slice<GS, TN>(g * GS, 0);
-        op.run(as, bs, p);
-        for (ushort i = 0; i < E; ++i) {
-            acc[i] += p[i] * float(sp[col[i] * G + g]) + sums[(g - g0) * TM + row[i]] * float(bp[col[i] * G + g]);
-        }
-    }
-
-    for (ushort i = 0; i < E; ++i) {
-        if (ok[i]) out[row[i] * TN + col[i]] = acc[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint o = simd * 32 + lane; o < uint(M) * TN; o += SG * 32) {
-        y[(ulong(split) * M + o / TN) * N + n0 + o % TN] = OT(out[o]);
-    }
-"""
-
-_QMM_REDUCE_SOURCE = """
-    const uint i = thread_position_in_grid.x * 4;
-    const uint size = p_shape[0] / KSPLIT;
-    if (i >= size) return;
-    float4 v = 0.0f;
-    for (int k = 0; k < KSPLIT; ++k) v += *(const device float4*)(p + ulong(k) * size + i);
-    *(device vec<T, 4>*)(y + i) = vec<T, 4>(v);
-"""
-
-QMM_PROBE_KEY = "small_m_qmm:" + hashlib.sha256(
-    (_QMM_HEADER + _QMM_SOURCE + _QMM_REDUCE_SOURCE).encode()).hexdigest()[:12]
-
-
-@functools.cache
-def _qmm_kernels():
-    return (mx.fast.metal_kernel(name = "unsloth_nax_small_m_qmm", input_names = ["x", "w", "scales", "biases"],
-                                 output_names = ["y"], header = _QMM_HEADER, source = _QMM_SOURCE),
-            mx.fast.metal_kernel(name = "unsloth_nax_small_m_qmm_reduce", input_names = ["p"],
-                                 output_names = ["y"], source = _QMM_REDUCE_SOURCE))
-
-
-def small_m_qmm_supported(N, K, group_size, bits, mode):
-    """Whether the small-row kernel covers an `[N, K]` weight quantized this way; the rest stay native."""
-    return (mode == "affine" and bits in _QMM_BITS and group_size in _QMM_GROUP_SIZES
-            and N > 0 and N % 64 == 0 and K > 0 and K % group_size == 0)
-
-
-def small_m_qmm_geometry(M, N, K, group_size):
-    """The (row tile, column tile, K splits, matmuls per fold) variant a call of M rows runs."""
-    row_tile = 8 if M <= 8 else 16
-    column_tile = 128 if N % 128 == 0 else 64
-    # Each thread holds matmuls-per-fold x row_tile / 2 partials; more spills registers.
-    unroll = min(256 // group_size, 64 // row_tile)
-    steps = -(-(K // group_size) // unroll)
-    cores = _gpu_core_count() or _QMM_MEASURED_CORES
-    threadgroups = _QMM_THREADGROUPS[row_tile] * cores // _QMM_MEASURED_CORES
-    splits = max(1, min(threadgroups // (N // column_tile), steps))
-    splits = -(-steps // -(-steps // splits))   # no more splits than the longest one needs
-    while row_tile * (-(-steps // splits) * unroll + column_tile) * 4 > _QMM_THREADGROUP_MEMORY:
-        splits += 1
-    return row_tile, column_tile, splits, unroll
-
-
-def small_m_qmm(x, w, scales, biases, group_size, bits):
-    """`quantized_matmul(x, w, scales, biases, transpose=True)` for a 2-D x of at most 16 rows."""
-    M, K = x.shape
-    N = w.shape[0]
-    row_tile, column_tile, splits, unroll = small_m_qmm_geometry(M, N, K, group_size)
-    main, reduce = _qmm_kernels()
-    partials = main(
-        inputs = [x, w, scales, biases],
-        template = [("T", x.dtype), ("OT", x.dtype if splits == 1 else mx.float32), ("K", K),
-                    ("GS", group_size), ("BITS", bits), ("TM", row_tile), ("TN", column_tile),
-                    ("KSPLIT", splits), ("U", unroll), ("EDGE", M % row_tile != 0)],
-        grid = (2 * N, splits, 1), threadgroup = (2 * column_tile, 1, 1),
-        output_shapes = [(M, N) if splits == 1 else (splits * M * N,)],
-        output_dtypes = [x.dtype if splits == 1 else mx.float32],
-    )[0]
-    if splits == 1:
-        return partials
-    return reduce(inputs = [partials], template = [("T", x.dtype), ("KSPLIT", splits)],
-                  grid = (M * N // 4, 1, 1), threadgroup = (min(256, M * N // 4), 1, 1),
-                  output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
-
-
-# Rows per call beating stock by >= 1.05x on chained projections (M5 Pro; M5 family alike); first match on (bits, group
-# or None, fewest weights, widest N, fewest rows, most rows); heads over 64K never start below narrower outputs (a head
-# alone gains too little); unmeasured keep >= 1.3x rows.
-_QMM_ROWS_BY_GPU = {
-    17: (
-        (4, None, 1 << 22, 8192, 6, 16), (4, None, 1 << 22, 65536, 6, 15), (4, None, 1 << 22, None, 6, 16),
-        (4, None, 1 << 21, None, 6, 16), (8, 32, 1 << 23, 8192, 11, 16), (8, None, 1 << 23, 8192, 7, 16),
-        (8, None, 1 << 23, 65536, 7, 14), (8, 32, 1 << 23, None, 11, 16), (8, None, 1 << 23, None, 7, 16),
-        (8, None, 1 << 21, None, 11, 16),
-    ),
-}
-_QMM_ROWS_UNMEASURED = (
-    (4, None, 1 << 22, 8192, 11, 16), (4, None, 1 << 22, 65536, 7, 12), (4, None, 1 << 22, None, 7, 12),
-    (8, 32, 1 << 23, 8192, 16, 16), (8, None, 1 << 23, 8192, 11, 16), (8, None, 1 << 23, 65536, 11, 12),
-    (8, None, 1 << 23, None, 11, 12),
-)
-
-
-def _measured_row_range(table, most, N, K, group_size, bits):
-    for entry_bits, entry_group_size, fewest, widest, low, high in table:
-        if (bits == entry_bits and entry_group_size in (None, group_size) and N * K >= fewest
-                and (widest is None or N <= widest)):
-            return max(low, 2), min(high, most)  # one row stays on stock qmv, at the bandwidth roofline
-    return 0, -1
-
-
-def small_m_qmm_row_range(N, K, group_size, bits):
-    """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
-    table = _QMM_ROWS_BY_GPU.get(_gpu_generation(), _QMM_ROWS_UNMEASURED)
-    return _measured_row_range(table, _QMM_MAX_ROWS, N, K, group_size, bits)
-
-
-def probe_small_m_qmm():
-    """Subprocess probe of the small-row kernel over every bit width, full and ragged row tiles, both column tiles,
-    split and unsplit K, all group sizes, bf16 and fp16."""
-    for dtype in (mx.bfloat16, mx.float16):
-        for bits in _QMM_BITS:
-            for (N, K), group_size in itertools.product(((384, 512), (320, 256)), _QMM_GROUP_SIZES):
-                w = mx.random.normal((N, K), key = mx.random.key(group_size)) * 0.05
-                w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
-                for M in (3, 8, 13, 16):
-                    x = mx.random.normal((M, K), key = mx.random.key(M)).astype(dtype)
-                    native = mx.quantized_matmul(x, w, scales, biases, transpose = True,
-                                                 group_size = group_size, bits = bits).astype(mx.float32)
-                    got = small_m_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
-                    error = mx.abs(got - native).max().item()
-                    assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
 
 
 # Prefill x @ W^T with int8 activations (oMLX QxA8 design); activation groups at most 64 wide become int8 codes with
@@ -840,7 +580,8 @@ def _int8_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows
 
 
 # M5 Pro thresholds, used on every NAX GPU since the route is opt-in; heads over 64K wide run at one prefill position.
-_INT8_PREFILL_MIN_ROWS = _QMM_MAX_ROWS + 1
+# Rows start past stock's few-row qmv_nax, which serves up to 16.
+_INT8_PREFILL_MIN_ROWS = 17
 _INT8_PREFILL_MIN_N = _INT8_PREFILL_MIN_K = 1024
 _INT8_PREFILL_MAX_N = 65536
 # Rows per routed expert by bits, as (calls quantizing each token once for all its experts, other calls); down

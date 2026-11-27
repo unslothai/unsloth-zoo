@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""top_entropy_quantile under TRL 0.22 get_high_entropy_mask: a rank with no valid tokens returns before the gather
-other ranks enter; 2 gloo ranks must both finish and match the TRL >= 0.24 result."""
+"""Empty rank returns before the TRL 0.22 gather; 2 gloo ranks finish and match TRL >= 0.24."""
 
 import datetime
 import os

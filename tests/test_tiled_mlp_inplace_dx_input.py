@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""TiledMLP backward when the MLP writes dX into its input in place (fused LoRA MLP) and the input is a
-non-view tensor that requires grad (a per-block compiled region's output)."""
+"""TiledMLP backward: a fused LoRA MLP writes dX in place into a non-view input needing grad."""
 
 import pytest
 import torch

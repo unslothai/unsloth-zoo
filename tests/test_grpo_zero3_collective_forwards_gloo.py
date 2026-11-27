@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSpeed ZeRO-3 GRPO: Core's old / ref scoring asks grpo_forwards_are_collective whether to agree the
-mini-batch count across ranks. It only knew FSDP2, so under ZeRO-3 a rank with longer sequences ran more
-forwards than its peer and the parameter all-gathers hung."""
+"""grpo_forwards_are_collective must detect ZeRO-3, else uneven-length ranks hang all-gathers."""
 
 from __future__ import annotations
 
@@ -72,8 +70,7 @@ def _worker(rank, port, out, ready):
         config = _ZeroConfig()
         hf_deepspeed._hf_deepspeed_config_weak_ref = weakref.ref(config)
 
-        # Core's old / ref path (unsloth/models/rl_replacements.py): split count sized from this
-        # rank's sequence length, agreed only when the forwards are collective.
+        # Split sized from each rank's sequence length, agreed only if forwards are collective.
         B = 1 if rank == 0 else 2
         collective = grpo_forwards_are_collective(model)
         if collective:

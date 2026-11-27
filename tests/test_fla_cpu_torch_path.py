@@ -126,13 +126,11 @@ def test_cpu_tensors_take_the_torch_path_and_match_fp64(monkeypatch):
     q, k, v, g, beta = _inputs(B, T, H, HV, K, V)
     h0 = torch.randn(B, HV, K, V, generator = torch.Generator().manual_seed(3)) * 0.1
     o_ref, ht_ref = _recurrent_fp64(q, k, v, g, beta, 0.3, h0)
-    # Every route a model can take: the package, its submodule, a modeling module that bound it at import.
     for fn in (package.chunk_gated_delta_rule, chunk.chunk_gated_delta_rule, modeling.chunk_gated_delta_rule):
         o, ht = fn(q, k, v, g = g, beta = beta, scale = 0.3, initial_state = h0, output_final_state = True,
                    use_qk_l2norm_in_kernel = True)
         torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
         torch.testing.assert_close(ht.double(), ht_ref, atol = 2e-5, rtol = 1e-4)
-    # One decode step from the prefix state, through fla's fused-recurrent contract.
     q1, k1, v1, g1, b1 = _inputs(B, 1, H, HV, K, V, seed = 7)
     o1_ref, ht1_ref = _recurrent_fp64(q1, k1, v1, g1, b1, K ** -0.5, ht_ref)
     for fn in (package.fused_recurrent_gated_delta_rule, recurrent.fused_recurrent_gated_delta_rule,
@@ -156,7 +154,6 @@ def test_gpu_tensors_still_reach_fla(monkeypatch):
     assert package.chunk_gated_delta_rule(gpu, gpu, gpu, gpu, gpu) == ("chunk", None)
     assert modeling.fused_recurrent_gated_delta_rule(q = gpu, k = gpu, v = gpu, g = gpu, beta = gpu) == ("recurrent", None)
     assert calls == ["chunk", "recurrent"]
-    # The torch path refuses what it cannot compute instead of computing something else.
     q, k, v, g, beta = _inputs(1, 1, 2, 2, 8, 8)
     with pytest.raises(RuntimeError, match = "gk / gv"):
         package.fused_recurrent_gated_delta_rule(q, k, v, gk = g, beta = beta)
@@ -252,8 +249,7 @@ def test_every_gated_delta_spelling_takes_the_cpu_path(monkeypatch, where, name)
 
 
 def test_rocm_wrapper_installed_first_keeps_chunk_gdn_on_the_cpu_path(monkeypatch):
-    """The gfx11 float32 wrapper replaces the canonical chunk callable first; chunk_gdn must follow it, or the
-    CPU installer (which matches by identity) leaves the shorthand on the raw kernel."""
+    """chunk_gdn must follow the gfx11 wrapper; CPU installer matches by identity."""
     package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
     ops = _bind_every_alias(monkeypatch, package, chunk, recurrent)
     monkeypatch.setattr(fla_vendor, "_rocm_has_fp32_faulting_gpu", lambda *a, **k: True)
@@ -281,8 +277,7 @@ def test_a_separately_implemented_export_is_never_rebound(monkeypatch):
 
 
 def test_cpu_decode_reset_gate_clears_the_state_instead_of_nan(monkeypatch):
-    """g = -inf is a full reset (decay exp(g) = 0): fla's fused_recurrent kernel and the fp64 recurrence
-    give a finite output and state; the chunk reference forms -inf - -inf = NaN in its decay matrix."""
+    """-inf gate is a full reset; chunk ref gives NaN from -inf - -inf, recurrent stays finite."""
     package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
     _run_patch_vendor_fla(monkeypatch)
     q, k, v, g, beta = _inputs(1, 1, 2, 4, 8, 8)
@@ -399,9 +394,8 @@ def test_gpu_host_cold_reference_first_call_compiles_fullgraph(monkeypatch, entr
 
 @pytest.mark.parametrize("has_gpu", [True, False])
 def test_install_imports_no_modeling_module_on_a_gpu_host(monkeypatch, has_gpu):
-    """Routing the live fla at `import unsloth` must not import transformers' Qwen3-Next modeling on a GPU host (about
-    a second for every model): there the reference comes from a modeling module already imported, or from the first
-    CPU call. A host with no GPU still resolves it at install, outside any trace."""
+    """Live fla at `import unsloth` must not import Qwen3-Next modeling on GPU hosts; they use an
+    imported module or first CPU call; no-GPU hosts resolve at install, outside any trace."""
     import importlib
 
     package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
@@ -440,8 +434,7 @@ def test_install_imports_no_modeling_module_on_a_gpu_host(monkeypatch, has_gpu):
 
 
 def test_cpu_decode_with_half_qk_and_float_v_keeps_values_past_half_range(monkeypatch):
-    """fla's fused_recurrent computes in float32 and stores into an output allocated like v. With fp16 q / k and
-    fp32 v, an output of 100000 (past fp16's 65504) must come back as 100000, not inf from a pass through q's dtype."""
+    """Output is allocated like v (fp32), so values past fp16's 65504 must not turn into inf."""
     package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
     _run_patch_vendor_fla(monkeypatch)
     K = 256

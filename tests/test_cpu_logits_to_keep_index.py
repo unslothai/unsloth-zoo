@@ -92,6 +92,5 @@ def test_int_kept_where_index_not_needed_or_unsupported(monkeypatch):
     tensor = torch.tensor([1, 2])
     assert convert(bf16, ids, None, tensor) is tensor
     assert convert(bf16, None, None, 1) == 1
-    # A forward that does not slice with transformers' int-or-tensor pattern keeps its int.
     monkeypatch.setattr(ops, "_forward_takes_index_logits_to_keep", lambda cls: False)
     assert convert(bf16, ids, None, 3) == 3

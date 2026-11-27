@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Re-exports over a file the user restricted: the staging temp must not sit at the umask default while the weights
-are written (CPU streamed save, MLX optimizer re-save), and the GPU single-pass shard writer must not publish the
-base checkpoint's wider mode over the old 0600 output. First exports keep the umask default."""
+"""Re-exports over a user-restricted file keep its mode: the staging temp is private while written,
+GPU shards never publish the base's wider mode; first exports keep the umask."""
 
 import ast, json, os, shutil, stat, struct, tempfile, time, types
 from pathlib import Path
@@ -113,8 +112,7 @@ def test_single_pass_writer_keeps_restricted_output_mode(tmp_path, umask022):
 
 
 def test_mlx_optimizer_resave_temp_is_private_while_written(tmp_path, umask022):
-    # MLX cannot run on Linux: extract save_optimizer_state and drive it with an mx stub that, like mlx's FileWriter,
-    # opens O_CREAT | O_TRUNC (an existing file keeps its mode).
+    # No MLX on Linux: an mx stub mirrors FileWriter's O_CREAT | O_TRUNC, which keeps the mode.
     seen = []
     def save_safetensors(path, flat, metadata = None):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)

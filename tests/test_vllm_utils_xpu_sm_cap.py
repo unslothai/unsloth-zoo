@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression guard: XPU (like ROCm) has no NVIDIA SM capability and torch.cuda.get_device_capability() fails there, so
-_get_vllm_state_dict must skip it and set sm_cap = 0, gating out SM90-only CUTLASS/DeepGEMM paths; checked from
-source text without importing vllm_utils."""
+"""XPU lacks SM capability (get_device_capability fails); sm_cap = 0 gates SM90-only CUTLASS/DeepGEMM."""
 
 import importlib.util
 import pathlib

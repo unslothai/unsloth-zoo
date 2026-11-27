@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests DeepSeek-V4 attention on flex attention: routing, block mask, and parity with transformers' eager attention
-(fp32 exact check, bf16 vs fp32 oracle, prefill and decode)."""
+"""DeepSeek-V4 flex attention vs transformers eager: routing, block mask, fp32 and bf16 parity."""
 
 import copy
 
@@ -247,8 +246,7 @@ def test_flex_keeps_finite_mask_biases_in_float32():
 
 @needs_flex_gpu
 def test_flex_compiles_fullgraph_with_a_biased_mask():
-    """Inside a fullgraph compile the bias check must not branch on data; output and dq match eager flex; compiled
-    no_grad inference falls back to eager, not a lowering failure."""
+    """Fullgraph compile: bias check must not branch on data; no_grad inference goes eager."""
     attn, q, kv, mask, _ = _function_case(torch.bfloat16)
     visible = mask > torch.finfo(mask.dtype).min / 2
     mask = torch.where(visible, mask - 0.5, mask)
@@ -427,8 +425,7 @@ def test_older_torch_keeps_eager(monkeypatch):
 @needs_flex_gpu
 @pytest.mark.parametrize("rate", [0, 4, 128])
 def test_flex_graphs_stay_bounded_over_lengths(rate):
-    """Sliding (rate 0), CSA (4), HCA (128) masks over varying lengths and batch 1 or 2, fwd and bwd: at most four
-    graphs (first length static, then dynamic; batch 1 vs > 1), none added per new length."""
+    """Sliding (rate 0), CSA (4), HCA (128) masks: at most four graphs, none added per length."""
     import torch._dynamo
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
@@ -567,8 +564,7 @@ def test_cuda_graph_capture_matches_eager(finite_bias):
 
 @needs_flex_gpu
 def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
-    """Right after install a fullgraph dynamic compile is one graph; setting the compiled flex callable lazily inside
-    the trace made its `_FLEX is None` guard recompile the next call."""
+    """Cold fullgraph compile is one graph; lazily setting _FLEX inside the trace recompiles."""
     import torch._dynamo
     monkeypatch.setattr(modeling, "eager_attention_forward", ORIGINAL)
     monkeypatch.setattr(F4, "_FLEX", None)

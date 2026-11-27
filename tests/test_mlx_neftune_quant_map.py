@@ -7,8 +7,7 @@ try:
     import mlx.core as mx
     from mlx_simulation import mlx_is_simulated
 
-    # Requires real mlx: a shim another test file installs during collection can win the import and lacks nn.RMSNorm and
-    # a rewindable RNG key, making results order-dependent.
+    # Needs real mlx: another test's shim can win the import, making results order-dependent.
     _MLX = not mlx_is_simulated()
     _METAL = _MLX and mx.metal.is_available()
 except Exception:
@@ -143,8 +142,7 @@ def test_neftune_preserves_dora_name_detection():
 
 @metal_only
 def test_lora_wrapped_embedding_map_key_and_reload():
-    """A LoRA/DoRA-wrapped quantized embed_tokens keeps the canonical key in both map scans and validates against the
-    unwrapped base; guards a leaked embed_tokens.embedding key."""
+    """Wrapped quantized embed_tokens keeps its canonical map key, not embed_tokens.embedding."""
     from mlx_lm.tuner.dora import DoRAEmbedding
     from mlx_lm.tuner.lora import LoRAEmbedding
     from unsloth_zoo.mlx import loader as mlx_loader

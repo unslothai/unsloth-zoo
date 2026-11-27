@@ -68,9 +68,8 @@ RATE = 16000
 
 results = {}
 
-# Margin for the two-tone gap over platform jitter; on macos-14 (mlx-vlm 0.6.3, mlx 0.32.0) the identical-input spread
-# (0.8-2.3) is as large as the tone gap (0.7-1.3), so no margin rescues it and the stage is Inconclusive; Linux gives
-# noise 0, signal 0.327.
+# Margin over platform jitter; on macos-14 (mlx-vlm 0.6.3, mlx 0.32.0) identical-input spread is as
+# large as the tone gap, so no margin rescues it (Inconclusive); Linux: noise 0, signal 0.327.
 TWO_TONE_MARGIN = 4.0
 
 TWO_TONE_REASONS = {
@@ -83,15 +82,13 @@ TWO_TONE_REASONS = {
 
 
 def two_tone_verdict(repeats, other):
-    """Did the second tone move the loss beyond platform jitter? repeats (one tone, several runs) give the spread, other
-    is the second tone; split out to test without a model or Mac, since the branch only fires where the model is not
-    reproducible."""
+    """Did the second tone (other) move the loss beyond the repeats' spread (one tone); split out to
+    test without a model, since the branch only fires where the model is not reproducible."""
     noise = max(repeats) - min(repeats)
     # Use the mean, not the first sample: the printed figure is what a reader compares against other.
     base = sum(repeats) / len(repeats)
     signal = abs(base - other)
-    # Print the repeats, not just their spread: jitter and monotone drift give the same spread but need opposite
-    # responses (platform fact vs forward-path bug); this string is the only artifact the macOS matrix leaves.
+    # Print repeats: jitter and drift share a spread; the string is the only macOS artifact.
     detail = (f"440Hz={base:.4f} 1760Hz={other:.4f} "
               f"signal={signal:.3g} noise={noise:.3g} "
               f"repeats=[{', '.join(f'{r:.4f}' for r in repeats)}]")
@@ -103,14 +100,12 @@ def two_tone_verdict(repeats, other):
 
 
 class Inconclusive(Exception):
-    """Stage could not measure (distinct from deciding against); failing it would blame an mlx-vlm version for the
-    machine, and it is not a pass since nothing was demonstrated."""
+    """Could not measure, not a pass nor a fail: failing would blame mlx-vlm for the machine."""
 
 
 def gating_stages(stages):
-    """Stages gating the exit code: stage 0 and its subchecks are diagnostic and never gated, and so are inconclusive
-    stages (stage 4 on Apple Silicon, see TWO_TONE_MARGIN); stages 1 to 3 still gate; the verdict still appears in
-    PROBE_RESULT."""
+    """Returns the stages that gate the exit code: stage 0 and its subchecks and inconclusive stages
+    (stage 4 on Apple Silicon) are excluded; their verdicts still appear in PROBE_RESULT."""
     return {k: v for k, v in stages.items()
             if not k.startswith("0_") and not v.get("inconclusive")}
 
@@ -157,8 +152,7 @@ def resolve(repo):
 
 @stage("0_mlx_vlm_alone_loads")
 def load_upstream(path):
-    """Diagnostic only, never part of the verdict; loads processor and weights separately because they fail for
-    unrelated reasons, reporting both rather than stopping at the first."""
+    """Diagnostic, not in the verdict: processor and weights load apart; each can fail alone."""
     from mlx_vlm.utils import load_model, load_processor
     notes = []
     for what, fn in (("processor", load_processor), ("weights", load_model)):
@@ -198,9 +192,7 @@ def check_tower(_repo):
 
 @stage("3_placeholders_match_the_audio_tower")
 def check_alignment(_repo):
-    """Checks the placeholder count zoo derives (framing arithmetic changed in 0.5.0) against what audio_tower emits,
-    counted from its returned mask; deriving it from _gemma4_audio_encoder_positions would compare a number with
-    itself."""
+    """Placeholder count vs tower mask (framing changed in 0.5.0); encoder-derived is circular."""
     import mlx.core as mx
     import numpy as np
 
@@ -229,8 +221,7 @@ def check_alignment(_repo):
             valid = np.ones(mel.shape[:2], dtype=bool)
         else:
             valid = np.asarray(raw_mask).astype(bool)
-        # The tower takes a PADDING mask, not a validity one: gemma4.py passes ~input_features_mask and gets one back in
-        # the same polarity, so feed the inverse and count False positions.
+        # Tower takes a PADDING mask, returned in the same polarity: feed ~valid, count False.
         encodings, out_mask = tower(mel, mx.array(~valid))
         mx.eval(encodings, out_mask)
         emitted = int((~np.asarray(out_mask)[0].astype(bool)).sum())
@@ -260,9 +251,8 @@ def check_alignment(_repo):
 
 @stage("4_audio_reaches_the_loss")
 def check_loss(_repo):
-    """Distinct audio must give losses differing by more than run-to-run noise: identical uncached Gemma 4 E2B forwards
-    differ on Apple Silicon, so a bare != would pass with disconnected audio; measure noise with repeated tones;
-    floor is 0 where reproducible."""
+    """Distinct audio must differ beyond run-to-run noise: identical uncached forwards differ on
+    Apple Silicon, so bare != would pass with disconnected audio; floor 0 where reproducible."""
     import numpy as np
 
     from unsloth_zoo.mlx.utils import (
@@ -298,8 +288,7 @@ def check_loss(_repo):
                 raise AssertionError(f"loss is not finite at {hz} Hz: {loss}")
             return loss
 
-        # Same tone three times: the disagreement is the platform's free noise floor with no audio involved; three, not
-        # two, since one pair is a single sample that can land small by luck.
+        # Same tone 3 times: platform noise, not audio; a pair can land small by luck.
         repeats = [loss_at(440.0) for _ in range(3)]
         verdict, detail = two_tone_verdict(repeats, loss_at(1760.0))
         if verdict == "below_noise":

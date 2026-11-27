@@ -62,8 +62,7 @@ def _restored(ws, before):
 
 
 def _fresh_arenas(device):
-    # A store whose unfold raised stays leased until its traceback cycle is collected; when that happens depends on
-    # the allocation history, so collect here or clear() keeps the old chunk.
+    # Leased until gc.collect() frees the traceback cycle, or clear() keeps the old chunk.
     gc.collect()
     for arena in ex._ARENAS.values():
         arena.clear()
@@ -116,7 +115,6 @@ def run_compiled(device):
             folded = (W.float() + (B.double() @ A.double() * 0.5).float()).to(W.dtype)
             y, status = fn(W, A, B)
             assert torch.equal(_bits(W), _bits(W0)), (backend, n, k)
-            # The traced region saw the folded weight.
             assert abs(float(y) - float(folded.float().sum())) <= 1e-2 * max(1.0, abs(float(y))), (backend, n, k)
             assert int(status[0]) > 0
         if backend == "count":
@@ -370,8 +368,7 @@ def run_unknown_keys(device):
 
 
 def run_empty_tiles(device):
-    # Rows 96.. have B = 0 (a fresh LoRA): those tiles hold no code words and take the fast path; the others keep a
-    # stream, including small-adapter rows 32..95 where a few elements still cross an exponent boundary.
+    # Rows 96.. (B = 0) take the fast path; rows 32..95 keep a stream for exponent crossings.
     def variants():
         caches = getattr(ex._exact_merge_kernel, "device_caches", None) or {}
         return {key: set(kernels[0]) for key, kernels in caches.items()}
@@ -437,8 +434,7 @@ def run_unfold_failure_keeps_keys(device):
 
 
 def run_partial_unfold_is_not_retried(device):
-    # An unfold that raises after its inverse kernels ran (escape launch failure) must drop its keys: a retry would
-    # subtract the adapter a second time.
+    # A failed unfold after inverse kernels ran drops its keys; a retry would subtract twice.
     ws, As, Bs, before = _lists(device, 2, seed = 80)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
     # CUDA writes one escape table; ROCm writes per-target slices: fail whichever writer runs.

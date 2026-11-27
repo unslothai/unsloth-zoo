@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins GGUF read-back provenance: the probe child must not take the working directory as a search path, and the parent
-accepts a reported gguf tree only from a root Unsloth itself chose; a planted CWD gguf would reach the training
-process holding the token."""
+"""Child must not search cwd (planted gguf would reach the token); parent trusts Unsloth roots."""
 
 from __future__ import annotations
 
@@ -57,8 +55,7 @@ def llama_cpp():
 
 
 def _ran(planted_dir):
-    """Whether a PROBE_PAYLOAD-planted package ran: checks the EXECUTED marker in the package's own directory, where the
-    payload can reach; any other path could never fail."""
+    """Checks EXECUTED in the package's own dir, the only place the payload can reach."""
     return (Path(planted_dir) / "gguf" / "EXECUTED").exists()
 
 
@@ -70,7 +67,6 @@ def _gguf_package(directory, body = "# gguf\n"):
     return str(directory)
 
 
-# --- The parent's sys.path takes trees Unsloth chose, not trees a child names ---
 
 def test_a_tree_outside_every_chosen_root_is_refused(llama_cpp, tmp_path):
     """The planted package passes every structural check, so only provenance, meaning the chosen root, separates it from the real gguf tree."""
@@ -129,7 +125,6 @@ def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, r
     else:
         monkeypatch.syspath_prepend(str(tree))
 
-    # Resolved, not the string handed in: see the symlink case below.
     assert llama_cpp._trusted_gguf_tree(tree, converter_location) == os.path.realpath(tree)
 
 
@@ -155,7 +150,6 @@ def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
         os.path.realpath(resolved_side)
     assert llama_cpp._trusted_gguf_tree(link_side, str(link)) == \
         os.path.realpath(link_side)
-    # Still nothing outside either of them.
     assert llama_cpp._trusted_gguf_tree(_gguf_package(tmp_path / "elsewhere"),
                                         str(link)) is None
 
@@ -174,7 +168,6 @@ def test_the_reported_tree_is_never_resolved_twice(llama_cpp, tmp_path, monkeypa
     def moving(path, *args, **kwargs):
         if str(path) == str(outside):
             calls.append(str(path))
-            # Second and later answers claim the tree now sits inside the root.
             return outside if len(calls) == 1 else inside
         return real_realpath(path, *args, **kwargs)
 
@@ -202,7 +195,6 @@ def test_the_checked_path_and_the_returned_path_cannot_diverge(
     def flipping(path, *args, **kwargs):
         if str(path) == str(link):
             seen["n"] += 1
-            # First answer: outside. By the second, the link has "moved" inside.
             return outside if seen["n"] == 1 else inside
         return real_realpath(path, *args, **kwargs)
 
@@ -226,7 +218,6 @@ def test_a_symlink_into_a_chosen_root_is_returned_resolved(llama_cpp, tmp_path, 
 
     assert llama_cpp._trusted_gguf_tree(str(link)) == os.path.realpath(str(tree))
 
-    # And the returned path does not follow the link once it is re-pointed.
     elsewhere = _gguf_package(tmp_path / "elsewhere")
     os.remove(str(link))
     os.symlink(str(elsewhere), str(link))
@@ -253,7 +244,6 @@ def test_the_conversion_screens_the_tree_before_the_verifier_gets_it(llama_cpp):
     assert screened, "convert_to_gguf no longer derives a read-back tree"
 
 
-# --- The probe child does not search the working directory ---
 
 PROBE_PAYLOAD = """
 import os
@@ -370,8 +360,7 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
         stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
     )
     actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
-    # Platforms differ on the winning side (POSIX resolves the link for sys.path[0], Windows keeps the link's
-    # directory); the test pins agreement, not a platform.
+    # POSIX resolves the link, Windows keeps its dir: the test pins agreement, not a platform.
     assert actual.startswith((str(resolved_gguf), str(linkdir))), actual
 
     probe_env = dict(env)
@@ -501,7 +490,6 @@ def test_the_probe_reports_the_tree_the_converter_will_actually_use(
     actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
     assert actual, run.stderr
 
-    # What the probe reports, through the shipped probe source with the same env.
     probe_env = dict(env)
     converter_safe = "1" if probe_env.get("PYTHONSAFEPATH") else "0"
     probe_env["PYTHONSAFEPATH"] = "1"
@@ -523,8 +511,7 @@ def test_the_probe_reports_the_tree_the_converter_will_actually_use(
 @pytest.mark.skipif(sys.version_info < (3, 11),
                     reason = "PYTHONSAFEPATH is honored from 3.11")
 def test_the_probe_keeps_the_converter_gguf_ahead_of_pythonpath(llama_cpp, tmp_path):
-    """Sibling tree at index 1 outranks PYTHONPATH; safe-path vacates index 0, so run with -S rather than through
-    _probe_child_gguf: a site .pth would occupy index 0 and hide the inversion."""
+    """Sibling tree at index 1 outranks PYTHONPATH; -S avoids a site .pth hiding the inversion."""
     ambient = tmp_path / "ambient"
     _gguf_package(ambient, body = "__version__ = 'ambient'\n")
     install = tmp_path / "install"

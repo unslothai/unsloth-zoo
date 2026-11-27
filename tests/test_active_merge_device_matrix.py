@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dispatch matrix for _active_merge_device(), spoofing cuda/xpu/mps/hip to test the cuda (covers ROCm) -> xpu -> mps ->
-cpu cascade; guards the LoRA merge fix (PR 620); new PROFILES rows are auto-parametrized."""
+"""Tests _active_merge_device() cuda (ROCm) -> xpu -> mps -> cpu; LoRA merge fix (PR 620)."""
 
 from __future__ import annotations
 
@@ -167,12 +166,10 @@ def test_lru_cache_freezes_first_result(spoof_accelerator):
     first = _active_merge_device()
     assert first == "cuda"
 
-    # Simulate a transient spoof change WITHOUT clearing the cache.
     with mock.patch.object(torch.cuda, "is_available", return_value=False):
         cached = _active_merge_device()
         assert cached == "cuda", "lru_cache should freeze the first result"
 
-    # After cache_clear, re-probing picks up the new state.
     _active_merge_device.cache_clear()
     with mock.patch.object(torch.cuda, "is_available", return_value=False), \
          mock.patch.object(torch.backends.mps, "is_available", return_value=True):

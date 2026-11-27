@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression guards for upstream-pinned MLX / Apple-Silicon / accelerator symbols, each citing its zoo commit; run on
-Linux+CUDA via the tests/mlx_simulation shim or natively on Apple Silicon; CPU-runnable in CI"""
+"""Regression guards for upstream-pinned MLX/Apple-Silicon/accelerator symbols; CPU-runnable."""
 
 from __future__ import annotations
 
@@ -28,13 +27,10 @@ import pytest
 import torch
 
 
-# Pins the partial torch.xpu build case (is_available True, symbol missing) for 35dc451, e08c1df, 2564f39 and d631837;
-# happy path is in test_backend_device_helpers.py.
 
 def test_xpu_partial_build_all_three_helpers_silent_no_op():
-    """The three device_type helpers must no-op, not raise AttributeError, on a torch.xpu lacking synchronize /
-    empty_cache / is_bf16_supported; these partial builds crashed GGUF merge and VLM mmproj export (e08c1df, 35dc451,
-    d631837)."""
+    """The three device_type helpers must no-op, not raise AttributeError, on a partial torch.xpu
+    lacking synchronize/empty_cache/is_bf16_supported (e08c1df, 35dc451, d631837)."""
     from unsloth_zoo import device_type as dt
 
     class PartialXpu:
@@ -122,8 +118,7 @@ def test_moe_expert_merges_call_active_merge_device():
     _helper_call_re = re.compile(r"\b(_merge_moe_[A-Za-z0-9_]+)\(")
 
     def _effective_source(name: str, seen: set) -> str:
-        """Returns the entry point's source plus any sibling _merge_moe_* helper it forwards to; one level is enough
-        since zoo never chains wrapper to wrapper to helper."""
+        """Entry point source plus sibling _merge_moe_* helpers; one level, zoo never chains."""
         if name in seen:
             return ""
         seen.add(name)
@@ -156,12 +151,10 @@ def test_moe_expert_merges_call_active_merge_device():
         )
 
 
-# Deprecated mx.metal.set_memory_limit / .set_cache_limit warn every training run; the MLX shim exposes both forms, so
-# the test pins the trainer source (70b93ad).
+# Deprecated mx.metal.set_* forms warn each run (70b93ad); shim exposes both, so pin source.
 
 def test_mlx_trainer_uses_modern_memory_apis_only():
-    """unsloth_zoo.mlx.trainer must use mx.set_memory_limit / set_cache_limit / set_wired_limit; the deprecated
-    mx.metal.set_* forms bring back the per-run warning fixed in 70b93ad."""
+    """Use mx.set_* APIs; deprecated mx.metal.set_* forms re-add a warning fixed in 70b93ad."""
     import importlib.util
     import pathlib
 
@@ -191,8 +184,7 @@ def test_mlx_trainer_uses_modern_memory_apis_only():
         assert modern in src, f"Expected modern API {modern} missing from {mlx_trainer_path.name}"
 
 
-# Commit 2053539 repaired Apple Silicon stub injection: gate was inverted, install_*_stub name was wrong, and
-# _Noop.__call__ silently returned None instead of raising.
+# Commit 2053539: inverted gate, wrong install_*_stub name, _Noop.__call__ returned None.
 
 def test_apple_silicon_stub_injection_entrypoints_pinned():
     """Commit 2053539 sub-bugs (a) and (b): init must gate stub injection on 'if _SKIP_GPU_INIT:' (not the negated form)
@@ -209,11 +201,9 @@ def test_apple_silicon_stub_injection_entrypoints_pinned():
         "Stub injection entry point inject_into_sys_modules vanished from "
         "unsloth_zoo/__init__.py — regresses commit 2053539 sub-bug (b)."
     )
-    # Pre-fix names that must NOT come back.
     assert "install_triton_stub" not in src
     assert "install_bitsandbytes_stub" not in src
 
-    # Sub-bug (a): the injection block must sit under positive 'if _SKIP_GPU_INIT:', not the negated 'if not _SKIP_GPU_INIT:' gate.
     assert "if _SKIP_GPU_INIT:" in src, (
         "Apple-Silicon stub-injection gate flipped — regresses commit "
         "2053539 sub-bug (a)."
@@ -541,7 +531,6 @@ def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
     monkeypatch.setattr(loader.tempfile, "mkdtemp", lambda **k: str(tmp_path))
 
     with _bnb_modules({"bitsandbytes": stub}):
-        # The lift reinstates cached real modules, standing in for the real import.
         loader._REAL_BITSANDBYTES_MODULES = {"bitsandbytes": real}
         loader._dequantize_bnb_to_tempdir(
             "some/repo", token = None, trust_remote_code = False,
@@ -589,14 +578,12 @@ def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
         assert stub_finder in sys.meta_path, "the stub finder was not put back"
 
 
-# mlx_loader rejects full_finetuning on pre-quantized repos (7d2bb95): without it the CCE backward returns mx.zeros for
-# quantized weight grads, so most of the model never updates.
+# mlx_loader rejects full_finetuning on pre-quantized repos (7d2bb95); else CCE zeroes grads.
 
 def test_get_existing_mlx_quantization_detects_both_keys():
     """Must detect both 'quantization' (MLX native) and 'quantization_config' (HF style) keys; checking only one
     re-enables the full_finetuning foot-gun closed by 7d2bb95."""
-    # Reads the file rather than importing it, to avoid the heavy mlx_loader import chain; the layout moved to
-    # mlx/loader.py in e6d8f7f, so both paths are tried.
+    # Reads the file to skip heavy mlx_loader import; layout moved to mlx/loader.py (e6d8f7f).
     import importlib.util
     import pathlib
     pkg_loc = pathlib.Path(
@@ -622,14 +609,11 @@ def test_get_existing_mlx_quantization_detects_both_keys():
     )
 
 
-# target_modules='all-linear' must collect every nn.Linear name (7f8b0ca); pre-fix it was rewritten to None, collapsing
-# to the canonical 7 and dropping GatedDelta in_proj_* and out_proj for Qwen3.5.
+# all-linear must collect all nn.Linear names (7f8b0ca); pre-fix dropped GatedDelta in_proj_*.
 
 def test_collect_all_linear_target_names_finds_qkv_and_moe():
-    """_collect_all_linear_target_names must find fused-QKV, GatedDelta projections, vision tower and MoE router/expert
-    linears, not just the canonical 7; walks a fake model's named_modules()."""
-    # Needs both mlx and mlx_lm: the helper's blanket except returns [] when mlx_lm is missing, which would read as a
-    # coverage regression instead of a missing dependency.
+    """Must find fused-QKV, GatedDelta, vision tower and MoE linears, not only the canonical 7."""
+    # Needs mlx and mlx_lm: missing mlx_lm makes the helper return [], faking a regression.
     pytest.importorskip("mlx")
     pytest.importorskip("mlx_lm")
     from unsloth_zoo.mlx_loader import _collect_all_linear_target_names, _is_mlx_lora_base
@@ -668,7 +652,6 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     names = set(_collect_all_linear_target_names(FakeQwen3p5()))
     canonical = {"q_proj", "k_proj", "v_proj", "o_proj",
                  "gate_proj", "up_proj", "down_proj"}
-    # Canonical 7 must still resolve; an empty result means the walk matched nothing, so check the MLX stack before the targeting logic.
     assert canonical <= names, (
         f"all-linear lost canonical names {sorted(canonical - names)}; got {sorted(names)}. "
         f"An EMPTY result here means the walk matched nothing at all -- check the MLX stack "
@@ -693,8 +676,7 @@ def test_patch_gated_delta_routes_training_through_efficient_path():
     pkg_loc = importlib.util.find_spec("unsloth_zoo").submodule_search_locations[0]
     src = (pathlib.Path(pkg_loc) / "gated_delta_vjp.py").read_text()
 
-    # The fix added is_training_call = state is None and an unconditional early return to gated_delta_ops_efficient
-    # before the kernel branch; both must be present.
+    # Needs is_training_call and the unconditional early return before the kernel branch.
     assert "is_training_call" in src, (
         "patch_gated_delta dropped the is_training_call gate; "
         "regresses commit 46866ce — custom VJP becomes dead code under "

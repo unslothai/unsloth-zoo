@@ -7,8 +7,7 @@ import os
 
 import pytest
 
-# Load pad_token.py directly from its file so the test stays truly offline; importing unsloth_zoo/__init__.py pulls the
-# full stack and can fail without the companion unsloth package.
+# Load pad_token.py by path to stay offline; importing unsloth_zoo can fail without unsloth.
 _PAD_TOKEN_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "unsloth_zoo", "pad_token.py",
@@ -125,8 +124,7 @@ def test_pad_equals_eos_picks_distinct_reserved():
 
 @pytest.mark.parametrize("wrapped", [False, True])
 def test_whisper_uses_existing_config_pad_token(wrapped):
-    # Whisper large-v3's tokenizer aliases pad/eos/unk to 50257 while its config declares the empty token at 50256 as
-    # pad; align to the config without adding a random token or resizing the vocabulary.
+    # Whisper large-v3 aliases pad to eos; reuse config pad 50256 with no new token or resize.
     tok = FakeTokenizer(
         {"": 50256, "<|endoftext|>": 50257},
         pad_token="<|endoftext|>",
@@ -286,8 +284,7 @@ def test_config_declared_pad_used_regardless_of_model_type():
 
 
 def test_non_whisper_model_reuses_config_declared_pad():
-    # Non-whisper model: tokenizer aliases pad to eos, so reuse the config's valid distinct pad id (an existing token
-    # the search families do not recognise) instead of adding one.
+    # Non-whisper: pad aliases eos; reuse the config's valid distinct pad id, not a new token.
     tok = FakeTokenizer(
         {"<|end|>": 7, "<extra_0>": 3},
         pad_token="<|end|>",
@@ -347,8 +344,7 @@ class _NoEosIdTokenizer(FakeTokenizer):
 
 @pytest.mark.parametrize("cls", [FakeTokenizer, _NoEosIdTokenizer])
 def test_config_declared_pad_never_re_aliases_eos(cls):
-    # A config declaring pad == eos must never be honoured (the bug being repaired); caught by id, or by token name when
-    # the tokenizer hides eos_token_id, where the id check alone would miss it.
+    # Config pad == eos is never honored; match by id, or by name if eos_token_id is hidden.
     tok = cls({"</s>": 2, "<s>": 1}, pad_token="</s>", eos_token="</s>")
     cfg = type("Cfg", (), {"vocab_size": 100, "pad_token_id": 2})()
 

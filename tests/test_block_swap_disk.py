@@ -77,6 +77,75 @@ def test_spill_file_round_trips_any_dtype_at_any_offset(tmp_path):
     assert torch.equal(buf, b)
 
 
+def _open_spill_fds():
+    out = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            if ".unsloth_offload_" in os.readlink(f"/proc/self/fd/{fd}"):
+                out.append(int(fd))
+        except OSError:
+            pass
+    return out
+
+
+def _live():
+    # live_spill() on this tree; the bare list before it (so the test also runs against an older tree).
+    fn = getattr(_disk, "live_spill", None)
+    return fn() if fn is not None else (_disk._SPILL[0] if _disk._SPILL else None)
+
+
+def _spilled_param(nbytes, need_bytes):
+    p = nn.Parameter(torch.randn(nbytes // 4), requires_grad = False)
+    _disk.spill_params([p], [0], p.data.nbytes, need_bytes = need_bytes)
+    return p
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the disk tier is Linux only")
+def test_spill_file_closes_with_its_last_user():
+    import gc
+    import weakref
+    if _disk.disk_tier_reason() is not None:
+        pytest.skip(_disk.disk_tier_reason())
+    before = _open_spill_fds()
+    p = _spilled_param(4 << 20, 4 << 20)
+    q = _spilled_param(1 << 20, 1 << 20)
+    store = weakref.ref(_live())
+    # Both models share the one file while either is alive.
+    assert p._unsloth_disk.store is q._unsloth_disk.store is store()
+    assert len(_open_spill_fds()) == len(before) + 1
+    del p
+    gc.collect()
+    assert store() is not None and _live() is store()
+    del q
+    gc.collect()
+    # The last user gone: the unlinked file is closed, so its disk blocks (and the bounce buffer) come back.
+    assert store() is None and _live() is None
+    assert _open_spill_fds() == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the disk tier is Linux only")
+def test_reused_spill_file_rechecks_free_space():
+    if _disk.disk_tier_reason() is not None:
+        pytest.skip(_disk.disk_tier_reason())
+    p = _spilled_param(1 << 20, 1 << 20)
+    store = _live()
+    assert _disk._shared_spill(1 << 20) is store
+    # A later load that needs more than the disk holds is refused up front, not by ENOSPC partway through.
+    with pytest.raises(ValueError, match = "no directory has that much free"):
+        _spilled_param(1 << 20, 1 << 60)
+    assert _live() is store and p._unsloth_disk.store is store
+
+
+def test_spill_file_close_survives_interpreter_teardown(monkeypatch, tmp_path):
+    if _disk.disk_tier_reason() is not None:
+        pytest.skip(_disk.disk_tier_reason())
+    store = _disk.SpillFile(1 << 20, directory = str(tmp_path))
+    # At exit, __del__ can run after module globals such as `os` are gone.
+    monkeypatch.setattr(_disk, "os", None)
+    store.close()
+    assert store.fd is None
+
+
 def test_disk_tier_reason_and_host_limit_parse(monkeypatch):
     monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     assert _disk.disk_tier_reason() == "UNSLOTH_OFFLOAD_DISK=0"
@@ -110,14 +179,72 @@ def test_host_limit_caps_the_host_fit(monkeypatch):
         _mod._check_host_fit([400_000] * 3)
 
 
+def test_host_limit_refusal_names_the_cap_not_the_system_reserve(monkeypatch):
+    # Plenty of free RAM: only UNSLOTH_OFFLOAD_HOST_LIMIT can refuse, so the message must name it.
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 << 30, 32 << 30))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "1MB")
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([400_000] * 3)
+    msg = str(e.value)
+    assert "UNSLOTH_OFFLOAD_HOST_LIMIT caps the offloaded layers at 1.0 MiB" in msg
+    assert "free for the system" not in msg and "At most 2 layers" in msg
+
+
+def test_free_ram_refusal_under_a_looser_cap_still_names_the_reserve(monkeypatch):
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 << 30, 1 << 20))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "1GB")
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([400_000] * 3)
+    msg = str(e.value)
+    assert "free for the system" in msg and "caps the offloaded layers" not in msg
+
+
 def test_auto_swap_indices_names_the_disk_tier():
     # CPU layers: auto_swap_indices plans CUDA cards only, so its picks go through the helper directly.
     layers = nn.ModuleList([nn.Linear(64, 64, bias = False).requires_grad_(False) for _ in range(10)])
     per = 64 * 64 * 4
     idx = list(range(10))
     assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 10 * per) == []
-    # Staging ring (2 layers) and a layer of lag come first: 6 layers of room keep 3 in RAM, the rest go to disk.
-    assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == list(range(3, 10))
+    # Staging ring (2 layers) and a layer of lag come first: 6 layers of room keep 3 in RAM, the rest go to disk:
+    # both turnarounds' blocks first, the rest spread between the RAM blocks.
+    assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == [0, 1, 3, 5, 7, 8, 9]
+    os.environ["UNSLOTH_OFFLOAD_DISK_PLACEMENT"] = "tail"
+    try:
+        assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == list(range(3, 10))
+    finally:
+        del os.environ["UNSLOTH_OFFLOAD_DISK_PLACEMENT"]
+
+
+@pytest.mark.parametrize("world, want", [(1, []), (2, [0, 1, 3, 5, 7, 8, 9])])
+def test_disk_tier_indices_plan_for_this_ranks_share_of_host_ram(monkeypatch, world, want):
+    """Local ranks read the same free RAM: each plans its disk tier for free // LOCAL_WORLD_SIZE."""
+    # Meta layers: none of their bytes are in host RAM yet.
+    layers = nn.ModuleList([nn.Linear(64, 64, bias = False, device = "meta").requires_grad_(False) for _ in range(10)])
+    per = 64 * 64 * 4
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 * per, 12 * per))
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_HOST_LIMIT", raising = False)
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_DISK_PLACEMENT", raising = False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(world))
+    assert _mod._disk_tier_indices(layers, list(range(10))) == want
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_plan_disk_budgets_this_ranks_share_of_host_ram(monkeypatch, world):
+    """BlockSwap's disk fallback keeps in host RAM only what this local rank's share of free RAM holds."""
+    from types import SimpleNamespace
+    per = 1 << 20
+    blocks = [SimpleNamespace(disk = None, sizes = [per], params = [object()], nbytes = lambda: per) for _ in range(10)]
+    stub = SimpleNamespace(blocks = blocks, _host_credit = [], depth = 1)
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 * per, 12 * per))
+    monkeypatch.setattr(_disk, "disk_tier_reason", lambda: None)
+    monkeypatch.setattr(_disk, "host_limit_bytes", lambda: None)
+    monkeypatch.setattr(_disk, "_shared_spill", lambda nbytes: None)
+    monkeypatch.setattr(_disk, "_round_up", lambda n: n)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(world))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_PLACEMENT", "tail")
+    assert BlockSwap._plan_disk(stub, "refused") is True
+    # 12 blocks of free RAM (world 1) or 6 (world 2), less the staging ring (2) and a block of lag (1).
+    assert len(stub._to_spill) == 10 - (12 // world - 3)
 
 
 # GPU -------------------------------------------------------------------------------------------------------------
@@ -219,7 +346,10 @@ def test_disk_tier_trains_bitwise_like_host_ram(monkeypatch, depth, reentrant):
     st = sw.stats()
     per = _layer_bytes(base)
     # Engagement: every disk layer read at least once per forward and per backward (3 steps + one inference pass).
-    assert st["disk_reads"] >= 3 * 7 and st["disk_read_bytes"] >= st["disk_reads"] * (per // 4096) * 4096, st
+    # Each read moves the block's stored region: raw, or encoded when the codec took it.
+    stored = min(n for b in sw.blocks if b.disk is not None for _, n, _ in b.disk_runs)
+    assert stored <= -(-per // 4096) * 4096
+    assert st["disk_reads"] >= 3 * 7 and st["disk_read_bytes"] >= st["disk_reads"] * stored, st
     sw.remove()
     ram.remove()
     # Restored weights are the originals.

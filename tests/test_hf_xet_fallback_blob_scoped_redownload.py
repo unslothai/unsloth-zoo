@@ -172,8 +172,7 @@ def _run_ladder(
         owned = owned,
     )
     monkeypatch.setattr(xf, "_run_download_attempt", attempt)
-    # Stubs the walk as authoritative so ladder cases test the ladder, not what runs here; a real walk is not neutral:
-    # non-dumpable processes like sd-pam raise the age bar and spare partials.
+    # Stub the walk for ladder tests; a real walk is not neutral since sd-pam is non-dumpable.
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
     monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
@@ -392,8 +391,7 @@ def test_a_stalled_snapshot_child_publishes_its_own_new_partial_as_owned(monkeyp
 
     monkeypatch.setattr(xf, "_CTX", _Ctx())
     monkeypatch.setattr(xf, "_terminate_process_group", lambda proc, grace: None)
-    # The stubbed walk is authoritative; with the real one this would assert the host, since sd-pam is non-dumpable on
-    # every systemd login and the inference then declines.
+    # Stubbed walk is authoritative; real walks decline as sd-pam is non-dumpable on systemd.
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
     monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
@@ -514,12 +512,9 @@ def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, 
 
 
 def test_a_writer_busy_in_another_repo_does_not_shield_this_one(monkeypatch, tmp_path):
-    """process_iter walks the whole host and hub names partials by etag, which identical files share across repos; a
-    bare-name match lets another repo's live writer shield this repo's dead partial and force a repo-wide
-    force_download."""
+    """Another repo's live writer on the same etag must not shield this repo's dead partial."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
-    # The same etag, in a different repo's cache, with a live writer on it.
     elsewhere = tmp_path / "models--acme--twin" / "blobs"
     elsewhere.mkdir(parents = True)
     (elsewhere / stale).write_bytes(b"\xa5" * 64)
@@ -632,9 +627,7 @@ def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monk
 
 
 def test_a_link_that_stops_dangling_before_the_unlink_is_left_alone(monkeypatch, tmp_path):
-    """Eligibility and deletion are separate moments: a link that starts resolving before the unlink must be kept, since
-    an older revision's link is not recreated by the current retry, breaking a later offline load; a partial
-    appearing beside the target means a download is in progress."""
+    """Old revision links are not recreated, so a link that resolves again must be kept."""
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
@@ -665,8 +658,7 @@ def test_a_link_that_stops_dangling_before_the_unlink_is_left_alone(monkeypatch,
 
 
 def test_a_nonce_suffixed_partial_still_says_the_blob_is_being_written(monkeypatch, tmp_path):
-    """Hub writes a process-unique `<etag>.<nonce>.incomplete` then renames (huggingface_hub PR 4228: a shared name
-    corrupts the cache where flock silently succeeds); the exact name alone misses live partials."""
+    """Per-process nonce partials (huggingface_hub PR 4228) are missed by the exact name."""
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
@@ -704,8 +696,7 @@ def test_a_container_that_cannot_see_the_other_pods_processes_declines(monkeypat
 
 
 def test_the_namespace_test_reads_containerisation_and_the_caches_mount(monkeypatch, tmp_path):
-    """Only a path the root mount itself carries counts as private, not st_dev: a host bind mount into LXC or nspawn
-    shares st_dev yet siblings stay invisible to process_iter; topology is stubbed."""
+    """Privacy follows the root mount, not st_dev: host bind mounts into LXC/nspawn share it."""
     if os.name == "nt" or not os.path.isdir("/proc"):
         pytest.skip("POSIX containers only")
 
@@ -791,9 +782,8 @@ def test_a_deletion_time_walk_that_could_not_read_every_process_declines(monkeyp
 
 
 def test_a_partial_a_sibling_reopens_after_the_scan_is_not_unlinked(monkeypatch, tmp_path):
-    """Ownership exempts a blob from the age and live-writer guards, so only a partial our dead child wrote may be
-    whitelisted; hub reuses a deterministic `<etag>.incomplete` path, so a scan-idle partial can be reopened by a
-    sibling."""
+    """Ownership exempts a blob from age and live-writer guards, so only our dead child's partial
+    qualifies; hub reuses a deterministic `<etag>.incomplete`, so a sibling can reopen it."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     blobs = tmp_path / REPO_DIR / "blobs"
     stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
@@ -818,8 +808,7 @@ def test_a_partial_a_sibling_reopens_after_the_scan_is_not_unlinked(monkeypatch,
 def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     monkeypatch, tmp_path
 ):
-    """Dangling snapshot links with no partial beside them must be cleared too; otherwise has_active_incomplete_blobs
-    stays true and the caller forces a repo-wide force_download (issue 9094)."""
+    """Dangling links with no partial must go, else a repo-wide force_download (issue 9094)."""
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
@@ -830,8 +819,7 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     orphan.symlink_to(os.path.relpath(blobs / _blob_name("tokenizer.model"), snap))
     assert orphan.is_symlink() and not orphan.exists()
 
-    # Uses the module handle loaded hermetically, not a package import: unsloth_zoo/__init__ raises without the separate
-    # unsloth install, which CI installs only best-effort.
+    # Load by handle: unsloth_zoo/__init__ raises without unsloth; CI installs it best-effort.
     assert hcs.has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is True
     before = _identity(tmp_path)
 
@@ -848,9 +836,7 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
 
 
 def test_a_dangling_link_whose_partial_is_still_being_written_is_kept(monkeypatch, tmp_path):
-    """A dangling link whose `.incomplete` partner may still be running is kept: hub creates the link on finalise, so
-    removing it loses a file a live writer is about to complete; while the partial survives, a repo-wide force is
-    right anyway."""
+    """A dangling link with a live `.incomplete` partner is kept: hub creates links on finalise."""
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(
         xf, "_partial_paths_with_a_live_writer", lambda: {_held(tmp_path, stranger)}
@@ -945,9 +931,8 @@ def test_the_private_cache_test_is_about_who_can_write_into_it(tmp_path):
         )
         os.chmod(cache, 0o750)
         assert xf._cache_is_private_to_this_user(str(cache)) is True
-        # Group-writable counts as shared only if others are in the group; under user-private groups (Fedora, RHEL,
-        # umask 002) it is private, so the expectation follows that rule, not this host's groups; declining would switch
-        # off the purge on those hosts.
+        # Group-writable is shared only if others are in the group; user-private groups (Fedora,
+        # RHEL, umask 002) are private, so declining would switch off the purge there.
         os.chmod(cache, 0o770)
         assert xf._cache_is_private_to_this_user(str(cache)) is (
             xf._group_is_private_to_this_user(os.getegid())
@@ -958,8 +943,7 @@ def test_the_private_cache_test_is_about_who_can_write_into_it(tmp_path):
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason = "POSIX permissions only")
 def test_a_shared_directory_under_a_private_root_is_still_shared(monkeypatch, tmp_path):
-    """Sharing is judged below the root: a 0700 root holding a group-writable repo directory is still shared, since
-    partials live in `blobs`; the root alone says nothing."""
+    """A group-writable repo under a 0700 root is still shared, as partials live in blobs."""
     monkeypatch.setattr(xf, "_group_is_private_to_this_user", lambda _gid: False)
     cache = tmp_path / "cache"
     _build_cache(cache, partial_age_s = 1800.0)
@@ -1126,8 +1110,7 @@ def _confirmation(monkeypatch, *, names, active):
 
 
 def test_a_cache_that_cannot_be_read_after_the_clear_does_not_release_the_force(monkeypatch):
-    """has_active_incomplete_blobs swallows OSError, so an unreadable or unmounted cache answers False like a clean one
-    and releases the force; HTTP then resumes the partial, finalizing it under its sha256."""
+    """Unreadable cache must not lift the force: has_active_incomplete_blobs swallows OSError."""
     assert _confirmation(monkeypatch, names = None, active = False) is False
 
 
@@ -1158,8 +1141,7 @@ def test_the_release_after_the_scoped_clear_asks_the_confirmation_probe():
 
 
 def test_a_sibling_that_reopened_our_partials_name_is_not_unlinked(monkeypatch, tmp_path):
-    """The older hub's deterministic `<etag>.incomplete` can be recreated by a sibling after our purge, so the captured
-    basename may name someone else's open download."""
+    """Older hub's `<etag>.incomplete` may be recreated by a sibling; the name may be theirs."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     reopened = tmp_path / REPO_DIR / "blobs" / mine
@@ -1255,8 +1237,7 @@ def test_a_reopened_owned_name_is_spared_when_the_walk_cannot_see_every_writer(
 
 
 def test_a_sibling_container_on_a_shared_volume_keeps_its_reopened_name(monkeypatch, tmp_path):
-    """Privacy checks only UIDs; a sibling container shares our UID in another namespace, so a shared volume passes
-    `_cache_is_private_to_this_user` yet the sibling is invisible, and an empty writer set is no evidence."""
+    """Privacy checks UIDs only, so a sibling container with our UID is invisible, not empty."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
@@ -1322,9 +1303,8 @@ def test_the_stalled_child_is_killed_before_the_live_writer_walk(monkeypatch, tm
 def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
     monkeypatch, tmp_path,
 ):
-    """A process of ours nothing can describe (macOS TCC, non-dumpable Linux) may hold the partial; declining would
-    leave issue 9094 unfixed for every systemd login, so the age bar is raised past 171s, the longest no-growth
-    window a live Xet writer has shown."""
+    """A process of ours nothing can describe (macOS TCC, non-dumpable Linux) may hold the partial;
+    declining would leave issue 9094 unfixed, so the age bar rises past 171s."""
     _build_cache(tmp_path, partial_age_s = 200.0)
     partial = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
 
@@ -1363,7 +1343,6 @@ def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
     assert xf._unowned_partials_safe_to_clear("model", REPO, str(tmp_path), 180.0, None) == set()
     assert xf._live_writer_walk_missed_our_own_uid() is True
 
-    # The same partial once it is genuinely stale clears, so the fix still works here.
     blobs = tmp_path / REPO_DIR / "blobs"
     old = time.time() - 4000.0
     os.utime(blobs / partial, (old, old))
@@ -1397,9 +1376,8 @@ def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
 def test_the_studio_path_forces_when_a_writer_we_cannot_describe_could_hold_the_legacy_name(
     monkeypatch, tmp_path,
 ):
-    """Hub 0.36's deterministic `<etag>.incomplete` can be recreated by an undescribable same-uid sibling, so it is
-    spared and the force stands; current hub's nonce-spelled partial cannot be recreated, so the scoped re-download
-    stays."""
+    """Hub 0.36's deterministic `<etag>.incomplete` can be recreated by an undescribable same-uid
+    sibling, so it is spared and forced; nonce partials cannot, so scoped re-download stays."""
     snap = _build_cache(tmp_path, partial_age_s = 20.0)
     legacy = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
@@ -1425,8 +1403,7 @@ def test_the_studio_path_forces_when_a_writer_we_cannot_describe_could_hold_the_
 
 
 def test_a_link_whose_partial_was_kept_is_kept_too(monkeypatch, tmp_path):
-    """A link whose partial was kept must be kept too; the snapshot sweep judges it on the same stale mtime, and a
-    sibling for another revision will not recreate it, stranding the blob."""
+    """A kept partial's link must be kept too, or the blob strands; no sibling recreates it."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     blobs = tmp_path / REPO_DIR / "blobs"
     partial = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
@@ -1578,8 +1555,7 @@ def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
     monkeypatch.setattr(xf, "_read_proc_text", lambda path: proc_text.get(path))
 
     present: set = set()
-    # Every gate path is answered from `present` alone, since the real filesystem would expose the runner's own
-    # /.dockerenv under Docker or Podman and fail the host arm.
+    # Gate paths read only `present`, since the runner's /.dockerenv would fail the host arm.
     simulated = frozenset({
         "/.dockerenv", "/run/.containerenv", "/run/systemd/container", "/run/host",
         "/proc/vz", "/proc/bc",
@@ -1626,8 +1602,7 @@ def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
 
 
 def test_a_root_cgroup_under_a_non_systemd_init_is_still_the_host(monkeypatch, tmp_path):
-    """`0::/` is not container-specific: OpenRC, runit and busybox init leave PID 1 in the root cgroup on ordinary
-    hosts, so reading it as a container declines the clearance repo-wide."""
+    """`0::/` under a non-systemd init is still the host; misreading it declines clearance."""
     if os.name == "nt" or not os.path.isdir("/proc"):
         pytest.skip("POSIX containers only")
 

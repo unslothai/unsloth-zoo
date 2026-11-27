@@ -213,8 +213,7 @@ def test_patch_function_keeps_a_bound_method_bound():
 
 
 def test_patch_function_survives_a_compiler_that_refuses():
-    """A carrier with no __wrapped__ is handed to torch untouched instead of raising AttributeError; the load survives
-    whatever torch does, as _compile_or_fall_back guarantees"""
+    """Carrier without __wrapped__ goes to torch as-is, not AttributeError; the load survives."""
     _run("""
         import torch
         from unsloth_zoo.temporary_patches.utils import patch_function
@@ -253,8 +252,7 @@ def test_patch_function_survives_a_compiler_that_refuses():
              "assert this reproduces is unreachable",
 )
 def test_the_bare_decorators_do_not_assert():
-    """Each entry point decorating a carrier on torch 2.11+ must not raise AssertionError; nothing executes, so it stays
-    runnable on a CPU-only box with no working inductor backend"""
+    """Bare decorators on torch 2.11+ must not assert; nothing executes, so CPU-only is enough."""
     _run(_CARRIER, """
         import torch
         for fullgraph in (True, False):

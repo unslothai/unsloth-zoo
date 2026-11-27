@@ -59,7 +59,6 @@ def experts(monkeypatch):
 
 
 def _ready(experts):
-    # Call the unbound method against the fake experts object.
     return GptOssExpertsBnb4bit._grouped_bnb4bit_ready(experts)
 
 

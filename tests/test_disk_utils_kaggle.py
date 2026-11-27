@@ -76,7 +76,6 @@ def _fake_free(disk_utils, monkeypatch, sizes):
     monkeypatch.setattr(disk_utils, "free_bytes", fake)
 
 
-# Detection
 
 
 class TestKaggleDetection:
@@ -150,7 +149,6 @@ class TestKaggleDetection:
         assert disk_utils.is_kaggle_environment() is False
 
 
-# Sizing
 
 
 class _FakeQuantState:
@@ -217,8 +215,7 @@ class TestLogicalSize:
         assert disk_utils.model_16bit_bytes(model) == 2 * 1_100_000
 
     def test_mxfp4_blocks_are_worth_twice_their_bytes(self, disk_utils):
-        """gpt-oss packed MXFP4 has no quant_state, so numel() is half the truth: convert_moe_packed_tensors turns (...,
-        G, B) into (..., G, B * 2) and consumes the scales."""
+        """gpt-oss MXFP4 has no quant_state, so numel() is half the truth; blocks count twice."""
         blocks = _MXFP4Param(90_000_000)
         assert (
             disk_utils.logical_numel(blocks, "model.layers.0.mlp.experts.gate_up_proj_blocks")
@@ -338,8 +335,7 @@ class TestGGUFEstimate:
         assert with_cache - without == n * 2
 
     def test_the_three_failing_rows_are_now_caught(self, disk_utils):
-        """On 174GB free a Gemma4 31B Vision export still failed: 62GB pre-warmed base cache plus 62GB merge left 50GB
-        for a 62GB GGUF; only counting the cached base exceeds free space; unsloth now drops the pre-warm."""
+        """Gemma4 31B export failed on 174GB: 62GB pre-warm + 62GB merge; pre-warm now dropped."""
         n = 31_000_000_000
         free = 174 * GB
         old_style = 2 * n * 2 + 2 * GB
@@ -359,7 +355,6 @@ class TestGGUFEstimate:
         assert three < free
 
 
-# The /tmp redirect
 
 
 class TestKaggleTmpRedirect:

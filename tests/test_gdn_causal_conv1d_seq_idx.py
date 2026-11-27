@@ -152,7 +152,6 @@ def test_single_sequence_seq_idx_is_bitwise_no_seq_idx(dtype):
 
 @requires_cuda
 def test_seq_idx_leak_is_visible_without_the_mask():
-    # Flip check: without seq_idx the oracle must fail.
     rows = [[5, 1, 7, 3, 48]]
     x, w, b, dy = _inputs(1, 64, 64, 4, torch.float32, True)
     seq_idx = _seq_idx_from_lengths(rows, "cuda")
@@ -188,7 +187,6 @@ def test_seq_idx_shape_mismatch_raises():
     for dtype in (torch.bool, torch.complex64):
         with pytest.raises(ValueError, match = "seq_idx"):
             gcc._legacy_causal_conv1d_fn(x = x, weight = w, seq_idx = torch.zeros(1, 10, dtype = dtype))
-    # Optional inputs default like the public entry points.
     torch.testing.assert_close(gcc._causal_conv1d_any(x, w), gcc.causal_conv1d_reference(x, w))
 
 
@@ -292,8 +290,7 @@ def _check_hub_layer_routing(hub_fn):
 
 
 def test_hub_layer_instance_keeps_its_kernel_metadata():
-    # kernels returns a layer instance whose kernel_layer_name is read from type(fn) by use_kernelized_func and
-    # kernelize, so GDN routing must keep the instance.
+    # kernel_layer_name is read from type(fn) by kernelize; routing must keep the instance.
     hub_fn = gcc._hub_gdn_function(_fake_kernels_decorator("causal_conv1d_fn"), _hub_conv)
     assert isinstance(hub_fn, torch.nn.Module)
     assert type(hub_fn).kernel_layer_name == "causal_conv1d_fn"
@@ -355,8 +352,7 @@ def test_hub_layer_keeps_routing_after_real_model_kernelize():
     with_fallback = getattr(with_fallback, "__wrapped__", with_fallback)
     hub_fn = gcc._hub_gdn_function(with_fallback("causal_conv1d_fn", "unsloth_missing_causal_conv1d"), _hub_conv)
     if not isinstance(hub_fn, torch.nn.Module):
-        # Skip because transformers only builds a layer with a kernels release inside its supported range
-        # (or with USE_HUB_KERNELS on); test_hub_layer_keeps_routing_after_kernelize_fallback covers the rest.
+        # Skip: no kernels layer unless transformers supports it or USE_HUB_KERNELS is on.
         pytest.skip("transformers did not build a kernels layer")
 
     @kernels.use_kernelized_func(hub_fn)
@@ -414,7 +410,6 @@ def test_seq_idx_on_cpu_with_cuda_activations(monkeypatch):
     for fn in (_triton, _reference, gcc._legacy_causal_conv1d_fn):
         for name, o, r in zip(("y", "dx", "dw", "db"), _run(fn, x, w, b, dy, "silu", seq_idx.cpu()), oracle):
             assert _rel(o, r) < 1e-5, (fn, name, _rel(o, r))
-    # Direct entry and dispatch both ran the kernel, not the fallback.
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_seq_idx"] - before == 2
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
     y = gcc._legacy_causal_conv1d_fn(x, w, b, "silu", seq_idx = seq_idx.cpu())
@@ -422,8 +417,7 @@ def test_seq_idx_on_cpu_with_cuda_activations(monkeypatch):
 
 
 def _random_seq_idx(g, T, W, dtype):
-    """Random document lengths, many shorter than W; IDs gapped, negative or huge, and reused only once at least W - 1
-    tokens away, since equal IDs in a window would join runs."""
+    """IDs are reused only once W-1 tokens apart, since equal IDs in a window would join runs."""
     pool = [-7, -1, 0, 3, 5, 11, 2**31 - 1, 2**32, 2**32 + 3, -2**40]
     pool = [v for v in pool if torch.iinfo(dtype).min <= v <= torch.iinfo(dtype).max]
     n_docs = int(torch.randint(1, min(12, T) + 1, (), generator = g))
@@ -446,7 +440,6 @@ def test_seq_idx_randomized_against_per_document():
         dtype = (torch.int64, torch.int32)[case % 2]
         x, w, b, dy = _inputs(B, 64, T, W, torch.float32, True, seed = case)
         rows = [_random_seq_idx(g, T, W, dtype) for _ in range(B)]
-        # Strided (B, T) view of a wider buffer.
         storage = torch.full((B, 2 * T), 99, dtype = dtype, device = "cuda")
         seq_idx = storage[:, ::2]
         seq_idx.copy_(torch.tensor(rows, dtype = dtype))

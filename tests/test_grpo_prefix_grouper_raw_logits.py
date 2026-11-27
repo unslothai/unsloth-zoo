@@ -40,7 +40,6 @@ L = 4                      # padded row length
 W = 4                      # scatter width
 ROWS = [[3, 5, 7, 9],      # row 0
         [3, 5, 11, 13]]    # row 1, shares the [3, 5] prefix
-# PrefixGrouper's flat stream: shared prefix once, then each row's suffix.
 FLAT = [3, 5, 7, 9, 11, 13]
 POS  = [0, 1, 2, 3, 2, 3]
 # One entry per predicted completion token, aligned 1:1.

@@ -63,11 +63,13 @@ def test_fp32_head_cast_once_same_bits(amp_dtype, hidden_dtype, need_weight_grad
     with _HeadCasts(w) as casts:
         new = ops._chunked_ce_forward_impl(h, w, y, rows, -100, True, need_weight_grad, exact, True, amp_dtype)
     assert casts.count == 1, casts.count
-    # Reference: the per-chunk casts autocast does when the loop gets the fp32 weight itself.
+    # Reference: per-chunk autocast casts of the fp32 weight, over the rows the op keeps (it drops ignored ones).
+    keep = (y != -100).nonzero().squeeze(-1)
     with torch.autocast("cpu", dtype = amp_dtype):
         with _HeadCasts(w) as casts:
-            old = ops._chunked_ce_forward_loop(h, w, y, rows, -100, True, need_weight_grad, exact)
+            old = ops._chunked_ce_forward_loop(h[keep], w, y[keep], rows, -100, True, need_weight_grad, exact)
     assert casts.count > 1
+    old = (old[0], old[1].new_zeros(h.shape).index_copy_(0, keep, old[1]), old[2])
     for a, b in zip(new, old):
         assert torch.equal(a, b)
 

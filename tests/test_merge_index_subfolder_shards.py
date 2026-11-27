@@ -101,7 +101,6 @@ def _fake_hub(monkeypatch, root):
     monkeypatch.setattr(S, "_try_copy_all_from_cache", lambda *a, **k: False)
 
 
-# Existence checks.
 
 def test_hub_repo_with_only_subfolder_shards_exists(monkeypatch, tmp_path):
     _write_tree(str(tmp_path), {"config.json": b"{}", "model.safetensors.index.json": _cosmos3_index(_SHARDS),
@@ -228,7 +227,6 @@ def _assert_merged_and_reloads(base, out, adapted, peft_model):
             assert torch.equal(merged[key], base_t), key
     assert n_adapted >= 1
 
-    # The export reloads through its root index and matches the LoRA model's output.
     from transformers import AutoModelForCausalLM
     reloaded = AutoModelForCausalLM.from_pretrained(out, dtype = torch.float32).eval()
     ids = torch.arange(1, 9).unsqueeze(0)

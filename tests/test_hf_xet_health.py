@@ -115,9 +115,7 @@ def test_two_failures_demote_and_a_success_recovers(monkeypatch):
 
 
 def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
-    """A success resets the streak and a failure increments it, so from a streak of 1 no serial order reaches the
-    threshold; a demotion therefore proves a dropped update, costing a day on HTTP where Xet works, so the
-    interleaving is forced, not raced."""
+    """Racing outcomes must not fabricate a demotion: a lost update would fake the streak."""
     import threading
 
     health.record_xet_outcome(False, "seed")           # streak = 1
@@ -232,8 +230,7 @@ def test_result_is_truthy_like_a_bool(monkeypatch):
 
 
 def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
-    """A 404 from an HF_ENDPOINT mirror that lacks the probe repo proves the endpoint is reachable; treating it as
-    unreachable pinned every mirror user to HTTP for 24h."""
+    """A 404 from a mirror lacking the probe repo proves reachable; demoting pins HTTP for 24h."""
     import urllib.error
     import urllib.request
 
@@ -255,8 +252,7 @@ def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
 
 
 def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
-    """Nothing is sent, so a 401 only means auth was never attempted; the 404 test cannot reach this arm (`or`
-    short-circuits), so assert `is None`, not falsiness, since the bug returned False."""
+    """Nothing is sent, so a 401 only means auth was never tried; assert `is None`, not falsy."""
     import urllib.error
     import urllib.request
 
@@ -320,8 +316,7 @@ def test_probe_403_still_demotes(monkeypatch):
 
 
 def test_an_unprobed_memo_does_not_satisfy_an_explicit_probe(monkeypatch):
-    """Download calls xet_health(probe=False) every time, so memoizing that optimistic default disarmed the explicit
-    preflight for a minute on the CAS-blocked machines it exists to catch."""
+    """Memoizing xet_health(probe=False) disarmed the explicit preflight on CAS-blocked hosts."""
     _big_machine(monkeypatch)
     probes: list[bool] = []
 
@@ -359,8 +354,7 @@ def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
 
 
 def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
-    """HF_HOME is often shared across a cluster, so verdicts must be machine-scoped: one node with blocked CAS would
-    demote every node for 24h, and none could record a clearing success."""
+    """HF_HOME is often shared across a cluster, so verdicts must be scoped to one machine."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 
@@ -395,8 +389,7 @@ def test_the_probe_is_bounded_by_a_wall_clock(monkeypatch):
 
 
 def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
-    """On a shared HF_HOME, scoping only the read let writes merge streaks across nodes, so one peer's single failure
-    demoted a healthy node; the write must be scoped too."""
+    """Scoping only reads let peers' writes demote a healthy node; scope the write too."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 

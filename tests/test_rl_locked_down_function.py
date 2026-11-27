@@ -28,8 +28,7 @@ BLOCKED = [
     ("socket", "def matmul(A, B):\n    import socket\n    return socket.socket()\n", ImportError),
     # The dunder is a string constant, so the AST check misses it; the case still fails because getattr is not in the allowlist at all.
     ("getattr", 'def matmul(A, B):\n    return getattr(A, "__class__")\n', NameError),
-    # Allowlisted modules re-export unsafe ones: random keeps a private handle on os and typing keeps sys; the
-    # private-attribute rule catches random._os, but only the facade stops typing.sys. Both are needed.
+    # Both are needed: the private rule catches random._os; only the facade stops typing.sys.
     ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', RuntimeError),
     ("typing.sys", 'def matmul(A, B):\n    import typing\n    return typing.sys.modules["os"].getpid()\n', AttributeError),
     # attrgetter takes a dotted string, so it walks dunders the AST check never sees; the member is denied while operator itself stays allowed.
@@ -39,8 +38,7 @@ BLOCKED = [
     # pickle_by_enum_name(member, proto) returns (getattr, ...): the real getattr then walks __self__ to builtins.__import__.
     ("enum.pickle_by_enum_name", 'def matmul(A, B):\n    import enum, re\n    g = enum.pickle_by_enum_name(re.IGNORECASE, 2)[0]\n    return g(g(g, "__self__"), "__import__")("os").getpid()\n', AttributeError),
     ("from enum import pickle_by_enum_name", 'def matmul(A, B):\n    from enum import pickle_by_enum_name\n    return pickle_by_enum_name\n', ImportError),
-    # Formatter.get_field resolves a dotted string and returns the object, recovering the real __import__; str.format
-    # walks attributes too but only returns text, so only this one matters.
+    # get_field resolves dotted names to objects (real __import__); str.format returns text.
     ("string.Formatter", 'def matmul(A, B):\n    import string\n    q = string.Formatter()\n    return q.get_field("0.get_field.__globals__[__builtins__][__import__]", (q,), {})[0]\n', ImportError),
 ]
 
@@ -220,8 +218,7 @@ def test_full_policy_remains_available():
 
 
 def test_dunder_method_definitions_are_denied():
-    # A method name is FunctionDef.name, not a Name or Attribute node, so the walk cannot see it; without the
-    # fail-closed rule, a custom __setattr__ captures what functools.update_wrapper copies.
+    # FunctionDef.name is not a Name node, so only fail-closed stops a custom __setattr__.
     source = (
         "def matmul(A, B):\n"
         "    import functools\n"
@@ -261,8 +258,7 @@ def test_functools_reduce_still_works():
 
 
 def test_frame_traversal_is_denied():
-    # A running generator reaches gi_frame.f_back.f_back.f_builtins, the trusted caller's real builtins; no module or
-    # underscore name is involved, so it needs its own rule.
+    # gi_frame.f_back chains reach the trusted caller's builtins; no name rule catches it.
     source = (
         "def matmul(A, B):\n"
         "    holder = []\n"

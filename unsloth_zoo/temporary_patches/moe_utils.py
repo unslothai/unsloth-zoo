@@ -307,13 +307,23 @@ def _load_cached_moe_utils_module():
 
 
 def _select_moe_backend_eagerly(module):
-    # Selecting inside a trace sets a guarded global and recompiles the graph once.
-    if torch.compiler.is_compiling():
+    # Selecting inside a trace sets a guarded global and recompiles the graph once. While unsloth imports, a worker
+    # that picks its card afterwards would probe (and open a context on) GPU 0: warm_moe_backend_selection selects at
+    # model load instead.
+    if torch.compiler.is_compiling() or _unsloth_importing():
         return
     try:
         module.select_moe_backend()
     except Exception:
         pass
+
+
+def warm_moe_backend_selection():
+    """Probe and select the MoE backend at model load (a temporary patch), before any trace; never during import."""
+    module = _load_cached_moe_utils_module()
+    for target in (module, sys.modules[__name__]):
+        if target is not None and hasattr(target, "select_moe_backend"):
+            _select_moe_backend_eagerly(target)
 
 
 def get_forward_moe_backend():
@@ -384,6 +394,145 @@ def _grouped_mm_eager(inputs, weight, offsets):
     # is cached.
     if not _grouped_mm_supported_on(inputs.device):
         return _manual_grouped_mm(inputs, weight, offsets)
+    try:
+        return _grouped_mm_native(inputs, weight, offsets)
+    except RuntimeError as exc:
+        refusal = _grouped_mm_refusal(exc)
+        if refusal is None:
+            raise
+    # Outside the except: the traceback no longer pins this call's frames while the fallback runs.
+    _latch_grouped_mm_refused(inputs.device, f"{str(inputs.dtype).replace('torch.', '')} call: {refusal}")
+    if _triton_grouped_mm_wanted(inputs, weight):
+        return _triton_grouped_mm(inputs, weight, offsets)
+    return _manual_grouped_mm(inputs, weight, offsets)
+
+
+_GROUPED_MM_REFUSALS = ("not supported on your system", "is only supported on cuda devices", "not supported on rocm")
+
+
+def _grouped_mm_refusal(exc):
+    """The message when exc is torch refusing grouped_mm for good, else None: an OOM or a shape error is not a latch."""
+    if isinstance(exc, torch.OutOfMemoryError) or torch.compiler.is_compiling():
+        return None
+    message = str(exc).strip()
+    lowered = message.lower()
+    if not any(refusal in lowered for refusal in _GROUPED_MM_REFUSALS):
+        return None
+    return (message.splitlines() or [""])[0][:240]
+
+
+def _latch_grouped_mm_refused(device, reason):
+    """A real call refused what the probe passed: latch grouped_mm off for this GPU model."""
+    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    kind = _grouped_mm_foreign_kind(device)
+    if kind is None:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
+    else:
+        _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = False
+        _TRANSPOSED_VIEW_SAFE_BY_KIND[kind] = False
+    _GROUPED_MM_RUNTIME_REFUSALS[0] += 1
+    # grouped_mm stays selected: later forwards run on Triton or the per-expert loop instead of raising.
+    _GROUPED_MM_RUNTIME_LATCHED[0] = True
+    _use_grouped_mm_triton_standin(device, reason)
+
+
+_GROUPED_MM_RUNTIME_REFUSALS = [0]
+_GROUPED_MM_RUNTIME_LATCHED = [False]
+
+
+# Grouped GEMMs that read the expert offsets on the host (one sync per call). "torch_fallback": eager torch._grouped_mm
+# forwards that torch serves with _grouped_mm_fallback, a per-expert mm loop (GroupedBlas.cpp: off bf16 sm90 / sm100,
+# off cuBLASLt grouped on CUDA >= 13.3 sm9x-11x, and on ROCm without the opt-in CK kernels); torch's own backward adds
+# up to two more per forward. "loop": Unsloth's per-expert loop (forward, backward and the dW loop; it runs eagerly
+# even inside compiled code; also transformers' own fallback loop). "compiled_sites": such calls traced into a compiled
+# graph, counted once per trace, since a graph cannot count its own runs. Read deltas around a step: grouped_mm_sync_calls().
+GROUPED_MM_SYNC_CALLS = {"torch_fallback": 0, "loop": 0, "compiled_sites": 0}
+_GROUPED_MM_SYNC_LOGGED = [False]
+_TORCH_GROUPED_MM_FALLBACK_BY_KEY = {}
+
+
+def grouped_mm_sync_calls():
+    """Copy of GROUPED_MM_SYNC_CALLS (eager grouped GEMM calls that synced on the expert offsets)."""
+    return dict(GROUPED_MM_SYNC_CALLS)
+
+
+def _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, groups):
+    """Whether torch._grouped_mm serves this call with its synced per-expert loop, from GroupedBlas.cpp's dispatch."""
+    key = (device.type, device.index, dtype, weight_dtype, groups <= 1024)
+    takes = _TORCH_GROUPED_MM_FALLBACK_BY_KEY.get(key)
+    if takes is not None:
+        return takes
+    takes = True
+    try:
+        if device.type == "cuda":
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            if is_rocm_torch(torch):
+                arch = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", "")).split(":")[0]
+                ck = os.environ.get("ROCM_ALLOW_GROUP_GEMM_CK", "0") == "1"
+                takes = not (ck and arch in ("gfx942", "gfx950", "gfx90a"))
+            else:
+                major, minor = torch.cuda.get_device_capability(index)
+                bf16 = dtype == weight_dtype == torch.bfloat16
+                cuda = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
+                # bf16 takes cuBLASLt only behind an opt-in flag, so only fp16 is counted as served there.
+                cublaslt = cuda >= (13, 3) and 9 <= major <= 11 and dtype == weight_dtype == torch.float16 \
+                    and key[-1]
+                takes = not (cublaslt or (bf16 and ((major, minor) == (9, 0) or major == 10)))
+    except Exception:
+        takes = True
+    _TORCH_GROUPED_MM_FALLBACK_BY_KEY[key] = takes
+    return takes
+
+
+@_assume_constant_result
+def _note_compiled_grouped_mm_site(device_type, device_index, dtype, weight_dtype):
+    # Dynamo runs this once per trace (assume_constant_result), never inside the compiled graph.
+    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
+    if _torch_grouped_mm_takes_fallback(device, dtype, weight_dtype, 1):
+        _record_grouped_mm_sync("compiled_sites")
+    return True
+
+
+@_assume_constant_result
+def _note_compiled_loop_site():
+    # A traced call into an opaque per-expert loop op (transformers' grouped_mm_fallback), once per trace.
+    _record_grouped_mm_sync("compiled_sites")
+    return True
+
+
+def _count_grouped_mm_sync(kind, inputs = None, weight = None, groups = 0):
+    if torch.compiler.is_compiling():
+        if kind == "opaque_loop":
+            _note_compiled_loop_site()
+        elif kind == "torch_fallback":
+            # The expert count can be symbolic (dynamic=True), which the constant helper cannot take, so traced
+            # calls are classified at 1 group: cuBLASLt's 1024-group limit is far above real expert counts.
+            _note_compiled_grouped_mm_site(inputs.device.type, inputs.device.index, inputs.dtype, weight.dtype)
+        return
+    if kind == "torch_fallback" and not _torch_grouped_mm_takes_fallback(inputs.device, inputs.dtype, weight.dtype, groups):
+        return
+    # "opaque_loop": a caller's per-expert loop op (transformers' grouped_mm_fallback), a loop when run eagerly.
+    _record_grouped_mm_sync("loop" if kind == "opaque_loop" else kind)
+
+
+def _record_grouped_mm_sync(kind):
+    # Shared with the compiled-cache copy of this module, so the package's counters see every call.
+    package = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    calls = getattr(package, "GROUPED_MM_SYNC_CALLS", GROUPED_MM_SYNC_CALLS)
+    logged = getattr(package, "_GROUPED_MM_SYNC_LOGGED", _GROUPED_MM_SYNC_LOGGED)
+    calls[kind] += 1
+    if not logged[0] and os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+        logged[0] = True
+        where = "Unsloth's per-expert loop" if kind == "loop" else "torch._grouped_mm's per-expert fallback"
+        print(
+            f"Unsloth: MoE expert GEMMs run on {where}, one host sync per call. "
+            "Per-step counts: unsloth_zoo.temporary_patches.moe_utils.grouped_mm_sync_calls()."
+        )
+
+
+def _grouped_mm_native(inputs, weight, offsets):
+    _count_grouped_mm_sync("torch_fallback", inputs, weight, offsets.shape[0])
     pad = _native_backward_pad(inputs, weight)
     if pad:
         if _is_transposed_stack(weight) and _transposed_view_safe_on(inputs.device):
@@ -431,9 +580,11 @@ def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
     grad_output = grad_output.contiguous()
     try:
         if _grouped_mm_supported_on(inputs.device):
+            _count_grouped_mm_sync("torch_fallback", inputs, grad_output, offsets.shape[0])
             return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
     except RuntimeError:
         pass
+    _count_grouped_mm_sync("loop")
     out = inputs.new_zeros((offsets.shape[0], inputs.shape[1], grad_output.shape[1]))
     start = 0
     for g, end in enumerate(offsets.tolist()):
@@ -522,8 +673,17 @@ _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 6):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
     (7, 5):  {"lora": 64, "many": 0,    "few": 0,   "dw": 0,   "dw_few": 0},
 }
+# ROCm, keyed by the gcnArch capability torch reports. There torch._grouped_mm is a per-expert mm loop, and on gfx1151
+# ROCm 7.13 / 7.14 it fails the training-shaped probe, so the LoRA GEMMs ran as about 3.8k per-expert mm per step.
+# gfx1151 (Strix Halo) LoRA GEMMs on Triton, Qwen3-30B-A3B layer shape (E 128, top-8), r16, bf16: 1.26x step speed on
+# Linux. Windows (triton-windows) timed 1.76x on one box and 0.94x on another, so auto keeps it on the loop there.
+# Base-sized classes are not timed yet and stay on torch; other ROCm archs keep the loop. =1 forces Triton anywhere.
+_TRITON_GROUPED_MM_AUTO_ROWS_ROCM = {
+    (11, 5): {"lora": -1, "many": 0, "few": 0, "dw": 0, "dw_few": 0},
+}
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
+_GROUPED_MM_TRITON_STANDIN = False
 
 
 def _triton_grouped_mm_capability(index):
@@ -536,12 +696,12 @@ def _triton_grouped_mm_capability(index):
 @_assume_constant_result
 def _triton_grouped_mm_max_rows(index, kind = "lora"):
     """Row limit for class kind on device index (0 off, -1 no limit), read from UNSLOTH_MOE_GROUPED_TRITON (auto|1|0),
-    UNSLOTH_DISABLE_MOE_TRITON=1 and UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS; baked in under torch.compile, so an env
-    change needs torch._dynamo.reset()."""
+    UNSLOTH_DISABLE_MOE_TRITON=1, UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS and the grouped_mm stand-in; baked in under
+    torch.compile, so an env change needs torch._dynamo.reset()."""
     environ = os.environ
     key = (
         index, kind, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
-        environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS"),
+        environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS"), _GROUPED_MM_TRITON_STANDIN,
     )
     limit = _TRITON_GROUPED_MM_POLICY.get(key)
     if limit is None:
@@ -555,12 +715,15 @@ def _triton_grouped_mm_lora_rank_scaled():
     return not os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
 
 
-def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
+def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = False):
     mode = (mode or "auto").strip().lower()
+    if standin and mode == "auto":
+        mode = "1"
     if mode in ("0", "false", "off") or disabled == "1":
         return 0
-    if is_rocm_torch(torch) or _GROUPED_MM_TRITON_OP is None or index is None:
+    if _GROUPED_MM_TRITON_OP is None or index is None:
         return 0
+    rocm = is_rocm_torch(torch)
     try:
         from unsloth_zoo.temporary_patches.moe_grouped_fp16 import triton as _triton
         if _triton is None:
@@ -570,9 +733,13 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
         return 0
     if mode in ("1", "true", "on"):
         # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
-        limit = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
+        limit = -1 if rocm or cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     else:
-        limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
+        if rocm:
+            table = {} if sys.platform == "win32" else _TRITON_GROUPED_MM_AUTO_ROWS_ROCM
+        else:
+            table = _TRITON_GROUPED_MM_AUTO_ROWS
+        limit = table.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
         try:
             limit = int(override)
@@ -738,6 +905,7 @@ _GROUPED_MM_TRITON_OP = _register_grouped_mm_triton_op()
 def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
     """Per-group loop out[s:e] = inputs[s:e] @ weight[g] with no autograd; bounds are pre-decoded group ends, since
     re-reading offsets would add a second stream sync per grouped matmul."""
+    _count_grouped_mm_sync("loop")
     outputs = []
     start = 0
     if bounds is None: bounds = offsets.detach().cpu().tolist()
@@ -830,6 +998,7 @@ class _ManualGroupedMM(torch.autograd.Function):
                 "make the router deterministic."
             )
         bounds = routing[:-_SIGNATURE_WIDTH]
+        _count_grouped_mm_sync("loop")
         need_x, need_w, _ = ctx.needs_input_grad
         grad_output = grad_output.contiguous()
         # Backward runs outside the forward's autocast, so grad_output can be bf16 while saved tensors are fp32; dtypes
@@ -2053,6 +2222,12 @@ w_t  = torch.ones(4, 64, 32, **bf16).transpose(-2, -1)
 probe(torch.ones(1, 8, **half), torch.ones(1, 8, 8, **half), [1])
 probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
 probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
+# The in-process training probe's backward (dX and the 2D x 2D dW) runs here first too.
+try:
+    x = torch.ones(32, 32, **bf16).requires_grad_(); w = torch.ones(4, 32, 48, **bf16).requires_grad_()
+    offs = torch.tensor([8, 8, 13, 32], device = d, dtype = torch.int32)
+    torch._grouped_mm(x, w, offs = offs).backward(torch.ones(32, 48, **bf16)); torch.cuda.synchronize(d)
+except Exception: pass
 """
 _GROUPED_MM_SURVIVES = None
 _GROUPED_MM_SURVIVES_BY_KIND = {}
@@ -2115,7 +2290,14 @@ def _run_grouped_mm_crash_probe(device):
     return False
 
 
+def _is_out_of_memory(exc):
+    oom = getattr(torch, "OutOfMemoryError", None)
+    return (isinstance(oom, type) and isinstance(exc, oom)) or "out of memory" in str(exc).lower()
+
+
 def _grouped_mm_runs_on(device):
+    """True / False, or None when the probe ran out of memory (no verdict: callers must not cache it)."""
+    _GROUPED_MM_LAST_REFUSAL[0] = None
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
@@ -2127,18 +2309,82 @@ def _grouped_mm_runs_on(device):
 
         torch._grouped_mm(x, w, offs=offs)
         del x, w, offs
-        return True
-    except Exception:
-        return False
+    except Exception as exc:
+        # Out of memory says nothing about the kernel: no verdict, so the next call probes again.
+        return None if _is_out_of_memory(exc) else False
+    _GROUPED_MM_LAST_REFUSAL[0] = _grouped_mm_trains_on(device)
+    return _GROUPED_MM_LAST_REFUSAL[0] is None
+
+
+_GROUPED_MM_PROBE_COUNTS = (8, 0, 5, 19)
+_GROUPED_MM_TRAINING_PROBE_FAILURE = None
+_GROUPED_MM_LAST_REFUSAL = [None]
+
+
+def _grouped_mm_probe_dtype(device):
+    if device.type == "cuda" and not is_rocm_torch(torch):
+        try:
+            if torch.cuda.get_device_capability(device)[0] < 8: return torch.float16
+        except Exception:
+            return torch.float16
+    return torch.bfloat16
+
+
+def _grouped_mm_on_device(device):
+    # torch picks the kernel from the current device, not the operands'.
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    context = getattr(backend, "device", None)
+    return context(device) if context is not None else contextlib.nullcontext()
+
+
+def _grouped_mm_trains_on(device):
+    """Training-shaped fwd + dX + dW vs per-expert matmuls; None when it runs, else why not. Windows CUDA wheels serve
+    one fp16 expert but refuse bf16 multi-expert. Integer operands: a wrong result misses by 1 or more. OOM is no verdict."""
+    if os.environ.get("UNSLOTH_MOE_GROUPED_MM_PROBE", "1") == "0": return None
+    dtype = _grouped_mm_probe_dtype(device)
+    counts = _GROUPED_MM_PROBE_COUNTS
+    try:
+        with _grouped_mm_on_device(device), torch.inference_mode(False), torch.enable_grad():
+            # CPU generator: the global RNG stays untouched.
+            gen = torch.Generator(device = "cpu").manual_seed(0)
+            E, M, K, N = len(counts), sum(counts), 32, 48
+            # device = "cpu": a torch.set_default_device("cuda") app must not move the reference off the generator.
+            x, w, dy = (torch.randint(-2, 3, shape, generator = gen, device = "cpu").double()
+                        for shape in ((M, K), (E, K, N), (M, N)))
+            ends = torch.tensor(counts, device = "cpu").cumsum(0).tolist()
+            x_d = x.to(device = device, dtype = dtype).requires_grad_()
+            w_d = w.to(device = device, dtype = dtype).requires_grad_()
+            offs = torch.tensor(ends, device = device, dtype = torch.int32)
+            y = torch._grouped_mm(x_d, w_d, offs = offs)
+            dx, dw = torch.autograd.grad(y, (x_d, w_d), dy.to(device = device, dtype = dtype))
+            spans = list(zip([0] + ends[:-1], ends))
+            want = (
+                ("forward", y, torch.cat([x[s:e] @ w[g] for g, (s, e) in enumerate(spans)])),
+                ("dX", dx, torch.cat([dy[s:e] @ w[g].T for g, (s, e) in enumerate(spans)])),
+                ("dW", dw, torch.stack([x[s:e].T @ dy[s:e] for s, e in spans])),
+            )
+            for name, got, ref in want:
+                # The exact answers are small integers (at most 192, exact in bf16 / fp16), so a wrong kernel misses
+                # by 1 or more. A correct one can still carry fp32 accumulation residue: gfx1151's grouped_mm gives
+                # 2**-19 where the answer is 0. Half a unit tells the two apart; `not <=` also rejects a NaN.
+                if got.shape != ref.shape or not float((got.detach().double().cpu() - ref).abs().max()) <= 0.5:
+                    raise RuntimeError(f"{name} differs from per-expert matmuls")
+        return None
+    except torch.OutOfMemoryError:
+        return None
+    except Exception as exc:
+        reason = f"{str(dtype).replace('torch.', '')}, {len(counts)} experts: {type(exc).__name__}: {exc}"
+        return reason.splitlines()[0][:240]
 
 
 def _probe_torch_grouped_mm_supported(device = None):
-    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    global _TORCH_GROUPED_MM_SUPPORTED, _TRANSPOSED_VIEW_GROUPED_MM_SAFE, _GROUPED_MM_TRAINING_PROBE_FAILURE
     kind = _grouped_mm_foreign_kind(device)
     if kind is not None:
         supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
+            if supported is None: return False  # out of memory: loop for now, probe again next call
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
             # Same eager region: a traced first use of this model must not break again on the view check.
             if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
@@ -2148,10 +2394,14 @@ def _probe_torch_grouped_mm_supported(device = None):
 
     # The anchored card, not whichever is current now: the flags must describe one card.
     device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else None
+    _GROUPED_MM_LAST_REFUSAL[0] = None
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
-        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+        supported = _grouped_mm_runs_on(device)
+        if supported is None: return False  # out of memory: loop for now, probe again next call
+        _TORCH_GROUPED_MM_SUPPORTED = supported
+    _GROUPED_MM_TRAINING_PROBE_FAILURE = _GROUPED_MM_LAST_REFUSAL[0]
     # Answer the view check here so a cold compiled block does not graph-break on it.
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
         _TRANSPOSED_VIEW_GROUPED_MM_SAFE = _TORCH_GROUPED_MM_SUPPORTED and _transposed_view_probe(device)
@@ -2397,10 +2647,64 @@ def _check_sonic_moe_available():
         return False
 
 
+def _grouped_mm_triton_standin_available(device):
+    if os.environ.get("UNSLOTH_MOE_GROUPED_TRITON", "auto").strip().lower() in ("0", "false", "off"): return False
+    if os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1": return False
+    if _GROUPED_MM_TRITON_OP is None or is_rocm_torch(torch) or getattr(device, "type", None) != "cuda": return False
+    try:
+        if _triton_grouped_mm_capability(device.index) < (8, 0): return False
+        from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+        return bool(mg.triton_grouped_available(device))
+    except Exception:
+        return False
+
+
+_GROUPED_MM_FALLBACK_LOGGED = set()
+
+
+def _log_grouped_mm_fallback(reason, fallback):
+    line = (
+        f"Unsloth: torch._grouped_mm cannot run MoE training on this GPU ({reason}). Using {fallback} instead. "
+        "Opt out: UNSLOTH_MOE_BACKEND=grouped_mm|unsloth_triton|native_torch picks the backend, "
+        "UNSLOTH_MOE_GROUPED_TRITON=0 keeps Triton out of grouped_mm, UNSLOTH_MOE_GROUPED_MM_PROBE=0 skips this check."
+    )
+    # Shared with the compiled-cache copy of this module: one line per process.
+    package = sys.modules.get("unsloth_zoo.temporary_patches.moe_utils")
+    logged = getattr(package, "_GROUPED_MM_FALLBACK_LOGGED", _GROUPED_MM_FALLBACK_LOGGED)
+    if line not in logged:
+        logged.add(line)
+        print(line)
+
+
+def _use_grouped_mm_triton_standin(device, reason):
+    global _GROUPED_MM_TRITON_STANDIN
+    if device is None or not _grouped_mm_triton_standin_available(device):
+        _log_grouped_mm_fallback(reason, "the per-expert loop for grouped_mm calls")
+        return False
+    _GROUPED_MM_TRITON_STANDIN = True
+    _log_grouped_mm_fallback(reason, "MoE backend 'grouped_mm' on Unsloth's Triton grouped GEMM kernels")
+    return True
+
+
+def _select_grouped_mm_on_triton(explicit):
+    """Auto takes the Triton stand-in only when the single-expert op works; older failures keep the old chain."""
+    reason = _GROUPED_MM_TRAINING_PROBE_FAILURE
+    if not explicit and reason is None:
+        return False
+    device = _grouped_mm_home() if _TORCH_GROUPED_MM_AVAILABLE else _grouped_mm_probe_device()
+    if device is None or not _grouped_mm_triton_standin_available(device):
+        return False
+    if reason is None:
+        reason = "the single-expert fp16 call failed" if _TORCH_GROUPED_MM_AVAILABLE else "this torch has no _grouped_mm"
+    return _use_grouped_mm_triton_standin(device, reason)
+
+
 def _select_moe_backend():
     requested = os.environ.get("UNSLOTH_MOE_BACKEND")
     if requested:
         if requested == "grouped_mm" and _check_torch_grouped_mm_supported():
+            return "grouped_mm"
+        if requested == "grouped_mm" and _select_grouped_mm_on_triton(explicit = True):
             return "grouped_mm"
         if requested == "unsloth_triton" and _check_grouped_gemm_available():
             return "unsloth_triton"
@@ -2416,13 +2720,41 @@ def _select_moe_backend():
             return "sonic_moe"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
+    if _rocm_arch_prefers_unsloth_triton() and _check_grouped_gemm_available():
+        _log_info("Unsloth: Using MoE backend 'unsloth_triton' (ROCm gfx1151: torch._grouped_mm is a synced per-expert loop)")
+        return "unsloth_triton"
     if _check_torch_grouped_mm_supported():
         _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
+    if _select_grouped_mm_on_triton(explicit = False):
+        return "grouped_mm"
+    backend = "native_torch"
     if _check_grouped_gemm_available() and _unsloth_triton_beats_loop():
         _log_info("Unsloth: Using MoE backend 'unsloth_triton'")
-        return "unsloth_triton"
-    return "native_torch"
+        backend = "unsloth_triton"
+    if _GROUPED_MM_TRAINING_PROBE_FAILURE is not None:
+        _log_grouped_mm_fallback(_GROUPED_MM_TRAINING_PROBE_FAILURE, f"MoE backend '{backend}'")
+    return backend
+
+
+# ROCm archs whose auto MoE backend is unsloth_triton even when torch._grouped_mm passes the training probe. There
+# torch._grouped_mm is its per-expert mm loop with a host sync per expert (CK grouped GEMM only on opt-in gfx942 /
+# gfx950 / gfx90a). gfx1151 (Strix Halo), Qwen3-30B-A3B layer shape (E 128, top-8), LoRA r16, bf16, exclusive GPU:
+# 0.4960 s/step on grouped_mm vs 0.4246 on unsloth_triton (1.17x; 5637 vs 5 aten::item per step), same distance to
+# an fp64 oracle. UNSLOTH_MOE_BACKEND=grouped_mm still selects grouped_mm.
+_ROCM_UNSLOTH_TRITON_ARCHS = ("gfx1151",)
+
+
+def _rocm_arch_prefers_unsloth_triton():
+    if not is_rocm_torch(torch):
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        arch = str(getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "gcnArchName", "") or "")
+    except Exception:
+        return False
+    return arch.split(":", 1)[0] in _ROCM_UNSLOTH_TRITON_ARCHS
 
 
 def _unsloth_triton_beats_loop():
@@ -5656,7 +5988,8 @@ def forward_native_grouped_mm(
     # This Unsloth Zoo code section is licensed under AGPL3
 
     # Runtime safety check (defense in depth); packed NVFP4 / MXFP8 stacks fall back to a per-group loop instead.
-    if not _check_torch_grouped_mm_supported() and not _moe_uses_new_packed_expert_weights(self):
+    if not _check_torch_grouped_mm_supported() and not _GROUPED_MM_TRITON_STANDIN \
+            and not _GROUPED_MM_RUNTIME_LATCHED[0] and not _moe_uses_new_packed_expert_weights(self):
         # Compute Capability is CUDA-only; on XPU it would mask this message.
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -6092,6 +6425,18 @@ def _triton_grouped_gemm_dims_supported(module, hidden_dim) -> bool:
     return hidden_dim % m == 0 and intermediate_dim % m == 0
 
 
+def _triton_moe_tensors_on_gpu(module, hidden_states) -> bool:
+    """The Triton grouped-GEMM kernels need CUDA / HIP tensors. The unsloth_triton backend is chosen once per process,
+    but a call's tensors can still live off the GPU (a CPU reference model, a CPU-offloaded expert stack)."""
+    if hidden_states.device.type != "cuda":
+        return False
+    for name in ("gate_up_proj", "down_proj"):
+        weight = getattr(module, name, None)
+        if isinstance(weight, torch.Tensor) and weight.device.type != "cuda":
+            return False
+    return True
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -6100,6 +6445,11 @@ def forward_triton_grouped_gemm(
 ) -> torch.Tensor:
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
+
+    # Tensors off the GPU run the eager loop. moe_utils.py is installed into the compiled cache as a whole file, so the
+    # helper travels with this function, as _triton_grouped_gemm_dims_supported below does.
+    if not _triton_moe_tensors_on_gpu(self, hidden_states):
+        return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
     packed = any(is_mxfp4_expert_param(getattr(self, name, None)) for name in ("gate_up_proj", "down_proj"))
     if packed or not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):

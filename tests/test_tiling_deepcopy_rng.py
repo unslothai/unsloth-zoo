@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Deepcopied tiled MLP decides RNG preservation from its own dropout state; deepcopy keeps the closure over the
-original module, so an eval original with a training copy broke recompute masks; CPU only."""
+"""Deepcopied tiled MLP decides RNG preservation from its dropout state, not the original's."""
 import copy
 
 import pytest
@@ -52,7 +51,6 @@ def test_training_deepcopy_of_eval_original_replays_dropout(target_arctic):
     x = torch.randn(2, 32, HIDDEN)
     grad_out = torch.randn(2, 32, HIDDEN)
 
-    # Reference: same tiles, same RNG order, ordinary autograd (no recompute).
     torch.manual_seed(3)
     x_ref = x.clone().requires_grad_(True)
     tiles = [reference(t.unsqueeze(0)) for t in torch.tensor_split(x_ref.view(-1, HIDDEN), 4, dim = 0)]

@@ -78,7 +78,6 @@ def _first_match(repo: str, ref: str, paths: list[str]) -> tuple[str, str] | Non
     return None
 
 
-# Gemma3 attention surface, zoo PR #635 / #488 / #571.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -178,8 +177,7 @@ def test_gpt_oss_modeling_classes(tag: str):
     )
 
 
-# qwen3_moe MoE patch surface (zoo PR 601 / 605 / 607 / 574 / 618); qwen3_moe.py rebinds Qwen3MoeSparseMoeBlock.forward
-# and Qwen3MoeExperts.forward by attribute assignment.
+# PRs 601/605/607/574/618 rebind Qwen3MoeSparseMoeBlock.forward and Qwen3MoeExperts.forward.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -246,8 +244,7 @@ def test_modeling_utils_checkpoint_and_pushtohubmixin(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_quantizers_should_convert_module_present_on_v5(tag: str):
-    """Zoo PRs 491 and 488 (patching_utils.py): on transformers 5.x should_convert_module must live in
-    transformers.quantizers.quantizers_utils; 4.x uses _replace_with_bnb_linear."""
+    """PRs 491/488: 5.x should_convert_module in quantizers_utils; 4.x _replace_with_bnb_linear"""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -296,9 +293,8 @@ def test_integrations_bitsandbytes_legacy_replace_fn(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_caching_allocator_warmup_reachable(tag: str):
-    """Zoo PR 569 wraps modeling_utils.caching_allocator_warmup in a <=24 GiB hasattr() skip-guard; plain removal
-    degrades gracefully, but a rename (original vanishes, a *warmup* sibling appears) silently drops the
-    OOM-before-load guard."""
+    """Zoo PR 569 wraps modeling_utils.caching_allocator_warmup in a <=24 GiB hasattr() skip-guard;
+    plain removal degrades gracefully, but a rename silently drops the OOM-before-load guard."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -373,14 +369,12 @@ def test_tokenization_auto_symbols_for_mlx_loader(tag: str):
     )
 
 
-# Qwen MoE LoRA extractor reads wrapper.get_base_layer(), .parameter_name, .hidden_dim and .intermediate_dim; peft must
-# keep emitting ParamWrapper (a LoraLayer subclass) in peft/tuners/lora/layer.py.
+# peft must keep ParamWrapper (a LoraLayer subclass) for the Qwen MoE LoRA extractor.
 
 
 @pytest.mark.parametrize("tag", PEFT_TAGS)
 def test_peft_lora_layer_paramwrapper_present(tag: str):
-    """Zoo PR 618: temporary_patches/qwen3_moe.py:46-77 walks wrapper.get_base_layer() and wrapper.parameter_name on
-    peft LoraLayer and ParamWrapper; if missing, the MoE LoRA extractor returns (None, None) and grouped-mm crashes."""
+    """Zoo PR 618: qwen3_moe.py needs get_base_layer and parameter_name, or grouped-mm crashes."""
     src = _fetch_text("huggingface/peft", tag, "src/peft/tuners/lora/layer.py")
     if src is None:
         pytest.skip(f"{tag}: peft/tuners/lora/layer.py missing")

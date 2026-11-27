@@ -2205,6 +2205,109 @@ def test_a_vision_row_s_events_report_each_sampled_id_once(last, reason, kept):
     assert events[-1].result.token_ids == kept
 
 
+def _splicing_embeddings(spliced):
+    """An embedding that, as FastVLM does, fills ``spliced`` more columns than its ids."""
+    def embed(input_ids, *a, **k):
+        rows = input_ids.tolist()
+        embeds = types.SimpleNamespace(shape = (len(rows), len(rows[0]) + spliced, 4))
+        return types.SimpleNamespace(inputs_embeds = embeds, to_dict = lambda: {"inputs_embeds": embeds})
+    return embed
+
+
+@pytest.mark.parametrize("spliced", [0, 255])
+def test_a_vision_row_charges_the_columns_its_media_was_spliced_into(spliced):
+    session = _vlm_session()
+    session.adapter.model.get_input_embeddings = _splicing_embeddings(spliced)
+    session.add(GenerationRequest(prompt = "abc"))
+    events = list(session._consume(
+        types.SimpleNamespace(uid = 0, token = 2, finish_reason = "stop", token_logprob = -0.5)))
+    assert events[-1].result.prompt_token_count == 3 + spliced
+
+
+@pytest.mark.parametrize("spliced", [0, 255])
+def test_a_prefill_chunk_charges_the_columns_its_media_was_spliced_into(spliced):
+    import numpy as np
+    from unsloth_zoo.mlx.generate import _VLMBatchAdapter
+
+    adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
+    adapter.defaults, adapter.per_row_prompt_kwargs = GenerationDefaults(), True
+    adapter.processor = types.SimpleNamespace(tokenizer = _CriteriaTokenizer())
+    adapter.constructor_params = {"prefill_batch_size", "completion_batch_size", "sampler"}
+    inputs = {"input_ids": np.array([[1, 2, 3]]),
+              "attention_mask": types.SimpleNamespace(sum = lambda axis: np.array([3]))}
+    adapter.prepare_inputs = lambda *a, **k: dict(inputs)
+    adapter.make_sampler = lambda **k: object()
+    adapter._add_special_tokens = lambda: True
+    adapter._drive = lambda *a, **k: iter(
+        [GenerationEvent(index = row, result = (k["prompt_token_counts"] or [k["prompt_token_count"]] * len(a[2]))[row])
+         for row in a[2]])
+    adapter._split_prompt_kwargs = lambda kw, n: [{}] * n
+    adapter._wired_limit = contextlib.nullcontext
+    adapter._chunked_prefill_kwargs = lambda **kw: {}
+    adapter.model = types.SimpleNamespace(
+        config = types.SimpleNamespace(image_token_index = 9), language_model = object(),
+        get_input_embeddings = _splicing_embeddings(spliced))
+    adapter.generator_type = lambda *a, **k: _vlm_stub(events = [[(0, 1, "stop")]])(*a[:2])
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")], [0])] == [3 + spliced]
+    del inputs["attention_mask"]
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")], [0])] == [3 + spliced]
+    # One shared prefill serves every reply to the same prompt, and each is charged its columns.
+    adapter.defaults, shared = GenerationDefaults(share_prompt_prefill = True), {}
+    replies = [GenerationRequest(prompt_token_ids = (1, 2, 3), vision_inputs = shared)] * 2
+    events = adapter._run_chunk(replies, [0, 1])
+    assert [event.result for event in events] == [3 + spliced] * 2
+    adapter.defaults = GenerationDefaults()
+    # Padded rows may be stripped and re-padded unevenly, so they keep their id counts.
+    inputs["attention_mask"] = types.SimpleNamespace(sum = lambda axis: np.array([2]))
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")], [0])] == [2]
+    inputs.update(input_ids = np.array([[1, 2, 3], [0, 4, 5]]),
+                  attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([3, 2])))
+    events = adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])
+    assert [event.result for event in events] == [3, 2]
+    inputs.update(input_ids = np.array([[0, 4, 5], [1, 2, 3]]),
+                  attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([2, 3])))
+    events = adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])
+    assert [event.result for event in events] == [2, 3]
+    # Unpadded rows holding as many placeholders each fill the embedded width; rows that differ keep their ids.
+    def pair(ids):
+        inputs.update(input_ids = np.array(ids), attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([3, 3])))
+        return [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])]
+
+    assert pair([[1, 9, 3], [4, 9, 5]]) == [3 + spliced] * 2
+    del inputs["attention_mask"]
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == [3 + spliced] * 2
+    assert pair([[1, 9, 3], [4, 5, 6]]) == pair([[1, 2, 3], [4, 9, 6]]) == [3, 3]
+    # Prepared vision inputs group by layout, not values, so their rows may splice unevenly too.
+    prepared = [GenerationRequest(prompt_token_ids = ids, vision_inputs = {}) for ids in ((1, 9, 3), (4, 9, 5))]
+    assert [event.result for event in adapter._run_chunk(prepared, [0, 1])] == [3, 3]
+    adapter.model.config.image_token_index = None
+    assert pair([[1, 9, 3], [4, 9, 5]]) == [3, 3]
+    inputs.update(input_ids = np.array([[1, 9, 3]]), attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([3])))
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")], [0])] == [3 + spliced]
+
+
+@pytest.mark.parametrize("spliced, prefix", [(0, 0), (255, 0), (0, 2)])
+def test_a_speculative_row_charges_the_columns_its_media_was_spliced_into(spliced, prefix):
+    import numpy as np
+    from unsloth_zoo.mlx import generate
+
+    adapter = _vlm_adapter()
+    adapter.model.get_input_embeddings = _splicing_embeddings(spliced)
+    adapter._prompt_inputs = lambda rows: {"input_ids": np.array([[1, 2, 3]])}
+
+    def admit(model, pending, input_ids, *a, **k):
+        model.get_input_embeddings(input_ids)
+        return types.SimpleNamespace(pending = 7, max_tokens = 1, cache = []), -0.1
+
+    session = object.__new__(generate._SpeculativeBatchSession)
+    session.__dict__.update(
+        adapter = adapter, speculative = types.SimpleNamespace(admit = admit),
+        tokenizer = adapter.processor.tokenizer, stop_tokens = frozenset(), _next_row = 0,
+        _pending = {}, _drawn = {}, _resume = lambda *a: prefix)
+    assert session.add(GenerationRequest(prompt = "abc")) == 0
+    assert session._pending[0].prompt_token_count == 3 + spliced
+
+
 def test_a_vision_row_given_token_ids_prefills_exactly_those_ids():
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     session = _vlm_session()

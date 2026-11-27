@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An unreachable Hub must not block a 16bit merge of a local FP8 base (`outputs/mymodel` reaches the probe):
-_merge_and_overwrite_lora_fp8 dequantizes it offline; nf4/fp4 keep raising, as falling back there is a silent no-op."""
+"""Unreachable Hub must not block local FP8 16bit merges; nf4/fp4 still raise (silent no-op)."""
 
 import json
 import os
@@ -155,8 +154,7 @@ def test_local_4bit_still_raises_when_the_hub_is_unreachable(
 def test_local_fp8_only_falls_back_for_the_16bit_merge(
     monkeypatch, tmp_path, error, save_method,
 ):
-    """FP8 is dequantized only for `merged_16bit`; other save methods write the stored FP8 tensor back, so the delta
-    lands in scaled space without its companion scale; falling back would turn an outage into a wrong export."""
+    """FP8 dequantizes only for merged_16bit; elsewhere a fallback exports an unscaled delta."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     _hub_raises(monkeypatch, error)
@@ -192,8 +190,7 @@ def _write_index(directory, shards):
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_a_partial_fp8_snapshot_does_not_satisfy_the_fallback(monkeypatch, tmp_path, error):
-    """`check_local_model_exists` passes on the first `.safetensors`, so an interrupted download passes; the merge then
-    rebuilds the index from present shards and reports success with missing layers."""
+    """Partial download passes the local check; merge reports success with missing layers."""
     monkeypatch.chdir(tmp_path)
     directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     os.remove(os.path.join(directory, "model.safetensors"))
@@ -312,9 +309,8 @@ def test_shards_from_different_sets_do_not_complete_each_other(tmp_path):
 
 
 def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
-    """A partial set beside a whole one is still incomplete: with no index the merge reads every top-level
-    `.safetensors`, and mismatched shapes raise the 'Bad in-place call' that the stale-shard filter exists to
-    prevent."""
+    """Partial set beside a whole one is incomplete: no index means every top-level .safetensors is
+    read; mismatched shapes hit 'Bad in-place call', which the stale-shard filter prevents."""
     directory = str(tmp_path)
     for shard in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
                   "backup-00001-of-00002.safetensors"):
@@ -324,8 +320,7 @@ def test_a_partial_set_beside_a_whole_one_is_still_not_complete(tmp_path):
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_an_unnumbered_stale_copy_is_ambiguous_too(monkeypatch, tmp_path, error):
-    """Unnumbered stale copies are ambiguous too: `model.safetensors` beside a stale `backup.safetensors` is read in
-    full and the index keeps whichever file was visited last."""
+    """Stale unnumbered copies are ambiguous: the index keeps whichever file was visited last."""
     monkeypatch.chdir(tmp_path)
     directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     _shard(directory, "backup.safetensors")
@@ -344,8 +339,7 @@ def _write_index_named(directory, names):
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_an_index_the_merge_will_not_honour_settles_nothing(monkeypatch, tmp_path, error):
-    """An index the merge will not honour settles nothing: `consolidated.safetensors` is dropped beside a partial shard,
-    and the empty index intersection keeps that shard."""
+    """An unhonoured index settles nothing; the empty intersection keeps the partial shard."""
     monkeypatch.chdir(tmp_path)
     directory = _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
     os.remove(os.path.join(directory, "model.safetensors"))
@@ -387,8 +381,7 @@ def test_an_unnumbered_extra_beside_a_whole_set_is_ambiguous(tmp_path):
 
 
 def test_a_consolidated_duplicate_beside_its_shards_is_still_one_snapshot(tmp_path):
-    """Mistral-7B-v0.3, Codestral, Nemo and Small ship a duplicate consolidated.safetensors that the merge drops when
-    proper shards coexist; counting it would call those repos incomplete."""
+    """Mistral-style duplicate consolidated.safetensors beside shards must not look incomplete."""
     directory = str(tmp_path)
     for name in ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
                  "consolidated.safetensors"):
@@ -454,8 +447,7 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_fp8_copy(monkeypatch,
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
     monkeypatch.setattr(
         saving_utils, "check_model_quantization_status",
-        # The local copy is looked up by absolute path and the Hub by the name as given, which tells the calls apart;
-        # **kwargs is needed since the Hub call passes `local_ok = False` for a name that is also a directory.
+        # Absolute path = local copy; **kwargs absorbs local_ok = False for dir-named repos.
         lambda name, token = None, **kwargs: (True, "fp8") if os.path.isabs(str(name)) else (False, None),
     )
 
@@ -552,8 +544,7 @@ def test_sibling_lookup_stays_silent_for_a_genuinely_absent_sibling(monkeypatch,
 def test_the_sibling_lookup_keeps_asking_the_hub_after_an_unreadable_local_config(
     monkeypatch, tmp_path,
 ):
-    """An unreadable local config.json says nothing about the Hub: skip that candidate and keep asking the Hub, or FP8
-    would be dequantized while a full-precision sibling sits on the Hub."""
+    """Unreadable local config says nothing: keep asking the Hub for a full-precision sibling."""
     monkeypatch.chdir(tmp_path)
     # `unsloth/GLM-Air-FP8` strips to `unsloth/GLM-Air`, which also exists locally, broken.
     local_sibling = os.path.join("unsloth", "GLM-Air")
@@ -565,8 +556,7 @@ def test_the_sibling_lookup_keeps_asking_the_hub_after_an_unreadable_local_confi
     def fake_ls(self, path, detail = True, **kwargs):
         return [{"name": f"{path}/model.safetensors"}]
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
-    # Stubs only the download so the real classifier runs on both sides: the broken local dir raises while the Hub
-    # serves a readable config; without the local skip, the broken dir answers for the Hub too.
+    # Stub only the download; without the local skip a broken local dir answers for the Hub.
     good_config = tmp_path / "hub-config.json"
     good_config.write_text(json.dumps({"model_type": "llama"}), encoding = "utf-8")
     import huggingface_hub

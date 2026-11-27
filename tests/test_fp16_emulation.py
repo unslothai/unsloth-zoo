@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the dormant float16 matmul emulation; the key property is that the unscaled split collapses at small
-magnitudes (float16 5-bit exponent), and test_unscaled_underflows_at_small_magnitude fails if that cliff is absent."""
+"""Dormant float16 emulation: unscaled split collapses at small magnitudes (5-bit exponent)."""
 import os
 import sys
 
@@ -52,8 +51,7 @@ def _pair(m, k, n, mag = 0.02, device = "cuda"):
 
 
 def _fp16_direct(A, B):
-    """float16 operands with float32 accumulate (what a tensor core does), not torch.mm(A.half(), B.half()), which
-    accumulates in float16 and is a much worse baseline; measures stored-operand precision."""
+    """Float16 operands, float32 accumulate (tensor-core); half mm accumulates in float16."""
     return torch.mm(A.half().float(), B.half().float())
 
 
@@ -104,7 +102,6 @@ def test_scaled_split_holds_ieee_parity(magnitude):
     split = _rel_l2(fp16_split_mm(A, B, scale = True), ref)
     direct = _rel_l2(_fp16_direct(A, B), ref)
 
-    # Within 2x of IEEE, and far better than plain float16.
     assert split < ieee * 2.0, f"scaled split {split:.3e} vs ieee {ieee:.3e}"
     assert split < direct / 10.0, f"scaled split {split:.3e} vs float16 {direct:.3e}"
 
@@ -213,8 +210,7 @@ def test_round_to_actually_rounds_under_compile():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_pow2_exponent_applies_cleanly_at_extremes():
-    """A materialised scale is unusable however it is stored: 2**128 overflows float32, and a 0-dim float64 scale still
-    promotes down to float32 when applied; ldexp does not."""
+    """Materialised scales overflow float32 (2**128) or promote to float32; ldexp does neither."""
     x = torch.tensor([2.0 ** -114])
     n = pow2_exponent(x)
     assert 2.0 ** n.item() == pow2_scale(x)
@@ -241,14 +237,12 @@ def test_pow2_exponent_matches_pow2_scale():
 
 
 # ---------------------------------------------------------------- degenerate operands
-# Degenerate operands where torch.mm is right: the emulation must not silently return a NaN or zero, or raise; as a
-# float32 matmul stand-in, wrong-but-fast is the one outcome it must not have.
+# Degenerate operands (torch.mm is right): no silent NaN/zero, no raise; never wrong-but-fast.
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_out_dtype_probe_matches_a_direct_call():
-    """aten::mm.dtype is CUDA-only: a CPU probe raises NotImplementedError, a RuntimeError subclass, so it would cache
-    False and disable the tensor-core path; compare with a direct call since out_dtype needs torch 2.8 while
-    pyproject allows torch>=2.4, so False is correct on older installs."""
+    """aten::mm.dtype is CUDA-only; a CPU probe would cache False and disable tensor cores.
+    out_dtype needs torch 2.8 (pyproject allows torch>=2.4), so False is right on older installs."""
     from unsloth_zoo.fp16_emulation import _has_out_dtype
     zero = torch.zeros(1, 1, dtype = torch.float16, device = "cuda")
     try:

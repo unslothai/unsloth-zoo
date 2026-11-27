@@ -2,14 +2,9 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Load-time warnings a user cannot act on stay out of the default log.
-
-* The Gemma 3 processor patch read `Gemma3ProcessorKwargs`, which transformers 5.23 turned
-  into a deprecated alias (FutureWarning on every access, removed in 5.29), so every
-  `import unsloth` printed it, Gemma or not.
-* The device-map planner's sizing probe printed transformers' "Unknown quantization type"
-  for the repo's config, which Inkling 2 loads never hand to transformers.
-"""
+"""Load-time warnings a user cannot act on stay out of the default log: the Gemma 3 processor patch
+no longer reads the Gemma3ProcessorKwargs alias that transformers 5.23 deprecated; the device-map
+planner's sizing probe no longer prints transformers' unknown quantization type warning."""
 
 import logging
 import warnings
@@ -50,7 +45,6 @@ def test_gemma3_processor_patch_does_not_warn():
         warnings.simplefilter("always")
         patch_Gemma3Processor()
     assert _future_warnings(record, "ProcessorKwargs") == [], [str(w.message) for w in record]
-    # The patch still installed its __call__.
     call = processing_gemma3.Gemma3Processor.__call__
     assert "unsloth_zoo" in (getattr(call, "__module__", "") or "")
 

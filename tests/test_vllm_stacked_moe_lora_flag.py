@@ -86,3 +86,29 @@ def test_other_model_types_untouched(monkeypatch, model_type):
     vllm_cls = _install(monkeypatch)
     assert patch_vllm_stacked_moe_lora(_config(model_type)) is False
     assert vllm_cls.is_3d_moe_weight is False
+
+
+@pytest.mark.parametrize("model_type,vllm_class,hf_module,hf_experts", [
+    ("deepseek_v2", "DeepseekV2ForCausalLM", "deepseek_v2.modeling_deepseek_v2", "DeepseekV2Experts"),
+    ("deepseek_v3", "DeepseekV3ForCausalLM", "deepseek_v3.modeling_deepseek_v3", "DeepseekV3Experts"),
+])
+@pytest.mark.parametrize("hf_stacked", [True, False])
+def test_deepseek_marked_3d_only_with_stacked_hf_experts(monkeypatch, model_type, vllm_class, hf_module, hf_experts, hf_stacked):
+    # vLLM's deepseek_v2.py holds both classes; transformers >= 5 stacks DeepSeek experts like Qwen3-MoE.
+    vllm_cls = type(vllm_class, (_FakeQwen3Moe,), {})
+    vllm_mod = types.ModuleType("vllm.model_executor.models.deepseek_v2")
+    setattr(vllm_mod, vllm_class, vllm_cls)
+    hf_mod = types.ModuleType(hf_module)
+    if hf_stacked:
+        setattr(hf_mod, hf_experts, type(hf_experts, (), {}))
+    fused_moe = types.ModuleType("vllm.lora.layers.fused_moe")
+    fused_moe.FusedMoE3DWithLoRA = type("FusedMoE3DWithLoRA", (), {})
+    for name, mod in {
+        "vllm.lora.layers.fused_moe": fused_moe,
+        "vllm.model_executor.models.deepseek_v2": vllm_mod,
+        f"transformers.models.{hf_module}": hf_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    assert patch_vllm_stacked_moe_lora(_config(model_type)) is hf_stacked
+    assert vllm_cls.is_3d_moe_weight is hf_stacked
+    assert _FakeQwen3Moe.is_3d_moe_weight is False

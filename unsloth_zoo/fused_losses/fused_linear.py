@@ -369,7 +369,7 @@ if _HAS_TRITON:
         return s
 
     @triton.jit
-    def _fl_top1_logits(x, z, ok, TOP1_ROUND: tl.constexpr):
+    def _fl_top1_logits(x, z, ok, TOP1_ROUND: tl.constexpr):  # argmax logits: 0 fp32 / 1 bf16 / 2 fp16
         # TRL's argmax reads the model's half logits: fp32 GEMM output rounded once, ties to the first column.
         if TOP1_ROUND == 1:
             return tl.where(ok, x.to(tl.bfloat16).to(tl.float32), -float("inf"))

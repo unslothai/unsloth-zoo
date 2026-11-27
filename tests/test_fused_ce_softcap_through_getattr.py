@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""PaliGemma on transformers 5.23 reads its softcap through getattr (PaliGemma 1's Gemma text config has none): the
-fused lm_head rewrite must still match it, and keep the getattr so a config without the field does not raise."""
+"""PaliGemma 1 has no softcap, so keep getattr (transformers 5.23); fused lm_head must match."""
 import types
 
 from unsloth_zoo.compiler import apply_fused_lm_head, fixup_fused_lm_head

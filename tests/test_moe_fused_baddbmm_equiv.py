@@ -1,5 +1,4 @@
-"""Batched baddbmm path for fused MoE expert LoRA must be numerically identical to the per-expert loop for standard and
-GPT-OSS transposed layouts, with alpha applied once per expert."""
+"""Batched baddbmm LoRA equals the per-expert loop for both layouts, alpha applied once."""
 import pytest
 import torch
 

@@ -168,8 +168,7 @@ def test_generate_keeps_a_falsy_processor(monkeypatch):
     def _fake_to_mx_vlm_batch(inputs):
         raise _Stop
 
-    # Pass the module object, not a dotted string: a string target is resolved by walking attributes, which fails on
-    # real MLX while the submodule is not yet bound on its parent package.
+    # Pass the module object: a dotted string fails on real MLX before the submodule is bound.
     monkeypatch.setattr(mutils, "_to_mx_vlm_batch", _fake_to_mx_vlm_batch)
     with pytest.raises(_Stop):
         loader._mlx_generate_vlm(model, "hello")

@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The MLX GGUF export keeps llama.cpp's converter to the load's remote-code decision, like the CPU export: the
-converter child can import auto_map code only when the model was loaded with trust_remote_code=True. Runs on the
-mlx-on-torch shim, so no Apple hardware is needed."""
+"""MLX GGUF export, like CPU, needs trust_remote_code=True for auto_map; runs on torch shim."""
 
 import ast
 import os

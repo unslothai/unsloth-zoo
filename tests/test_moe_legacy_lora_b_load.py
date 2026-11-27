@@ -178,8 +178,7 @@ def test_inference_is_limited_to_families_the_old_forward_owned():
 
 
 def test_family_survives_fully_shard_class_swap():
-    # fully_shard(experts) swaps the class for FSDP<Name>(FSDPModule, <Name>) defined in torch; the family must
-    # still come from the original class, or a markerless legacy adapter loads its expert lora_B unrepacked.
+    # Family must come from the original class, or legacy expert lora_B is left unrepacked.
     assert pathlib.Path(MU.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])
     upstream = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"})
     fsdp_module = type("FSDPModule", (), {"__module__": "torch.distributed.fsdp._fully_shard._fully_shard"})
@@ -307,8 +306,7 @@ def test_trainer_resume_hook_installs(monkeypatch):
 
 @pytest.mark.parametrize("shard_dim, expected", [(0, (1, 0)), (1, (0, 1))])
 def test_local_shard_fp32_state_is_permuted_not_reset(shard_dim, expected):
-    # bitsandbytes 32-bit optimizers keep per-rank state shaped like the local shard of a row-sharded DTensor;
-    # comparing with the global shape reset those fp32 moments and the step instead of permuting them.
+    # bnb 32-bit state matches local DTensor shard; a global-shape check resets, not permutes.
     import pathlib
     from torch.distributed.tensor.placement_types import Shard
     assert pathlib.Path(MU.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])

@@ -96,7 +96,7 @@ def _run(model, input_ids, **overrides):
             rr.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": rr.chunked_selective_log_softmax,
         "_refresh_lm_head": lambda: None, "_fp32_bind": lambda entropy = False: None, "lm_head_bias": None,
-        "_fused_route": False, "_fused_pack": None, "_pg_layout": None,
+        "_fused_route": False, "_fused_pack": None, "_pg_layout": None, "_sc_ids": None,
         "create_completion_attention_mask": rr.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None,
         "UNSLOTH_ENABLE_LOGGING": False,
@@ -180,8 +180,7 @@ def test_oom_log_reports_the_cap_not_disabled(monkeypatch, capsys):
 
 
 def test_capped_batch_skips_packing_prep(monkeypatch):
-    # A batch at or above the OOM cap decides from host lengths alone: no flatten of the ids and no active-row read,
-    # since both cost a GPU sync and keep buffers alive.
+    # Batches at the OOM cap skip packing prep: it costs a GPU sync and keeps buffers alive.
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     model = _Model(torch.cuda.OutOfMemoryError("CUDA out of memory"))
     ns = _run(model, LONG)

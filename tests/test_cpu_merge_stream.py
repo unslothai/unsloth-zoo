@@ -92,7 +92,6 @@ def test_streamed_merge_matches_the_copying_path(tmp_path, monkeypatch, case, sa
     assert new_config == ref_config
     if case == "sharded":
         assert os.path.exists(streamed / "model.safetensors.index.json")
-    # The live model is untouched (weights, adapters, merge state).
     after = model.state_dict()
     assert set(after) == set(before) and all(torch.equal(after[k], before[k]) for k in before)
 
@@ -192,8 +191,7 @@ def test_streamed_merge_still_streams_plain_lora():
 
 
 def test_streamed_merge_reexport_removes_obsolete_shards(tmp_path):
-    """Exporting again into the same folder with another shard count leaves only the new export's weights, as
-    save_pretrained does; unrelated files (adapters, tokenizer, other names) stay."""
+    """Re-export leaves only the new weights, like save_pretrained; unrelated files stay."""
     import json
     from unsloth_zoo.cpu import loader
     model = _lora_model(_TINY, torch.float32)
@@ -318,8 +316,7 @@ print("OK")
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_streamed_merge_into_the_directory_the_model_was_loaded_from(tmp_path, dtype):
-    """from_pretrained memory-maps the weights: overwriting model.safetensors in place crashed (SIGBUS) or failed
-    with EFAULT and destroyed the source checkpoint. Files are now written aside and moved into place."""
+    """In-place overwrite of mmapped weights destroyed the source (SIGBUS); write aside, move."""
     script = tmp_path / "run.py"
     script.write_text(_SOURCE_DIR_SCRIPT)
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", "")}

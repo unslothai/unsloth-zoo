@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generic bnb 4-bit experts route stays out of compiled regions except Unsloth's per-layer block compile
-(UNSLOTH_DECODE_COMPILE set while tracing), avoiding a graph break per MoE layer."""
+"""Generic bnb 4-bit experts stay uncompiled except in block compile (UNSLOTH_DECODE_COMPILE)."""
 
 import pytest
 import torch

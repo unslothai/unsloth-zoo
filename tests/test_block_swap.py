@@ -130,25 +130,32 @@ def test_prefetch_direction_flips_with_grad_mode():
 
 
 def test_post_hook_evicts_only_under_no_grad():
-    # Not block 0: its backward hook re-arms and refetches it.
+    # Not one of the first `depth` blocks: their backward hook keeps them for the next forward.
     sw = _scheduler(6, depth = 3)
     for b in sw.blocks:
         sw._release(b)
     with torch.no_grad():
-        sw._pre(2)(None, (), {})
-        assert sw.blocks[2].resident
-        sw._post(2)(None, None, None)
-    assert not sw.blocks[2].resident, "under no_grad the post hook evicts"
+        sw._pre(4)(None, (), {})
+        assert sw.blocks[4].resident
+        sw._post(4)(None, None, None)
+    assert not sw.blocks[4].resident, "under no_grad the post hook evicts"
     for b in sw.blocks:
         sw._release(b)
     with torch.enable_grad():
         x = torch.ones(1, requires_grad = True)
-        sw._pre(2)(None, (x,), {})
-        assert sw.blocks[2].resident
-        sw._post(2)(None, None, x * 2)
-    assert sw.blocks[2].resident, "with grad on, eviction waits for the backward hook"
-    sw._bwd(2)(None)
-    assert not sw.blocks[2].resident
+        sw._pre(4)(None, (x,), {})
+        assert sw.blocks[4].resident
+        sw._post(4)(None, None, x * 2)
+    assert sw.blocks[4].resident, "with grad on, eviction waits for the backward hook"
+    sw._bwd(4)(None)
+    assert not sw.blocks[4].resident
+    # One of the first `depth` blocks: its backward keeps it on the card for the next forward.
+    with torch.enable_grad():
+        x = torch.ones(1, requires_grad = True)
+        sw._pre(1)(None, (x,), {})
+        sw._post(1)(None, None, x * 2)
+    sw._bwd(1)(None)
+    assert sw.blocks[1].resident and not sw.blocks[1].pending
 
 
 def test_backward_hook_on_block_zero_arms_next_step():

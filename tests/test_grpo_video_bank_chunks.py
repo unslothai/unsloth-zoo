@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grpo_vision_chunks reads a deduplicated video bank (video_bank_rows) and must hand every chunk the same
-pixel_values_videos the flat layout (one copy per sample) would."""
+"""grpo_vision_chunks over a dedup video bank gives each chunk the flat pixel_values_videos."""
 
 import pytest
 import torch
@@ -91,8 +90,7 @@ def test_mismatched_index_raises():
 
 
 def test_noncontiguous_chunks_are_built_only_when_read():
-    # Repeated prompts give noncontiguous bank ranges, so each chunk's rows are a copy: they must be built per
-    # read, not all up front, or a forward loop would hold every chunk's copy at once.
+    # Noncontiguous bank rows are copies: build chunks per read, else all copies live at once.
     import unsloth_zoo.rl_replacements as rr
 
     flat, banked = _layouts([0, 1, 0, 1, 0, 1, 0, 1], [1, 2])

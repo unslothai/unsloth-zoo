@@ -58,7 +58,6 @@ def _cases():
     yield "non_utf8", {"a.log": bytes(range(256)) * 9000 + _MARKER + b"\xff\xfe\x80"}
     yield "second_file", {"a.log": b"ok\n" * 1000, "b.log": b"x" * 10 + _MARKER}
     yield "near_miss", {"a.log": b"429 Too Many Request " + b"429 Too  Many Requests"}
-    # Marker straddling every split point of the 1 MiB block boundary.
     for shift in range(-2, len(_MARKER) + 2):
         yield f"boundary_{shift}", {"a.log": b"y" * (MIB - shift) + _MARKER + b"z" * 7}
     yield "third_block", {"a.log": b"q" * (2 * MIB + 12345) + _MARKER}

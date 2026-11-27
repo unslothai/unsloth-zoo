@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for the import-time offline env cross-sync: setting any of HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE or
-HF_DATASETS_OFFLINE sets all three; without HF_DATASETS_OFFLINE in the sync, load_dataset() hits the network and
-fails with ConnectionError."""
+"""Offline env cross-sync: any of HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE or HF_DATASETS_OFFLINE sets
+all three; without the last, load_dataset() hits the network (ConnectionError)."""
 
 from __future__ import annotations
 
@@ -27,9 +26,7 @@ def _is_guarded(name: str) -> bool:
 
 @pytest.fixture
 def reload_zoo(monkeypatch):
-    """Strips the offline env vars, then reloads unsloth_zoo; teardown restores unsloth_zoo* and bitsandbytes* in
-    sys.modules, since a reload swaps in a half-initialized package and the conftest guard flags bitsandbytes swaps;
-    the contract is to leave sys.modules as found."""
+    """Strips offline env vars and reloads unsloth_zoo; teardown restores sys.modules as found."""
     for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(v, raising = False)
 
@@ -80,8 +77,7 @@ class TestOfflineCrossSync:
         assert os.environ.get("HF_DATASETS_OFFLINE") == "1"
 
     def test_truthy_spellings_trigger_cross_sync_and_normalize(self, monkeypatch, reload_zoo):
-        # Any documented truthy spelling (1, true, yes, on; case-insensitive) triggers the cross-sync and normalizes all
-        # three vars to the literal 1 (see _OFFLINE_TRUE in unsloth_zoo/__init__.py).
+        # Truthy spellings (1/true/yes/on, any case) set all three vars to 1 (_OFFLINE_TRUE).
         for spelling in ("true", "yes", "on", "TRUE", "Yes", "On"):
             monkeypatch.setenv("HF_HUB_OFFLINE", spelling)
             reload_zoo()

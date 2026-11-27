@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A local base model must resolve with the Hub unreachable: path-shaped names (leading ., /, ~ or several /) never
-reach the Hub, local copies resolve first, and single names like gpt2 are still probed; HfFileSystem.ls error types
-differ across versions."""
+"""Path-shaped names skip the Hub; local copies win; HfFileSystem.ls errors vary by version."""
 
 import json
 import os
@@ -100,8 +98,7 @@ def test_local_path_is_absent_not_unreachable(monkeypatch, model_name):
 @pytest.mark.parametrize("model_name", _NOT_REPO_IDS)
 @pytest.mark.parametrize("typed_uris", [False, True])
 def test_a_path_stays_a_path_on_either_huggingface_hub(monkeypatch, model_name, typed_uris):
-    """Runs the path contract under both parser answers for the models/ prefix, since one job installs only one
-    huggingface_hub version; a version-gated strip passed here yet broke this file on 1.25.1."""
+    """Both parser answers for models/ (one hub version per job); a version gate broke 1.25.1."""
     monkeypatch.setattr(
         saving_utils, "_hub_addresses_typed_model_uris", lambda: typed_uris,
     )
@@ -110,8 +107,7 @@ def test_a_path_stays_a_path_on_either_huggingface_hub(monkeypatch, model_name, 
 
 
 def test_valid_repo_id_is_still_probed(monkeypatch):
-    """Real repo ids must still be probed, including single-segment ids like gpt2 that huggingface_hub 0.x lists
-    (pyproject supports >= 0.34); rejecting them breaks gpt2 merges."""
+    """gpt2-style single ids must stay probed: hub 0.x lists them; pyproject allows >= 0.34."""
     seen = []
     def fake_ls(self, path, detail = True, **kwargs):
         seen.append(path)
@@ -209,9 +205,7 @@ def test_local_base_model_resolves_without_network(monkeypatch, tmp_path, shape)
 
 
 def test_absolute_local_path_resolves_under_hf_hub_offline(monkeypatch, tmp_path):
-    """Absolute path under HF_HUB_OFFLINE=1: HF_HUB_OFFLINE is read at import time and cannot offline an imported hub,
-    and the OfflineModeIsEnabled fake is never reached (absolute paths are never probed); removing either still
-    fails."""
+    """HF_HUB_OFFLINE is read at import; absolute paths never reach OfflineModeIsEnabled."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.chdir(tmp_path)
     _make_local_model("base")
@@ -298,8 +292,7 @@ def test_absent_repo_with_no_local_copy_still_reports_nothing_found(monkeypatch,
 def test_unreachable_hub_does_not_fall_back_to_a_priority_5_local_copy(
     monkeypatch, tmp_path,
 ):
-    """A bnb-4bit local copy is priority 5, below the Hub's 3 and 4; substituting it on Hub failure would reach the
-    silent no-op under merged_16bit, so the RuntimeError propagates."""
+    """Hub failure must raise, never a local bnb-4bit copy: merged_16bit would silently no-op."""
     monkeypatch.chdir(tmp_path)
     _make_local_model(os.path.join("unsloth", "mymodel"), quantization_config = {
         "load_in_4bit": True, "bnb_4bit_quant_type": "nf4",

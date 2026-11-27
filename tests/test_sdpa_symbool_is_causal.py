@@ -31,8 +31,7 @@ def test_symbool_is_causal_compiles_fullgraph(monkeypatch):
     import transformers.integrations.sdpa_attention as sdpa_module
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    # CI sets UNSLOTH_COMPILE_DISABLE=1, which skips the patch; install it here and restore transformers' forward
-    # afterwards so the rest of the session is unchanged.
+    # CI's UNSLOTH_COMPILE_DISABLE=1 skips patch: install here, restore transformers' forward.
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     monkeypatch.setattr(sdpa_module, "sdpa_attention_forward", sdpa_module.sdpa_attention_forward)
     monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, "sdpa", ALL_ATTENTION_FUNCTIONS["sdpa"])

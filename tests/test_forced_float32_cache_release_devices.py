@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Forced-float32 pass calls empty_cache once after syncing only the model's own GPUs (not device_count()): per-module
-calls freed cached blocks on other GPUs mid-write (illegal access later), and syncing unused GPUs creates a CUDA
-context per card (hundreds of MB per rank under DDP)."""
+"""Forced-float32 pass calls empty_cache once, after syncing only the model's GPUs: per-module calls
+free other GPUs' cached blocks mid-write; syncing unused GPUs creates CUDA contexts."""
 
 from __future__ import annotations
 
@@ -94,7 +93,6 @@ def test_gpu_model_syncs_its_own_devices_once():
 
     assert set(recorder.synchronised) == expected
     assert len(recorder.synchronised) == len(expected)
-    # One empty_cache for the whole pass; the trailing gc loop in patch_model_and_tokenizer adds a fixed three on top,
-    # so the total (4) is bounded by a constant, not model-sized.
+    # One empty_cache per pass; the trailing gc loop adds three, so the total 4 is constant.
     assert recorder.empty_cache_calls < n_modules
     assert recorder.empty_cache_calls == 4

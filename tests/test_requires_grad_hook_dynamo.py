@@ -210,8 +210,7 @@ def test_post_hook_still_raises_on_unknown_output_while_compiling(monkeypatch):
 
 
 def test_compiled_tuple_output_still_raises():
-    """End to end: requires_grad_for_gradient_checkpointing picks a tuple-returning fallback post-hook target itself, a
-    shape Unsloth produces; the error must survive tracing."""
+    """The tuple-output fallback target the hook picks itself must still raise under compile."""
     torch._dynamo.reset()
     model = _TupleOutputModel()
     model.requires_grad_(False)

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UnslothVisionDataCollator pickles for spawn DataLoader workers (Windows, macOS, or an explicit
-spawn start method) with every resize_dimension and train_on_responses_only."""
+"""Collator pickles for spawn workers, with resize_dimension and train_on_responses_only."""
 
 import pickle
 from types import SimpleNamespace

@@ -78,7 +78,6 @@ def test_vllm_supports_flashinfer_reports_a_failed_import_without_a_name_error()
         if isinstance(n, ast.FunctionDef) and n.name == "vllm_supports_flashinfer"
     )
     handler = next(n for n in ast.walk(fn) if isinstance(n, ast.ExceptHandler))
-    # Every name the handler reads must exist there: builtins, the caught error, or a parameter.
     bound = {"e"} | {a.arg for a in fn.args.args} | set(dir(builtins))
     used = {n.id for n in ast.walk(handler) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
     assert used <= bound, used - bound

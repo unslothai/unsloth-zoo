@@ -49,7 +49,6 @@ ROWS = [
     # The prompt's trailing space merges with the answer: " two", " สอง".
     {"prompt": "Question: one plus one? Answer: ", "completion": "two"},
     {"prompt": "คำถาม: หนึ่งบวกหนึ่ง คำตอบ: ", "completion": "สอง"},
-    # Controls: the space is on the completion side.
     {"prompt": "Question: one plus one? Answer:", "completion": " two"},
     {"prompt": "คำถาม: หนึ่งบวกหนึ่ง คำตอบ:", "completion": " สอง"},
 ]

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Down-LoRA row order: the second grouped GEMM uses permute_y=True (token order); the expert-sorted LoRA delta must be
-scattered through gather_indices or rows land on wrong tokens."""
+"""Down-LoRA delta must scatter through gather_indices; permute_y=True keeps token order."""
 
 import sys
 import types
@@ -69,7 +68,13 @@ def _install_fake_unsloth_kernels(monkeypatch):
         parent = module
 
     interface = types.ModuleType("unsloth.kernels.moe.grouped_gemm.interface")
-    interface.grouped_gemm = _reference_grouped_gemm
+    calls = []
+
+    def grouped_gemm(*args, **kwargs):
+        calls.append(1)
+        return _reference_grouped_gemm(*args, **kwargs)
+
+    interface.grouped_gemm = grouped_gemm
     monkeypatch.setitem(sys.modules, interface.__name__, interface)
     monkeypatch.setattr(parent, "interface", interface, raising=False)
 
@@ -80,6 +85,7 @@ def _install_fake_unsloth_kernels(monkeypatch):
         sys.modules["unsloth.kernels.moe"], "autotune_cache", autotune_cache,
         raising=False,
     )
+    return calls
 
 
 def _build_experts(num_experts, hidden, intermediate):
@@ -112,8 +118,23 @@ def _reference_forward(experts, X, top_k_index, top_k_weights, first, second, sc
     return out
 
 
+_TRITON_CALLS = []
+
+
+@pytest.fixture(autouse=True)
+def _reaches_the_triton_path():
+    """A test that set up the fake kernels must have run them: a silent fallback to the eager or native path would
+    still match the reference numerically and pass without testing the row order at all."""
+    _TRITON_CALLS.clear()
+    yield
+    if _TRITON_CALLS:
+        assert _TRITON_CALLS[0], "forward_triton_grouped_gemm never reached the (fake) Triton grouped GEMM"
+
+
 def _setup(monkeypatch):
-    _install_fake_unsloth_kernels(monkeypatch)
+    _TRITON_CALLS[:] = [_install_fake_unsloth_kernels(monkeypatch)]
+    # CPU tensors would run the eager loop; these tests are about the Triton path's row order, so let them reach it.
+    monkeypatch.setattr(moe_utils, "_triton_moe_tensors_on_gpu", lambda module, hidden_states: True)
     monkeypatch.setattr(moe_utils, "native_moe_grouped_mm", moe_utils._manual_grouped_mm)
 
     num_experts, hidden, intermediate, rank = 4, 16, 16, 4

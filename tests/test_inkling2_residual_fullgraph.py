@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Inkling 2 block attention residuals stay out of Inductor (wrong input grads compiled on CUDA). The decorator the
-compiler emits for them must still let an enclosing fullgraph = True training compile trace through (no graph break,
-no Unsupported), with the eager forward and gradients."""
+"""Inkling 2 attention residuals stay out of Inductor (wrong input grads compiled on CUDA); the
+emitted decorator must let fullgraph=True trace through, matching eager forward and grads."""
 
 import contextlib
 import importlib
@@ -198,9 +197,8 @@ def test_residual_op_follows_the_caller_autocast(monkeypatch, num_queries, attn,
     ("inkling2_loop", 2304, 3, 64.0),
 ])
 def test_fp16_residual_stays_finite_where_sdpa_does(monkeypatch, model_type, hidden, num_queries, fill, backend):
-    """A large finite query: hidden * |q| overflows fp16 unless the softmax scale is applied before the product,
-    as SDPA does. The op must stay finite and match the stock sdpa module, values and grads, on the default and
-    the math SDPA backend (the one a wide head falls back to)."""
+    """fp16 hidden * |q| overflows unless the scale is applied before the product, as SDPA does; it
+    must stay finite and match stock sdpa values and grads on default and math backends."""
     import contextlib
     from torch.nn.attention import SDPBackend, sdpa_kernel
     kernel = sdpa_kernel(SDPBackend.MATH) if backend == "math" else contextlib.nullcontext()

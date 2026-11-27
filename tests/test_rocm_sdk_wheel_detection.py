@@ -165,6 +165,8 @@ _GUARDED = (
     "unsloth_zoo/fused_losses/chunked_logprob.py",
     "unsloth_zoo/fused_losses/fused_linear.py",
     "unsloth_zoo/fused_losses/preference_loss.py",
+    "unsloth_zoo/score_centering.py",
+    "unsloth_zoo/rl_replacements.py",
     "unsloth_zoo/temporary_patches/fla_vendor.py",
     "unsloth_zoo/temporary_patches/moe_utils.py",
 )
@@ -192,3 +194,71 @@ def test_the_raw_read_check_can_fail(tmp_path):
     p = tmp_path / "x.py"
     p.write_text("import torch\na = torch.version.hip is None\nb = getattr(torch.version, 'hip', None)\n", encoding = "utf-8")
     assert _raw_hip_reads(p) == [2, 3]
+
+
+def _score_centering_head_mode(monkeypatch):
+    from unsloth_zoo import score_centering
+    from unsloth_zoo.fused_losses import chunked_logprob
+
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    monkeypatch.delenv("UNSLOTH_LOGPROB_FP32_LOGITS", raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # A 16-bit CUDA head on CPU: the auto default's scope, and no float32-out GEMM (as on every ROCm build).
+    monkeypatch.setattr(chunked_logprob, "fp32_lm_head_auto_ok", lambda weight: True)
+    monkeypatch.setattr(chunked_logprob, "fp32_out_linear_ok", lambda weight: False)
+    head = torch.zeros(4, 3, dtype = torch.bfloat16)
+    mode, weight, _ = score_centering._head_projection(head, None)
+    return mode, weight
+
+
+@pytest.mark.skipif(not hasattr(torch.ops.aten.mm, "dtype"), reason = "the fp32 default needs aten::mm.dtype")
+def test_score_centering_sdk_wheel_keeps_the_head_dtype(sdk_wheel, monkeypatch):
+    # A raw torch.version.hip read took the fp32 CUDA default here, copying the whole head to float32 per call.
+    mode, weight = _score_centering_head_mode(monkeypatch)
+    assert mode == "plain" and weight.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not hasattr(torch.ops.aten.mm, "dtype"), reason = "the fp32 default needs aten::mm.dtype")
+def test_score_centering_cuda_wheel_keeps_the_fp32_default(cuda_wheel, monkeypatch):
+    mode, weight = _score_centering_head_mode(monkeypatch)
+    assert mode == "fp32" and weight.dtype == torch.float32
+
+
+def test_truncated_support_auto_is_cuda_only_on_an_sdk_wheel(sdk_wheel, monkeypatch):
+    from unsloth_zoo import rl_replacements
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert rl_replacements._grpo_truncated_support_auto_platform() is False
+
+
+def test_truncated_support_auto_stays_on_for_a_cuda_wheel(cuda_wheel, monkeypatch):
+    from unsloth_zoo import rl_replacements
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert rl_replacements._grpo_truncated_support_auto_platform() is True
+
+
+@pytest.mark.skipif(not hasattr(torch.ops.aten.mm, "dtype"), reason = "the fp32 default needs aten::mm.dtype")
+@pytest.mark.parametrize("wheel, want", [("sdk_wheel", False), ("cuda_wheel", True)])
+def test_grpo_scorer_fp32_defaults_agree_with_score_centering(wheel, want, request, monkeypatch):
+    # Old / new logps and score centering must project the head in the same precision on every wheel.
+    import inspect as _inspect
+    from unsloth_zoo import rl_replacements
+
+    request.getfixturevalue(wheel)
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    monkeypatch.delenv("UNSLOTH_LOGPROB_FP32_LOGITS", raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert rl_replacements.grpo_fp32_lm_head_default(None) is want
+    # The scorers' defaults are evaluated wherever the source is copied (the compiled trainer), with no is_rocm_torch.
+    for fn in (
+        rl_replacements.chunked_hidden_states_selective_log_softmax,
+        rl_replacements.chunked_hidden_states_selective_log_softmax_recompute,
+    ):
+        namespace = dict(vars(rl_replacements))
+        namespace.pop("is_rocm_torch", None)
+        exec(compile(_inspect.getsource(fn), "<copied>", "exec"), namespace)
+        default = _inspect.signature(namespace[fn.__name__]).parameters["fp32_lm_head_cuda"].default
+        assert default is want, fn.__name__
+    mode, _ = _score_centering_head_mode(monkeypatch)
+    assert (mode != "plain") is want

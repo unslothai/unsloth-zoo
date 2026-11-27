@@ -35,8 +35,7 @@ import torch
 
 from unsloth_zoo import sparse_attention as sa
 
-# NVIDIA CUDA only: the forced index kernel skips its own HIP exclusion (sparse_mqa_supported), and a CPU wheel under
-# the consolidated is_available() spoof has no torch.version.cuda.
+# NVIDIA only: forced index kernel skips its HIP exclusion; CPU spoof lacks torch.version.cuda.
 _CUDA = torch.cuda.is_available() and torch.version.cuda is not None and torch.version.hip is None
 _F16_EPS = torch.finfo(torch.float16).eps
 
@@ -117,8 +116,7 @@ def test_triton_fp16_backward_precision_vs_fp64_split_d(monkeypatch, seed):
 
 def _check_backward_precision(monkeypatch, mk, shape, seed):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "triton")
-    # Both torch arms are fp32 / fp64 einsums: TF32 left on by another test would move the bounds. Saved and
-    # restored by hand: monkeypatch cannot undo an attribute of torch's cuBLASModule.
+    # TF32 must stay off or bounds move; monkeypatch can't undo cuBLASModule: restore by hand.
     tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
@@ -148,8 +146,7 @@ def _check_backward_precision_fp32(mk, shape, seed):
         msg = (f"d{d} s{s} seed{seed} {name}: kernel max {e_max:.3e} mean {e_mean:.3e} | designed max {d_max:.3e} "
                f"mean {d_mean:.3e} | fp32-torch max {t_max:.3e} | |ref| {scale_r:.3e}")
         if name == "dsink":
-            # dsink = -sum p_sink * delta is reduced in torch; delta comes from the fp16 output by design, so its
-            # error is fp16-level relative to |dsink| (measured <= 8e-4 relative).
+            # Delta comes from the fp16 output by design, so the dsink error is fp16-level.
             assert e_max <= 2 * _F16_EPS * max(scale_r, 1.0), msg
             continue
         assert e_max <= 1.25 * d_max, msg

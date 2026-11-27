@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compile cache temp fallback must not reuse a folder another user made:
-<tmp>/unsloth_compiled_cache has a fixed name, so another account could pre-create it and serve
-rewritable Python; foreign ownership is faked by patching os.geteuid, since a real one needs
-root."""
+"""Temp compile fallback must not reuse another account's pre-created <tmp>/unsloth_compiled_cache
+(fixed name, rewritable Python); ownership is faked via os.geteuid, since a real one needs root."""
 import os
 import stat
 import sys
@@ -51,7 +49,6 @@ def test_fresh_temp_folder_is_default_name_and_private(temp_base):
     assert use_temp is True
     assert location == str(temp_base / "unsloth_compiled_cache")
     _assert_private(location)
-    # Idempotent: a second call reuses it.
     again, _ = compiler._get_compile_folder(use_tempfile = True)
     assert again == location
 
@@ -78,14 +75,12 @@ def test_folder_owned_by_another_user_is_not_used(temp_base, monkeypatch):
     planted = temp_base / "unsloth_compiled_cache"
     planted.mkdir(mode = 0o755)
     real_uid = os.geteuid()
-    # Pretend we are someone else: the existing folder now belongs to "another user".
     monkeypatch.setattr(compiler.os, "geteuid", lambda: real_uid + 1)
     real_lstat = os.lstat
 
     def lstat(path, *a, **k):
         result = real_lstat(path, *a, **k)
         if os.path.basename(str(path)) == f"unsloth_compiled_cache_{real_uid + 1}":
-            # The per-user folder we create is ours under the patched uid.
             return os.stat_result((result.st_mode, result.st_ino, result.st_dev,
                                    result.st_nlink, real_uid + 1, result.st_gid,
                                    result.st_size, int(result.st_atime),

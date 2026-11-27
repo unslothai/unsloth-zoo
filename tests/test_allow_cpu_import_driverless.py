@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""UNSLOTH_ALLOW_CPU=1 must survive import on a driverless CUDA-built torch, where module-scope get_device_capability()
-raises; compiler and loss_utils are on the import unsloth path; each case is a fresh interpreter with
-CUDA_VISIBLE_DEVICES set empty."""
+"""UNSLOTH_ALLOW_CPU=1 must survive import on driverless CUDA-built torch, where module-scope
+get_device_capability() raises; cases run in fresh interpreters with CUDA_VISIBLE_DEVICES empty."""
 
 import os
 import pathlib
@@ -16,8 +15,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 _NO_DEVICE = "No CUDA GPUs are available"
 
-# Every unsloth_zoo module reached at import time that reads a device capability at module scope; vllm_utils is absent
-# since its probes sit behind fast_inference = True.
+# Modules reading device capability at import (vllm_utils absent: fast_inference gates it).
 _MODULES = ("unsloth_zoo", "unsloth_zoo.compiler", "unsloth_zoo.loss_utils", "unsloth_zoo.patching_utils")
 
 
@@ -88,8 +86,7 @@ def test_a_host_with_no_device_claims_no_capability():
 
 
 def test_without_the_variable_the_import_still_refuses():
-    """The documented refusal is not what this fix relaxes; a driverless host gets the CPU training backend, so
-    UNSLOTH_DISABLE_CPU_FALLBACK=1 is needed to reach the refusal."""
+    """Refusal is unchanged; driverless hosts need UNSLOTH_DISABLE_CPU_FALLBACK=1 to reach it."""
     _needs_cuda_build()
     out = _run("import unsloth_zoo.compiler", UNSLOTH_DISABLE_CPU_FALLBACK = "1")
     assert out.returncode != 0, out.stdout

@@ -254,8 +254,7 @@ def test_compile_gate_not_installed_when_overridden(monkeypatch):
 
 
 def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
-    """A layer whose forward lowers but whose backward cannot: AOTAutograd would defer that failure to
-    loss.backward(), past the fallback. The guarded call lowers the backward inside the forward instead."""
+    """Backward-only compile errors would escape the fallback; lower the backward in forward."""
     import torch._functorch.config as functorch_config
     from unsloth_zoo.cpu import loader
     if not hasattr(functorch_config, "force_non_lazy_backward_lowering"):
@@ -270,8 +269,7 @@ def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
             raise RuntimeError("backward lowering failed")
         return original(*args, **kwargs)
     monkeypatch.setattr(compile_fx, "_compile_fx_inner", backward_fails)
-    # Importing unsloth's GPU model utilities (as other tests in this process may) sets suppress_errors = True, and
-    # Dynamo then swallows the injected failure before the fallback sees it; a CPU-only Unsloth process leaves it False.
+    # Importing GPU utils sets suppress_errors True, so Dynamo swallows the injected failure.
     monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
     from peft import LoraConfig, get_peft_model
     torch._dynamo.reset()
@@ -334,9 +332,8 @@ def test_compile_error_on_a_later_layer_keeps_checkpoint_recompute_compiled(monk
 
 
 def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monkeypatch, capsys):
-    """A layer with a graph break runs its first compiled segment (Linear / GELU), then the second segment fails to
-    compile. Rerunning eagerly inside the same non-reentrant checkpoint would leave the first segment's saved tensors
-    in it and backward raises CheckpointError; the whole checkpointed call restarts eagerly instead."""
+    """After a graph break, the failing second segment restarts the whole non-reentrant checkpoint
+    eagerly: a partial rerun keeps the first segment's saved tensors (CheckpointError)."""
     from functools import partial
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
@@ -353,8 +350,7 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
             return self.down(x) * 2.0
 
     if loader._checkpoints_inside_forward(Block()):
-        # transformers >= 5.23 checkpoints inside forward, so the compiled call contains the checkpoint and Dynamo
-        # cannot split it at a graph break: no segment compiles before the failure, the case this test pins.
+        # transformers >= 5.23 checkpoints inside forward: Dynamo can't split at a graph break.
         pytest.skip("this transformers checkpoints inside forward; no compiled segment precedes the graph break")
 
     graphs = []
@@ -395,8 +391,7 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
 
 
 def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch, capsys):
-    """Cached inference through compiled layers: a KV-cache update, then a graph break, then a
-    compile failure; a retry would append the same tokens twice, so cached calls run eagerly."""
+    """Cached calls run eagerly: a retry after a compile failure would append KV tokens twice."""
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
     monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
@@ -446,8 +441,7 @@ def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch,
 
 @pytest.mark.parametrize("reentrant", [False, True])
 def test_two_outstanding_checkpoints_of_one_layer_replay_in_their_own_mode(monkeypatch, capsys, reentrant):
-    """Two outstanding checkpoints of one layer, the second shape failing to compile: each
-    recomputes in its own mode, so the eager one never retries the compile in backward."""
+    """Each checkpoint recomputes in its own mode: eager never retries the compile in backward."""
     from functools import partial
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader

@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The installed fused forward replaces the class forward of every transformers *ForCausalLM, so a model
-loaded with plain transformers in the same process ran it too and returned empty logits with labels.
-Once require_model_marker() is on, only models passed to mark_model fuse; the rest return the logits
-and loss of an unpatched forward. Without it every model fuses, as before."""
+"""The fused forward replaces every transformers *ForCausalLM forward, so plain models got empty
+logits with labels; require_model_marker() fuses only mark_model models; without it all fuse."""
 
 import json
 import os

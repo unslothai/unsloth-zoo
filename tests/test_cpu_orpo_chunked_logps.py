@@ -18,11 +18,13 @@
 
 import dataclasses
 import os
+import sys
 
 import pytest
 import torch
 
-TINY = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tiny_qwen3 import tiny_snapshot  # noqa: E402
 
 
 def _orpo():
@@ -42,11 +44,8 @@ def _trainer(tmp_path, dtype, bf16, lora = False, trainer_cls = None):
     from unsloth_zoo.cpu import loader
     from unsloth_zoo.cpu.trainer import install_cpu_training_defaults
     install_cpu_training_defaults()
-    try:
-        model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = not lora,
-                                                               load_in_4bit = False)
-    except OSError as error:  # offline without the tiny model cached
-        pytest.skip(f"{TINY} unavailable: {error}")
+    model, tokenizer = loader.FastCPUModel.from_pretrained(tiny_snapshot(), dtype = dtype, full_finetuning = not lora,
+                                                           load_in_4bit = False)
     assert getattr(model, "_unsloth_cpu_chunked_ce", False)
     if lora:  # frozen lm_head: the _ChunkedLogProbs path behind PEFT's wrappers
         model = loader.FastCPUModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"])
@@ -192,8 +191,7 @@ def _tiny_llama():
 
 
 def test_plain_head_weight_disabled_adapters_and_hooks():
-    """The raw-weight projection must equal calling the head: PEFT's disable_adapter() runs the base head, and hooks
-    or an instance forward act on the module call."""
+    """Must equal the head call: PEFT disable_adapter() runs base head; hooks act on the call."""
     from peft import LoraConfig, get_peft_model
     from unsloth_zoo.cpu.ops import _plain_head_weight
     model = get_peft_model(_tiny_llama(), LoraConfig(r = 2, target_modules = ["q_proj"], modules_to_save = ["lm_head"]))
@@ -253,8 +251,7 @@ def test_head_off_cpu_keeps_trl_forward():
 
 
 def test_trainable_head_metrics_only_requested(monkeypatch):
-    """Trainable head: only the requested detached metrics are computed (ORPO asks for mean_logits alone), and the
-    values match an fp64 oracle."""
+    """Trainable head: only requested detached metrics (ORPO's mean_logits); values match fp64."""
     from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
     torch.manual_seed(0)
     hidden = torch.randn(13, 8, requires_grad = True)
@@ -357,16 +354,11 @@ def _ddp_step(tmp_path, chunked, model_dir):
 
 
 def test_ddp_trainable_head_grads_synced(tmp_path):
-    """CPU gloo DDP, 2 ranks with different rows, untied trainable lm_head, find_unused_parameters = True (the Trainer
-    default without gradient checkpointing): the head runs inside DDP's forward, so the step runs and the head
-    gradient is all-reduced across ranks, equal to TRL's own forward."""
+    """CPU gloo DDP (2 ranks), untied trainable lm_head, find_unused_parameters=True (Trainer
+    default w/o grad checkpointing): head runs in DDP's forward; grad all-reduced, equals TRL's."""
     if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
         pytest.skip("no gloo")
-    try:
-        from huggingface_hub import snapshot_download
-        model_dir = snapshot_download(TINY)
-    except Exception as error:
-        pytest.skip(f"{TINY} unavailable: {error}")
+    model_dir = tiny_snapshot()
     # The ranks load this snapshot, not the repo id: conftest points HF_HOME at an empty per-test dir that the
     # torchrun children inherit, and an HF_HUB_OFFLINE=1 set earlier in this worker would leave them nothing to load.
     chunked, stock = _ddp_step(tmp_path, "1", model_dir), _ddp_step(tmp_path, "0", model_dir)

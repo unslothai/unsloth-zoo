@@ -14,6 +14,8 @@ import torch
 from unsloth_zoo.temporary_patches import moe_utils as M
 from unsloth_zoo.temporary_patches import sdpa_gqa
 
+pytestmark = pytest.mark.usefixtures("triton_moe_on_cpu")
+
 
 def _tuner_with_device(num_experts, hidden_dim, intermediate_dim, top_k, dtype, force_autotune = False,
                        seq_len = 8192, weight_dtype = None, device = None):

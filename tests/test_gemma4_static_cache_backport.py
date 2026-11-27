@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Backport for issue 6028: unsloth generate forces a static cache, which drops the bidirectional image overlay Gemma
-needs at prefill; clears _supports_static_cache only if unsloth lacks the guard"""
+"""Static cache drops Gemma's prefill image overlay; clears _supports_static_cache if unguarded."""
 import sys
 import types
 

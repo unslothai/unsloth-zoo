@@ -80,8 +80,7 @@ def test_single_tensor_and_one_tuple_unchanged():
 
 
 def test_no_differentiable_output_still_raises():
-    # torch's reentrant checkpoint raises when no recomputed output requires grad, and so did this shim for a single
-    # output; silently returning no gradients would turn that error into a step that trains nothing.
+    # Raise if no output needs grad, like torch's checkpoint; silent no-op steps are worse.
     import pytest
 
     def constant(h, w):

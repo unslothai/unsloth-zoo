@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The fully masked row filter and the label builder read mask columns a batch at a time on a map-style
-Dataset, with the same rows and labels as row by row; an IterableDataset stays row by row. CPU-only."""
+"""Batched mask filter and labels match row by row (IterableDataset stays per row); CPU-only."""
 
 from types import SimpleNamespace
 

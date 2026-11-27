@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A base repo with only .bin weights must not be reported missing: check_hf_model_exists needs a .safetensors file, so
-unsloth/bge-m3 looks absent; diagnosis only, resolution unchanged."""
+"""Diagnosis only: .bin-only repos are not reported missing; the check needs .safetensors."""
 
 import os
 import sys

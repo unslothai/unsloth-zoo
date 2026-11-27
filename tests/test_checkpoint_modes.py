@@ -13,9 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Only use_gradient_checkpointing=True is a deferring region (non-reentrant packs in forward, unpacks in backward);
-unsloth and reentrant checkpointing answer False because they re-derive a fresh graph; checked on torch 2.6.0 to
-2.12.0."""
+"""Only use_gradient_checkpointing=True defers pack/unpack (non-reentrant); torch 2.6.0-2.12.0"""
 
 import torch
 import torch.utils.checkpoint as C

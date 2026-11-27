@@ -73,9 +73,8 @@ def _make_lora_weights(num_layers, num_experts, rank_per, hidden, intermediate, 
 
 
 def _delta(A, B, alpha, expert_idx, num_experts):
-    """Legacy means on-disk unfused w1/w2/w3 keys; the adapter is a fused PEFT-0.19 one, read with PEFT packing, not an
-    older Unsloth convention (lora_A expert-slowest, lora_B expert-fastest, reshape out,rank,num_experts); written
-    out, not imported."""
+    """Legacy: on-disk unfused w1/w2/w3 keys; adapter is fused PEFT-0.19 read with PEFT packing
+    (lora_A expert-slowest, lora_B expert-fastest, reshape out,rank,E); restated, not imported."""
     r = A.shape[0] // num_experts
     a = A[expert_idx * r:(expert_idx + 1) * r].to(torch.float64)
     b = B.reshape(B.shape[0], r, num_experts)[:, :, expert_idx].to(torch.float64)
@@ -258,9 +257,8 @@ def test_legacy_mixtral_down_proj_keyed_adapter_is_merged(tmp_path):
 
 
 def test_legacy_mixtral_both_fused_keys_resolve_num_experts(tmp_path):
-    """Fused .gate_up_proj and .down_proj keys with no .base_layer or bare .experts: neither matches the issue 5410
-    num_experts override, so num_experts must come from the wrapped module (lora_stats), not the shard key scan, or
-    the fused rank slices are wrong."""
+    """Fused .gate_up_proj/.down_proj keys without .base_layer or bare .experts miss issue 5410's
+    override; take num_experts from lora_stats, not the shard key scan, or slices are wrong."""
     num_layers, num_experts, rank_per = 1, 4, 3
     hidden, intermediate = 12, 8
     alpha = 2.0
@@ -417,9 +415,7 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
 
 
 def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
-    """Option C two-phase: dequantize FP8 legacy-Mixtral shard to 16bit (no LoRA), then merge expert LoRA on the
-    standard path; output is genuine bf16 with scales dropped, delta matches the analytic reference; mirrors the
-    orchestrator's FP8 merged_16bit export."""
+    """FP8 legacy-Mixtral dequant to 16bit, LoRA merge; bf16 output matches analytic delta."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         _fp8_dequant_blockwise, _fp8_requant_blockwise,
     )

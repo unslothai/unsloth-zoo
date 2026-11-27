@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference = True under torchrun (DDP): vLLM's private world_size = 1 tcp:// rendezvous hangs since
-TORCHELASTIC_USE_AGENT_STORE=True makes it a TCPStore client with no server; load_vllm uses external_launcher; CPU
-only, gloo."""
+"""TORCHELASTIC_USE_AGENT_STORE makes the tcp:// rendezvous hang, so load_vllm uses external_launcher."""
 
 import os
 import pathlib

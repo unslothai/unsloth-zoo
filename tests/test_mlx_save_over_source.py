@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Re-saving lazily loaded adapters or optimizer state over their own source must work, so writers use a temp file; mlx
-0.32.1 raises on CPU but defers to the next mx.eval on Metal."""
+"""Re-saving over a lazy source needs a temp file; mlx 0.32.1 raises on CPU, defers on Metal."""
 
 import os
 import stat

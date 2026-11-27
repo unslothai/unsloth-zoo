@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Cached QSA decode (Qwen4Exp) must match the full-prefix recompute's logits and the reference
-indexer's tokens and pooled block keys across budget, padding, LoRA, mask, dtype and kill-switch
-cases; it also catches a block pooled before its tokens are written (SGLang #46125)."""
+"""Cached QSA decode matches the recompute's logits; catches early pooling (SGLang #46125)."""
 
 import os
 
@@ -160,8 +158,7 @@ def _reference_block_keys(indexer, raw, full_cos, full_sin, start, n_blocks):
 
 
 def _install_checker(monkeypatch, record):
-    """Around every cached-decode step: the selection must equal the reference indexer's on the same inputs, and the
-    cached block keys must equal the reference's pooling of the complete blocks."""
+    """Each cached step must match the reference indexer's selection and complete-block keys."""
     real = _REAL_CACHED_DECODE
 
     def checked(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
@@ -467,8 +464,7 @@ def test_interior_gap_selection_equals_the_reference(patched):
 
 
 def test_mask_outside_the_padding_shape_keeps_the_reference_on_cpu(patched):
-    # A 2-token step whose first row sees slot 3 but whose last row does not (a caller-built 4D mask): no cached
-    # selection can serve both rows, so a host-resident mask takes the reference before any cache write.
+    # A host 4D mask whose rows disagree on slot 3 takes the reference before any cache write.
     from transformers.cache_utils import DynamicCache
     model = _model()
     module = model.model.layers[1].self_attn
@@ -492,8 +488,7 @@ def test_mask_outside_the_padding_shape_keeps_the_reference_on_cpu(patched):
 
 
 def test_inference_mode_then_no_grad_decode(patched):
-    # The mismatch counter is created on the first cached step; under inference_mode it must not become an
-    # inference tensor, or a later cached step under plain no_grad raises on counter.add_().
+    # Counter must not become an inference tensor under inference_mode; no_grad add_() raises.
     zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.clear()
     model = _model()
     ids, mask, prompt = _batch([30, 30], 40)

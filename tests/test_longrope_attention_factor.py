@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Ignores LongRoPE attention_factor == factor when factor > 2: the true value is near 1, and two published configs set
-it to factor (32.0), about 27x too large, with no error."""
+"""Ignores LongRoPE attention_factor == factor when factor > 2; the true value is near 1."""
 
 import math
 import sys

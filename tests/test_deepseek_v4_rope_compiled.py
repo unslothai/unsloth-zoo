@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests DeepSeek-V4 rope, compiled only via the `split` rewrite: upstream's trailing slice makes dynamic=True Inductor
-read out of bounds in backward (pytorch issue 198553, torch <= 2.13)."""
+"""Upstream slice breaks dynamic Inductor backward (pytorch issue 198553, torch <= 2.13)."""
 
 import importlib.util
 import json

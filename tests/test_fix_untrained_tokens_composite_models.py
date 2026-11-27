@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Checkpoints that cannot return one input embedding matrix; stand-in models reproduce the offending shape since the
-real Qwen3-Omni and stepfun-ai/Step-3.7-Flash are 30B and larger."""
+"""Models whose input embedding is not one matrix; stand-ins copy the shape of 30B+ real ones."""
 
 import datasets
 import pytest

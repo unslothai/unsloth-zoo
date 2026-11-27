@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grad-accum loss normalisation in _unsloth_get_batch_samples, mirroring stock Trainer._get_num_items_in_batch: count
-only when model_accepts_loss_kwargs is True or compute_loss_func exists, since a count with the flag False normalises
-twice; CPU only."""
+"""Grad-accum count in _unsloth_get_batch_samples mirrors Trainer._get_num_items_in_batch; count
+only if model_accepts_loss_kwargs or compute_loss_func, else normalises twice; CPU only."""
 
 import inspect
 import re
@@ -48,9 +47,7 @@ def test_guard_is_present_and_mirrors_the_stock_predicate():
 
 
 def test_guard_only_suppresses_never_flips_the_flag():
-    """Only suppress the count, never assign the flag: TRL trainers (membership varies by version; RewardTrainer sets it
-    only from 1.x) and transformers 5.5.0 (DeepSpeed sequence-parallel) set it False on purpose; the check is module
-    wide."""
+    """Suppress the count, never the flag: TRL and transformers 5.5.0 set it False by design."""
     src = inspect.getsource(_loss_utils())
     assert not re.search(r"\.model_accepts_loss_kwargs\s*=[^=]", src), (
         "loss_utils must not assign model_accepts_loss_kwargs. Suppressing the "
@@ -111,9 +108,7 @@ def test_get_batch_samples_still_returns_the_documented_pair():
 
 
 def _tiny_model():
-    """Token-normalising loss (sum / count, else mean) as in unsloth_fused_ce_loss and TRL's
-    _chunked_cross_entropy_loss; a 'CausalLM' class name and **kwargs forward make _unsloth_get_batch_samples count
-    it."""
+    """Sum/count loss, not mean; a 'CausalLM' name plus **kwargs makes the counter count it."""
     torch = pytest.importorskip("torch")
     import torch.nn as nn
     import torch.nn.functional as F
@@ -213,7 +208,6 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
         "accumulated gradients no longer match the single batch gradient"
     )
 
-    # What the unguarded code returned, run through the same training_step rule.
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
     _, unguarded = fn(_fake_trainer(model, True), iter(microbatches), grad_accum)
     assert unguarded is not None
@@ -279,8 +273,7 @@ def test_a_module_carrying_no_shifted_label_signal_is_not_counted(name):
 
 
 def test_a_real_loss_type_outranks_the_detector_fallback():
-    """A masked LM the detector would match still declines, because its own loss_type says the labels are not shifted; a
-    real loss_type outranks the detector fallback."""
+    """A real loss_type outranks the detector: a masked LM's unshifted labels still decline."""
     pytest.importorskip("torch")
 
     class ExplicitForCausalLM(type(_tiny_model())):
@@ -297,15 +290,11 @@ def test_a_real_loss_type_outranks_the_detector_fallback():
     assert count is None
 
 
-# Widening the gate only widens eligibility; the body counts shifted causal targets and is set on
-# transformers.trainer.Trainer for all subclasses; a *ForSequenceClassification has one label per row, so labels[...,
-# 1:] drops an example and breaks broadcasting, surfacing as RuntimeError.
+# *ForSequenceClassification has one label per row; labels[..., 1:] raises RuntimeError.
 
 
 def _tiny_sequence_classifier():
-    """Mirrors LlamaForSequenceClassification as _unsloth_get_batch_samples sees it: the class-wide LlamaModel.forward
-    patch makes the walk detect it as causal via its backbone; without that backbone the fixture passes for the wrong
-    reason."""
+    """Needs the LlamaModel.forward patch to look causal, else it passes for the wrong reason."""
     torch = pytest.importorskip("torch")
     import torch.nn as nn
 
@@ -467,9 +456,8 @@ def test_only_a_shifted_label_loss_may_enable_the_new_count(
 
 
 def test_the_shifted_label_signal_survives_patch_loss_functions():
-    """patch_loss_functions rewrites the causal LOSS_MAPPING entries the signal reads, so keys are snapshotted at
-    import; an identity check would silently switch the count off on any transformers without
-    Trainer._loss_shifts_labels."""
+    """Keys are snapshotted at import, since patch_loss_functions rewrites LOSS_MAPPING; an identity
+    check would drop the count on transformers lacking Trainer._loss_shifts_labels."""
     torch = pytest.importorskip("torch")
     import torch.nn as nn
     mod = _loss_utils()
@@ -515,8 +503,7 @@ def _two_rank_trainer(model, peer_count, peer_flags):
 
 
 def test_the_distributed_count_path_makes_exactly_one_collective():
-    """The count path must make exactly one collective: a second gather adds a sync point per accumulation group, and
-    ranks with differing collective counts deadlock."""
+    """Exactly one collective: a second gather deadlocks ranks whose collective counts differ."""
     torch = pytest.importorskip("torch")
     mod = _loss_utils()
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
@@ -536,7 +523,6 @@ def test_a_locally_short_rank_keeps_the_gathered_count():
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
 
     short = {"input_ids": torch.randint(0, 11, (2, 1)), "labels": torch.randint(0, 11, (2, 1))}
-    # Peer is healthy: 10 targets, neither flag set.
     trainer = _two_rank_trainer(_tiny_model(), peer_count = 10, peer_flags = [0, 0])
     _, count = mod._unsloth_get_batch_samples(trainer, iter([short]), 1)
     assert count is not None and int(count) == 10, (
@@ -564,7 +550,6 @@ def test_one_degenerate_rank_makes_every_rank_decline():
 
     ids = torch.randint(0, 11, (2, 6))
     healthy = {"input_ids": ids, "labels": ids.clone()}
-    # This rank is fine; the peer reports degenerate.
     trainer = _two_rank_trainer(_tiny_model(), peer_count = 10, peer_flags = [1, 0])
     _, count = mod._unsloth_get_batch_samples(trainer, iter([healthy]), 1)
     assert count is None, (
@@ -648,11 +633,8 @@ def test_causal_model_with_a_single_label_column_degrades_to_no_count():
 @pytest.mark.parametrize("custom_loss", [True, False])
 @pytest.mark.parametrize("accepts", [True, False])
 def test_eligibility_truth_table_for_a_causal_model(forward_has_kwargs, custom_loss, accepts):
-    """A count exactly when the model is causal and something consumes it.
-
-    accepts only drives the final guard, which exempts compute_loss_func, so the
-    only combination it suppresses is a **kwargs forward with no custom loss.
-    """
+    """Needs a causal model and a consumer; accepts only suppresses a **kwargs forward with no
+    custom loss."""
     mod = _loss_utils()
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
     if forward_has_kwargs:
@@ -725,9 +707,8 @@ def test_seq2seq_is_never_run_through_the_causal_counter(forward_has_kwargs, cus
                       (lambda *a, **k: None) if custom_loss else None),
         iter([batch]), 1,
     )
-    # Either way no count: with **kwargs the batch is already a dead run on main (encoder mask cannot broadcast to
-    # decoder labels), so no working count is lost and the mean beats RuntimeError; without **kwargs only the widened
-    # gate could admit it.
+    # Either way no count: with **kwargs the batch already dies on main (encoder mask won't
+    # broadcast), so the mean beats RuntimeError; without **kwargs only the widened gate admits one.
     assert count is None, f"seq2seq returned {count}"
 
 
@@ -825,9 +806,8 @@ def test_unequal_microbatch_counts_stay_grad_accum_invariant():
     torch.testing.assert_close(model.lm_head.weight.grad, reference_grad)
 
 
-# Subtracting N-1 boundaries double counts ones a collator masked to -100 (TRL >= 0.23.1 labels[position_ids == 0]),
-# under-counting num_items_in_batch; must be idempotent, not version detected; packed_seq_lengths is attached even
-# without packing, so LoRA with per_device_train_batch_size > 1 hits it.
+# Subtracting N-1 boundaries double counts ones TRL >= 0.23.1 masks to -100: must be idempotent, not
+# version-detected; packed_seq_lengths is attached even unpacked (LoRA, batch > 1).
 
 
 def _padding_free_batch(lengths, premask_starts = False, completion_only = 0):
@@ -1036,8 +1016,7 @@ def test_zero_length_entries_are_ignored():
 def test_lengths_overrunning_the_batch_do_not_kill_live_targets():
     """Boundaries past the batch end must be dropped, not wrapped onto a real row; metadata can overrun."""
     torch = pytest.importorskip("torch")
-    # A boundary at flat 15 lies past the 10 token batch and off any row start; only the rows < n_rows filter stops the
-    # IndexError that re-raises as RuntimeError.
+    # Flat 15 is past the batch; only n_rows filters it, else IndexError becomes RuntimeError.
     for overrun in ([4, 3, 3, 5, 50], [4, 3, 3, 50, 50], [4, 3, 3, 1]):
         batch = _padding_free_batch([4, 3, 3])
         batch["packed_seq_lengths"] = torch.tensor(overrun, dtype = torch.int32)
@@ -1055,8 +1034,7 @@ def test_metadata_shorter_than_the_batch_never_targets_the_trailing_boundary():
 
 
 def test_a_document_starting_at_a_row_boundary_is_not_dropped_twice():
-    """A document that begins exactly at a row start was already dropped by the
-    labels[..., 1:] slice, so it must not be zeroed again."""
+    """A row-start document is already dropped by labels[..., 1:] slice; don't zero it again."""
     torch = pytest.importorskip("torch")
     g = torch.Generator().manual_seed(3)
     ids = torch.randint(1, 11, (2, 6), generator = g)
@@ -1152,9 +1130,7 @@ def test_normalize_does_not_raise_when_the_length_filter_cannot_run():
 
 
 def test_the_counting_path_does_not_raise_on_a_traced_tensor():
-    """The same escape, observed where it actually hurts: through the public
-    counting entry point, whose except clause converts anything that gets out into
-    a RuntimeError that ends the run."""
+    """Same escape via the public counting entry point; its except turns it into RuntimeError."""
     torch = pytest.importorskip("torch")
     fake = pytest.importorskip("torch._subclasses.fake_tensor")
     mod = _loss_utils()
@@ -1168,14 +1144,12 @@ def test_the_counting_path_does_not_raise_on_a_traced_tensor():
             "packed_seq_lengths": torch.tensor([4, 3, 3], dtype = torch.int32),
         }
         mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
-        # Called directly, not through _counted, since its int(count) .item() raises on a fake tensor; the only contract
-        # under a fake tensor is that the run is not ended.
+        # Called directly: int(count).item() fails on fakes; only 'run not ended' is checked.
         fn(_fake_trainer(_tiny_model(), True), iter([batch]), 1)
 
 
 def test_the_count_can_never_go_negative():
-    """Subtracting N-1 could make num_items_in_batch zero or negative; zeroing is bounded below, and declining to count
-    is not acceptable since every case has real targets."""
+    """Subtracting N-1 can go <= 0: clamp at zero, never decline (all cases have targets)."""
     torch = pytest.importorskip("torch")
     # (lengths, completion_only, premask, true target count)
     cases = [
@@ -1303,8 +1277,7 @@ def test_guard_returns_a_count_exactly_when_stock_transformers_would():
                 f"accepts={accepts} compute_loss_func={loss_func is not None}: "
                 f"we returned {ours!r} where stock returned {theirs!r}"
             )
-            # Where stock counts over labels[..., 1:], the counts must agree too, not just nullity; transformers adopted
-            # that in 5.x and zoo always counted that way, so before 5.x they legitimately differ by one token per row.
+            # Counts match where stock shifts labels; pre-5.x they legitimately differ by one.
             if _stock_counts_shifted_labels(stock) and ours is not None:
                 assert int(ours) == int(theirs), (
                     f"accepts={accepts} compute_loss_func={loss_func is not None}: "
