@@ -144,13 +144,13 @@ def test_patched_forward_matches_stock_loss_and_grads(name, softcap, monkeypatch
     torch.manual_seed(1)
     ids = torch.randint(0, 96, (2, 12))
     labels = ids.clone()
-    labels[:, :8] = -100  # response-only: two thirds masked
+    labels[:, :8] = -100
     out = model(input_ids = ids, labels = labels)
     ref = stock(input_ids = ids, labels = labels)
     assert out.logits is None
     out.loss.backward()
     ref.loss.backward()
-    assert len(applied) == 1  # engagement: the chunked loss ran
+    assert len(applied) == 1
     if softcap:
         assert applied[0][0] == softcap
     assert torch.allclose(out.loss, ref.loss, rtol = 1e-5, atol = 1e-6), (out.loss, ref.loss)
