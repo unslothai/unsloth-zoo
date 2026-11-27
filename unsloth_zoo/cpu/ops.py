@@ -281,7 +281,7 @@ class _ChunkedLogProbs(torch.autograd.Function):
 
 def _checkpointed_log_probs(hidden, weight, bias, targets, inv_t, softcap, logit_scale, rows, outputs):
     """Trainable LM head / bias: row chunks under activation checkpointing, so autograd forms every gradient."""
-    from ..gradient_checkpointing import _torch_checkpoint
+    from unsloth_zoo.gradient_checkpointing import _torch_checkpoint
     checkpoint = _torch_checkpoint()
     want_entropy = "entropy" in outputs
     grad = torch.is_grad_enabled() and (hidden.requires_grad or weight.requires_grad)
