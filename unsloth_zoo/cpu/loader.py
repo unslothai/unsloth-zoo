@@ -19,6 +19,7 @@ __all__ = ["FastCPUModel"]
 import contextlib
 import gc
 import functools
+import inspect
 import itertools
 import os
 import re
@@ -40,6 +41,23 @@ from .ops import (
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
 _PREQUANTIZED_SUFFIX = re.compile(r"(-unsloth)?-bnb-4bit$", re.IGNORECASE)
+
+
+def _gguf_dequantize_config():
+    """`GgufConfig(dequantize = True)` where transformers has a GGUF quantizer (5.17+), else None.
+
+    Left at its default that quantizer keeps Qwen3.5 / LFM2 weights packed where the ggml kernel resolves, and for
+    every other architecture stays attached with `is_trainable = False`, so Trainer refuses LoRA and full
+    finetuning. Dequantizing drops it: the dense model a GGUF load gave before 5.17."""
+    try:
+        from transformers import GgufConfig
+    except ImportError:
+        return None
+    if "dequantize" not in inspect.signature(GgufConfig.__init__).parameters:
+        return None
+    return GgufConfig(dequantize = True)
+
+
 # GPU-only kwargs never reach AutoModelForCausalLM.from_pretrained, whose __init__ rejects them.
 _GPU_LOADER_KWARGS_IGNORED = (
     "load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
@@ -888,6 +906,10 @@ class FastCPUModel:
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
         use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
+        if use_4bit and kwargs.get("gguf_file"):
+            # transformers refuses a BitsAndBytesConfig beside a GGUF, whose weights are unpacked at load anyway.
+            _print("`gguf_file` weights are dequantized at load, so load_in_4bit is ignored.")
+            use_4bit = False
         # A saved LoRA checkpoint (notebooks reload "lora_model"): load its base, then the adapter on top,
         # trainable, so training resumes and merged exports see a PeftModel.
         adapter_name = adapter_revision = None
@@ -980,6 +1002,8 @@ class FastCPUModel:
                 llm_int8_skip_modules = list(SKIP_QUANTIZATION_MODULES),
             )
 
+        if quantization_config is None and kwargs.get("gguf_file"):
+            quantization_config = _gguf_dequantize_config()
         if quantization_config is not None:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
             kwargs["quantization_config"] = quantization_config
@@ -1025,7 +1049,7 @@ class FastCPUModel:
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
             except RuntimeError as error:
                 # bitsandbytes' CPU packing rejects very narrow layers (hidden size < 64).
-                if quantization_config is None:
+                if quantization_config is None or not use_4bit:
                     raise
                 _print(f"bitsandbytes 4-bit failed on CPU ({error}), loading 16-bit weights instead.")
             if model is None:
