@@ -23,6 +23,13 @@ from unsloth_zoo.packed_experts import (
     quantize_experts_nvfp4,
 )
 
+@pytest.fixture(autouse = True)
+def _dequantize_path(monkeypatch):
+    # These pin the dequantize + grouped GEMM path bitwise; the fused decode-in-GEMM path is covered by
+    # test_packed_experts_fused.py.
+    monkeypatch.setenv("UNSLOTH_PACKED_EXPERTS_FUSED", "0")
+
+
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]

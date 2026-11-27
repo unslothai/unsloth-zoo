@@ -389,6 +389,106 @@ if _HAS_TRITON:
         tl.store(out_ptr + rows[:, None].to(tl.int64) * (G * 32) + cols[None, :], vals, mask = m)
 
 
+if _HAS_TRITON:
+    # NVFP4 / MXFP8 expert stacks (packed_experts.py): the same fp32 decode as their dequantize kernels, done per GEMM
+    # tile, so a frozen stack feeds the grouped GEMM without a dense bf16 copy. No fp8 instructions (sm_80 decodes).
+    from .packed_experts import _e2m1_value, _e4m3_value, _e8m0_value
+
+    @triton.jit
+    def _decode_packed_tile(
+        codes_ptr, scales_ptr, glob_ptr, e64, rows, col0, NR, KC, ROWS_PER_PART, PARTS,
+        ROWS: tl.constexpr, COLS: tl.constexpr, FMT: tl.constexpr, MULTIPLY: tl.constexpr,  # tile rows / decoded cols (% 32) / 0 NVFP4, 1 MXFP8 / global multiplies
+    ):
+        """fp32 values of packed rows ``rows``, decoded columns ``col0 .. col0 + COLS``; out of range reads 0."""
+        mask_r = rows < NR
+        prow = e64 * NR + rows.to(tl.int64)
+        if FMT == 0:
+            half = KC // 2
+            groups = KC // 16
+            cb = col0 // 2 + tl.arange(0, COLS // 2)
+            cg = col0 // 16 + tl.arange(0, COLS // 16)
+            byte = tl.load(
+                codes_ptr + prow[:, None] * half + cb[None, :], mask = mask_r[:, None] & (cb[None, :] < half), other = 0,
+            ).to(tl.int32)
+            scale = tl.load(
+                scales_ptr + prow[:, None] * groups + cg[None, :], mask = mask_r[:, None] & (cg[None, :] < groups),
+                other = 0,
+            ).to(tl.int32)
+            scale = _e4m3_value(scale)
+            glob = tl.load(glob_ptr + e64 * PARTS + rows // ROWS_PER_PART, mask = mask_r, other = 1.0).to(tl.float32)
+            if MULTIPLY:
+                group = scale * glob[:, None]
+            else:
+                group = tl.math.div_rn(scale, glob[:, None])
+            values = tl.reshape(tl.join(_e2m1_value(byte & 15), _e2m1_value(byte >> 4)), (ROWS, COLS // 16, 16))
+            values = tl.reshape(values * group[:, :, None], (ROWS, COLS))
+        else:
+            groups = KC // 32
+            ck = col0 + tl.arange(0, COLS)
+            cg = col0 // 32 + tl.arange(0, COLS // 32)
+            byte = tl.load(
+                codes_ptr + prow[:, None] * KC + ck[None, :], mask = mask_r[:, None] & (ck[None, :] < KC), other = 0,
+            ).to(tl.int32)
+            s = tl.load(
+                scales_ptr + prow[:, None] * groups + cg[None, :], mask = mask_r[:, None] & (cg[None, :] < groups),
+                other = 127,
+            ).to(tl.int32)
+            values = tl.reshape(_e4m3_value(byte), (ROWS, COLS // 32, 32)) * _e8m0_value(s)[:, :, None]
+            values = tl.reshape(values, (ROWS, COLS))
+        return values
+
+    # M: rows per call; == 1 kept, no % 16 binary.
+    @_jit_any_alignment("M")
+    def _packed_grouped_mm_kernel(
+        x_ptr, codes_ptr, scales_ptr, glob_ptr, out_ptr, counts_ptr,
+        E, NR, KC, K, N, M, ROWS_PER_PART, PARTS,
+        stride_xm, stride_om,
+        TRANS_B: tl.constexpr, E_POW2: tl.constexpr,  # x @ W[e]^T (W packed (E, NR, KC)) / num experts pow2
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # tile M rows / N cols / K reduction
+        FMT: tl.constexpr, MULTIPLY: tl.constexpr,  # 0 NVFP4, 1 MXFP8 / NVFP4 global multiplies (else divides)
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        e_offs = tl.arange(0, E_POW2)
+        counts = tl.load(counts_ptr + e_offs, mask = e_offs < E, other = 0)
+        tiles = (counts + BLOCK_M - 1) // BLOCK_M
+        tile_end = tl.cumsum(tiles, 0)
+        e = tl.sum((tile_end <= pid_m).to(tl.int32), 0)
+        if e >= E:
+            return
+        row_end = tl.sum(tl.where(e_offs == e, tl.cumsum(counts, 0), 0), 0)
+        row_start = row_end - tl.sum(tl.where(e_offs == e, counts, 0), 0)
+        tile_start = tl.sum(tl.where(e_offs == e, tile_end - tiles, 0), 0)
+        offs_m = row_start + (pid_m - tile_start) * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < row_end
+        e64 = e.to(tl.int64)
+        x_rows = x_ptr + offs_m.to(tl.int64)[:, None] * stride_xm
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        if TRANS_B:
+            # out[m, n] = sum_k x[m, k] * W[e, n, k]: packed rows are n, decoded columns k.
+            for k0 in range(0, K, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                a = tl.load(x_rows + offs_k[None, :], mask = mask_m[:, None] & (offs_k[None, :] < K), other = 0.0)
+                w = _decode_packed_tile(
+                    codes_ptr, scales_ptr, glob_ptr, e64, offs_n, k0, NR, KC, ROWS_PER_PART, PARTS,
+                    BLOCK_N, BLOCK_K, FMT, MULTIPLY,
+                )
+                acc = tl.dot(a, tl.trans(w.to(a.dtype)), acc)
+        else:
+            # out[m, n] = sum_k x[m, k] * W[e, k, n]: packed rows are k, decoded columns n.
+            for k0 in range(0, K, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                a = tl.load(x_rows + offs_k[None, :], mask = mask_m[:, None] & (offs_k[None, :] < K), other = 0.0)
+                w = _decode_packed_tile(
+                    codes_ptr, scales_ptr, glob_ptr, e64, offs_k, pid_n * BLOCK_N, NR, KC, ROWS_PER_PART, PARTS,
+                    BLOCK_K, BLOCK_N, FMT, MULTIPLY,
+                )
+                acc = tl.dot(a, w.to(a.dtype), acc)
+        out = out_ptr + offs_m.to(tl.int64)[:, None] * stride_om + offs_n[None, :]
+        tl.store(out, acc.to(out_ptr.dtype.element_ty), mask = mask_m[:, None] & (offs_n[None, :] < N))
+
+
 def _decode_for_test(blocks, scales):
     *prefix, G, _ = blocks.shape
     rows = blocks.numel() // (G * 16)
@@ -907,3 +1007,186 @@ def _available(device, dtype, tiles):
             ok = False
     _AVAILABLE_DTYPE[key] = ok
     return ok
+
+
+# NVFP4 / MXFP8 packed expert stacks ------------------------------------------------------------------------------
+
+_PACKED_FORMATS = {"nvfp4": 0, "mxfp8": 1}
+
+
+def _pick_packed_config(M, E, transpose_b):
+    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages) by routed rows per expert; the decoded tile side is a multiple of 32."""
+    per_expert = M / max(E, 1)
+    if transpose_b:
+        if per_expert <= 16:
+            return (16, 64, 128, 4, 3)
+        if per_expert <= 64:
+            return (32, 128, 64, 4, 3)
+        if per_expert <= 192:
+            return (64, 128, 64, 4, 3)
+        return (128, 128, 64, 8, 3)
+    if per_expert <= 16:
+        return (16, 64, 64, 4, 3)
+    if per_expert <= 64:
+        return (32, 128, 64, 4, 3)
+    return (64, 128, 64, 4, 3)
+
+
+def packed_grouped_mm(x, codes, scales, glob, counts, fmt, transpose_b = True, multiply = False, out = None, config = None):
+    """Grouped ``x @ W[e]^T`` (``transpose_b``) or ``x @ W[e]`` over a frozen NVFP4 / MXFP8 stack, decoded per tile.
+
+    ``codes`` uint8 ``(E, N, K / 2)`` (NVFP4, low nibble = even column) or ``(E, N, K)`` (MXFP8 e4m3 bytes); ``scales``
+    uint8 e4m3 ``(E, N, K / 16)`` or e8m0 ``(E, N, K / 32)``; ``glob`` fp32 ``(E, P)`` NVFP4 global scales (divide, or
+    ``multiply``), None for MXFP8. Rows of ``x`` sorted by expert, ``counts`` (E,) on device. The weight tile is the
+    value the dequantize kernels write, so this equals dequantize + grouped GEMM up to the GEMM's summation order."""
+    f = _PACKED_FORMATS[fmt]
+    E, NR, packed_cols = codes.shape
+    KC = packed_cols * 2 if f == 0 else packed_cols
+    M, K = x.shape
+    if K != (KC if transpose_b else NR):
+        raise ValueError(f"Unsloth: x has {K} columns, the packed stack multiplies {KC if transpose_b else NR}")
+    N = NR if transpose_b else KC
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if out is None:
+        out = torch.empty((M, N), dtype = x.dtype, device = x.device)
+    if M == 0:
+        return out
+    if f == 0:
+        g = glob.to(torch.float32).reshape(E, -1).contiguous()
+        parts = g.shape[1]
+    else:
+        g, parts = x, 1
+    BM, BN, BK, warps, stages = config or _pick_packed_config(M, E, transpose_b)
+    grid = (-(-M // BM) + min(E, M), -(-N // BN))
+    with torch.cuda.device(x.device):
+        _packed_grouped_mm_kernel[grid](
+            x, codes.contiguous(), scales.contiguous(), g, out, counts.to(device = x.device, dtype = torch.int32).contiguous(),
+            E, NR, KC, K, N, M, NR // parts, parts,
+            x.stride(0), out.stride(0),
+            TRANS_B = bool(transpose_b), E_POW2 = 1 << (E - 1).bit_length(),
+            BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, FMT = f, MULTIPLY = bool(multiply),
+            num_warps = warps, num_stages = stages,
+            enable_fp_fusion = True,
+        )
+    return out
+
+
+_PACKED_AVAILABLE = {}
+
+
+def packed_grouped_mm_mode():
+    """UNSLOTH_PACKED_EXPERTS_FUSED: auto (default, fused below the row cutoff), 1 (always), 0 (dequantize)."""
+    import os
+    mode = os.environ.get("UNSLOTH_PACKED_EXPERTS_FUSED", "auto").strip().lower()
+    return mode if mode in ("0", "1") else "auto"
+
+
+_PACKED_MAX_ROWS = {}
+
+
+def _packed_default_max_rows(capability):
+    """Default auto cutoff (rows per expert) from LoRA training steps, Qwen3-30B-A3B expert shapes, NVFP4 experts,
+    fused vs dequantize + grouped GEMM, whole step (fwd, checkpoint replay, dX):
+    RTX PRO 6000 (sm_120) +14-18% at 32 rows, +1-9% at 64, +4-9% at 128 -> 192 on sm_12x;
+    L4 (sm_89) +26-32% at 32 rows, -0.3 to +7% at 64, -5 to +3% at 128 -> 64 on sm_86 / sm_89;
+    A100 (sm_80) the layer alone gains only below 32 rows -> 32 elsewhere."""
+    capability = tuple(capability)
+    if capability[0] == 12:
+        return 192
+    if capability in ((8, 6), (8, 7), (8, 9)):
+        return 64
+    return 32
+
+
+def packed_grouped_mm_max_rows(device = None):
+    """Routed rows per expert below which the fused kernel runs under auto (UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS);
+    the per-architecture default is _packed_default_max_rows."""
+    import os
+    value = os.environ.get("UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS")
+    if value is not None:
+        try:
+            return max(int(value), 0)
+        except ValueError:
+            pass
+    index = None
+    if device is not None:
+        index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    rows = _PACKED_MAX_ROWS.get(index)
+    if rows is None:
+        rows = _PACKED_MAX_ROWS[index] = _packed_default_max_rows(torch.cuda.get_device_capability(index))
+    return rows
+
+
+def _packed_arch_supported(capability, triton_version):
+    """sm_80+; on sm_100 / sm_120 also Triton 3.3+: Triton 3.2 aborts the process lowering tl.dot there (an assert in
+    AccelerateMatmul, not an exception the probe could catch)."""
+    capability = tuple(capability)
+    if capability < (8, 0):
+        return False
+    if capability[0] >= 10:
+        try:
+            major, minor = (int(v) for v in str(triton_version).split(".")[:2])
+        except ValueError:
+            return False
+        return (major, minor) >= (3, 3)
+    return True
+
+
+def packed_grouped_mm_available(device, fmt, dtype = torch.bfloat16) -> bool:
+    """CUDA sm_80+ (not ROCm), bf16 / fp16 inputs, and a per (device, format, dtype) self-check against dequantize."""
+    if fmt not in _PACKED_FORMATS or dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if not _HAS_TRITON or _triton_too_old() or torch.version.hip is not None or not torch.cuda.is_available():
+        return False
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, fmt, dtype)
+    ok = _PACKED_AVAILABLE.get(key)
+    if ok is not None:
+        return ok
+    if not _packed_arch_supported(torch.cuda.get_device_capability(index), triton.__version__):
+        _PACKED_AVAILABLE[key] = False
+        return False
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return False  # the probe syncs; decide on the next uncaptured call
+    except Exception:
+        return False
+    try:
+        with torch.autocast("cuda", enabled = False), torch.no_grad():
+            ok = _probe_packed(torch.device("cuda", index), fmt, dtype)
+    except torch.cuda.OutOfMemoryError:
+        return False  # transient: dequantize this call, probe again on the next one
+    except Exception as exception:
+        import warnings
+        warnings.warn(f"Unsloth: fused {fmt.upper()} grouped GEMM unavailable ({exception}); dequantizing instead.")
+        ok = False
+    _PACKED_AVAILABLE[key] = ok
+    return ok
+
+
+def _probe_packed(device, fmt, dtype):
+    from unsloth_zoo import packed_experts as pe
+    gen = torch.Generator(device = device).manual_seed(0)
+    E, N, K = 3, 96, 160
+    w = torch.randn((E, N, K), device = device, generator = gen)
+    param = pe.quantize_experts_nvfp4(w, dtype) if fmt == "nvfp4" else pe.quantize_experts_mxfp8(w, dtype)
+    scales, glob = param._companions()
+    dense = param.dequantize(torch.float32, transpose = False)  # (E, N, K)
+    counts = torch.tensor([5, 0, 19], dtype = torch.int32, device = device)
+    rows = torch.repeat_interleave(torch.arange(E, device = device), counts.long())
+    for transpose_b in (True, False):
+        x = torch.randn((24, K if transpose_b else N), device = device, generator = gen).to(dtype)
+        got = packed_grouped_mm(x, param.data, scales, glob, counts, fmt, transpose_b,
+                                param.packed_global_mode == "multiply").float()
+        weight = dense.to(dtype).float()[rows]
+        weight = weight.transpose(1, 2) if transpose_b else weight
+        want = torch.bmm(x.float().unsqueeze(1), weight).squeeze(1)
+        if not torch.allclose(got, want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item()):
+            return False
+    return True

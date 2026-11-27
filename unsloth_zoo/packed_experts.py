@@ -55,7 +55,7 @@ _E2M1_MAX = 6.0
 _E4M3_MAX = 448.0
 
 # Engagement counters; tests read them.
-PACKED_EXPERT_STATS = {"calls": 0, "chunks": 0}
+PACKED_EXPERT_STATS = {"calls": 0, "chunks": 0, "fused": 0}
 
 _TORCH_CHUNK_ELEMS = 1 << 24
 
@@ -559,7 +559,25 @@ def _out_dim(codes, fmt, transpose_b):
     return N if transpose_b else K
 
 
+def _fused_grouped_ok(inputs, codes, fmt):
+    """Decode-in-GEMM for this call (mxfp4_gemm.packed_grouped_mm): auto below the per-expert row cutoff, where the
+    chunked dequantize writes and re-reads a whole bf16 stack for few rows; past it cuBLAS on the dense chunk wins."""
+    if not inputs.is_cuda or inputs.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    from unsloth_zoo import mxfp4_gemm
+    mode = mxfp4_gemm.packed_grouped_mm_mode()
+    if mode == "0":
+        return False
+    if mode == "auto" and inputs.shape[0] >= mxfp4_gemm.packed_grouped_mm_max_rows(inputs.device) * codes.shape[0]:
+        return False
+    return mxfp4_gemm.packed_grouped_mm_available(inputs.device, fmt, inputs.dtype)
+
+
 def _grouped_impl(inputs, codes, scales, glob, counts, fmt, transpose_b, multiply):
+    if _fused_grouped_ok(inputs, codes, fmt):
+        from unsloth_zoo.mxfp4_gemm import packed_grouped_mm
+        PACKED_EXPERT_STATS["fused"] += 1
+        return packed_grouped_mm(inputs.contiguous(), codes, scales, glob, counts, fmt, transpose_b, multiply)
     from unsloth_zoo.mxfp4_stacked_experts import _chunked_grouped_mm
     param = _rebuild(fmt, codes, scales, glob, False, multiply)
     # Contiguous like the fake: an unaligned N comes back as a column slice of a padded GEMM output.
