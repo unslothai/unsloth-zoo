@@ -1896,8 +1896,7 @@ def _load_mlx_lm_with_strict_fallback(
 
 
 def _mlx_download(path_or_hf_repo, revision=None, allow_patterns=None, download=None):
-    """mlx-lm's `_download` (or `download`), resolving the cached snapshot when offline mode refuses it: huggingface_hub
-    1.26 to 2.1.1 lists the remote tree for a pinned commit with no cached tree listing, even offline."""
+    """`download` (mlx-lm's), else the cached snapshot: huggingface_hub 1.26-2.1.1 lists the tree for a pinned commit offline."""
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import LocalEntryNotFoundError, OfflineModeIsEnabled
 

@@ -217,7 +217,6 @@ def test_offline_distributed_vlm_resolves_the_cached_snapshot(monkeypatch, tmp_p
         return object(), object()
 
     vlm_utils = types.ModuleType("mlx_vlm.utils")
-    # mlx-vlm's get_model_path is snapshot_download with its own patterns.
     vlm_utils.get_model_path = lambda repo, revision=None: Path(snapshot_download(repo, revision=revision))
     vlm_utils.sharded_load = sharded_load
     monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
