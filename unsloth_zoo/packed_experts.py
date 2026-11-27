@@ -39,6 +39,7 @@ __all__ = [
     "quantize_experts_mxfp8",
     "PACKED_EXPERT_STATS",
     "PACKED_EXPERT_OWN_GROUPED_LINEAR",
+    "PACKED_EXPERT_OWN_GROUPED_MM",
 ]
 
 try:
@@ -654,12 +655,21 @@ class _PackedGroupedLinear(torch.autograd.Function):
 
 
 # Packed stacks of any other format (a ``_PackedExpertParam`` subclass with its own ``_decode``, e.g. Unsloth's GGUF
-# expert stacks) run the chunked dequantize + grouped GEMM below; callers check this flag before relying on it.
+# expert stacks) run their own ``packed_grouped_mm`` if they bring one, else the chunked dequantize + grouped GEMM
+# below; callers check these flags before relying on them.
 PACKED_EXPERT_OWN_GROUPED_LINEAR = True
+PACKED_EXPERT_OWN_GROUPED_MM = True
 _BUILTIN_FORMATS = ("nvfp4", "mxfp8")
 
 
 def _own_grouped_impl(inputs, param, counts, transpose_b):
+    # A stack class may bring a grouped GEMM over its own blocks (`packed_grouped_mm(param, x, counts,
+    # transpose_b)`, frozen weight, returns None to decline); else the chunked dequantize + grouped GEMM.
+    own = getattr(type(param), "packed_grouped_mm", None)
+    if own is not None:
+        out = own(param, inputs.contiguous(), counts, transpose_b)
+        if out is not None:
+            return out.contiguous()
     from unsloth_zoo.mxfp4_stacked_experts import _chunked_grouped_mm
     return _chunked_grouped_mm(inputs.contiguous(), param, counts, None, inputs.dtype, transpose_b).contiguous()
 

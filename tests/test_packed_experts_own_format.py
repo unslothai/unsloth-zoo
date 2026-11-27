@@ -69,3 +69,38 @@ def test_own_format_multi_chunk_matches_single_chunk(monkeypatch):
     monkeypatch.setattr(mse, "_chunk_bytes", lambda: 32 * 64 * 4)  # one expert per chunk
     many = pe.packed_expert_grouped_linear(x, param, counts, True)
     assert torch.equal(one, many)
+
+
+class _OwnGemmExpertParam(_ScaledInt8ExpertParam):
+    """Brings its own grouped GEMM; records each call. Declines (None) when asked to."""
+
+    calls = []
+    decline = False
+
+    def packed_grouped_mm(self, x, counts, transpose_b):
+        type(self).calls.append(transpose_b)
+        if type(self).decline:
+            return None
+        dense = self.dequantize(x.dtype, transpose = False)
+        weight = dense.transpose(-1, -2) if transpose_b else dense
+        return _grouped_mm(x, weight, torch.cumsum(counts, 0, dtype = torch.int32))
+
+
+@pytest.mark.parametrize("decline", [False, True])
+def test_own_grouped_mm_is_used_for_forward_and_dx(decline):
+    assert pe.PACKED_EXPERT_OWN_GROUPED_MM is True
+    codes = torch.randint(-127, 128, (3, 32, 64), dtype = torch.int8).view(torch.uint8)
+    param = _OwnGemmExpertParam(codes, packed_scales = torch.rand(3, 32) * 0.01)
+    _OwnGemmExpertParam.calls, _OwnGemmExpertParam.decline = [], decline
+    counts = torch.tensor([2, 0, 5])
+    x = torch.randn(7, 64, requires_grad = True)
+    x2 = x.detach().clone().requires_grad_(True)
+    out = pe.packed_expert_grouped_linear(x, param, counts, True)
+    ref = _grouped_mm(x2, param.dequantize(torch.float32, transpose = False).transpose(-1, -2),
+                      torch.cumsum(counts, 0, dtype = torch.int32))
+    assert torch.equal(out, ref)
+    g = torch.randn_like(out)
+    out.backward(g)
+    ref.backward(g)
+    assert torch.equal(x.grad, x2.grad)
+    assert _OwnGemmExpertParam.calls == [True, False]  # forward, then dX with the transpose flipped
