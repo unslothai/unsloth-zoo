@@ -14,18 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Growable full-attention KV layers for CPU / MPS generate (GRPO / online DPO rollouts and plain model.generate).
+"""CPU / MPS generate: full-attention KV written in place into a chunk-grown buffer, returned as `[:, :, :n]` views.
 
-transformers' DynamicLayer appends each token with torch.cat, which copies the whole K and V of every layer on every
-decode step: O(L) bytes per step and O(L^2) per rollout, and on CPU each fresh buffer is also page-faulted in. This
-layer keeps a buffer with a chunk of spare slots, writes new tokens in place and hands attention a `[:, :, :n]` view,
-so attention still reads exactly n positions (unlike a full-length StaticCache, which attends over the whole limit and
-was ~3x slower on CPU). Growth is linear in chunks (UNSLOTH_GROWABLE_KV_MIN, 256 tokens) rather than Unsloth's GPU
-power-of-two buckets, because spare slots here cost RAM only: at most two chunks per layer above what is written.
-
-Only generate's own default DynamicCache is converted, only when every layer is a plain full-attention DynamicLayer
-(sliding-window, chunked and linear-attention / hybrid caches keep their classes), only for greedy and sampling
-decode (beam search reorders the whole cache every step anyway), and UNSLOTH_GROWABLE_KV=0 turns it off."""
+DynamicLayer's per-token torch.cat copies every layer's whole KV each step (O(L^2) per rollout). A full-length
+StaticCache is not the fix: attention then reads the whole limit (~3x slower on CPU). Growth is linear in chunks, not
+the GPU cache's power-of-two buckets, since spare slots here cost RAM only. UNSLOTH_GROWABLE_KV=0 turns it off."""
 
 import functools
 import inspect
@@ -47,17 +40,16 @@ __all__ = [
     "ENGAGED",
 ]
 
-# Caches converted so far (tests and run logs read it to prove the path ran).
+# Caches converted so far (engagement proof for tests / benches).
 ENGAGED = [0]
 
 _DEVICES = ("cpu", "mps")
 _MODES = ("greedy_search", "sample")
-# generate writes its cache under one of these names (past_key_values up to 5.2x, cache after the rename).
+# past_key_values up to transformers 5.2x, cache after the rename.
 _CACHE_KEYS = ("past_key_values", "cache")
 
 
 def enabled():
-    # Same switch as Unsloth's GPU growable cache: UNSLOTH_GROWABLE_KV=0 keeps the stock DynamicCache.
     return _DynamicLayer is not None and os.environ.get("UNSLOTH_GROWABLE_KV", "1") != "0"
 
 
@@ -71,17 +63,13 @@ def _chunk():
 if _DynamicLayer is not None:
 
     class GrowableDynamicLayer(_DynamicLayer):
-        """A DynamicLayer whose keys / values are views of a preallocated buffer that grows in chunks.
-
-        Anything else that reassigns `keys` / `values` (crop, batch_select_indices, batch_repeat_interleave,
-        reorder_cache, reset, offload) is adopted on the next update as a full buffer: the next write then
-        reallocates, so a tensor this layer did not allocate is never written in place."""
+        """keys / values that something else reassigned (crop, batch ops, reorder, reset, offload) are adopted with
+        capacity == length, so the next write reallocates: a tensor this layer did not allocate is never written."""
 
         def _grow_buffers(self):
             keys = getattr(self, "keys", None)
             if keys is not None and keys is getattr(self, "_grow_kview", None):
                 return self._grow_k, self._grow_v, keys.shape[-2]
-            # Not our view: adopt what is there (capacity == length, so the next write grows).
             values = getattr(self, "values", None)
             if keys is None or values is None or keys.dim() != 4 or values.dim() != 4:
                 return None, None, 0
@@ -111,14 +99,14 @@ if _DynamicLayer is not None:
                 return super().update(key_states, value_states, *args, **kwargs)
             t = key_states.shape[-2]
             need = n + t
-            # A cache kept from a generate under inference_mode and reused outside it cannot be written in place.
+            # A cache kept from an inference_mode generate and reused outside it is read-only.
             stale = k_buf is not None and k_buf.is_inference() and not torch.is_inference_mode_enabled()
             if k_buf is None or need > k_buf.shape[-2] or stale:
                 chunk = _chunk()
                 capacity = ((need + chunk - 1) // chunk + 1) * chunk
                 new_k = key_states.new_empty((*key_states.shape[:-2], capacity, key_states.shape[-1]))
                 new_v = value_states.new_empty((*value_states.shape[:-2], capacity, value_states.shape[-1]))
-                if n:  # copy_ out of an inference tensor is allowed; writes into one are not
+                if n:
                     new_k[:, :, :n].copy_(k_buf[:, :, :n])
                     new_v[:, :, :n].copy_(v_buf[:, :, :n])
                 k_buf, v_buf = new_k, new_v
@@ -134,16 +122,14 @@ else:  # pragma: no cover
 
 
 def make_growable(cache):
-    """Converts a fresh stock DynamicCache whose layers are all plain full-attention DynamicLayers, in place.
-    Returns whether it did. Subclasses, offloaded caches, sliding / chunked / linear-attention layers and caches
-    that already hold tokens are left alone."""
+    """In place, only a fresh stock DynamicCache of plain full-attention DynamicLayers (sliding, chunked, hybrid /
+    linear-attention, subclassed and offloaded caches keep the stock path). Returns whether it converted."""
     if not enabled() or type(cache) is not _DynamicCache or getattr(cache, "offloading", False):
         return False
     layers = getattr(cache, "layers", None)
     if layers is None:
         return False
     if len(layers) == 0:
-        # No config: layers are appended lazily from layer_class_to_replicate.
         if getattr(cache, "layer_class_to_replicate", None) is not _DynamicLayer:
             return False
         cache.layer_class_to_replicate = GrowableDynamicLayer
