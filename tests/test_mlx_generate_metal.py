@@ -324,8 +324,8 @@ def _record_widths(monkeypatch, module):
 
 
 @metal_only
-@pytest.mark.parametrize("stream", (False, True))
-def test_spliced_image_rows_report_the_columns_their_prompt_filled(monkeypatch, stream):
+@pytest.mark.parametrize("stream, rows", ((False, 1), (True, 1), (False, 2)))
+def test_spliced_image_rows_report_the_columns_their_prompt_filled(monkeypatch, stream, rows):
     from PIL import Image
     from mlx_vlm import load
     from mlx_vlm.prompt_utils import apply_chat_template
@@ -333,21 +333,21 @@ def test_spliced_image_rows_report_the_columns_their_prompt_filled(monkeypatch, 
     model, processor = load(VLM_MODEL)  # FastVLM: one <image> id becomes hundreds of columns
     model._is_vlm_model = True
     prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
-    request = GenerationRequest(prompt=prompt, image=Image.new("RGB", (64, 64), "red"), max_tokens=1)
+    requests = [GenerationRequest(prompt=prompt, image=Image.new("RGB", (64, 64), c), max_tokens=1) for c in ("red", "blue")[:rows]]
     widths = _record_widths(monkeypatch, model.language_model)
-    defaults = GenerationDefaults(max_tokens=1)
+    defaults = GenerationDefaults(max_tokens=1, prefill_batch_size=rows, completion_batch_size=rows)
     if stream:
         with BatchStream(model, processor, defaults=defaults) as batch:
-            batch.add(request)
-            result = None
-            while result is None:
+            batch.add(requests[0])
+            results = [None]
+            while results[0] is None:
                 for event in batch.step():
-                    result = event.result or result
+                    results[0] = event.result or results[0]
     else:
-        (result,) = generate_batch(model, processor, [request], defaults=defaults)
-    # Prefill chunks feed all but the last prompt column, which decodes the first token.
+        results = generate_batch(model, processor, requests, defaults=defaults)
+    # One chunk prefills every row; its chunks feed all but the last prompt column, which decodes the first token.
     fed = sum(width for width in widths if width > 1) + 1
-    assert fed > 200 and result.prompt_token_count == fed, widths
+    assert fed > 200 and [result.prompt_token_count for result in results] == [fed] * rows, widths
 
 
 @metal_only
