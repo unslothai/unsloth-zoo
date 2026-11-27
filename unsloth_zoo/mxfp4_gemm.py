@@ -1120,6 +1120,21 @@ def packed_grouped_mm_max_rows(device = None):
     return rows
 
 
+def _packed_arch_supported(capability, triton_version):
+    """sm_80+; on sm_100 / sm_120 also Triton 3.3+: Triton 3.2 aborts the process lowering tl.dot there (an assert in
+    AccelerateMatmul, not an exception the probe could catch)."""
+    capability = tuple(capability)
+    if capability < (8, 0):
+        return False
+    if capability[0] >= 10:
+        try:
+            major, minor = (int(v) for v in str(triton_version).split(".")[:2])
+        except ValueError:
+            return False
+        return (major, minor) >= (3, 3)
+    return True
+
+
 def packed_grouped_mm_available(device, fmt, dtype = torch.bfloat16) -> bool:
     """CUDA sm_80+ (not ROCm), bf16 / fp16 inputs, and a per (device, format, dtype) self-check against dequantize."""
     if fmt not in _PACKED_FORMATS or dtype not in (torch.bfloat16, torch.float16):
@@ -1134,7 +1149,7 @@ def packed_grouped_mm_available(device, fmt, dtype = torch.bfloat16) -> bool:
     ok = _PACKED_AVAILABLE.get(key)
     if ok is not None:
         return ok
-    if torch.cuda.get_device_capability(index) < (8, 0):
+    if not _packed_arch_supported(torch.cuda.get_device_capability(index), triton.__version__):
         _PACKED_AVAILABLE[key] = False
         return False
     try:

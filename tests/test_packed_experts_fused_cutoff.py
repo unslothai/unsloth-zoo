@@ -31,3 +31,12 @@ def test_cpu_inputs_never_fuse(monkeypatch, mode):
     inputs = torch.zeros((4, 32), dtype = torch.bfloat16)
     codes = torch.zeros((2, 8, 16), dtype = torch.uint8)
     assert pe._fused_grouped_ok(inputs, codes, "nvfp4") is False
+
+
+@pytest.mark.parametrize("capability, triton_version, ok", [
+    ((7, 5), "3.6.0", False), ((8, 0), "3.2.0", True), ((8, 9), "3.2.0", True), ((9, 0), "3.2.0", True),
+    ((10, 0), "3.2.0", False), ((12, 0), "3.2.0", False), ((10, 0), "3.3.0", True), ((12, 0), "3.6.0", True),
+    ((12, 0), "3.9.0+git1234", True), ((10, 0), "bad", False),
+])
+def test_arch_gate_keeps_old_triton_off_blackwell(capability, triton_version, ok):
+    assert mg._packed_arch_supported(capability, triton_version) is ok
