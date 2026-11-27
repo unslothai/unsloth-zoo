@@ -39,6 +39,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
     # Lazy safetensors readers keyed by tensor name: `tensors[key]()` loads one tensor.
     "block_swap.py": {"tensors"},
+    # The routing weight formulas, plain torch functions keyed by name: `_formulas()[formula](logits, ids)`.
+    "routing_replay.py": {"_formulas()"},
 }
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
