@@ -255,3 +255,37 @@ def test_bias_routers_of_other_families_replay(replay, model_type):
     torch.testing.assert_close(
         weights.float(), _expected(logits, forced, renorm, rr._replay_scale(router)), rtol = 1e-4, atol = 1e-6,
     )
+
+
+def test_lfm2_forced_low_score_experts_keep_the_router_epsilon(replay):
+    # LFM2-MoE renormalises with sum + 1e-6. On forced experts whose sigmoid scores are ~1e-7 that epsilon decides
+    # the weights; replay must give what the router itself gives for that selection.
+    model, routers = _bias_router_model("lfm2_moe")
+    router = routers[0]
+    name, bias = _bias_of(model, router)
+    if bias is None or name not in inspect.signature(type(router).forward).parameters:
+        pytest.skip("this transformers' LFM2-MoE router takes no expert_bias")
+    torch.manual_seed(0)
+    router.weight.data.normal_(0, 0.5)
+    hidden = torch.ones(4, 32)
+    router.weight.data[6:8] = -16.0 / 32  # logits of -16 for experts 6 and 7
+    zero = torch.zeros_like(bias)
+    natural = router(hidden, zero)
+    forced = torch.tensor([[6, 7]] * 4)
+    assert not torch.equal(natural[2].sort(-1).values, forced)
+    # The router's own weights for that selection: a bias that makes it pick experts 6 and 7.
+    pick = zero.clone()
+    pick[6:8] = 10.0
+    own = router(hidden, pick)
+    assert torch.equal(own[2].sort(-1).values, forced)
+    # Prime the formula on a natural call, then replay the forced selection.
+    rr._STATE.current = natural[2][:, None, :].clone()
+    rr._router_hook(0)(router, (hidden, zero), natural)
+    assert router._unsloth_replay_formula == "sigmoid_renorm"
+    rr._STATE.current = forced[:, None, :].clone()
+    _, weights, ids = rr._router_hook(0)(router, (hidden, zero), router(hidden, zero))
+    assert torch.equal(ids.long().sort(-1).values, forced)
+    replayed = weights.float().gather(-1, ids.long().argsort(-1))
+    own_weights = own[1].float().gather(-1, own[2].argsort(-1))
+    torch.testing.assert_close(replayed, own_weights, rtol = 1e-4, atol = 1e-6)
+    assert float(own_weights.max()) < 0.5  # the epsilon matters here: 1e-20 would give 0.75 each

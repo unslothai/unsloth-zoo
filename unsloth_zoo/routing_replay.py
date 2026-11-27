@@ -1059,13 +1059,42 @@ def _probs_gather(probs, ids, renorm):
     return torch.where(ok, out, torch.zeros_like(out))
 
 
-def _sigmoid_gather(logits, ids, renorm):
+_DEFAULT_RENORM_EPS = 1e-20
+_RENORM_EPS_RE = re.compile(r"\.sum\([^()]*\)\s*\+\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\)")
+
+
+def _sigmoid_gather(logits, ids, renorm, eps = _DEFAULT_RENORM_EPS):
     # DeepSeek-V3 / GLM-4 MoE style: the score correction bias only picks the experts; the weights are the
-    # unbiased sigmoid scores over the picked ones, renormalised with the same 1e-20 floor.
+    # unbiased sigmoid scores over the picked ones, renormalised with the router's own floor (1e-20 there).
     w = logits.float().sigmoid().gather(-1, ids)
     if not renorm:
         return w
-    return w / (w.sum(dim = -1, keepdim = True) + 1e-20)
+    return w / (w.sum(dim = -1, keepdim = True) + eps)
+
+
+def _renorm_eps(module):
+    """The constant the router adds to the top-k sum before dividing (LFM2-MoE: 1e-6, DeepSeek-V3 / HY-V3:
+    1e-20), read once from its forward's source. On natural selections it is negligible, so detection cannot tell
+    it apart; on forced low-score experts it decides the weights. 1e-20 when the source has none."""
+    eps = getattr(module, "_unsloth_replay_eps", None)
+    if eps is not None:
+        return eps
+    eps = _DEFAULT_RENORM_EPS
+    try:
+        found = _RENORM_EPS_RE.findall(inspect.getsource(type(module).forward))
+        values = {float(v) for v in found}
+        if len(values) == 1:
+            eps = max(values.pop(), _DEFAULT_RENORM_EPS)
+    except (OSError, TypeError, ValueError):
+        pass
+    module._unsloth_replay_eps = eps
+    return eps
+
+
+def _reweight(formula, module, logits, ids):
+    if formula == "sigmoid_renorm":
+        return _sigmoid_gather(logits, ids, True, _renorm_eps(module))
+    return _formulas()[formula](logits, ids)
 
 
 def _replay_scale(module):
@@ -1257,15 +1286,13 @@ def _router_hook(layer_index, compact = None):
             # A router that states whether it renormalises the top-k decides it: top-k mass near
             # one would otherwise pass a normalised formula for an unnormalised router.
             renorm = getattr(module, "norm_topk_prob", None)
-            formulas = _formulas()
             for name in _formula_order(module):
-                fn = formulas[name]
                 if name.startswith("probs") != probs:
                     continue
                 if isinstance(renorm, bool) and name.endswith("_renorm") != renorm:
                     continue
                 with torch.no_grad():
-                    candidate = fn(logits2, ids2).float()
+                    candidate = _reweight(name, module, logits2, ids2).float()
                 for scale in _scale_candidates(module):
                     scaled = (candidate * scale).to(weights2.dtype).float()
                     if torch.allclose(scaled, weights2.float(), rtol = 2e-2, atol = 2e-3):
@@ -1312,8 +1339,7 @@ def _router_hook(layer_index, compact = None):
                 _STATE.record[layer_index] = (
                     _fingerprint(ids2), forced.clone(), valid, signature, layer_input, None,
                 )
-        reweight = _formulas()[formula]
-        new_weights = reweight(logits2, forced)
+        new_weights = _reweight(formula, module, logits2, forced)
         scale = _replay_scale(module)
         if scale != 1.0:
             new_weights = new_weights * scale
