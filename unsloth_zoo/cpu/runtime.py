@@ -482,6 +482,71 @@ def _pin_omp_env(threads):
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(threads)))
 
 
+@functools.cache
+def _cpu_vendor():
+    """Lower-cased CPU vendor string ("authenticamd", "genuineintel", ...; "" when unknown)."""
+    try:
+        with open("/proc/cpuinfo", "r", encoding = "utf-8", errors = "ignore") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                if key.strip().lower() == "vendor_id":
+                    return value.strip().lower()
+    except OSError:
+        pass
+    # Windows: "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD".
+    return (platform.processor() or "").lower()
+
+
+def _logical_cpus():
+    """Logical CPUs (SMT siblings counted) in the affinity mask, quota-capped on Linux; os.cpu_count() elsewhere."""
+    if sys.platform.startswith("linux"):
+        try:
+            cpus = len(_process_affinity())
+        except (AttributeError, OSError):
+            return None
+        try:
+            quota = _cgroup_cpu_limit()
+        except Exception:
+            quota = None
+        return max(1, min(cpus, quota) if quota else cpus)
+    return os.cpu_count()
+
+
+# Fitted counts a rollout may widen: the defaults, not a user's, a launcher's or a quota's.
+_ROLLOUT_WIDEN_REASONS = ("default", "physical cores")
+
+
+def rollout_threads():
+    """torch threads for CPU generate (decode, GRPO rollouts), or None to keep the training count.
+
+    Training uses one thread per physical core (SMT siblings made SFT and GRPO 13-20% slower). Decoding is batched
+    GEMVs that stream every weight per token, and on AMD x86 without native bf16 (Zen 3 and older, EPYC 7763) the
+    siblings help it: a 2-core x 2-SMT Windows EPYC 7763 runner decoded Qwen3-0.6B GRPO rollouts 35% faster on 4
+    threads with training left at 2 (step -23%), while Zen 4 (EPYC 9V45, native bf16) was 4-12% slower, so only the
+    first class widens. UNSLOTH_CPU_ROLLOUT_THREADS=N sets the count for every host, 0 keeps the training count."""
+    import torch
+    explicit = os.environ.get("UNSLOTH_CPU_ROLLOUT_THREADS", "").strip().lower()
+    current = torch.get_num_threads()
+    if explicit:
+        try:
+            target = int(explicit)
+        except ValueError:
+            return None
+        return target if target > 0 and target != current else None
+    fitted = _THREADS_FITTED
+    if fitted is None or fitted[1] not in _ROLLOUT_WIDEN_REASONS or fitted[0] != current or _local_world_size() > 1:
+        return None
+    if platform.machine().lower() not in ("x86_64", "amd64") or "authenticamd" not in _cpu_vendor():
+        return None
+    if cpu_bf16_supported():
+        return None
+    logical = _logical_cpus()
+    if not logical:
+        return None
+    target = min(logical, 2 * current, _DEFAULT_THREAD_CAP)
+    return target if target > current else None
+
+
 _CGROUP_ROOT = "/sys/fs/cgroup"
 _PROC_SELF_CGROUP = "/proc/self/cgroup"
 

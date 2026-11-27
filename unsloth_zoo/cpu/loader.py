@@ -1517,6 +1517,15 @@ def _unpack_encoding_generate(generate):
             # tensors, and the next training forward could not save them for backward.
             with torch.inference_mode(False):
                 restore = set_bf16_stored_dtype(self, torch.float32) > 0
+        # Decode only: SMT siblings where they speed up the per-token GEMVs (runtime.rollout_threads), then back.
+        training_threads, threads = torch.get_num_threads(), None
+        try:
+            from .runtime import rollout_threads
+            threads = rollout_threads()
+            if threads:
+                torch.set_num_threads(threads)
+        except Exception:
+            threads = None
         try:
             set_stance = getattr(torch.compiler, "set_stance", None)
             modules = self.modules() if isinstance(self, torch.nn.Module) else ()
@@ -1526,6 +1535,8 @@ def _unpack_encoding_generate(generate):
                     return generate(self, *args, **kwargs)
             return generate(self, *args, **kwargs)
         finally:
+            if threads:
+                torch.set_num_threads(training_threads)
             if restore:
                 with torch.inference_mode(False):
                     set_bf16_stored_dtype(self, torch.bfloat16)
