@@ -9852,8 +9852,9 @@ def fast_verify_checkpoint_available(model_dir):
     if not (model_dir / "config.json").is_file() or not shards:
         return FastVerifyStatus(False, "not_downloaded", 0)
     config = json.loads((model_dir / "config.json").read_text())
-    family = SPECULATIVE_FAMILIES.get(str(config.get("model_type")).removesuffix("_moe"))
-    if family is None or "lanes" not in family.capabilities:
+    model_type = str(config.get("model_type"))
+    family = SPECULATIVE_FAMILIES.get(model_type.removesuffix("_moe"))
+    if (family is None or "lanes" not in family.capabilities) and model_type not in LANE_FAMILIES:
         return FastVerifyStatus(False, "no_eligible_projections", 0)
     quantization = config.get("quantization") or {}
     tensors = {}
@@ -9890,14 +9891,18 @@ def _lane_coverage(model, modules):
     if not _lane_kernel_on() or getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
         return None, None, [], []
     modules = {id(module): module for _, module in _fusion_modules(model, modules)}
+    calls = []
     for family in SPECULATIVE_FAMILIES.values():
         language = sys.modules.get(family.language)
         native = getattr(sys.modules.get(family.module), family.forward, None)
         call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
         target = getattr(language, family.target, None)
-        if "lanes" not in family.capabilities or call is None or native is None or _verifier_native(type(target)) is not native:
-            continue
-        found = [module for module in modules.values() if getattr(type(module), "__call__", None) is call]
+        if "lanes" in family.capabilities and call is not None and native is not None and _verifier_native(type(target)) is native:
+            calls.append((target, native, call))
+    calls += [(None, None, getattr(getattr(sys.modules.get(name), "LanguageModel", None), "__call__", None))
+              for name in LANE_FAMILIES.values()]
+    for target, native, call in calls:
+        found = [module for module in modules.values() if call is not None and getattr(type(module), "__call__", None) is call]
         if found:
             covered = [module for module in modules.values() if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
                        and _nax_qmm_shape(module, _LANE_QMM_ROUTE)]
@@ -9922,12 +9927,15 @@ def row_invariant_lane_projections(model, *, _modules = None):
                 bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
                 if bindings is not None and nax.kernel_probe_passed(
                         matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
-                    target.__dict__.setdefault("_unsloth_lane_bindings", bindings)
-                    for owner in [target, *found, *covered]:
+                    verifiers = [] if target is None else [target]
+                    for owner in verifiers:
+                        owner.__dict__.setdefault("_unsloth_lane_bindings", bindings)
+                    for owner in [*verifiers, *found, *covered]:
                         owner._unsloth_lane_verify_scopes = getattr(owner, "_unsloth_lane_verify_scopes", 0) + 1
                         owners.append(owner)
-                    _layer_verifier(target, native)
-                    verifier = target
+                    for owner in verifiers:
+                        _layer_verifier(owner, native)
+                        verifier = owner
                     for module in covered:
                         module._unsloth_lane_qmm = True
                         swapped = _lane_module_class(type(module))
@@ -11938,6 +11946,9 @@ SPECULATIVE_FAMILIES = {
         gdn_qk_eps = _qwen4_qk_eps, gdn_l2 = True, capabilities = {"attention": _QWEN4_ATTENTION_CONTRACT, "lanes": {}},
         causal_mask = _qwen4_causal_mask),
 }
+# By checkpoint model type, the language modules whose targets Fast Verify's lane projections serve with no exact
+# verifier forward: their speculative calls' projections alone, where that measured faster.
+LANE_FAMILIES = {"inkling2": "mlx_vlm.models.inkling2.language", "inkling2_loop": "mlx_vlm.models.inkling2.language"}
 
 
 # Outermost first; every generation path (Studio included) enters these. A scope that is not bitwise stock

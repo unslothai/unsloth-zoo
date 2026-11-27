@@ -1,6 +1,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 
 import contextlib
+import importlib
 import itertools
 import json
 from types import SimpleNamespace
@@ -867,6 +868,33 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
     assert type(verifier) is native
     assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
     assert not any(type(m).__name__.startswith("_Lane") for _, m in model.named_modules())
+
+
+def test_lane_projections_serve_a_family_with_no_exact_verifier(qwen_4bit, monkeypatch):
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import language, speculative_verifier
+    from unsloth_zoo.mlx import inference, matmul
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids, cache), rows, kernel = qwen_4bit, [], matmul.lane_qmm
+    verifier, native = language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
+    monkeypatch.setattr(inference, "SPECULATIVE_FAMILIES", {})
+    monkeypatch.setattr(inference, "LANE_FAMILIES", {"qwen3_5": language.__name__})
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append(args[1].shape[0]) or kernel(*args, **kwargs))
+    head = model.language_model.model.layers[0].mlp.down_proj
+    x = mx.ones((1, 2, head.weight.shape[1] * 32 // head.bits), mx.bfloat16)
+    expected = head(x)
+    assert inference.fast_verify_covers(model) and inference.fast_verify_available(model)
+    with inference.row_invariant_lane_projections(model):
+        assert type(verifier) is native and "_unsloth_lane_bindings" not in vars(verifier)
+        assert head.__dict__.get("_unsloth_lane_qmm") and type(head).__name__.startswith("_Lane")
+        y = head(x)
+    assert rows == [head.weight.shape[0]] and mx.allclose(y, expected, atol = 1e-2).item()
+    assert type(head) is nn.QuantizedLinear and type(verifier) is native
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
+    monkeypatch.setattr(inference, "LANE_FAMILIES", {})
+    assert not inference.fast_verify_covers(model)
 
 
 @pytest.mark.parametrize("low", [0, 4])
@@ -3816,6 +3844,9 @@ def test_fast_verify_available_reports_what_the_lane_kernel_takes(qwen_4bit, mon
     tensors = {**row(136, 16), **row(132, 16), **row(8, 16)}   # 132 outputs are no multiple of 8
     assert checkpoint(dict(model_type = "qwen3_5_moe", quantization = quantization), tensors) == (True, "", 2)
     assert checkpoint(dict(model_type = "gemma4", quantization = quantization), tensors) == (False, "no_eligible_projections", 0)
+    assert checkpoint(dict(model_type = "inkling2_loop", quantization = quantization), tensors) == (True, "", 2)
+    if importlib.util.find_spec("mlx_vlm.models.inkling2") is not None:
+        assert all(hasattr(importlib.import_module(name), "LanguageModel") for name in set(inference.LANE_FAMILIES.values()))
     with monkeypatch.context() as patch:
         patch.setattr(nax, "kernel_probe_passed", lambda *args: False)
         assert inference.fast_verify_available(model) == (False, "probe_failed", status.projections)
