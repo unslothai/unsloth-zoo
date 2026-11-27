@@ -152,6 +152,29 @@ def test_packing_bins_are_whole_rows_within_the_cap():
     assert rr.grpo_packing_bins([], L) == []
 
 
+def test_reverify_rows_come_from_multi_row_bins():
+    # lengths [14, 14, 6, 6, 14] under a 14-token cap: only rows 2 and 3 share a forward.
+    lengths, counts = [14, 14, 6, 6, 14], [4, 4, 4, 4, 4]
+    bins = rr.grpo_packing_bins(lengths, 14)
+    assert bins == [(0, 1), (1, 2), (2, 4), (4, 5)]
+    masked = rr.grpo_packing_multirow_counts(counts, bins)
+    assert masked == [0, 0, 4, 4, 0]
+    picked = rr.grpo_packing_verify_rows(lengths, masked, True)
+    assert 2 in picked or 3 in picked
+    assert rr.grpo_packing_multirow_counts(counts, [(0, 5)]) is counts
+
+
+def test_unsafe_length_applies_to_the_longest_bin(monkeypatch):
+    # An unsafe mark above every bin's tokens (but below the whole batch's) keeps packing on.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    model = _Model()
+    model._unsloth_seq_packing_grad_ok = True
+    model._unsloth_seq_packing_grad_unsafe_T = sum(_REAL[:4]) + 1
+    assert sum(_REAL) >= model._unsloth_seq_packing_grad_unsafe_T
+    calls = _run(mini_batch = 2, model = model)
+    assert [n for kind, n in calls if kind == "packed"][:2] == [sum(_REAL[:4]), sum(_REAL[4:])], calls
+
+
 def test_packing_stays_within_the_mini_batch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     # 6 splits: one row per forward. Single-row bins cannot test cross-row isolation, so unverified packing does

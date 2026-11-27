@@ -4237,6 +4237,19 @@ def grpo_packing_bins(lengths, cap):
 pass
 
 
+def grpo_packing_multirow_counts(completion_counts, bins):
+    """Completion counts with the rows of single-row bins zeroed: rows only share a packed forward inside a bin, so a
+    re-verify of trusted packing must pick its rows where cross-row isolation is actually exercised."""
+    if bins is None or len(bins) <= 1:
+        return completion_counts
+    counts = [0] * len(completion_counts)
+    for lo, hi in bins:
+        if hi - lo >= 2:
+            counts[lo:hi] = completion_counts[lo:hi]
+    return counts
+pass
+
+
 # Rows a re-verify of already trusted packing scores one at a time. The first verify scores every row.
 GRPO_PACKING_REVERIFY_ROWS = 3
 
@@ -5231,19 +5244,19 @@ def grpo_accumulated_loss(
                 _pack_sw = getattr(getattr(unwrapped_model, "config", None), "sliding_window", None)
                 _pack_sw_ok = not (isinstance(_pack_sw, int) and _pack_sw > 0 and _pack_maxseg > _pack_sw)
                 _pack_unsafe = getattr(unwrapped_model, "_unsloth_seq_packing_grad_unsafe_T", None)
-                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
-                # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
-                _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
                 # One packed forward per bin of whole rows, each within one padded [batch_size, L] mini-batch's
                 # tokens (the chunked loop's cap): a batch that fits is one bin, as before, and a larger one packs
                 # in a few bins instead of falling back to the padded loop. None: one row alone does not fit.
-                from unsloth_zoo.rl_replacements import grpo_packing_bins
-                _pack_bins = None if _pack_capped else grpo_packing_bins(_pack_lengths_cpu, batch_size * _pack_L)
+                from unsloth_zoo.rl_replacements import grpo_packing_bins, grpo_packing_multirow_counts
+                _pack_bins = grpo_packing_bins(_pack_lengths_cpu, batch_size * _pack_L)
                 _pack_capped = _pack_bins is None
                 if _pack_bins is not None and len(_pack_bins) > 1:
                     # From here on _pack_T is the longest packed forward's tokens: the length the trusted envelope,
                     # the unsafe mark and an OOM refer to.
                     _pack_T = max(sum(_pack_lengths_cpu[_b_lo:_b_hi]) for _b_lo, _b_hi in _pack_bins)
+                # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
+                # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
+                _pack_capped = _pack_capped or (_pack_unsafe is not None and _pack_T >= _pack_unsafe)
                 if not _pack_capped:
                     _pack_active = _pack_active_cpu
                     if len(_pack_bins) > 1:
@@ -5358,7 +5371,8 @@ def grpo_accumulated_loss(
                         # verify against the per-row clean forward (exact ground truth; no grad, value check).
                         # A re-verify of trusted packing scores at most 3 rows (grpo_packing_verify_rows).
                         _pack_vrows = grpo_packing_verify_rows(
-                            _pack_lengths_cpu, _pack_ccount_cpu, _pack_ok is True and _pack_vT > 0,
+                            _pack_lengths_cpu, grpo_packing_multirow_counts(_pack_ccount_cpu, _pack_bins),
+                            _pack_ok is True and _pack_vT > 0,
                             model = unwrapped_model,
                         )
                         _pack_ref = torch.zeros_like(_pack_result)
