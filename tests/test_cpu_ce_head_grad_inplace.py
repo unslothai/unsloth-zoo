@@ -151,3 +151,115 @@ def test_forward_does_not_zero_fill_the_head_grad():
     fills = [e for e in prof.key_averages(group_by_input_shape = True)
              if e.key in ("aten::fill_", "aten::zero_") and str(e.input_shapes).startswith("[" + head)]
     assert not fills, [(e.key, e.input_shapes, e.count) for e in fills]
+
+
+def _tied_model(name, pad_token_id = None):
+    import transformers
+    torch.manual_seed(0)
+    common = dict(vocab_size = 96, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                  num_attention_heads = 4, num_key_value_heads = 2, head_dim = 8, tie_word_embeddings = True,
+                  pad_token_id = pad_token_id)
+    config, cls = {
+        "qwen3": (transformers.Qwen3Config, transformers.Qwen3ForCausalLM),
+        "llama": (transformers.LlamaConfig, transformers.LlamaForCausalLM),
+        "gemma2": (transformers.Gemma2Config, transformers.Gemma2ForCausalLM),
+        "cohere": (transformers.CohereConfig, transformers.CohereForCausalLM),
+        "granite": (transformers.GraniteConfig, transformers.GraniteForCausalLM),
+    }[name]
+    config = config(**common)
+    config._attn_implementation = "eager"
+    model = cls(config).float()
+    model.tie_weights()
+    assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+    assert ops.patch_chunked_causal_lm_loss(model)
+    model._unsloth_cpu_chunked_ce_active = True
+    return model
+
+
+def _train_grads(model, steps = 2, retain = False):
+    for p in model.parameters():
+        p.grad = None
+    losses = []
+    for step in range(steps):
+        g = torch.Generator().manual_seed(100 + step)
+        ids = torch.randint(0, 96, (2, 12), generator = g)
+        ids[0, :3] = 5  # repeated tokens: the per-row summation order matters
+        ids[1, -2:] = 1  # the padding id when the config sets one
+        labels = ids.clone()
+        labels[:, :4] = -100
+        out = model(input_ids = ids, labels = labels, num_items_in_batch = int((labels[:, 1:] != -100).sum()) * steps)
+        out.loss.backward(retain_graph = retain)
+        losses.append(out.loss.detach())
+    return losses, {n: p.grad.clone() for n, p in model.named_parameters()}
+
+
+@needs_keep_graph
+@pytest.mark.parametrize("name", ["qwen3", "llama", "gemma2", "cohere", "granite"])
+@pytest.mark.parametrize("pad_token_id", [None, 1])
+def test_tied_embedding_folds_into_head_grad_bitwise(name, pad_token_id, monkeypatch, stored):
+    claimed = []
+    claim = ops._TiedHeadGradLink.claim
+    monkeypatch.setattr(ops._TiedHeadGradLink, "claim", lambda self: claimed.append(claim(self)) or claimed[-1])
+    model = _tied_model(name, pad_token_id)
+    folded = _train_grads(model)
+    if type(model.get_input_embeddings()) is torch.nn.Embedding:
+        assert len(claimed) == 2 and all(g is not None for g in claimed), "the embedding backward did not fold"
+        assert claimed[0].data_ptr() == stored[0]  # the CE's own buffer, adopted as .grad
+    else:  # a scaled embedding module (Gemma 2 on newer transformers) keeps its own forward
+        assert claimed == []
+    monkeypatch.setenv("UNSLOTH_CPU_HEAD_GRAD_REUSE", "0")
+    claimed.clear()
+    dense = _train_grads(_tied_model(name, pad_token_id))
+    assert claimed == []
+    assert all(torch.equal(a, b) for a, b in zip(folded[0], dense[0]))
+    assert folded[1].keys() == dense[1].keys()
+    for n in dense[1]:
+        assert torch.equal(folded[1][n], dense[1][n]), n
+
+
+@needs_keep_graph
+def test_tied_embedding_retain_graph_keeps_dense_path():
+    folded = _train_grads(_tied_model("qwen3"), retain = True)
+    import os
+    os.environ["UNSLOTH_CPU_HEAD_GRAD_REUSE"] = "0"
+    try:
+        dense = _train_grads(_tied_model("qwen3"), retain = True)
+    finally:
+        del os.environ["UNSLOTH_CPU_HEAD_GRAD_REUSE"]
+    for n in dense[1]:
+        assert torch.equal(folded[1][n], dense[1][n]), n
+
+
+@needs_keep_graph
+def test_tied_embedding_skips_the_vocab_zero_fill():
+    model = _tied_model("qwen3")
+    ids = torch.randint(0, 96, (2, 12), generator = torch.Generator().manual_seed(7))
+    with torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CPU], record_shapes = True) as prof:
+        model(input_ids = ids, labels = ids.clone()).loss.backward()
+    head = "[" + str([96, 32])
+    fills = [e for e in prof.key_averages(group_by_input_shape = True)
+             if e.key in ("aten::fill_", "aten::zero_", "aten::zeros") and str(e.input_shapes).startswith(head)]
+    assert not fills, [(e.key, e.input_shapes, e.count) for e in fills]
+
+
+def test_untied_or_hooked_embedding_is_not_folded():
+    model = _tied_model("qwen3")
+    ids = torch.zeros(1, 4, dtype = torch.long)
+    head = model.get_output_embeddings().weight
+    assert ops._tied_embedding_link(model, head, ids, None) is not None
+    handle = model.get_input_embeddings().register_forward_hook(lambda m, i, o: o * 2)
+    assert ops._tied_embedding_link(model, head, ids, None) is None
+    handle.remove()
+    assert ops._tied_embedding_link(model, head, None, torch.zeros(1, 4, 32)) is None
+    other = torch.nn.Parameter(head.detach().clone())
+    assert ops._tied_embedding_link(model, other, ids, None) is None
+    with torch.no_grad():
+        assert ops._tied_embedding_link(model, head, ids, None) is None
+
+
+def test_kill_switch_scales_out_of_place(stored, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_CPU_HEAD_GRAD_REUSE", "0")
+    hidden, weight, labels = _inputs(8)
+    w = weight.clone().requires_grad_()
+    (_loss(hidden.clone().requires_grad_(), w, labels) * 0.5).backward()
+    assert len(stored) == 1 and w.grad.data_ptr() != stored[0]
