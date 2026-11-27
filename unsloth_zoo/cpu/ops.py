@@ -72,8 +72,7 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
                 hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
                 amp_dtype if amp else None, softcap, logit_scale,
             )
-        # Ignored rows add nothing to the loss or the grads: drop them before the LM head GEMMs (eager and compiled
-        # alike, since this op is opaque) and give their hidden grad rows zeros.
+        # Ignored rows skip the LM head GEMMs (compiled calls too: this op is opaque); their hidden grads are zero.
         keep = valid.nonzero().squeeze(-1)
         total, grad_hidden, grad_weight = _chunked_ce_forward_loop(
             hidden.index_select(0, keep), weight, labels.index_select(0, keep), chunk_rows, ignore_index,
@@ -86,8 +85,7 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
 
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
                              need_weight_grad, exact, amp_dtype = None, softcap = 0.0, logit_scale = 1.0):
-    """CE over (hidden @ W.T) * logit_scale, then softcap * tanh(. / softcap) when softcap > 0 (Gemma 2 / 3), as the
-    model's own forward applies them; d(capped)/d(raw) = logit_scale * (1 - tanh^2) scales the logit grads."""
+    """CE over softcap * tanh(hidden @ W.T * logit_scale / softcap) (no tanh if softcap is 0)."""
     rows = hidden.shape[0]
     # A detached head misses autocast's cast cache, so cast it once instead of per chunk.
     mm_weight = weight
@@ -700,8 +698,7 @@ def patch_causal_conv1d_fallback(model):
 def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = None,
                                  ignore_index = -100, shift_labels = None, chunk_rows = None,
                                  softcap = None, logit_scale = 1.0):
-    """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss. The logits are
-    (hidden @ weight.T) * logit_scale, then softcap * tanh(logits / softcap) when softcap is set."""
+    """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss."""
     if shift_labels is None:
         labels = F.pad(labels, (0, 1), value = ignore_index)
         shift_labels = labels[..., 1:]
@@ -718,8 +715,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         divisor = torch.full((), num_items_in_batch, dtype = torch.float32, device = hidden.device)
     else:
         divisor = float(num_items_in_batch)
-    # Skip ignored rows' LM head work. Eager drops them here; under torch.compile the sync would break the graph, so
-    # the forward op (opaque to Dynamo) drops them instead.
+    # Skip ignored rows' LM head work here in eager; compiled calls drop them inside the opaque forward op.
     if not torch.compiler.is_compiling():
         valid = shift_labels != ignore_index
         if bool(valid.any()) and not bool(valid.all()):
@@ -762,8 +758,7 @@ def _plain_head_and_inner(model):
 
 
 def _inner_model_name(model):
-    """The attribute holding the decoder stack: base_model_prefix, else `model` (Gemma 3 text on transformers 4.x
-    declares `language_model` but stores `model`)."""
+    """base_model_prefix, else `model` (transformers 4.x Gemma 3 text declares `language_model`)."""
     for name in (getattr(model, "base_model_prefix", "model"), "model"):
         if isinstance(getattr(model, name, None), torch.nn.Module):
             return name
@@ -782,8 +777,7 @@ _LOGIT_KNOBS = ("final_logit_softcapping", "logits_soft_cap", "logit_scale", "lo
 
 
 def _lm_head_transform(model):
-    """(softcap, logit_scale) such that the model's logits are softcap * tanh(lm_head(hidden) * logit_scale / softcap)
-    (no tanh when softcap is None), exactly what its forward feeds its CE; None when chunked CE cannot match it."""
+    """(softcap, logit_scale) of the logits the model's forward feeds its CE, or None when chunked CE cannot match."""
     if _plain_lm_head(model):
         return None, 1.0
     config = getattr(model, "config", None)
