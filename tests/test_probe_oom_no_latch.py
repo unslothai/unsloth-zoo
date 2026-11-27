@@ -323,3 +323,27 @@ def test_cpu_loader_out_of_memory_retry_with_nested_inputs_and_many_checkpoints(
     assert all(x.grad is not None for x in xs)
     assert len(calls) == 1
     assert "training eagerly" not in capsys.readouterr().out
+
+
+def test_cpu_loader_reused_input_does_not_hold_the_eager_window_open(capsys):
+    # A plain (not checkpointed) training layer called again and again on one long-lived input after an OOM: the
+    # window closes with each step's output, so compile resumes and nothing accumulates.
+    from unsloth_zoo.cpu import loader
+
+    layer = torch.nn.Linear(4, 4)
+    calls = []
+
+    def compiled(x):
+        calls.append(1)
+        if len(calls) == 1:
+            raise MemoryError()
+        return torch.nn.functional.linear(x, layer.weight, layer.bias)
+
+    layer._compiled_call_impl = compiled
+    loader._fall_back_to_eager_on_compile_error([layer])
+    x = torch.ones(2, 4, requires_grad = True)
+    for _ in range(100):
+        layer.zero_grad()
+        layer(x).square().sum().backward()
+    assert len(calls) == 100  # one OOM call rerun eagerly, every later step compiled
+    assert "training eagerly" not in capsys.readouterr().out
