@@ -1123,7 +1123,8 @@ def test_checkpoint_wrappers_the_window_cannot_reproduce_are_refused(how):
     assert all(p.grad is None for p in layers.parameters())
 
 
-def test_unsloth_checkpoint_shims_count_as_reentrant(monkeypatch):
+def test_unsloth_checkpoint_shims_are_refused(monkeypatch):
+    """They replay MoE routing / saved-attention frames around the recompute; the window would bypass them."""
     import types
 
     def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
@@ -1133,8 +1134,10 @@ def test_unsloth_checkpoint_shims_count_as_reentrant(monkeypatch):
         shims = types.ModuleType("unsloth_zoo.gradient_checkpointing")
         monkeypatch.setitem(sys.modules, "unsloth_zoo.gradient_checkpointing", shims)
     monkeypatch.setattr(shims, "unsloth_gradient_checkpoint", unsloth_gradient_checkpoint, raising = False)
-    layer = _CkptToy(functools.partial(unsloth_gradient_checkpoint, use_reentrant = False))
-    assert lm._checkpoint_mode(layer) == (True, None)
+    for func in (unsloth_gradient_checkpoint, functools.partial(unsloth_gradient_checkpoint, use_reentrant = False)):
+        layer = _CkptToy(func)
+        no_grad_forward, problem = lm._checkpoint_mode(layer)
+        assert no_grad_forward is False and "routing" in problem
     layer.gradient_checkpointing = False
     assert lm._checkpoint_mode(layer) == (False, None)
 

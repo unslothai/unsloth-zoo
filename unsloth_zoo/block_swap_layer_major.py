@@ -308,12 +308,12 @@ _CKPT_SHIMS = ("unsloth_checkpoint", "unsloth_gradient_checkpoint", "unsloth_off
 def _checkpoint_mode(layer, swapper = None):
     """(no_grad_forward, problem) for the layer's own checkpoint wrapper, which the window bypasses. Only these
     function objects (identity, not names: functools.wraps copies those) are known: torch's checkpoint (current or
-    the pristine one Unsloth keeps), optionally a functools.partial binding nothing but use_reentrant; Unsloth's
-    checkpoint shims; and the checkpoint wrapper this block swap installed around one of them. Anything else is
-    refused. no_grad_forward: standard training runs the layer's forward without gradients (reentrant: torch with
-    use_reentrant True or unset, which torch resolves to True; Unsloth's shims are autograd Functions either way), so
-    the window's no-grad forward and grad-mode recompute are exactly standard accumulation's, also where the two
-    differ in the last bit (a compiled block's inference and training graphs)."""
+    the pristine one Unsloth keeps; what Unsloth's own layers carry), optionally a functools.partial binding nothing
+    but use_reentrant, and the checkpoint wrapper this block swap installed around it. Anything else, Unsloth's
+    checkpoint shims included (routing / attention frames), is refused. no_grad_forward: standard training runs the
+    layer's forward without gradients (reentrant: use_reentrant True or unset, which torch resolves to True), so the
+    window's no-grad forward and grad-mode recompute are exactly standard accumulation's, also where the two differ
+    in the last bit (a compiled block's inference and training graphs)."""
     if not (getattr(layer, "gradient_checkpointing", False) and getattr(layer, "training", False)):
         return False, None
     fn, reentrant = getattr(layer, "_gradient_checkpointing_func", None), None
@@ -331,7 +331,9 @@ def _checkpoint_mode(layer, swapper = None):
             fn = fn.func
             continue
         if id(fn) in shim_fns:
-            return True, None
+            # They record and replay MoE routing / saved-attention frames around the recompute, which the window's
+            # bypass would skip (a recompute could route differently from the forward that produced the loss).
+            return False, "Unsloth's checkpoint shims replay routing / attention frames the window cannot"
         if id(fn) in torch_fns:
             return reentrant is None or reentrant is True, None
         attrs = getattr(fn, "__dict__", None) or {}
