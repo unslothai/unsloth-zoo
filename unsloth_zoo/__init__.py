@@ -75,12 +75,26 @@ def _hf_transfer_importable() -> bool:
 
 _hf_transfer_installed = _hf_transfer_importable()
 
-# Hugging Face Hub faster downloads (skipped when offline mode is requested).
+
+def _hub_supports_hf_transfer() -> bool:
+    # Hub 1.0 removed hf_transfer. Read metadata without importing Hub, which
+    # reads the cache, offline and transfer settings at import time.
+    from importlib.metadata import PackageNotFoundError, version
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(version("huggingface_hub")).major == 0
+    except (PackageNotFoundError, InvalidVersion):
+        return False
+
+
+# Keep faster HTTP downloads on Hub 0.x when supported.
 if (
     "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
     and not _offline_env
     and not _windows_on_arm
     and _hf_transfer_installed
+    and _hub_supports_hf_transfer()
 ):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
