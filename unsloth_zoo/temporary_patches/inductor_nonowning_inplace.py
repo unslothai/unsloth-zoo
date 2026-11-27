@@ -16,6 +16,6 @@
 
 """Installs the Inductor NonOwningLayout in-place guard (unsloth_zoo/inductor_nonowning_inplace.py) on import."""
 
-from ..inductor_nonowning_inplace import patch_inductor_nonowning_inplace
+from unsloth_zoo.inductor_nonowning_inplace import patch_inductor_nonowning_inplace
 
 __all__ = ["patch_inductor_nonowning_inplace"]
