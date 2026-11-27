@@ -18,11 +18,13 @@
 
 import dataclasses
 import os
+import sys
 
 import pytest
 import torch
 
-TINY = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tiny_qwen3 import tiny_snapshot  # noqa: E402
 
 
 def _orpo():
@@ -42,11 +44,8 @@ def _trainer(tmp_path, dtype, bf16, lora = False, trainer_cls = None):
     from unsloth_zoo.cpu import loader
     from unsloth_zoo.cpu.trainer import install_cpu_training_defaults
     install_cpu_training_defaults()
-    try:
-        model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = not lora,
-                                                               load_in_4bit = False)
-    except OSError as error:  # offline without the tiny model cached
-        pytest.skip(f"{TINY} unavailable: {error}")
+    model, tokenizer = loader.FastCPUModel.from_pretrained(tiny_snapshot(), dtype = dtype, full_finetuning = not lora,
+                                                           load_in_4bit = False)
     assert getattr(model, "_unsloth_cpu_chunked_ce", False)
     if lora:  # frozen lm_head: the _ChunkedLogProbs path behind PEFT's wrappers
         model = loader.FastCPUModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"])
@@ -362,11 +361,7 @@ def test_ddp_trainable_head_grads_synced(tmp_path):
     gradient is all-reduced across ranks, equal to TRL's own forward."""
     if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
         pytest.skip("no gloo")
-    try:
-        from huggingface_hub import snapshot_download
-        model_dir = snapshot_download(TINY)
-    except Exception as error:
-        pytest.skip(f"{TINY} unavailable: {error}")
+    model_dir = tiny_snapshot()
     # The ranks load this snapshot, not the repo id: conftest points HF_HOME at an empty per-test dir that the
     # torchrun children inherit, and an HF_HUB_OFFLINE=1 set earlier in this worker would leave them nothing to load.
     chunked, stock = _ddp_step(tmp_path, "1", model_dir), _ddp_step(tmp_path, "0", model_dir)

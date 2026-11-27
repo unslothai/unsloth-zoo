@@ -211,17 +211,17 @@ def torch_chunk_gated_delta_rule(
     if mm_dtype is None:
         # float16 inputs use float16 matmuls; others float32 (bf16 has no sm75 tensor cores).
         mm_dtype = torch.float16 if q.dtype == torch.float16 else torch.float32
-    groups = v.shape[2] // q.shape[2]
-    if groups > 1:
-        q = q.repeat_interleave(groups, dim = 2)
-        k = k.repeat_interleave(groups, dim = 2)
     if use_qk_l2norm_in_kernel:
-        # fla's l2norm: x * rsqrt(sum(x^2) + 1e-6), reduced in float32.
+        # fla's l2norm: x * rsqrt(sum(x^2) + 1e-6), reduced in float32, per head (before the repeat).
         acc = torch.float64 if q.dtype == torch.float64 else torch.float32
         q = q.to(acc)
         k = k.to(acc)
         q = q * torch.rsqrt((q * q).sum(-1, keepdim = True) + 1e-6)
         k = k * torch.rsqrt((k * k).sum(-1, keepdim = True) + 1e-6)
+    groups = v.shape[2] // q.shape[2]
+    if groups > 1:
+        q = q.repeat_interleave(groups, dim = 2)
+        k = k.repeat_interleave(groups, dim = 2)
     if scale is None:
         scale = q.shape[-1] ** -0.5
     with torch.autocast(device_type = q.device.type, enabled = False):

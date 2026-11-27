@@ -27,11 +27,28 @@ mask, else the token ids with pad ids dropped on both sides), so any reordering,
 packing or sequence packing of the batch still finds its rollout. Every `llm.generate` call
 between two training forwards belongs to one rollout, so a rollout split into sub-batches is
 kept whole. A row or token with no match keeps its natural routing.
+
+Routing weights (UNSLOTH_GRPO_ROUTING_REPLAY_WEIGHTS, on by default with R3, vLLM >= 0.28): the
+colocated engine is patched to return the router's fp32 top-k weights next to the ids, and the
+trainer forward uses those values. The gradient still goes through the trainer's own weights over
+the forced ids (straight-through), so a trainable router and the hidden states feeding a frozen
+one keep their gradient. Older vLLM returns ids only and the weights are recomputed as before.
+
+Old-policy replay (R2, UNSLOTH_GRPO_ROUTING_REPLAY_R2=1, no vLLM needed): after each rollout (a
+vLLM `generate` call, or a forward with a KV cache, i.e. HF generation), the first trainer forward of
+a row records the experts it was routed to. That forward is the one pi_old comes from (TRL's
+no-grad old logprob forward, or the first policy forward when pi_old is taken from it), so the later
+forwards of that row (num_iterations > 1, later minibatches) replay them. Rows R3 has rollout routes
+for keep those.
 """
 
 __all__ = [
     "ROUTING_REPLAY_ENV",
+    "ROUTING_REPLAY_WEIGHTS_ENV",
+    "ROUTING_REPLAY_R2_ENV",
     "routing_replay_requested",
+    "routing_weights_requested",
+    "old_policy_replay_requested",
     "vllm_supports_routed_experts",
     "routing_replay_engine_args",
     "record_routed_experts",
@@ -43,6 +60,7 @@ __all__ = [
 
 import functools
 import inspect
+import math
 import os
 import re
 import typing
@@ -54,15 +72,126 @@ import torch
 import torch.nn.functional as F
 
 ROUTING_REPLAY_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY"
+ROUTING_REPLAY_WEIGHTS_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY_WEIGHTS"
+ROUTING_REPLAY_R2_ENV = "UNSLOTH_GRPO_ROUTING_REPLAY_R2"
 _LAYER_INDEX_RE = re.compile(r"\.layers\.(\d+)\.")
 _MAX_ROLLOUTS = 2
 _MAX_CALLS_PER_ROLLOUT = 64
 # Leak guard only: evicting a forward awaiting its recompute makes that recompute route naturally.
 _MAX_PENDING = 1024
+# R2 rows kept (old-policy routes of the latest no-grad forwards); older ones route naturally.
+_MAX_R2_ROWS = 8192
 
 
 def routing_replay_requested():
     return os.environ.get(ROUTING_REPLAY_ENV, "0") == "1"
+
+
+def routing_weights_requested():
+    return routing_replay_requested() and os.environ.get(ROUTING_REPLAY_WEIGHTS_ENV, "1") == "1"
+
+
+def old_policy_replay_requested():
+    return os.environ.get(ROUTING_REPLAY_R2_ENV, "0") == "1"
+
+
+# Set once the colocated vLLM is patched to return weights: (ids | fp32 low 16 bits | high 16 bits).
+_VLLM_WEIGHTS_PACKED = False
+# The top-k of the engine this process built with the patch; routes from any other engine (an
+# out-of-process server) keep their plain k columns and are read as ids only.
+_PACKED_TOP_K = None
+# Rollout weights further than this from the trainer's own weights over the same experts are not
+# this router's (a scaled or differently normalised vLLM router): those rows keep the trainer's.
+_WEIGHT_TOLERANCE = 0.1
+
+
+def _pack_routed_weights(topk_ids, topk_weights):
+    # GPU ops only: runs inside vLLM's CUDA graph capture, replayed every decode step.
+    bits = topk_weights.float().contiguous().view(torch.int32)
+    return torch.cat([topk_ids.to(torch.int32), bits & 0xFFFF, (bits >> 16) & 0xFFFF], dim = -1)
+
+
+def _unpack_routed_weights(routed, top_k):
+    """vLLM's widened capture [..., 3k] -> (ids [..., k], fp32 weights [..., k])."""
+    routed = torch.as_tensor(routed).to(torch.int64)
+    ids = routed[..., :top_k]
+    bits = (routed[..., top_k : 2 * top_k] & 0xFFFF) | ((routed[..., 2 * top_k :] & 0xFFFF) << 16)
+    # int64 -> int32 keeps the low 32 bits, i.e. the fp32 pattern.
+    weights = bits.to(torch.int32).view(torch.float32)
+    return ids, weights
+
+
+def _select_reads_capture_fn(select):
+    """True when vLLM's BaseRouter._select_experts reads self.capture_fn itself, as 0.28 - 0.34 do to capture the
+    logical ids before the EPLB map; the wrapper below swaps that attribute for the call. A probe of the attribute
+    names the compiled function loads, not of its source text, so a reformat or a renamed local keeps it."""
+    if select is None:
+        return False
+    code = getattr(inspect.unwrap(select), "__code__", None)
+    return code is not None and "capture_fn" in code.co_names
+
+
+def _patch_vllm_routed_weights():
+    """Make the in-process vLLM return fp32 top-k weights beside the expert ids. Every transport
+    (0.28 - 0.30 slot buffer, 0.31+ aux output connector) sizes itself from
+    _get_routed_experts_shape, so widening its top-k to 3k columns (ids, low and high halves of the
+    fp32 bits; 257 experts selects uint16) carries the weights end to end. True when patched."""
+    global _VLLM_WEIGHTS_PACKED
+    if _VLLM_WEIGHTS_PACKED:
+        return True
+    try:
+        from vllm.model_executor.layers.fused_moe import routed_experts_capturer as capturer_module
+        from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+    except Exception:
+        return False
+    shape_fn = getattr(capturer_module, "_get_routed_experts_shape", None)
+    capturer_cls = getattr(capturer_module, "RoutedExpertsCapturer", None)
+    select = getattr(BaseRouter, "_select_experts", None)
+    capture = getattr(capturer_cls, "capture", None)
+    if shape_fn is None or capture is None or not _select_reads_capture_fn(select):
+        return False
+    if getattr(shape_fn, "_unsloth_routed_weights", False):
+        _VLLM_WEIGHTS_PACKED = True
+        return True
+
+    @functools.wraps(shape_fn)
+    def routed_experts_shape(*args, **kwargs):
+        global _PACKED_TOP_K
+        num_layers, num_experts, top_k = shape_fn(*args, **kwargs)
+        _PACKED_TOP_K = top_k
+        return num_layers, max(num_experts, 257), 3 * top_k
+
+    @functools.wraps(capture)
+    def capture_with_weights(self, layer_id, topk_ids, *args, **kwargs):
+        width = self.device_buffer.shape[-1]
+        if topk_ids.dim() == 2 and 3 * topk_ids.shape[-1] == width:
+            # Ids only (a monolithic kernel, a model's own capture source): zero weights = none.
+            topk_ids = torch.cat([topk_ids.to(torch.int32), topk_ids.new_zeros(
+                (topk_ids.shape[0], 2 * topk_ids.shape[-1]), dtype = torch.int32,
+            )], dim = -1)
+        return capture(self, layer_id, topk_ids, *args, **kwargs)
+
+    @functools.wraps(select)
+    def select_experts_with_weights(self, *args, **kwargs):
+        capture_fn = self.capture_fn
+        if capture_fn is None:
+            return select(self, *args, **kwargs)
+        logical = []
+        # The original captures the logical ids before EPLB mapping: take them from its call.
+        self.capture_fn = logical.append
+        try:
+            topk_weights, topk_ids = select(self, *args, **kwargs)
+        finally:
+            self.capture_fn = capture_fn
+        capture_fn(_pack_routed_weights(logical[0] if logical else topk_ids, topk_weights))
+        return topk_weights, topk_ids
+
+    routed_experts_shape._unsloth_routed_weights = True
+    capturer_module._get_routed_experts_shape = routed_experts_shape
+    capturer_cls.capture = capture_with_weights
+    BaseRouter._select_experts = select_experts_with_weights
+    _VLLM_WEIGHTS_PACKED = True
+    return True
 
 
 def _engine_arg_names():
@@ -100,6 +229,24 @@ def _config_is_hybrid_attention(config):
     return False
 
 
+def _loop_passes(config):
+    """Passes over the same decoder layers (Inkling-2 style looped models), 1 when not looped."""
+    for sub in (config, getattr(config, "text_config", None)):
+        value = getattr(sub, "loop_num_passes", None) if sub is not None else None
+        if isinstance(value, int) and value > 1:
+            return value
+    return 1
+
+
+def _warn_looped(passes):
+    warnings.warn(
+        f"Unsloth: MoE routing replay is off for this looped model (loop_num_passes = {passes}): it keys "
+        "routes by layer, and every pass reuses the same layers and routers, so the passes' routes would "
+        "overwrite each other.",
+        stacklevel = 3,
+    )
+
+
 def _vllm_at_least(major, minor):
     try:
         from importlib.metadata import version
@@ -113,6 +260,9 @@ def _vllm_at_least(major, minor):
 def routing_replay_engine_args(config):
     """Extra vLLM engine args, empty unless requested, supported and the model is MoE."""
     if not routing_replay_requested() or not _config_is_moe(config):
+        return {}
+    if _loop_passes(config) > 1:
+        _warn_looped(_loop_passes(config))
         return {}
     if not vllm_supports_routed_experts():
         warnings.warn(
@@ -143,6 +293,12 @@ def routing_replay_engine_args(config):
     # capture all zeros (vllm-project/vllm#44116); the Triton backend goes through the hook.
     if "moe_backend" in _engine_arg_names():
         args["moe_backend"] = "triton"
+    if routing_weights_requested() and not _patch_vllm_routed_weights():
+        warnings.warn(
+            f"Unsloth: {ROUTING_REPLAY_WEIGHTS_ENV}=1 needs vLLM 0.28 or newer to return routing weights; "
+            "routing replay forces the rollout's expert ids and recomputes their weights.",
+            stacklevel = 2,
+        )
     return args
 
 
@@ -170,10 +326,25 @@ class _ReplayState:
             router_calls_replayed = 0,
             router_calls_natural = 0,
             router_calls_recomputed = 0,
+            r2_recorded = 0,
+            r2_replayed_tokens = 0,
         )
         self.changed = None
         self.warned_invalid = False
         self.warned_evicted = False
+        # Rollout fp32 routing weights [tokens, layers, k] beside `current` (NaN: none for that row).
+        self.current_weights = None
+        # R2: old-policy routes recorded by forwards without grad, attended tokens -> int16 rows.
+        self.r2_on = False
+        self.r2_exact = OrderedDict()
+        self.r2_unpadded = OrderedDict()
+        self.r2_capture = None
+        self.r2_meta = None
+        # Rollouts seen: R2 records nothing before the first, and each one starts a fresh table.
+        self.r2_rollout = 0
+        self.r2_generating = False
+        self.num_layers = None
+        self.moe_layers = ()
 
 
 _STATE = _ReplayState()
@@ -186,7 +357,9 @@ def reset_routing_replay():
 
 def routing_replay_stats():
     out = dict(_STATE.stats)
-    out["changed_selections"] = 0 if _STATE.changed is None else int(_STATE.changed.item())
+    changed = [0, 0] if _STATE.changed is None else _STATE.changed.reshape(-1).tolist()
+    out["changed_selections"] = int(changed[0])
+    out["replayed_weight_rows"] = int(changed[1]) if len(changed) > 1 else 0
     return out
 
 
@@ -220,14 +393,16 @@ def _count_conflicts(a, b):
         _STATE.stats["conflicting_routes"] = _STATE.stats.get("conflicting_routes", 0) + conflicts
 
 
-def _fill_prefix(rows, full, start, store):
-    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1."""
+def _fill_prefix(rows, full, start, store, weights = None):
+    """Fill rows [0, start) from this rollout's captures sharing that prefix; disagreeing captures leave -1.
+    `weights`: this capture's weight rows, filled from the same captures as the ids (so their order matches)."""
     prefix = tuple(full[:start])
     stores = [store]
     if not _STATE.forwarded_since_record and _STATE.generations:
         # Earlier rollouts ran on older weights: their routes are not this policy's.
         stores += [call[0] for call in reversed(next(reversed(_STATE.generations.values())))]
     merged = rows[:start].clone()
+    merged_weights = None if weights is None else weights[:start].clone()
     seen = torch.zeros(rows.shape[:-1], dtype = torch.bool)[:start]
     conflict = seen.clone()
     for candidate in stores:
@@ -243,16 +418,54 @@ def _fill_prefix(rows, full, start, store):
             new = routed & ~seen[:m]
             if bool(new.any()):
                 merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
+                if merged_weights is not None:
+                    earlier_weights = getattr(candidate, "weights", {}).get(key, None)
+                    part_weights = torch.full(part.shape, float("nan")) if earlier_weights is None \
+                        or earlier_weights.shape[1:] != part.shape[1:] else earlier_weights[:m]
+                    merged_weights[:m] = torch.where(new.unsqueeze(-1), part_weights, merged_weights[:m])
                 seen[:m] |= new
     keep = seen & ~conflict
     rows[:start] = torch.where(keep.unsqueeze(-1), merged, rows[:start])
+    if weights is not None:
+        weights[:start] = torch.where(keep.unsqueeze(-1), merged_weights, weights[:start])
+
+
+class _Store(dict):
+    """token ids -> expert id rows of one generate call; `weights` holds their fp32 routing weights
+    (NaN where vLLM returned none) for the keys it has them for."""
+
+    def __init__(self):
+        super().__init__()
+        self.weights = {}
+
+
+def _as_routes(routed):
+    """(ids int16, weights fp32 or None) from one vLLM capture."""
+    routed = torch.as_tensor(routed)
+    if _PACKED_TOP_K and routed.dim() >= 1 and routed.shape[-1] == 3 * _PACKED_TOP_K:
+        ids, weights = _unpack_routed_weights(routed, _PACKED_TOP_K)
+        return ids.to(torch.int16), weights
+    return routed.to(torch.int16), None
+
+
+def _clean_weights(rows, weights):
+    # Usable top-k weights are finite and non-negative; an all zero row is an ids-only capture. Their scale is
+    # the router's (DeepSeek-V3 multiplies by routed_scaling_factor, so rows may sum past 1): whether a row
+    # matches this router's normalisation and values is checked per router where it is used
+    # (_apply_rollout_weights).
+    w = weights.float()
+    ok = torch.isfinite(w).all(-1) & (w >= 0).all(-1)
+    ok &= (w > 0).any(-1) & ~(rows < 0).any(-1)
+    return torch.where(ok.unsqueeze(-1), w, torch.full_like(w, float("nan")))
 
 
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
-    """Store per-token expert ids per completion; prompt_starts = routed_experts_prompt_start."""
+    """Store vLLM's per-token expert ids (and routing weights, when the engine returns them) per
+    finished completion. prompt_starts: per-request `SamplingParams.routed_experts_prompt_start`
+    (prompt position of the first returned row)."""
     if pad_token_id is None:
         pad_token_id = _STATE.pad_token_id
-    store = {}
+    store = _Store()
     unpadded = {}
     for index, request_output in enumerate(request_outputs):
         prompt_ids = list(getattr(request_output, "prompt_token_ids", None) or [])
@@ -260,30 +473,39 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
         # vLLM 0.21 returns prompt routes on the request, generated-token routes on the completion.
         split = hasattr(request_output, "prompt_routed_experts")
         prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+        prompt_weights = None
         if prompt_routed is not None:
-            prompt_routed = torch.as_tensor(prompt_routed).to(torch.int16)
+            prompt_routed, prompt_weights = _as_routes(prompt_routed)
         for completion in getattr(request_output, "outputs", None) or []:
             routed = getattr(completion, "routed_experts", None)
+            weights = None
             if routed is None and split and prompt_routed is not None:
                 # vLLM 0.21 returns None for an empty generation part; the prompt part stays on the request.
                 routed = prompt_routed[:0]
+                weights = None if prompt_weights is None else prompt_weights[:0]
+            elif routed is not None:
+                routed, weights = _as_routes(routed)
             if routed is None:
                 continue
             full = prompt_ids + list(completion.token_ids)
-            routed = torch.as_tensor(routed).to(torch.int16)
             # vLLM never forwards the last sampled token, so it has no routing.
             rows = torch.full((len(full),) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
+            wrows = None
+            if weights is not None or prompt_weights is not None:
+                wrows = torch.full(rows.shape, float("nan"), dtype = torch.float32)
             if split:
-                parts = [(len(prompt_ids), routed)]
+                parts = [(len(prompt_ids), routed, weights)]
                 if prompt_routed is not None and prompt_routed.shape[1:] == routed.shape[1:]:
-                    parts.append((0, prompt_routed[: len(prompt_ids)]))
+                    parts.append((0, prompt_routed[: len(prompt_ids)], prompt_weights))
             else:
-                parts = [(start, routed)]
-            for offset, part in parts:
+                parts = [(start, routed, weights)]
+            for offset, part, part_weights in parts:
                 n = max(0, min(len(full) - offset, part.shape[0]))
                 rows[offset : offset + n] = part[:n]
+                if wrows is not None and part_weights is not None and part_weights.shape[1:] == wrows.shape[1:]:
+                    wrows[offset : offset + n] = part_weights[:n]
             if start > 0 and not split:
-                _fill_prefix(rows, full, start, store)
+                _fill_prefix(rows, full, start, store, wrows)
             if rows.shape[-1] > 1:
                 # A real top-k picks distinct experts; repeats (an all-zero capture) are not routing.
                 ordered = rows.sort(dim = -1).values
@@ -297,12 +519,19 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
                             "Unsloth: vLLM returned routed experts with repeated ids; those tokens keep "
                             "the trainer's own routing."
                         )
+            if wrows is not None:
+                wrows = _clean_weights(rows, wrows)
             # Keyed by every token: a pad id inside the sequence (pad == eos) can be real.
             key = tuple(full)
             if key in store:
                 _count_conflicts(store[key], rows)
                 rows = _agreed(store[key], rows)
+                # _agreed keeps the earlier capture's expert order: only its weights stay aligned.
+                wrows = store.weights.get(key, None)
             store[key] = rows
+            if wrows is not None:
+                store.weights[key] = wrows
+                _STATE.stats["recorded_weights"] = _STATE.stats.get("recorded_weights", 0) + 1
             if pad_token_id is not None:
                 unpadded[_make_key(full, pad_token_id)] = key
             _STATE.stats["recorded"] += 1
@@ -330,21 +559,36 @@ def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = 
 
 def _lookup(key, exact = False):
     """Rows for `key`: all attended tokens when `exact`, else the tokens with pad ids dropped."""
+    return _lookup_routes(key, exact)[0]
+
+
+def _lookup_routes(key, exact = False):
+    """(expert id rows, fp32 weight rows or None) for `key`; (None, None) when unrecorded."""
     for rollout in reversed(_STATE.generations.values()):
-        found = None
+        found = found_weights = None
         for store, unpadded, pad in reversed(rollout):
+            weights = None
             if exact or pad is None:
                 rows = store.get(key, None)
+                if rows is not None:
+                    weights = getattr(store, "weights", {}).get(key, None)
             else:
                 full = unpadded.get(key, None)
                 rows = None
                 if full is not None:
-                    rows = store[full][torch.tensor([t != pad for t in full], dtype = torch.bool)]
+                    keep = torch.tensor([t != pad for t in full], dtype = torch.bool)
+                    rows = store[full][keep]
+                    weights = getattr(store, "weights", {}).get(full, None)
+                    weights = None if weights is None else weights[keep]
             if rows is not None:
-                found = rows if found is None else _agreed(found, rows)
+                if found is None:
+                    found, found_weights = rows, weights
+                else:
+                    # The first (latest) capture's expert order is kept: only its weights stay aligned.
+                    found = _agreed(found, rows)
         if found is not None:
-            return found.clamp_min(-1)
-    return None
+            return found.clamp_min(-1), found_weights
+    return None, None
 
 
 def _prompt_starts(args, kwargs, count):
@@ -369,6 +613,7 @@ def wrap_vllm_generate(llm):
 
     @functools.wraps(generate)
     def generate_with_routing_record(*args, **kwargs):
+        _r2_new_rollout()
         outputs = generate(*args, **kwargs)
         try:
             outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
@@ -394,53 +639,157 @@ def _segments(input_ids, position_ids):
     return [(r, 0, T) for r in range(rows)]
 
 
-def _build_replay(input_ids, position_ids, attention_mask = None):
-    if not _STATE.generations:
+def _fit_layers(rows, width, fill):
+    """Rows in another layer numbering: vLLM 0.21+ numbers MoE layers only, R2 every decoder layer."""
+    if rows.shape[1] == width:
+        return rows
+    moe = list(_STATE.moe_layers)
+    if not moe or _STATE.num_layers is None:
+        return None
+    if rows.shape[1] == len(moe) and width == _STATE.num_layers:
+        out = torch.full((rows.shape[0], width) + tuple(rows.shape[2:]), fill, dtype = rows.dtype)
+        out[:, moe] = rows
+        return out
+    if rows.shape[1] == _STATE.num_layers and width == len(moe):
+        return rows[:, moe]
+    return None
+
+
+def _r2_new_rollout():
+    if _STATE.r2_on:
+        _STATE.r2_exact.clear()
+        _STATE.r2_unpadded.clear()
+        _STATE.r2_rollout += 1
+
+
+def _r2_lookup(key, exact):
+    if not _STATE.r2_on:
+        return None
+    rows = (_STATE.r2_exact if exact else _STATE.r2_unpadded).get(key, None)
+    return None if rows is None else torch.from_numpy(rows)
+
+
+def _build_replay(input_ids, position_ids, attention_mask = None, use_r2 = False, r2_new = None):
+    """Replay rows for this forward. r2_new: a list that receives the (row, start, end) segments
+    neither R3 nor R2 has routes for, for R2 to record."""
+    _STATE.current_weights = None
+    if not _STATE.generations and not use_r2:
         return None
     pad = _STATE.pad_token_id
     ids = input_ids.detach().to("cpu")
     rows, T = ids.shape
-    out = None
-    replayed = unmatched = 0
+    out = out_weights = None
+    replayed = unmatched = r2_replayed = 0
     ids_list = ids.tolist()
     mask_list = None
     if torch.is_tensor(attention_mask) and tuple(attention_mask.shape) == (rows, T):
         mask_list = attention_mask.detach().to("cpu").bool().tolist()
     for row, start, end in _segments(ids, position_ids):
         tokens = ids_list[row][start:end]
-        routed = None
+        routed = weights = None
+        from_r2 = False
         if mask_list is not None:
             # Padding is what the mask leaves out, so real pad id tokens keep their routing.
             cols = [start + i for i in range(end - start) if mask_list[row][start + i]]
             if cols:
                 attended = tuple(ids_list[row][c] for c in cols)
-                routed = _lookup(attended, exact = True)
+                routed, weights = _lookup_routes(attended, exact = True)
+                if routed is None and use_r2:
+                    routed = _r2_lookup(attended, exact = True)
+                    from_r2 = routed is not None
                 if routed is None and pad is not None and pad in attended:
                     # An attended pad id is a real token (pad == eos): dropping it would match
                     # another history, so a miss keeps the natural routing.
                     unmatched += len(cols)
+                    if r2_new is not None:
+                        r2_new.append((row, start, end))
                     continue
         elif pad is not None and pad in tokens:
             # Packed segments hold only attended tokens: try the whole history first.
             cols = list(range(start, end))
-            routed = _lookup(tuple(tokens), exact = True)
+            routed, weights = _lookup_routes(tuple(tokens), exact = True)
+            if routed is None and use_r2:
+                routed = _r2_lookup(tuple(tokens), exact = True)
+                from_r2 = routed is not None
         if routed is None:
             cols = [start + i for i, t in enumerate(tokens) if pad is None or t != pad]
             if not cols:
                 continue
-            routed = _lookup(_make_key(tokens, pad))
+            routed, weights = _lookup_routes(_make_key(tokens, pad))
+            if routed is None and use_r2:
+                routed = _r2_lookup(_make_key(tokens, pad), exact = False)
+                from_r2 = routed is not None
+        if routed is None and r2_new is not None:
+            r2_new.append((row, start, end))
         if routed is None or routed.shape[0] != len(cols):
             unmatched += len(cols)
             continue
         if out is None:
             out = torch.full((rows * T,) + tuple(routed.shape[1:]), -1, dtype = torch.int16)
-        out[torch.tensor(cols) + row * T] = routed
+            if _VLLM_WEIGHTS_PACKED:
+                out_weights = torch.full(out.shape, float("nan"), dtype = torch.float32)
+        routed = _fit_layers(routed, out.shape[1], -1) if routed.dim() == 3 and out.dim() == 3 else routed
+        if routed is None or routed.shape[1:] != out.shape[1:]:
+            unmatched += len(cols)
+            continue
+        index = torch.tensor(cols) + row * T
+        out[index] = routed.to(torch.int16)
+        if out_weights is not None and weights is not None:
+            weights = _fit_layers(weights, out.shape[1], float("nan")) if weights.dim() == 3 else None
+            if weights is not None and weights.shape[1:] == out_weights.shape[1:]:
+                out_weights[index] = weights
         replayed += len(cols)
+        r2_replayed += len(cols) if from_r2 else 0
     _count("replayed_tokens", replayed)
     _count("unmatched_tokens", unmatched)
+    if r2_replayed:
+        _count("r2_replayed_tokens", r2_replayed)
     if out is None:
         return None
+    if out_weights is not None:
+        _STATE.current_weights = out_weights.to(input_ids.device, non_blocking = True)
     return out.to(input_ids.device, non_blocking = True).long()
+
+
+def _r2_store_forward():
+    """Store the routes a forward without grad used, per row, as the old policy's (R2)."""
+    capture, meta = _STATE.r2_capture, _STATE.r2_meta
+    _STATE.r2_capture = _STATE.r2_meta = None
+    if not capture or meta is None or _STATE.num_layers is None:
+        return
+    ids, position_ids, attention_mask, segments = meta
+    rows, T = ids.shape
+    k = next(iter(capture.values())).shape[-1]
+    full = torch.full((rows * T, _STATE.num_layers, k), -1, dtype = torch.int16)
+    for layer_index, routed in capture.items():
+        if layer_index < _STATE.num_layers and routed.shape == (rows * T, k):
+            full[:, layer_index] = routed.to("cpu", torch.int16)
+    full = full.numpy().copy()  # numpy: forwards under inference_mode make inference tensors
+    pad = _STATE.pad_token_id
+    ids_list = ids.tolist()
+    mask_list = None
+    if torch.is_tensor(attention_mask) and tuple(attention_mask.shape) == (rows, T):
+        mask_list = attention_mask.detach().to("cpu").bool().tolist()
+    stored = 0
+    for row, start, end in segments:
+        if mask_list is not None:
+            cols = [start + i for i in range(end - start) if mask_list[row][start + i]]
+        else:
+            cols = list(range(start, end))
+        if not cols:
+            continue
+        tokens = [ids_list[row][c] for c in cols]
+        exact = tuple(tokens)
+        # The first forward of a row after the rollout is pi_old's: later ones never overwrite it.
+        _STATE.r2_exact.setdefault(exact, full[[c + row * T for c in cols]])
+        # Without a pad id the key keeps every token, as the lookup's does.
+        kept = [c for c, t in zip(cols, tokens) if pad is None or t != pad]
+        _STATE.r2_unpadded.setdefault(_make_key(tokens, pad), full[[c + row * T for c in kept]])
+        stored += 1
+    for table in (_STATE.r2_exact, _STATE.r2_unpadded):
+        while len(table) > _MAX_R2_ROWS:
+            table.popitem(last = False)
+    _count("r2_recorded", stored)
 
 
 _MEDIA_KWARGS = ("pixel_values", "pixel_values_videos", "input_features")
@@ -481,20 +830,41 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = (), moe_layers = 
                     "the oldest ones recompute with the trainer's own routing, so their gradients no longer "
                     "match their forward. Run backward more often (fewer chunks per backward)."
                 )
+    _STATE.r2_capture = _STATE.r2_meta = None
+    use_r2 = False
+    if _STATE.r2_on:
+        # Generation hands the decoder a KV cache; scoring forwards build none before the call.
+        # transformers 5.24 renamed past_key_values to cache.
+        generating = any(kwargs.get(name, None) is not None for name in _CACHE_KWARGS)
+        if generating and not _STATE.r2_generating:
+            _r2_new_rollout()
+        _STATE.r2_generating = generating
+        use_r2 = not generating and _STATE.r2_rollout > 0
     if input_ids is None or input_ids.dim() != 2:
         _STATE.current = None
+        _STATE.current_weights = None
         return None
-    # Left set on purpose: the backward's checkpoint recompute must replay the same routing.
-    _STATE.current = _build_replay(
-        input_ids, kwargs.get("position_ids", None), kwargs.get("attention_mask", None),
-    )
+    r2_new = [] if use_r2 else None
+    position_ids, attention_mask = kwargs.get("position_ids", None), kwargs.get("attention_mask", None)
+    # Left set after the forward on purpose: the gradient checkpointing recompute in
+    # backward must see the same routing as the forward it replays.
+    _STATE.current = _build_replay(input_ids, position_ids, attention_mask, use_r2 = use_r2, r2_new = r2_new)
+    if r2_new:
+        # R2: rows seen for the first time since the rollout record the routes this forward uses.
+        _STATE.r2_capture = {}
+        _STATE.r2_meta = (input_ids.detach().to("cpu"), position_ids, attention_mask, r2_new)
     return None
 
 
 def _decoder_post_hook(module, args, output):
     _STATE.in_forward = False
     _STATE.record = None
+    if _STATE.r2_capture is not None:
+        _r2_store_forward()
     return None
+
+
+_CACHE_KWARGS = ("cache", "past_key_values", "past_key_value", "cache_params")
 
 
 def _uses_checkpointing(decoder):
@@ -573,22 +943,28 @@ def _compiled_recomputed_routes(layer_index, ids2, signature, layer_input):
     return _RECOMPUTE_OP(ids2, signature, layer_input, layer_index)
 
 
+def _no_weights(ids2):
+    return torch.full(ids2.shape, float("nan"), dtype = torch.float32, device = ids2.device)
+
+
 def _recompute_impl(
     ids2: torch.Tensor, signature: typing.Optional[torch.Tensor],
     layer_input: typing.Optional[torch.Tensor], layer_index: int,
-) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if _STATE.pending:
         # Run time: a non-reentrant recompute stops early, so a traced assignment would never run.
         _STATE.recomputed = True
     picked = _pick_recorded(layer_index, ids2, signature, layer_input) if _STATE.pending else _NATURAL
     if picked is _NATURAL:
-        return _natural_impl(ids2)
-    forced, valid = picked
-    return forced.long().clone(), valid.reshape(ids2.shape[0], 1).to(ids2.device).clone()
+        return (*_natural_impl(ids2), _no_weights(ids2))
+    forced, valid = picked[0], picked[1]
+    weights = picked[2] if len(picked) > 2 else None
+    weights = _no_weights(ids2) if weights is None else weights.to(ids2.device, torch.float32).clone()
+    return forced.long().clone(), valid.reshape(ids2.shape[0], 1).to(ids2.device).clone(), weights
 
 
 def _recompute_fake(ids2, signature, layer_input, layer_index):
-    return _natural_fake(ids2)
+    return (*_natural_fake(ids2), ids2.new_empty(ids2.shape, dtype = torch.float32))
 
 
 def _natural_impl(ids2: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
@@ -635,7 +1011,15 @@ def _pick_recorded(layer_index, ids2, signature, layer_input):
     # natural routing; only the expert set counts, not its order.
     agree = ((forced_all.sort(-1).values == forced.sort(-1).values).flatten(1).all(-1) | ~match).all()
     valid = torch.stack([c[2] for c in candidates]).index_select(0, pick)[0] & match.any() & agree
-    return forced, valid
+    if not any(len(c) > 5 and c[5] is not None for c in candidates):
+        return forced, valid
+    # Rollout weights the picked forward replayed, so its recompute uses the same values.
+    weights = torch.stack([
+        c[5].to(forced.device, torch.float32) if len(c) > 5 and c[5] is not None and c[5].shape == forced.shape
+        else torch.full(forced.shape, float("nan"), dtype = torch.float32, device = forced.device)
+        for c in candidates
+    ]).index_select(0, pick.to(forced.device))[0]
+    return forced, valid, weights
 
 
 def _softmax_gather(logits, ids, renorm):
@@ -661,6 +1045,94 @@ def _probs_gather(probs, ids, renorm):
     return torch.where(ok, out, torch.zeros_like(out))
 
 
+_DEFAULT_RENORM_EPS = 1e-20
+_RENORM_EPS_RE = re.compile(r"\.sum\([^()]*\)\s*\+\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\)")
+
+
+def _sigmoid_gather(logits, ids, renorm, eps = _DEFAULT_RENORM_EPS):
+    # DeepSeek-V3 / GLM-4 MoE style: the score correction bias only picks the experts; the weights are the
+    # unbiased sigmoid scores over the picked ones, renormalised with the router's own floor (1e-20 there).
+    w = logits.float().sigmoid().gather(-1, ids)
+    if not renorm:
+        return w
+    return w / (w.sum(dim = -1, keepdim = True) + eps)
+
+
+def _renorm_eps(module):
+    """The constant the router adds to the top-k sum before dividing (LFM2-MoE: 1e-6, DeepSeek-V3 / HY-V3:
+    1e-20), read once from its forward's source. On natural selections it is negligible, so detection cannot tell
+    it apart; on forced low-score experts it decides the weights. 1e-20 when the source has none."""
+    eps = getattr(module, "_unsloth_replay_eps", None)
+    if eps is not None:
+        return eps
+    eps = _DEFAULT_RENORM_EPS
+    try:
+        found = _RENORM_EPS_RE.findall(inspect.getsource(type(module).forward))
+        values = {float(v) for v in found}
+        if len(values) == 1:
+            eps = max(values.pop(), _DEFAULT_RENORM_EPS)
+    except (OSError, TypeError, ValueError):
+        pass
+    module._unsloth_replay_eps = eps
+    return eps
+
+
+def _reweight(formula, module, logits, ids):
+    if formula == "sigmoid_renorm":
+        return _sigmoid_gather(logits, ids, True, _renorm_eps(module))
+    return _formulas()[formula](logits, ids)
+
+
+def _replay_scale(module):
+    """The factor the router multiplies its top-k weights by (routed_scaling_factor), 1.0 when it has none."""
+    return float(getattr(module, "_unsloth_replay_scale", 1.0))
+
+
+def _scale_candidates(module):
+    # A router may apply its scaling factor itself (DeepSeek-V3, HY-V3, LFM2-MoE) or leave it to its MoE block:
+    # try both.
+    for name in ("routed_scaling_factor", "router_scaling_factor"):
+        scale = getattr(module, name, None)
+        try:
+            scale = float(scale)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(scale) and scale > 0 and scale != 1.0:
+            return (scale, 1.0)
+    return (1.0,)
+
+
+_BIAS_ARGS = ("e_score_correction_bias", "expert_bias")
+
+
+def _bias_routed(module):
+    """True for a router that picks experts by biased scores: it holds the bias, or its forward takes it."""
+    if any(hasattr(module, name) for name in _BIAS_ARGS):
+        return True
+    try:
+        params = inspect.signature(type(module).forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return any(name in params for name in _BIAS_ARGS)
+
+
+def _apply_rollout_weights(weights, rollout, valid, renorm, total = 1.0):
+    """Straight-through: the rollout's weight values, the gradient of the trainer's `weights`.
+    Rows whose rollout weights are missing, not normalised like this router's (to `total`, its
+    routed_scaling_factor), or far from the trainer's keep the trainer's. The delta is built without grad, so autograd saves nothing new
+    (a non-reentrant checkpoint compares what its recompute saves)."""
+    with torch.no_grad():
+        trainer = weights.detach().float()
+        rollout = rollout.to(trainer.device, torch.float32)
+        diff = rollout - trainer
+        ok = valid & torch.isfinite(rollout).all(-1, keepdim = True)
+        ok = ok & (diff.abs() <= _WEIGHT_TOLERANCE).all(-1, keepdim = True)
+        if renorm:
+            ok = ok & ((rollout.sum(-1, keepdim = True) - total).abs() <= 1e-2 * max(1.0, total))
+        delta = torch.where(ok, diff, torch.zeros_like(diff)).to(weights.dtype)
+    return weights + delta, ok.sum()
+
+
 def _formulas():
     # gpt-oss = softmax_renorm; transformers 5.2-5.7 Qwen MoE routers return probs as logits.
     return OrderedDict(
@@ -668,7 +1140,18 @@ def _formulas():
         softmax = lambda logits, ids: _softmax_gather(logits, ids, False),
         probs_renorm = lambda probs, ids: _probs_gather(probs, ids, True),
         probs = lambda probs, ids: _probs_gather(probs, ids, False),
+        sigmoid_renorm = lambda logits, ids: _sigmoid_gather(logits, ids, True),
+        sigmoid = lambda logits, ids: _sigmoid_gather(logits, ids, False),
     )
+
+
+def _formula_order(module):
+    """Formula names in the order they are tried: sigmoid first for a router with a score correction bias, since
+    near-zero logits make a renormalised sigmoid and a renormalised softmax agree (both about 1/k)."""
+    names = list(_formulas())
+    if _bias_routed(module):
+        names = [n for n in names if n.startswith("sigmoid")] + [n for n in names if not n.startswith("sigmoid")]
+    return names
 
 
 def _looks_like_probs(logits2):
@@ -763,9 +1246,16 @@ def _router_hook(layer_index, compact = None):
             or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
         )
-        # Reweight here too so the non-reentrant checkpoint sees identical saved tensors.
-        mirror = natural and _STATE.record is not None and torch.compiler.is_compiling() \
-            and isinstance(getattr(module, "_unsloth_replay_formula", None), str)
+        # The recompute reweights whenever another pending forward replayed this layer (compiled:
+        # always, via the opaque pick); reweight here too (all rows invalid) so the non-reentrant
+        # checkpoint sees identical saved tensors. Eager too: a replayed and a natural forward of the
+        # same length before one backward (rows without rollout routes) hit it there as well.
+        # Eager, a router without a formula yet picks it here (below), so the first checkpointed forward
+        # mirrors too: with R2 that forward is natural and the later ones of the same rows are replayed.
+        known = getattr(module, "_unsloth_replay_formula", None)
+        mirror = natural and _STATE.record is not None and (
+            isinstance(known, str) or (known is None and not torch.compiler.is_compiling())
+        )
         if natural and not mirror:
             _count("router_calls_natural")
             return None
@@ -776,15 +1266,20 @@ def _router_hook(layer_index, compact = None):
             probs = _looks_like_probs(logits2)
             # norm_topk_prob decides renormalising; top-k mass near one would fool the check.
             renorm = getattr(module, "norm_topk_prob", None)
-            for name, fn in _formulas().items():
+            for name in _formula_order(module):
                 if name.startswith("probs") != probs:
                     continue
                 if isinstance(renorm, bool) and name.endswith("_renorm") != renorm:
                     continue
                 with torch.no_grad():
-                    candidate = fn(logits2, ids2).to(weights2.dtype).float()
-                if torch.allclose(candidate, weights2.float(), rtol = 2e-2, atol = 2e-3):
-                    formula = name
+                    candidate = _reweight(name, module, logits2, ids2).float()
+                for scale in _scale_candidates(module):
+                    scaled = (candidate * scale).to(weights2.dtype).float()
+                    if torch.allclose(scaled, weights2.float(), rtol = 2e-2, atol = 2e-3):
+                        formula = name
+                        module._unsloth_replay_scale = scale
+                        break
+                if formula is not None:
                     break
             else:
                 formula = False
@@ -800,37 +1295,54 @@ def _router_hook(layer_index, compact = None):
         if mirror:
             # Opaque: in-graph constants are rematerialised in backward, so saved tensors would differ.
             recomputed = _NATURAL_OP(ids2)
+        rollout_weights = None
         if recomputed is None:
             # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
             forced = replay[:, row, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
+            current_weights = _STATE.current_weights
+            if current_weights is not None and current_weights.shape == replay.shape:
+                rollout_weights = current_weights[:, row, :].to(ids2.device, non_blocking = True)
             if _STATE.record is not None:
                 _STATE.has_pending = True
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
                 _STATE.record[layer_index] = (
-                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input, rollout_weights,
                 )
         else:
-            forced, valid = recomputed
+            forced, valid = recomputed[0], recomputed[1]
+            rollout_weights = recomputed[2] if len(recomputed) > 2 and _VLLM_WEIGHTS_PACKED else None
             forced = torch.where(valid, forced, ids2.long())
             if mirror:
                 # Recorded too, else an identical replayed forward would donate its forced experts.
                 _STATE.record[layer_index] = (
-                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input, None,
                 )
-        reweight = _formulas()[formula]
-        new_weights = reweight(logits2, forced)
-        if formula == "probs_renorm":
-            # Forced probs (nearly) underflow: nothing to replay, so keep the natural routing.
+        new_weights = _reweight(formula, module, logits2, forced)
+        scale = _replay_scale(module)
+        if scale != 1.0:
+            new_weights = new_weights * scale
+        if formula in ("probs_renorm", "sigmoid_renorm"):
+            # The forced probabilities (nearly) all underflowed: nothing to replay with, so keep the
+            # natural routing (_probs_gather returns zeros there).
             valid = valid & (new_weights.sum(dim = -1, keepdim = True) > 0)
             forced = torch.where(valid, forced, ids2.long())
+        weight_rows = None
+        if rollout_weights is not None:
+            new_weights, weight_rows = _apply_rollout_weights(
+                new_weights, rollout_weights, valid, formula.endswith("_renorm"), scale,
+            )
         new_weights = new_weights.to(weights2.dtype)
         new_weights = torch.where(valid, new_weights, weights2)
         with torch.no_grad():
             changed = (forced.sort(-1).values != ids2.long().sort(-1).values).any(-1).sum()
+            # One counter tensor (changed selections, rows on rollout weights): a second one would add a
+            # recompile when it first turns from None into a tensor.
+            changed = torch.stack([changed, torch.zeros_like(changed) if weight_rows is None else weight_rows.to(changed)])
             _STATE.changed = changed if _STATE.changed is None else _STATE.changed + changed.to(_STATE.changed.device)
-        _count("router_calls_replayed")
+        # A mirrored call keeps every row natural.
+        _count("router_calls_natural" if mirror else "router_calls_replayed")
 
         if dense:
             new_weights = torch.zeros_like(scores2).scatter(-1, forced, new_weights)
@@ -841,7 +1353,18 @@ def _router_hook(layer_index, compact = None):
         output[wi] = new_weights.reshape(weights.shape)
         return tuple(output)
 
-    return hook
+    def hook_with_r2(module, args, output):
+        result = hook(module, args, output)
+        if _STATE.r2_capture is not None and _STATE.in_forward:
+            # R2: the experts this forward without grad routed to (forced or natural).
+            routed = output if result is None else result
+            positions = _split_router_output(routed)
+            if positions is not None:
+                ids = routed[positions[2]]
+                _STATE.r2_capture[layer_index] = ids.detach().reshape(-1, ids.shape[-1])
+        return result
+
+    return hook_with_r2
 
 
 def _input_addresses(tensors):
@@ -984,7 +1507,12 @@ def _is_router(module):
 
 def install_routing_replay(model, llm = None, tokenizer = None):
     """Hook every router of `model` and the decoder's forward. Returns the number of routers."""
-    if not routing_replay_requested() or getattr(model, "_unsloth_routing_replay_installed", False):
+    if not (routing_replay_requested() or old_policy_replay_requested()) \
+            or getattr(model, "_unsloth_routing_replay_installed", False):
+        return 0
+    passes = max(_loop_passes(getattr(m, "config", None)) for m in (model, getattr(model, "get_base_model", lambda: None)()))
+    if passes > 1:
+        _warn_looped(passes)
         return 0
     if llm is not None:
         wrap_vllm_generate(llm)
@@ -1013,6 +1541,9 @@ def install_routing_replay(model, llm = None, tokenizer = None):
         return 0
     moe_layers = sorted({layer_index for layer_index, _ in routers})
     dense = len(moe_layers) < len(decoder.layers)
+    _STATE.num_layers = len(decoder.layers)
+    _STATE.moe_layers = tuple(moe_layers)
+    _STATE.r2_on = old_policy_replay_requested()
     for layer_index, module in routers:
         compact = (moe_layers.index(layer_index), len(moe_layers)) if dense else None
         module.register_forward_hook(_router_hook(layer_index, compact))
@@ -1045,5 +1576,10 @@ def install_routing_replay(model, llm = None, tokenizer = None):
     )
     decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True
-    print(f"Unsloth: MoE routing replay is on for {len(routers)} routers.")
+    kinds = []
+    if routing_replay_requested():
+        kinds.append("rollout ids and weights" if _VLLM_WEIGHTS_PACKED else "rollout ids")
+    if _STATE.r2_on:
+        kinds.append("old-policy routes (R2)")
+    print(f"Unsloth: MoE routing replay is on for {len(routers)} routers ({', '.join(kinds)}).")
     return len(routers)

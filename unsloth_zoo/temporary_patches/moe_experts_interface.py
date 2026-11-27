@@ -465,6 +465,15 @@ def _patch_transformers_grouped_mm():
     def _grouped_mm(input, weight, offs, *args, **kwargs):
         if not args and not kwargs and input.dtype == weight.dtype and wanted(input, weight):
             return op(input, weight, offs)
+        count = getattr(moe_utils, "_count_grouped_mm_sync", None)
+        if count is not None and weight.dim() == 3:
+            can_use = getattr(transformers_moe, "_can_use_grouped_mm", None)
+            if can_use is not None and not can_use(input, weight, offs):
+                # transformers' own per-expert loop (offs.tolist()): always a sync.
+                count("opaque_loop")
+            else:
+                # transformers casts the input to the weight dtype first, so classify the call at weight.dtype.
+                count("torch_fallback", weight, weight, offs.shape[0])
         return original(input, weight, offs, *args, **kwargs)
 
     _grouped_mm._unsloth_patched = True

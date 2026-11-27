@@ -387,6 +387,7 @@ def test_active_gpt_oss_bnb4bit_forward_applies_the_replay_routing():
 def test_gpt_oss_v5_lora_forward_applies_the_replay_routing_once(monkeypatch, backend):
     """Non-4-bit GPT-OSS LoRA on transformers v5 assigns a native backend straight onto GptOssExperts.forward; that
     forward must route through the checkpoint hook exactly once per experts call."""
+    import importlib
     import sys
     import types
 
@@ -399,7 +400,9 @@ def test_gpt_oss_v5_lora_forward_applies_the_replay_routing_once(monkeypatch, ba
     fake = types.ModuleType("transformers.models.gpt_oss.modeling_gpt_oss")
     fake.GptOssExperts = GptOssExperts
     monkeypatch.setitem(sys.modules, "transformers.models.gpt_oss.modeling_gpt_oss", fake)
-    monkeypatch.setattr(sys.modules["transformers.models.gpt_oss"], "modeling_gpt_oss", fake, raising = False)
+    # Import the parent package rather than relying on an earlier test to have done it (order-dependent under xdist).
+    parent = importlib.import_module("transformers.models.gpt_oss")
+    monkeypatch.setattr(parent, "modeling_gpt_oss", fake, raising = False)
     monkeypatch.setattr(gpt_oss, "_normalized_unsloth_model_name", lambda: "gpt_oss")
     monkeypatch.setattr(gpt_oss, "_is_gpt_oss_4bit_load", lambda: False)
     monkeypatch.setattr(gpt_oss, "_should_use_gpt_oss_bnb4bit", lambda: False)

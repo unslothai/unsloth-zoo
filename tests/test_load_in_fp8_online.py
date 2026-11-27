@@ -138,3 +138,57 @@ def test_finalize_cast_keeps_float8_and_ties():
 
 def test_plain_model_reports_no_quantized_tensors():
     assert not _has_quantized_tensors(torch.nn.Linear(2, 2))
+
+
+def _ns(d):
+    from types import SimpleNamespace
+    return SimpleNamespace(**{k: _ns(v) if isinstance(v, dict) else v for k, v in d.items()})
+
+
+@pytest.mark.parametrize(
+    "env, layers, expected",
+    [
+        (None, 28, []),
+        ("0", 28, []),
+        ("1", 28, [23, 24, 25, 26, 27]),  # ceil(0.15 * 28) = 5
+        ("1", 36, [30, 31, 32, 33, 34, 35]),  # ceil(5.4) = 6
+        ("1", 20, [17, 18, 19]),  # 0.15 * 20 = 3 exactly: no float round-up to 4
+        ("0.5", 4, [2, 3]),
+        ("0.01", 4, [3]),
+    ],
+)
+def test_bf16_tail_layers(env, layers, expected, monkeypatch):
+    from unsloth_zoo.vllm_utils import _fp8_bf16_tail_fraction, _fp8_bf16_tail_layers
+    if env is None:
+        monkeypatch.delenv("UNSLOTH_FP8_BF16_TAIL", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_FP8_BF16_TAIL", env)
+    config = _ns({"text_config": {"num_hidden_layers": layers}})
+    assert _fp8_bf16_tail_layers(config, _fp8_bf16_tail_fraction()) == expected
+
+
+@pytest.mark.parametrize("env", ["2", "-0.1", "abc", "1.0"])
+def test_bf16_tail_bad_values(env, monkeypatch):
+    from unsloth_zoo.vllm_utils import _fp8_bf16_tail_fraction
+    monkeypatch.setenv("UNSLOTH_FP8_BF16_TAIL", env)
+    with pytest.raises(ValueError):
+        _fp8_bf16_tail_fraction()
+
+
+def test_bf16_tail_ignore_matches_vllm_prefixes(monkeypatch):
+    import re
+    from unsloth_zoo.vllm_utils import _vllm_online_fp8_bf16_tail_ignore
+    monkeypatch.delenv("UNSLOTH_FP8_BF16_TAIL", raising = False)
+    config = _ns({"num_hidden_layers": 28})
+    assert _vllm_online_fp8_bf16_tail_ignore(config) == []
+    monkeypatch.setenv("UNSLOTH_FP8_BF16_TAIL", "1")
+    ignore = _vllm_online_fp8_bf16_tail_ignore(config)
+    regs = [re.compile(x[3:]) for x in ignore]
+    hit = lambda name: any(r.match(name) for r in regs)  # vLLM should_ignore_layer: re.match
+    for name in ("model.layers.23.self_attn.qkv_proj", "model.layers.27.mlp.down_proj",
+                 "language_model.model.layers.25.mlp.gate_up_proj", "model.layers.3.mlp.shared_expert.gate_up_proj",
+                 "model.layers.0.mlp.shared_experts.down_proj"):
+        assert hit(name), name
+    for name in ("model.layers.22.self_attn.qkv_proj", "model.layers.2.mlp.down_proj", "model.layers.230.mlp.down_proj",
+                 "vision_tower.vision_model.encoder.layers.27.mlp.fc1", "lm_head", "model.layers.3.mlp.shared_expert_gate"):
+        assert not hit(name), name

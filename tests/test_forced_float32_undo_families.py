@@ -54,6 +54,9 @@ import transformers
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
 
 fam, loads, dtype = json.loads(sys.argv[1]), json.loads(sys.argv[2]), getattr(torch, sys.argv[3])
+# Results are compared bit for bit across processes, and a multi-threaded fp16 step on CPU is not
+# reproducible across processes (about 1 in 64 drifts by an ulp at 3 threads), so pin one thread.
+torch.set_num_threads(1)
 patch_module = importlib.import_module(fam["patches"])
 modeling = importlib.import_module(fam["modeling"])
 patches = [p for p in TEMPORARY_PATCHES if getattr(p, "__module__", "") == patch_module.__name__]
@@ -101,7 +104,7 @@ print("RESULT " + json.dumps(result))
 def _run(family, loads, dtype):
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
-        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", TORCHDYNAMO_DISABLE = "1",
+        UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", TORCHDYNAMO_DISABLE = "1", OMP_NUM_THREADS = "1",
     )
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(ROOT), os.environ.get("PYTHONPATH")) if p)
     for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_MODEL_NAME"):

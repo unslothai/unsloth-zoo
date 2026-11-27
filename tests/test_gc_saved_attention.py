@@ -97,6 +97,9 @@ def _clean(monkeypatch):
     SA.SAVED_ATTENTION_STATS.clear()
     monkeypatch.setattr(SA, "_WARNED_HIP", set() if isinstance(SA._WARNED_HIP, set) else [False])
     monkeypatch.setattr(SA, "_ROCM_SDPA_SELECT", getattr(SA, "_default_rocm_sdpa_selector", None), raising = False)
+    # Automatic mode off unless a test turns it on: a GPU with a measured length (gfx1151, sm75, sm80,
+    # sm89) leaves it active once anything asked for the threshold.
+    monkeypatch.setattr(SA, "_AUTO_ACTIVE", [False])
     yield
     SA.SAVED_ATTENTION_STATS.clear()
 
@@ -1086,7 +1089,9 @@ def _fake_gpu(monkeypatch, capability, hip = None, cuda = True, arch = "gfx1100"
     )
 
 
-@pytest.mark.parametrize("capability, min_seq", [((7, 5), 8192), ((8, 0), 8192), ((8, 9), 16384)])
+@pytest.mark.parametrize(
+    "capability, min_seq", [((7, 5), 8192), ((8, 0), 8192), ((8, 9), 16384), ((12, 0), 8192)],
+)
 def test_auto_min_seq_on_measured_gpus(monkeypatch, capability, min_seq):
     _fake_gpu(monkeypatch, capability)
     assert SA.save_attention_auto_min_seq() == min_seq
@@ -1107,7 +1112,7 @@ def test_auto_min_seq_on_measured_gpus(monkeypatch, capability, min_seq):
         ((8, 0), "6.4", True, "1"),
         ((8, 0), None, False, None),
         ((10, 0), None, True, None),
-        ((12, 0), None, True, None),
+        ((12, 0), None, True, "0"),
     ],
 )
 def test_auto_min_seq_is_off(monkeypatch, capability, hip, cuda, setting):
@@ -1175,6 +1180,8 @@ def test_auto_declines_calls_shorter_than_the_frame_device_length(monkeypatch, a
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (the real allocator's peak and free memory)")
 def test_cuda_auto_mode_with_the_real_allocator(monkeypatch, auto):
+    # The budget against the real allocator, not the per-device length: every call long enough on any GPU.
+    monkeypatch.setattr(SA, "save_attention_auto_min_seq", lambda device = None: 1)
     params, x = _make()
     params = [[p.detach().to("cuda", torch.bfloat16).requires_grad_() for p in w] for w in params]
     x = x.to("cuda", torch.bfloat16)

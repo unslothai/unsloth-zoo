@@ -1651,6 +1651,7 @@ def patch_CsmForConditionalGeneration_merge():
             # =======================================
             # TODO: @eustlb, this should be batched !!!
             # but requires making sure batched inference of the codec model works as intended
+            frame_size = getattr(getattr(self.codec_model, "config", None), "frame_size", None)
             with torch.no_grad():
                 audio_tokens_list = []
                 for batch_input_values, batch_input_values_cutoffs in zip(input_values, input_values_cutoffs):
@@ -1659,6 +1660,9 @@ def patch_CsmForConditionalGeneration_merge():
                         start_idx = batch_input_values_cutoffs[i]
                         end_idx = batch_input_values_cutoffs[i + 1]
                         audio_batch = batch_input_values[..., start_idx:end_idx]
+                        # Whole frames like kyutai's encoder (CSM's labels); HF Mimi pads per conv and moves the last frame (#19438).
+                        if frame_size:
+                            audio_batch = torch.nn.functional.pad(audio_batch, (0, -audio_batch.shape[-1] % frame_size))
                         codec_outputs = self.codec_model.encode(audio_batch.unsqueeze(0))
                         codebook_ids = codec_outputs.audio_codes.transpose(1, -1)
                         audio_tokens_list.append(codebook_ids[0])

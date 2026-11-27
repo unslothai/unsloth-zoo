@@ -67,6 +67,13 @@ except Exception:
 _FUSED_CE_COMPILE_DISABLED = os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1"
 _FUSED_CE_COMPILE_SUPPORTED = None if not _FUSED_CE_COMPILE_DISABLED else False
 
+
+def _is_out_of_memory(error):
+    # BackendCompilerFailed / InductorError keep an OOM raised while compiling as inner_exception.
+    return isinstance(error, torch.OutOfMemoryError) or isinstance(
+        getattr(error, "inner_exception", None), torch.OutOfMemoryError
+    )
+
 @functools.cache
 def _get_mapping(autograd):
     parameters = inspect.signature(getattr(autograd, "forward")).parameters
@@ -561,9 +568,15 @@ class UnslothFusedLoss(torch.autograd.Function):
                 )
                 # A loss-only graph does not prove the grad_and_value graph compiles.
                 if compute_gradients: _FUSED_CE_COMPILE_SUPPORTED = True
-            except Exception:
-                _FUSED_CE_COMPILE_SUPPORTED = False
-                torch._dynamo.reset()
+                _probe_failed = None
+            except Exception as _probe_error:
+                # An OOM is transient: this call runs eager, the next probes again, no graphs dropped.
+                _probe_failed = "oom" if _is_out_of_memory(_probe_error) else "error"
+            if _probe_failed is not None:
+                # Retried outside the except, so the failed attempt's traceback no longer pins its tensors.
+                if _probe_failed == "error":
+                    _FUSED_CE_COMPILE_SUPPORTED = False
+                    torch._dynamo.reset()
                 accumulated_loss.zero_()
                 if grad_inputs is not None and not overwrite:
                     grad_inputs.zero_()

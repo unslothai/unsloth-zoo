@@ -191,6 +191,34 @@ def _drop_inductor_cache_dir_in_compile_location():
 pass
 
 
+_ALLOW_CUSTOM_AUTOGRAD_ENV = "TORCHINDUCTOR_AUTOGRAD_CACHE_ALLOW_CUSTOM_AUTOGRAD"
+
+
+def allow_custom_autograd_functions_in_aot_cache():
+    """Custom autograd.Functions (fused LoRA) otherwise bypass the AOTAutograd cache. Safe: dynamo traces
+    their forward and backward into the cache key, so an edit misses. A user's env setting wins."""
+    if _ALLOW_CUSTOM_AUTOGRAD_ENV in os.environ:
+        return False
+    try:
+        import torch._functorch.config as functorch_config
+    except Exception:
+        return False
+    name = "autograd_cache_allow_custom_autograd_functions"
+    if not hasattr(functorch_config, name):
+        return False
+    try:
+        # torch >= 2.12 keeps config per thread; checkpoint recomputes compile on autograd's thread.
+        from unsloth_zoo.torch_config import set_torch_config
+        set_torch_config(functorch_config, name, True)
+    except Exception:
+        try:
+            setattr(functorch_config, name, True)
+        except Exception:
+            return False
+    return getattr(functorch_config, name, False) is True
+pass
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
@@ -253,6 +281,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # AOTAutograd cache env override was renamed. Set the current name too so
     # backward graphs are also cached on disk across process restarts.
     os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+    allow_custom_autograd_functions_in_aot_cache()
 
     # Torch compile arguments
     torch_compile_arguments = [
@@ -272,7 +301,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         f"config.max_autotune_gemm = False", # GEMM is unnecessary
         "config.max_autotune_gemm_backends = 'ATEN,TRITON,CPP'", # Not much faster
         "config.autotune_fallback_to_aten = True", # Fallback to ATEN backend
-        "config.autotune_multi_device = True", # If autotuning in subprocess, whether to use multiple devices
+        # No autotune_multi_device: int()-parses CUDA_VISIBLE_DEVICES (UUID / MIG masks raise) and tunes on every visible card.
         f"config.coordinate_descent_tuning = {O3}",
         f"config.aggressive_fusion = {O3}", # Careful changes results!
         # [TODO] COMBO KERNELS makes everything slower!
@@ -280,9 +309,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # "config.combo_kernel_foreach_dynamic_shapes = True",
         "config.freezing = False", # Freezes weights --> ** only useful for inference **
         # f"config.triton.multi_kernel = {O3}", # use tuning to pick between different subkernels
-        "config.cuda.enable_cuda_lto = True",
-        # cuda.use_fast_math stays off as in get_torch_compile_options. cuda.compile_opt_level was written
-        # unquoted, so it never applied; cuda.* only reaches CUTLASS, which the backends above leave out.
+        # No cuda.* knobs: CUTLASS only (left out above), and deprecated cutlass.* aliases that warn on 2.16.
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)

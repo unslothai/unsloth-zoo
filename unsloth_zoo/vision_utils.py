@@ -42,7 +42,23 @@ from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
-from PIL import Image, ImageOps
+try:
+    from PIL import Image, ImageOps
+except ImportError:  # pillow is a declared dependency; a --no-deps install can still lack it
+
+    class _MissingPillow:
+        """Stands in for PIL until an image is touched, so importing Unsloth never needs pillow."""
+
+        def __init__(self, name):
+            self._name = name
+
+        def __getattr__(self, attr):
+            raise ImportError(
+                f"Unsloth: images need pillow (`{self._name}.{attr}`), which is not installed. "
+                "Install it with `pip install pillow`."
+            )
+
+    Image, ImageOps = _MissingPillow("PIL.Image"), _MissingPillow("PIL.ImageOps")
 import base64
 import contextvars
 from io import BytesIO
@@ -1582,8 +1598,10 @@ def _get_dtype(dtype):
         print(f"Unsloth: {dtype} is not recognized, so we'll default to None")
         return None
 
-import PIL.Image
-LANCZOS = PIL.Image.Resampling.LANCZOS
+try:
+    LANCZOS = Image.Resampling.LANCZOS
+except ImportError:
+    LANCZOS = None  # no pillow: resize is never reached, every image path needs PIL first
 from .dataset_utils import train_on_responses_only as _train_on_responses_only
 
 

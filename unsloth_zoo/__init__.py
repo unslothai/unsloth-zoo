@@ -166,6 +166,14 @@ _, _, xet_cache = _active_caches()
 apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
 del has_429_exact_full_read, xet_cache, redirect_hf_cache_if_readonly, _active_caches, apply_xet_env
 
+# NVRTC opens its nvrtc-builtins DLL by name through PATH, not torch's DLL directories, so a torch whose
+# torch\lib is not otherwise reachable fails every jiterator kernel (fused CE among them). Before torch loads,
+# and after hf_cache / hf_xet_tuning so those stay registered even if this import fails.
+from .windows_nvrtc import expose_torch_lib_to_nvrtc as _expose_torch_lib_to_nvrtc
+
+_expose_torch_lib_to_nvrtc()
+del _expose_torch_lib_to_nvrtc
+
 if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
     os.environ["HF_HUB_VERBOSITY"] = "info"
 
@@ -561,6 +569,11 @@ if not _SKIP_GPU_INIT:
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
 if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
+    # Before vLLM imports flashinfer, which can point Triton at an older system ptxas for sm_100+.
+    from .triton_ptxas import keep_newest_blackwell_ptxas as _keep_newest_blackwell_ptxas
+    _keep_newest_blackwell_ptxas()
+    del _keep_newest_blackwell_ptxas
+
     from unsloth_zoo.temporary_patches import (
         encode_conversations_with_harmony,
     )

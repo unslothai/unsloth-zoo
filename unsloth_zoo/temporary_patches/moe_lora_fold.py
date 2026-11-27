@@ -117,7 +117,7 @@ def lora_fold_decline_reason(inputs, first, second, source):
     if compiling:
         # Never run the self-check while tracing, and never key the graph on whether it has run yet (that recompiled
         # once it had): the op body checks at run time and falls back to the separated arithmetic.
-        if mg.triton is None or torch.version.hip is not None:
+        if mg.triton is None:
             return "unavailable"
     elif not mg.triton_grouped_available(inputs.device):
         return "unavailable"

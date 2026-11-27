@@ -1545,6 +1545,13 @@ def fix_attention_dtype_consistency(source):
 pass
 
 
+# `self.norm(hidden_states.to(dtype = self.norm.weight.dtype))`, not followed by a cast back.
+_ACTIVATION_FOLLOWS_NORM_DTYPE = re.compile(
+    r"self\.(\w*norm\w*)\(\s*\w+\.to\(\s*(?:dtype\s*=\s*)?self\.\1\.weight\.dtype\s*\)\s*\)(?!\s*\.to\()"
+)
+
+
+# Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(
         re.finditer(
@@ -1576,6 +1583,14 @@ def higher_precision_layernorms(modeling_file):
     elif "return output * self.weight" in norm_module:
         dtype = torch.float16
     else:
+        dtype = torch.float16
+
+    # A block that feeds its norm `x.to(dtype = self.norm.weight.dtype)` and does not cast the result back
+    # (Nemotron-H on transformers >= 5.18, whose RMSNorm became `self.weight.to(torch.float32) * x`) takes
+    # the norm weight's dtype as its activation dtype: a float32 weight would turn the residual stream and
+    # every mixer input into float32 and the next 16-bit Linear raises a dtype mismatch. That norm already
+    # multiplies in float32, so the stored 16-bit weight loses nothing.
+    if dtype == torch.float32 and _ACTIVATION_FOLLOWS_NORM_DTYPE.search(modeling_file):
         dtype = torch.float16
 
     higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"

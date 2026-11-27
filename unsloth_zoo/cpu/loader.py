@@ -19,8 +19,11 @@ __all__ = ["FastCPUModel"]
 import contextlib
 import gc
 import functools
+import inspect
+import itertools
 import os
 import re
+import sys
 import types
 import warnings
 import weakref
@@ -38,6 +41,55 @@ from .ops import (
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
 _PREQUANTIZED_SUFFIX = re.compile(r"(-unsloth)?-bnb-4bit$", re.IGNORECASE)
+
+
+def _gguf_dequantize_config():
+    """`GgufConfig(dequantize = True)` where transformers has a GGUF quantizer (5.17+), else None.
+
+    Left at its default that quantizer keeps Qwen3.5 / LFM2 weights packed where the ggml kernel resolves, and for
+    every other architecture stays attached with `is_trainable = False`, so Trainer refuses LoRA and full
+    finetuning. Dequantizing drops it: the dense model a GGUF load gave before 5.17."""
+    try:
+        from transformers import GgufConfig
+    except ImportError:
+        return None
+    if "dequantize" not in inspect.signature(GgufConfig.__init__).parameters:
+        return None
+    return GgufConfig(dequantize = True)
+
+
+# Files a tokenizer builds its vocabulary from (tokenizer_config.json alone gives transformers 5 an empty one).
+_TOKENIZER_VOCAB_FILES = (
+    "tokenizer.json", "tokenizer.model", "vocab.json", "vocab.txt", "spiece.model", "sentencepiece.bpe.model",
+    "tekken.json",
+)
+
+
+def _has_tokenizer_files(model_name, revision = None, token = None, cache_dir = None, subfolder = None,
+                         local_files_only = False):
+    """Whether a folder or Hub repo ships a tokenizer vocabulary. GGUF repos often ship only config.json next to
+    the .gguf files, whose metadata holds the tokenizer."""
+    names = [os.path.join(subfolder, f) if subfolder else f for f in _TOKENIZER_VOCAB_FILES]
+    if os.path.isdir(model_name):
+        return any(os.path.isfile(os.path.join(model_name, n)) for n in names)
+    if not local_files_only and os.environ.get("HF_HUB_OFFLINE", "0") in ("0", "", "false", "False"):
+        try:
+            from huggingface_hub import HfApi
+            files = set(HfApi().list_repo_files(model_name, revision = revision, token = token))
+            return any(n.replace(os.sep, "/") in files for n in names)
+        except Exception:
+            pass
+    # Offline or the Hub is unreachable: what the cache holds.
+    from huggingface_hub import try_to_load_from_cache
+    for name in names:
+        try:
+            if isinstance(try_to_load_from_cache(model_name, name, cache_dir = cache_dir, revision = revision), str):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # GPU-only kwargs never reach AutoModelForCausalLM.from_pretrained, whose __init__ rejects them.
 _GPU_LOADER_KWARGS_IGNORED = (
     "load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
@@ -211,6 +263,52 @@ def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code,
         return None
     size = count * torch.empty((), dtype = dtype).element_size()
     return size if size * 4 <= available else None
+
+
+# float32 frozen weights may take at most this share of the free RAM (the rest: activations, LoRA, optimizer).
+_FP32_FROZEN_RAM_SHARE = 0.25
+
+
+def _fp32_frozen_storage_pays():
+    """x86 without native bf16, on Windows and on Linux CPUs with AVX-512. There a bf16-stored weight's upcast on every
+    forward, backward and decoded token was 30-34% of a 2-thread Qwen3-0.6B GRPO step (aten::copy_, Xeon 8370C /
+    8573C), and float32 storage made GRPO 9-21% faster on Windows. On a Linux AVX-512 Xeon, decoding through float32
+    weights was also faster than the per-call upcast (59 vs 101 ms per Qwen3-0.6B token pass). On AVX2-only Linux x86
+    (EPYC 7763) decoding through float32 reads twice the bytes and GRPO was 1-6% slower, so bf16 storage stays there;
+    Apple Silicon has its fp32 rollout instead."""
+    import platform
+    if platform.machine().lower() not in ("amd64", "x86_64"):
+        return False
+    if sys.platform == "win32":
+        return True
+    if sys.platform.startswith("linux"):
+        from .runtime import cpu_flags
+        return "avx512f" in cpu_flags()
+    return False
+
+
+def _fp32_weights_fit(model_name, token, revision, trust_remote_code, **kwargs):
+    """(bytes, free RAM) when float32 frozen storage pays on this host (``_fp32_frozen_storage_pays``) and the whole
+    model in float32 takes at most a quarter of the free RAM, else None (also when either is unknown). Then the frozen
+    projections are kept in float32 instead of bfloat16, at 2 more bytes per frozen weight. None under several training
+    processes: each would read the same free RAM for its own copy."""
+    if not _fp32_frozen_storage_pays() or _multi_process():
+        return None
+    try:
+        from transformers import AutoConfig
+        config = kwargs.get("config")
+        if config is None:
+            config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                                trust_remote_code = trust_remote_code,
+                                                **{k: v for k, v in kwargs.items() if k != "config"})
+    except Exception:
+        return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    size = 4 * count
+    return (size, available) if size <= _FP32_FROZEN_RAM_SHARE * available else None
 
 
 def _checkpoint_dtype(model_name, **kwargs):
@@ -700,6 +798,30 @@ def _cpu_compile_unavailable():
 _CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
 
 
+def _parallel_kernel_builds():
+    """Windows: build a compile's C++ kernels in parallel. torch sets compile_threads = 1 on win32 for its Triton
+    worker pool, so MSVC builds ran one at a time (cold Qwen3 layer: 45 s first step on 4 vCPU, 21 s parallel). CPU
+    kernels build on Inductor's in-process thread pool; the Triton pool stays off (TORCH_WARM_POOL=0). A user's
+    TORCHINDUCTOR_COMPILE_THREADS, a raised compile_threads or UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=1 is kept."""
+    if sys.platform != "win32" or "TORCHINDUCTOR_COMPILE_THREADS" in os.environ:
+        return None
+    if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1":
+        return None
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return None
+    if getattr(inductor_config, "compile_threads", 1) not in (None, 1):
+        return None
+    count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    threads = min(32, count)
+    if threads <= 1:
+        return None
+    os.environ.setdefault("TORCH_WARM_POOL", "0")
+    inductor_config.compile_threads = threads
+    return threads
+
+
 def compile_cpu_layers(model, explicit = False):
     """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
     if getattr(model, "_unsloth_cpu_compiled", False):
@@ -711,6 +833,10 @@ def compile_cpu_layers(model, explicit = False):
         else:
             _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
         return 0
+    _parallel_kernel_builds()
+    # CPU Inductor has the torch < 2.16 cat in-place bug too, and this path never imports temporary_patches.
+    from unsloth_zoo.inductor_nonowning_inplace import patch_inductor_nonowning_inplace
+    patch_inductor_nonowning_inplace()
     count = _compile_layers(model)
     model._unsloth_cpu_compiled = True
     _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
@@ -814,6 +940,10 @@ class FastCPUModel:
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
         use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
+        if use_4bit and kwargs.get("gguf_file"):
+            # transformers refuses a BitsAndBytesConfig beside a GGUF, whose weights are unpacked at load anyway.
+            _print("`gguf_file` weights are dequantized at load, so load_in_4bit is ignored.")
+            use_4bit = False
         # A saved LoRA checkpoint (notebooks reload "lora_model"): load its base, then the adapter on top,
         # trainable, so training resumes and merged exports see a PeftModel.
         adapter_name = adapter_revision = None
@@ -876,6 +1006,24 @@ class FastCPUModel:
                 if master_fit is not None and master_fit[2]:
                     master_fp32, master_choice, dtype = True, "fits", torch.float32
 
+        # dtype = "auto" loads the checkpoint's dtype (float16 moves to bfloat16 / float32 after loading, as below).
+        loaded_dtype = dtype
+        if auto_dtype and full_finetuning:
+            loaded_dtype = _checkpoint_dtype(model_name, token = token, revision = revision,
+                                             trust_remote_code = trust_remote_code, **probe_kwargs)
+            if loaded_dtype == torch.float16:
+                loaded_dtype = torch.bfloat16 if cpu_bf16_supported() else torch.float32
+        if full_finetuning and loaded_dtype == torch.float32 and not (master_fit is not None and master_fit[2]) \
+                and not _multi_process():
+            # float32 weights, grads and AdamW states (every CPU without native bf16: Apple Silicon, AVX2 x86) that do not
+            # fit in RAM swap: Qwen3-0.6B on a 7 GB Apple M1 took 266 s per step instead of about 3 s.
+            fp32_fit = master_fit or _fp32_master_fit(model_name, token, revision, trust_remote_code,
+                                                      resize_model_vocab, **kwargs)
+            if fp32_fit is not None and fp32_fit[0] > fp32_fit[1]:
+                _print(f"float32 full finetuning needs about {fp32_fit[0] / 1024 ** 3:.1f} GB for weights, grads and "
+                       f"AdamW states, but only {fp32_fit[1] / 1024 ** 3:.1f} GB of RAM is free: training will swap "
+                       "and can be 100x slower. LoRA (get_peft_model) or a smaller model fits.")
+
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
             from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
@@ -888,17 +1036,20 @@ class FastCPUModel:
                 llm_int8_skip_modules = list(SKIP_QUANTIZATION_MODULES),
             )
 
+        if quantization_config is None and kwargs.get("gguf_file"):
+            quantization_config = _gguf_dequantize_config()
         if quantization_config is not None:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
             kwargs["quantization_config"] = quantization_config
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
-        # fp32 training of a bf16 checkpoint keeps the frozen projections in bf16 (lossless, half their RAM, no
-        # measurable step-time cost). Default where fp32 is the default (no native bf16); UNSLOTH_CPU_FROZEN_BF16=1 / 0
-        # forces it on / off.
+        # fp32 training of a bf16 checkpoint can keep the frozen projections in bf16 (lossless, half their RAM), at the
+        # cost of an upcast per call. Default where fp32 is the default (no native bf16), except on Windows x86 and
+        # AVX-512 Linux x86 when the fp32 weights fit in a quarter of the free RAM; UNSLOTH_CPU_FROZEN_BF16=1 / 0 forces
+        # it on / off, =training keeps it whatever the RAM and OS (bf16 for training, fp32 for generation where that pays).
         frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
-        frozen_wanted = frozen_env in ("1", "true", "yes", "on") or (
+        frozen_wanted = frozen_env in ("1", "true", "yes", "on", "training") or (
             frozen_env not in ("0", "false", "no", "off") and not cpu_bf16_supported()
         )
         frozen_bf16 = (
@@ -907,8 +1058,19 @@ class FastCPUModel:
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
         )
+        frozen_fp32 = False
+        if frozen_bf16 and frozen_env not in ("1", "true", "yes", "on", "training"):
+            fp32_fit = _fp32_weights_fit(model_name, token, revision, trust_remote_code,
+                                         **probe_kwargs, **({"config": kwargs["config"]} if "config" in kwargs else {}))
+            if fp32_fit is not None:
+                # Still loaded in bf16, then upcast one tensor at a time: a float32 load of a bf16 checkpoint peaked at
+                # 4.7 GB RSS on Qwen3-0.6B, against 1.9 GB for the bf16 load.
+                frozen_bf16, frozen_fp32 = False, True
+                _print(f"frozen weights kept in float32: they fit in RAM ({fp32_fit[0] / 1024 ** 3:.2f} GB of "
+                       f"{fp32_fit[1] / 1024 ** 3:.0f} GB free), and bfloat16 storage would upcast them on every "
+                       "call on this CPU. UNSLOTH_CPU_FROZEN_BF16=training keeps bfloat16 storage.")
         load_kwargs = dict(
-            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
+            **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 or frozen_fp32 else dtype)},
             device_map = "cpu",
             token = token,
             revision = revision,
@@ -921,7 +1083,7 @@ class FastCPUModel:
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
             except RuntimeError as error:
                 # bitsandbytes' CPU packing rejects very narrow layers (hidden size < 64).
-                if quantization_config is None:
+                if quantization_config is None or not use_4bit:
                     raise
                 _print(f"bitsandbytes 4-bit failed on CPU ({error}), loading 16-bit weights instead.")
             if model is None:
@@ -949,6 +1111,11 @@ class FastCPUModel:
             model_max_length = max_seq_length, padding_side = "right",
             **{k: kwargs[k] for k in ("cache_dir", "local_files_only", "subfolder") if k in kwargs},
         )
+        if kwargs.get("gguf_file") and adapter_name is None and tokenizer_name == model_name \
+                and not _has_tokenizer_files(model_name, revision, token, **probe_kwargs):
+            # Without gguf_file transformers 5 builds an empty tokenizer (vocab 1) and 4.57 raises.
+            _print(f"{model_name} has no tokenizer files, so the tokenizer is read from {kwargs['gguf_file']}.")
+            tokenizer_kwargs["gguf_file"] = kwargs["gguf_file"]
         try:
             if adapter_name is not None and tokenizer_name == adapter_name:
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, **{**tokenizer_kwargs, **adapter_kwargs, "revision": adapter_revision})
@@ -969,6 +1136,10 @@ class FastCPUModel:
         if getattr(model.config, "pad_token_id", None) is None:
             model.config.pad_token_id = tokenizer.pad_token_id
 
+        if frozen_fp32:
+            for tensor in itertools.chain(model.parameters(), model.buffers()):
+                if tensor.dtype == torch.bfloat16:
+                    tensor.data = tensor.data.float()
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
             # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
@@ -1231,15 +1402,43 @@ def _set_inference_mode(model, inference):
             break
 
 
-def _frozen_bf16_for(model, training):
-    """bf16 only for training (fp32 for decode speed); UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16."""
+def _frozen_bf16_mode(model):
     inner, mode = model, None
     for _ in range(4):
         mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
         inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
         if inner is None:
             break
-    if mode == "training" and isinstance(model, torch.nn.Module):
+    return mode
+
+
+# A rollout's fp32 copy of the frozen weights may use at most this share of the RAM still available.
+_FP32_ROLLOUT_RAM_SHARE = 0.5
+
+
+def _slow_bf16_upcast():
+    """Apple Silicon: upcasting the bf16-stored projections on every decoded token made a Qwen3-0.6B GRPO step 1.6x
+    slower (M1). On x86 without native bf16 (AVX2) it cost about 2%, not worth the fp32 copy's RAM."""
+    import platform
+    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
+
+
+def _fp32_rollout_fits(model):
+    """True on Apple Silicon when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits in RAM."""
+    if not _slow_bf16_upcast():
+        return False
+    extra = 2 * sum(m.weight.numel() for m in model.modules()
+                    if isinstance(m, Bf16StoredLinear) and m.weight.dtype == torch.bfloat16 and not m.weight.requires_grad)
+    if extra == 0:
+        return False
+    available = available_ram()
+    return available is not None and extra <= _FP32_ROLLOUT_RAM_SHARE * available
+
+
+def _frozen_bf16_for(model, training):
+    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
+    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    if _frozen_bf16_mode(model) == "training" and isinstance(model, torch.nn.Module):
         set_bf16_stored_dtype(model, torch.bfloat16 if training else torch.float32)
 
 
@@ -1252,16 +1451,29 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        restore = False
         if isinstance(self, torch.nn.Module) and not self.training:
             # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
             _frozen_bf16_for(self, training = False)
-        set_stance = getattr(torch.compiler, "set_stance", None)
-        modules = self.modules() if isinstance(self, torch.nn.Module) else ()
-        if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
-            # Layers compiled for training would recompile per layer against the KV cache, up to the limit.
-            with set_stance("force_eager"):
-                return generate(self, *args, **kwargs)
-        return generate(self, *args, **kwargs)
+        elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self):
+            # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
+            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon, then store bf16.
+            # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
+            # tensors, and the next training forward could not save them for backward.
+            with torch.inference_mode(False):
+                restore = set_bf16_stored_dtype(self, torch.float32) > 0
+        try:
+            set_stance = getattr(torch.compiler, "set_stance", None)
+            modules = self.modules() if isinstance(self, torch.nn.Module) else ()
+            if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
+                # Layers compiled for training would recompile per layer against the KV cache, up to the limit.
+                with set_stance("force_eager"):
+                    return generate(self, *args, **kwargs)
+            return generate(self, *args, **kwargs)
+        finally:
+            if restore:
+                with torch.inference_mode(False):
+                    set_bf16_stored_dtype(self, torch.bfloat16)
     wrapper._unsloth_cpu = True
     return wrapper
 

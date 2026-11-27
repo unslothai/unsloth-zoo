@@ -897,6 +897,8 @@ def _available(device, dtype, tiles):
         try:
             with torch.autocast(device.type, enabled = False), torch.no_grad():
                 ok = _probe_dense(device, dtype)
+        except torch.cuda.OutOfMemoryError:
+            return False  # transient: dequantize this call, probe again on the next one
         except Exception as exception:
             import warnings
             warnings.warn(f"Unsloth: fused MXFP4 GEMM unavailable for {dtype} ({exception}); dequantizing instead.")
