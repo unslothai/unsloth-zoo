@@ -1,5 +1,7 @@
 import concurrent.futures
 import contextlib
+import contextvars
+import gc
 import importlib
 import importlib.util
 import inspect
@@ -8,6 +10,7 @@ import sys
 import threading
 import types
 import warnings
+import weakref
 from dataclasses import make_dataclass
 import pytest
 
@@ -587,6 +590,143 @@ def test_vision_text_engine_is_the_language_model_only_for_verified_types_with_p
         assert (engine.text_engine_model(types.SimpleNamespace(_is_vlm_model=True, language_model=language, config=config)) is not None) == routed
 
 
+def test_a_text_row_hears_each_prompt_chunk_past_what_it_did_not_hear_prefilled(monkeypatch):
+    from unsloth_zoo.mlx.generate import _PromptProgress
+    with pytest.raises(TypeError, match="must be callable"):
+        GenerationRequest(prompt="a", prompt_progress=object())
+
+    class Generator(_OpenBatchGenerator):  # mlx-lm: chunks of 2 over all but the last token, then the split
+        def insert(self, prompts, max_tokens=None, samplers=None, logits_processors=None, caches=None, all_tokens=None):
+            uids = super().insert(prompts, max_tokens, samplers, logits_processors)
+            self.prompts = {**getattr(self, "prompts", {}), **{uid: [0, len(ids)] for uid, ids in zip(uids, prompts)}}
+            return uids
+
+        def next(self):
+            prompting = []
+            for uid, seen in self.prompts.items():
+                if seen[0] < seen[1]:
+                    seen[0] = min(seen[0] + 2, seen[1] - 1) if seen[0] < seen[1] - 1 else seen[1]
+                    prompting.append(types.SimpleNamespace(uid=uid, progress=tuple(seen)))
+            return (prompting, []) if prompting else ([], self.next_generated())
+
+    heard = {}
+    tell = lambda name: lambda *counts: heard.setdefault(name, []).append(counts)
+    stream = _open_stream(monkeypatch, generator_type=Generator, max_tokens=2)
+    with contextlib.closing(stream):
+        session = stream._session
+        stream.add(GenerationRequest(prompt_token_ids=[9] * 6))
+        assert session._next_generated() and session.generator.steps == 1
+        stream.add(GenerationRequest(prompt_token_ids=[9] * 6, prompt_progress=tell("cold")))
+        session.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=tell("cached")), ([9], [1, 2, 3], None))
+        prefilled = _PromptProgress(tell("prefilled"))
+        prefilled(2, 4, 0)
+        session.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=print), ([9], [1, 2, 3], None), prefilled)
+        refused = []
+
+        def reenter(*_):
+            for change in (lambda: stream.add(GenerationRequest(prompt_token_ids=[9])), stream.close):
+                with pytest.raises(RuntimeError) as caught:
+                    change()
+                refused.append(str(caught.value))
+            1 / 0
+        stream.add(GenerationRequest(prompt_token_ids=[9] * 3, prompt_progress=reenter))
+        with pytest.warns(UserWarning, match="ZeroDivisionError"):
+            assert [event.index for event in stream.step()] == [0, 1, 2, 3, 4]
+        assert not session._progress and refused == ["A prompt_progress callback cannot change the BatchStream reporting to it."] * 2
+        while stream.rows_in_flight:
+            stream.step()
+    assert heard == {
+        "cold": [(2, 6, 0), (4, 6, 0), (5, 6, 0), (6, 6, 0)],
+        "cached": [(1, 1, 3)],
+        "prefilled": [(2, 4, 0), (4, 4, 0)],
+    }
+    from unsloth_zoo.mlx.generate import _report_row_prefill
+    batch = types.SimpleNamespace(uids=[3, 5, 7], prompt_cache=[], _unsloth_prefilled=4, _unsloth_columns=9,
+                                  _unsloth_reported=0, _unsloth_cached=2)
+    rows = {uid: _PromptProgress(tell(uid)) for uid in (5, 7)}
+    _report_row_prefill(rows, [batch, batch])
+    _report_row_prefill(rows, [batch])
+    assert heard[5] == heard[7] == [(4, 9, 2)] and 3 not in heard
+    failing = _PromptProgress(lambda *_: 1 / 0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert failing(1, 2, 0) is False and failing.callback is None
+    # A row's callback holds its stream weakly, so dropping the stream releases it (and its lock) at once.
+    dropped = _open_stream(monkeypatch, max_tokens=2)
+    dropped.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=print))
+    ref = weakref.ref(dropped)
+    gc.disable()
+    try:
+        del dropped
+        assert ref() is None
+    finally:
+        gc.enable()
+        if ref() is not None:
+            ref().close()
+
+
+def test_a_prefill_bar_tells_the_open_callback_each_chunk(monkeypatch):
+    from unsloth_zoo.mlx import generate
+
+    class Bar:  # the tqdm surface generate_step uses
+        def __init__(self, *args, **kwargs): self.n = 0
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def update(self, n): self.n += n
+
+    module = types.SimpleNamespace(generate_step=object(), tqdm=Bar)
+    monkeypatch.setattr(generate, "_resolve_module_attr", lambda names, attribute: module)
+
+    def prefill(desc="Prefill"):
+        with module.tqdm(total=10, desc=desc, unit="tok") as bar:
+            bar.update(4)
+            bar.update(5)
+        return bar.n
+
+    heard = []
+    with generate.vlm_prefill_progress(lambda *progress: heard.append(progress)):
+        assert prefill() == 9 and prefill("Decode") == 9
+        installed = module.tqdm
+    assert prefill() == 9 and heard == [(4, 10), (9, 10)]
+    with generate.vlm_prefill_progress(print):
+        assert module.tqdm is installed
+
+    def held(sink=heard):  # a reply generator closed from another context than the one that opened it
+        with generate.vlm_prefill_progress(lambda *progress: sink.append(progress)):
+            yield
+    opened, reply = contextvars.copy_context(), held()
+    opened.run(next, reply)
+    contextvars.copy_context().run(reply.close)
+    assert opened.run(prefill) == 9 and heard == [(4, 10), (9, 10)]
+    outer = []
+    with generate.vlm_prefill_progress(lambda *progress: outer.append(progress)):
+        reply = held()
+        next(reply)
+        with module.tqdm(total=10, desc="Prefill") as bar:
+            bar.update(1)
+            contextvars.copy_context().run(reply.close)
+            bar.update(1)
+        assert prefill() == 9 and outer == [(4, 10), (9, 10)] and heard[2:] == [(1, 10)]
+    inner = []
+    first, second = held(), held(inner)  # closed out of order in one context
+    next(first), next(second), first.close()
+    assert prefill() == 9 and inner == [(4, 10), (9, 10)] and len(heard) == 3
+    second.close()
+    for _ in range(3):
+        reply = held()
+        opened.run(next, reply)
+        contextvars.copy_context().run(reply.close)
+    assert opened.run(generate._PREFILL_PROGRESS.get)[1] is None
+    replies = [held() for _ in range(4)]  # each opened before the one before it closes
+    for previous, reply in zip([None, *replies], replies):
+        opened.run(next, reply)
+        if previous is not None:
+            contextvars.copy_context().run(previous.close)
+    assert opened.run(generate._PREFILL_PROGRESS.get)[1][1] is None
+    with pytest.raises(TypeError, match="callback must be callable"):
+        generate.vlm_prefill_progress(None).__enter__()
+
+
 def test_vlm_adapter_reports_admission_stall_without_counting_polls():
     # Prefill yields eventless polls, so only impossible admission is a stall.
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
@@ -983,8 +1123,12 @@ def _audio_adapter(events, tokenizer=None, stops=()):
     adapter.stream_calls = []
     adapter.audio_warn_stacklevel = 3
     def stream(*args, **kwargs):
+        from unsloth_zoo.mlx.generate import _open_prefill_scope
         adapter.stream_calls.append((args, kwargs))
-        return iter(events)
+        scope = _open_prefill_scope()  # as mlx-vlm's Prefill bar reports, before the first event
+        if scope is not None:
+            scope[0](3, 5)
+        yield from events
     adapter.stream_module = types.SimpleNamespace(stream_generate=stream)
     return adapter
 
@@ -1016,10 +1160,16 @@ class _CriteriaTokenizer(_CharTokenizer):
     # Nothing generated at all: newer releases emit one event with no token.
     (((None, "length"),), None, ([], "length")),
 ])
-def test_audio_fallback_keeps_the_batched_result_contract(specs, tokenizer, expected):
+def test_audio_fallback_keeps_the_batched_result_contract(monkeypatch, specs, tokenizer, expected):
+    from unsloth_zoo.mlx import generate
+    monkeypatch.setattr(generate, "_install_prefill_bar", lambda: None)
+    heard = []
+    watched = _audio_row(_audio_adapter(_audio_events(*specs), tokenizer), GenerationRequest(
+        prompt="p", audio="a.wav", prompt_progress=lambda *counts: heard.append(counts)))
     result, streamed = _audio_row(
         _audio_adapter(_audio_events(*specs), tokenizer),
         GenerationRequest(prompt="p", audio="a.wav"))
+    assert watched == (result, streamed) and heard == [(3, 5, 0)]
     assert (result.token_ids, result.finish_reason) == expected
     assert streamed == result.text
     # Logprobs must belong to the tokens they sit beside, not to their successors.
@@ -1960,6 +2110,76 @@ def test_a_batch_s_last_leaving_row_is_handed_views_of_its_own_buffers(monkeypat
         _row_cache([batch], 0)
 
 
+def test_a_vision_row_hears_each_prefill_chunk_once_it_has_run(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate
+
+    class Prompt:  # mlx-vlm's PromptProcessingBatch: one async chunk per prompt_step
+        def __init__(self, uids, columns):
+            self.uids, self.prompt_cache = uids, [types.SimpleNamespace(state=f"cache {uids}")]
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, columns, 4))
+        def prompt_step(self):
+            left = self._inputs_embeds.shape[1]
+            n = min(4, left - 1)
+            self._inputs_embeds = types.SimpleNamespace(shape=(1, left - n, 4))
+            return n
+
+    public = types.SimpleNamespace(PromptProcessingBatch=Prompt)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", public)
+    order = []
+    monkeypatch.setattr(mx, "eval", lambda states: order.append(("eval", states[0])))
+
+    class Generator(_OpenVLMGenerator):
+        @property
+        def has_work(self):
+            return True
+        def next(self):  # decodes the rows past their prompt, then runs one chunk of the next
+            events = [types.SimpleNamespace(uid=uid, token=1, finish_reason=None if left else "length",
+                                            token_logprob=-0.1) for uid, left in self.left.items()]
+            self.left = {uid: left - 1 for uid, left in self.left.items() if left}
+            batch = self._prompt_batch
+            if batch is None and len(self.built) < len(self.inserted):
+                uid = len(self.built)
+                batch = self._prompt_batch = public.PromptProcessingBatch(uids=[uid], columns=(6, 14, 9)[uid])
+                self.built.append(batch)
+            if batch is not None and batch._inputs_embeds.shape[1] > 1:
+                batch.prompt_step()
+            elif batch is not None:
+                self._prompt_batch, self.left[batch.uids[0]] = None, 2
+            return [], events
+
+    session = _vlm_session(Generator, prefill_batch_size=1)
+    session.generator.built, session.generator.left, session.generator.completion_batch_size = [], {}, 4
+    session.generator._generation_batch = type("Decoding", (), {"uids": [], "__len__": lambda self: len(self.uids)})()
+    session.adapter.batch_module = public
+
+    def loud(*progress):
+        order.append(("loud", progress))
+        if progress[0] == 8:
+            raise OSError("the reply's client went away")
+    quiet = session.add(GenerationRequest(prompt="ab"))
+    loud = session.add(GenerationRequest(prompt="cd", prompt_progress=loud))
+    finished = []
+    with pytest.warns(UserWarning, match="its row reports no more progress"):
+        while session.rows_in_flight:
+            for event in list(session.step()):
+                order.append(("token", event.index))
+                finished += [event.index] if event.result else []
+    assert finished == [quiet, loud]
+    # Each chunk is waited for, then told once, after the step's tokens; a failing reporter stops alone.
+    assert order == [
+        ("token", quiet), ("eval", "cache [1]"), ("loud", (4, 14, 0)),
+        ("token", quiet), ("eval", "cache [1]"), ("loud", (8, 14, 0)),
+        ("token", quiet), *[("token", loud)] * 3,
+    ]
+    assert session._progress == {} and session._prefilling == ()
+    cancelled = session.add(GenerationRequest(prompt="ef", prompt_progress=print))
+    assert list(session.step()) == [] and session._prefilling
+    assert session.cancel(cancelled) and session._prefilling == ()
+    session.add(GenerationRequest(prompt="gh"))
+    assert list(session.step()) == [] and session._prefilling == ()
+
+
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     """A key only some rows carry cannot be merged into a batch-wide keyword."""
     session = _vlm_session()
@@ -2582,13 +2802,13 @@ def test_shared_prefixes_live_only_while_their_rows_can_decode(monkeypatch, layo
 
         rows_in_flight = property(lambda self: len(self.rows))
 
-        def prefill_prompt(self, ids):
+        def prefill_prompt(self, ids, progress=None):
             prefix = Prefix(ids)
             alive.add(prefix)
             peak[0] = max(peak[0], len(alive))
             return prefix
 
-        def add(self, request, prefix=None):
+        def add(self, request, prefix=None, progress=None):
             added.append((tuple(request.prompt_token_ids), prefix and prefix.ids))
             self.rows.append(prefix)
 
