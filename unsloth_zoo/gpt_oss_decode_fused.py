@@ -44,6 +44,7 @@ __all__ = [
 import os
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 from .log import logger
 from .triton_fast_launch import launch as _fast_launch
@@ -70,7 +71,7 @@ if HAS_TRITON and not _INTERPRET:
         _libdevice = None
 
 # NVIDIA only for now: the libdevice exp / rsqrt and rounding were verified on sm75 / sm80 / sm120, not on ROCm.
-_ENABLED = HAS_TRITON and torch.version.hip is None and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
+_ENABLED = HAS_TRITON and not is_rocm_torch(torch) and os.environ.get("UNSLOTH_GPT_OSS_FUSED_DECODE", "1") != "0"
 # Engagement counters (tests and benchmarks read them).
 FUSED_DECODE_CALLS = {"add_rms_norm": 0, "sink_scale_output": 0, "static_cache_update": 0, "rope_decode": 0}
 _MAX_COLS = 32768

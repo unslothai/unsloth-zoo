@@ -53,6 +53,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 from unsloth_zoo.decode_graph_state import in_graph_decode_step as _in_graph_decode_step
 from unsloth_zoo.triton_fast_launch import launch as _fast_launch
@@ -479,7 +480,7 @@ def _block_k(K, blocksize):
 
 def _even_k(K, block_k):
     # Same values without the K masks; HIP keeps the masked kernel (unmeasured there).
-    return K % block_k == 0 and torch.version.hip is None
+    return K % block_k == 0 and not is_rocm_torch(torch)
 
 
 def _lora_args(lora, dummy):

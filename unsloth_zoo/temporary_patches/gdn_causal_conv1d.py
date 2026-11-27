@@ -40,6 +40,7 @@ import importlib
 import importlib.util
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 from .common import (
     TEMPORARY_PATCHES,
@@ -1109,7 +1110,7 @@ def install_mamba_ssm_triton_conv():
     True when installed (or already installed); False leaves the caller's fallback in charge."""
     if _disabled() or _real_causal_conv1d_available():
         return False
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    if not torch.cuda.is_available() or is_rocm_torch(torch):
         return False
     try:
         import triton  # noqa: F401

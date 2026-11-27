@@ -30,6 +30,7 @@ __all__ = [
 import os
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 from . import moe_ready_epoch as _ready_epoch
 # Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
@@ -121,7 +122,7 @@ def stacked_dequant_available(device) -> bool:
         and _DISABLED_REASON is None
         and os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") != "0"
         and getattr(device, "type", None) == "cuda"
-        and torch.version.hip is None   # HIP has no libdevice mul_rn
+        and not is_rocm_torch(torch)   # HIP has no libdevice mul_rn
         and os.environ.get("TRITON_INTERPRET", "0") != "1"
     )
 
@@ -583,7 +584,7 @@ def _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_toke
     if (
         os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") != "0"
         and os.environ.get("UNSLOTH_GPTOSS_FUSED_COMBINE", "1") != "0"
-        and y.is_cuda and torch.version.hip is None
+        and y.is_cuda and not is_rocm_torch(torch)
         # FakeTensor / subclass probes must not reach the kernel: a failure there disables it process-wide.
         and type(y) is torch.Tensor and type(w) is torch.Tensor and type(sorted_idx) is torch.Tensor
     ):

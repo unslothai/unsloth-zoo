@@ -39,6 +39,7 @@ import logging
 import os
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 logger = logging.getLogger(__name__)
 
@@ -533,7 +534,7 @@ def fp8_fused_enabled(device) -> bool:
     """CUDA sm89+ (native e4m3 converts), not ROCm, Triton >= 3.1, self-checked once per device."""
     if fp8_fused_mode() == "0" or triton is None or _FP8_DTYPE is None:
         return False
-    if getattr(device, "type", None) != "cuda" or torch.version.hip is not None:
+    if getattr(device, "type", None) != "cuda" or is_rocm_torch(torch):
         return False
     key = str(device)
     ok = _AVAILABLE.get(key)

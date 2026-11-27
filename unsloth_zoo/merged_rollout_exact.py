@@ -47,6 +47,7 @@ import threading
 from typing import List
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 try:
     import triton
@@ -861,7 +862,7 @@ def exact_unfold(targets, stream = None):
                 after = check[1]
                 for dtype in (torch.int32, s.idx_dtype, torch.int16, torch.int64): _dummy(s.device, dtype)
                 group = members[id(s)]
-                if len(group) == len(s.tiles) and len(group) > 1 and torch.version.hip is None:
+                if len(group) == len(s.tiles) and len(group) > 1 and not is_rocm_torch(torch):
                     esc = _escape_table(s, group, idx, val, after)
                 else:
                     esc = _escape_slices(s, group, idx, val, after)
