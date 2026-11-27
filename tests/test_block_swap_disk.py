@@ -77,6 +77,75 @@ def test_spill_file_round_trips_any_dtype_at_any_offset(tmp_path):
     assert torch.equal(buf, b)
 
 
+def _open_spill_fds():
+    out = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            if ".unsloth_offload_" in os.readlink(f"/proc/self/fd/{fd}"):
+                out.append(int(fd))
+        except OSError:
+            pass
+    return out
+
+
+def _live():
+    # live_spill() on this tree; the bare list before it (so the test also runs against an older tree).
+    fn = getattr(_disk, "live_spill", None)
+    return fn() if fn is not None else (_disk._SPILL[0] if _disk._SPILL else None)
+
+
+def _spilled_param(nbytes, need_bytes):
+    p = nn.Parameter(torch.randn(nbytes // 4), requires_grad = False)
+    _disk.spill_params([p], [0], p.data.nbytes, need_bytes = need_bytes)
+    return p
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the disk tier is Linux only")
+def test_spill_file_closes_with_its_last_user():
+    import gc
+    import weakref
+    if _disk.disk_tier_reason() is not None:
+        pytest.skip(_disk.disk_tier_reason())
+    before = _open_spill_fds()
+    p = _spilled_param(4 << 20, 4 << 20)
+    q = _spilled_param(1 << 20, 1 << 20)
+    store = weakref.ref(_live())
+    # Both models share the one file while either is alive.
+    assert p._unsloth_disk.store is q._unsloth_disk.store is store()
+    assert len(_open_spill_fds()) == len(before) + 1
+    del p
+    gc.collect()
+    assert store() is not None and _live() is store()
+    del q
+    gc.collect()
+    # The last user gone: the unlinked file is closed, so its disk blocks (and the bounce buffer) come back.
+    assert store() is None and _live() is None
+    assert _open_spill_fds() == before
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the disk tier is Linux only")
+def test_reused_spill_file_rechecks_free_space():
+    if _disk.disk_tier_reason() is not None:
+        pytest.skip(_disk.disk_tier_reason())
+    p = _spilled_param(1 << 20, 1 << 20)
+    store = _live()
+    assert _disk._shared_spill(1 << 20) is store
+    # A later load that needs more than the disk holds is refused up front, not by ENOSPC partway through.
+    with pytest.raises(ValueError, match = "no directory has that much free"):
+        _spilled_param(1 << 20, 1 << 60)
+    assert _live() is store and p._unsloth_disk.store is store
+
+
+def test_spill_file_close_survives_interpreter_teardown(monkeypatch, tmp_path):
+    if _disk.disk_tier_reason() is not None:
+        pytest.skip(_disk.disk_tier_reason())
+    store = _disk.SpillFile(1 << 20, directory = str(tmp_path))
+    # At exit, __del__ can run after module globals such as `os` are gone.
+    monkeypatch.setattr(_disk, "os", None)
+    store.close()
+    assert store.fd is None
+
+
 def test_disk_tier_reason_and_host_limit_parse(monkeypatch):
     monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     assert _disk.disk_tier_reason() == "UNSLOTH_OFFLOAD_DISK=0"

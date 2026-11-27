@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -40,6 +41,7 @@ __all__ = [
     "DiskTier",
     "DiskRef",
     "spill_params",
+    "live_spill",
     "placeholder_like",
     "disk_ref",
     "read_bytes",
@@ -398,26 +400,53 @@ class SpillFile:
             except (AttributeError, OSError):
                 pass
 
-    def close(self):
+    def close(self, _close = os.close):
+        # `_close` is bound at definition: __del__ can run at interpreter exit, after `os` is torn down.
         fd, self.fd = getattr(self, "fd", None), None
+        self._bounce = None
         if fd is not None:
             try:
-                os.close(fd)
+                _close(fd)
             except OSError:
                 pass
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
+# [weakref to the shared SpillFile]. Weak: the file (unlinked, so its blocks) and its bounce buffer go with the last
+# DiskRef / block / BlockSwap that uses it, not at process exit.
 _SPILL = []
 
 
+def live_spill():
+    """The process's shared spill file while some model still uses it, else None."""
+    store = _SPILL[0]() if _SPILL else None
+    if store is None or store.fd is None:
+        _SPILL[:] = []
+        return None
+    return store
+
+
+def _has_room(directory, need_bytes):
+    try:
+        st = os.statvfs(directory)
+    except (OSError, AttributeError):  # no statvfs off POSIX: as before, trust the first check
+        return True
+    return st.f_bavail * st.f_frsize >= need_bytes + _MARGIN_BYTES
+
+
 def _shared_spill(need_bytes):
-    """One spill file per process: layers spilled at load and at install share it."""
-    if not _SPILL or _SPILL[0].fd is None:
-        _SPILL[:] = [SpillFile(need_bytes)]
-    return _SPILL[0]
+    """One spill file per process: layers spilled at load and at install share it. Reused only while its directory
+    still holds `need_bytes` plus the margin; else a fresh pick (another directory, or the refusal)."""
+    store = live_spill()
+    if store is None or not _has_room(store.directory, need_bytes):
+        store = SpillFile(need_bytes)
+        _SPILL[:] = [weakref.ref(store)]
+    return store
 
 
 def spill_params(params, layout, region_bytes, need_bytes = None, store = None):
