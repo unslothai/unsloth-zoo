@@ -393,6 +393,7 @@ from huggingface_hub import (
 )
 from safetensors import safe_open
 from safetensors.torch import save_file
+from .safetensors_pread import pread_backend_kwargs
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
@@ -1217,7 +1218,11 @@ def _merge_and_overwrite_lora(
             header_metadata = json.loads(mm.read(length_of_header))
             mm.seek(0)
 
-        with safe_open(filename_original if source_path is None else source_path, framework = "pt", device = "cpu") as file:
+        # only LoRA / bias / vocab targets are read, one at a time, and merged on the GPU: pread where mmap -> GPU is slow
+        with safe_open(
+            filename_original if source_path is None else source_path, framework = "pt", device = "cpu",
+            **pread_backend_kwargs(),
+        ) as file:
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
             bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)

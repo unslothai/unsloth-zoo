@@ -2759,8 +2759,10 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
     by_file = {}
     for key in keys: by_file.setdefault(weight_map[key], []).append(key)
     loaded = 0
+    from .safetensors_pread import pread_backend_kwargs
     for file, file_keys in by_file.items():
-        with safe_open(file, framework = "pt") as f:
+        # each tensor is copied once to the model's device: pread where mmap -> GPU is slow
+        with safe_open(file, framework = "pt", device = "cpu", **pread_backend_kwargs()) as f:
             for key in file_keys:
                 old = params.get(key, buffers.get(key))
                 if old is None: continue
