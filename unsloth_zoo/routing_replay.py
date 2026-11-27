@@ -453,12 +453,13 @@ def _as_routes(routed):
 
 
 def _clean_weights(rows, weights):
-    # Usable top-k weights are finite, in [0, 1] and sum to at most 1 (scaled or garbage ones are
-    # not this router's); an all zero row is an ids-only capture.
+    # Usable top-k weights are finite and non-negative; an all zero row is an ids-only capture. Their scale is
+    # the router's (DeepSeek-V3 multiplies by routed_scaling_factor, so rows may sum past 1): whether a row
+    # matches this router's normalisation and values is checked per router where it is used
+    # (_apply_rollout_weights).
     w = weights.float()
-    eps = 1e-3
-    ok = torch.isfinite(w).all(-1) & (w >= 0).all(-1) & (w <= 1 + eps).all(-1)
-    ok &= (w.sum(-1) <= 1 + eps) & (w > 0).any(-1) & ~(rows < 0).any(-1)
+    ok = torch.isfinite(w).all(-1) & (w >= 0).all(-1)
+    ok &= (w > 0).any(-1) & ~(rows < 0).any(-1)
     return torch.where(ok.unsqueeze(-1), w, torch.full_like(w, float("nan")))
 
 

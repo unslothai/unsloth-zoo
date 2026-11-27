@@ -289,3 +289,42 @@ def test_lfm2_forced_low_score_experts_keep_the_router_epsilon(replay):
     own_weights = own[1].float().gather(-1, own[2].argsort(-1))
     torch.testing.assert_close(replayed, own_weights, rtol = 1e-4, atol = 1e-6)
     assert float(own_weights.max()) < 0.5  # the epsilon matters here: 1e-20 would give 0.75 each
+
+
+def test_scaled_rollout_weights_reach_a_scaled_router(replay, monkeypatch):
+    # DeepSeek-V3 weights sum to routed_scaling_factor (2.5): rollout weights on that scale, close to the trainer's,
+    # must be ingested and used, not dropped for summing past 1.
+    _router()  # skips on a transformers whose router has another layout
+    monkeypatch.setattr(rr, "_VLLM_WEIGHTS_PACKED", True)
+    monkeypatch.setattr(rr, "_PACKED_TOP_K", TOP_K)
+    model = _model()
+    prompt, completion = [5, 6, 7, 8], [9, 10, 11, 12, 13]
+    ids = prompt + completion
+    captured = {}
+    handles = [
+        layer.mlp.gate.register_forward_hook(
+            lambda m, a, out, i = i: captured.__setitem__(i, (out[2].detach().clone(), out[1].detach().float().clone()))
+        )
+        for i, layer in enumerate(model.model.layers)
+    ]
+    with torch.no_grad():
+        model(input_ids = torch.tensor([ids]))
+    for h in handles:
+        h.remove()
+    routes = torch.stack([captured[i][0] for i in range(NUM_LAYERS)], dim = 1)
+    weights = torch.stack([captured[i][1] for i in range(NUM_LAYERS)], dim = 1)
+    assert float(weights.sum(-1).mean()) == pytest.approx(2.5, rel = 1e-4)
+    generator = torch.Generator().manual_seed(1)
+    rollout = (weights + 0.02 * torch.rand(weights.shape, generator = generator)).clamp_min(1e-4)
+    rollout = rollout / rollout.sum(-1, keepdim = True) * 2.5
+    packed = rr._pack_routed_weights(routes.long(), rollout.float()).numpy().astype(np.uint16)
+    assert rr.install_routing_replay(model, None, SimpleNamespace(pad_token_id = PAD)) == NUM_LAYERS
+    rr.record_routed_experts([
+        SimpleNamespace(
+            prompt_token_ids = list(prompt),
+            outputs = [SimpleNamespace(token_ids = list(completion), routed_experts = packed[:-1])],
+        )
+    ])
+    with torch.no_grad():
+        model(input_ids = torch.tensor([ids]))
+    assert rr.routing_replay_stats()["replayed_weight_rows"] == (len(ids) - 1) * NUM_LAYERS
