@@ -126,6 +126,17 @@ def test_other_calls_keep_torchs_path(case):
 
 
 @needs_fast
+def test_draws_stay_on_cpu_under_another_default_device():
+    p = torch.softmax(torch.randn(2, 8192), -1)
+    torch.manual_seed(3)
+    a = ORIGINAL(p, 1)
+    with torch.device("meta"):  # any non-CPU default device: the draws must still be CPU tensors
+        torch.manual_seed(3)
+        b, n = _engaged(lambda: FAST(p, 1))
+    assert n == 1 and b.device.type == "cpu" and torch.equal(a, b)
+
+
+@needs_fast
 def test_kill_switch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_CPU_FAST_MULTINOMIAL", "0")
     p = torch.softmax(torch.randn(2, 8192), -1)

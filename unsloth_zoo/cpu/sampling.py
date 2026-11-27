@@ -48,7 +48,8 @@ def _enabled():
 
 def _exponential(shape, dtype, generator):
     """Exp(1) as torch's CPU exponential_ forms it: -1.0 / lambda * log1p(-u), u a float64 uniform, cast."""
-    u = torch.rand(shape, dtype = torch.float64, generator = generator)
+    # device = "cpu": under torch.set_default_device("cuda" / "mps") a bare rand would not be on the input's device.
+    u = torch.rand(shape, dtype = torch.float64, device = "cpu", generator = generator)
     return torch.log1p(u.neg_()).neg_().to(dtype)
 
 
@@ -58,9 +59,9 @@ def fast_multinomial_ok():
         ok = True
         try:
             for shape in ((1, 37), (2, 151936)):
-                a = torch.Generator().manual_seed(3407)
-                b = torch.Generator().manual_seed(3407)
-                q = torch.empty(shape, dtype = torch.float32).exponential_(generator = a)
+                a = torch.Generator(device = "cpu").manual_seed(3407)
+                b = torch.Generator(device = "cpu").manual_seed(3407)
+                q = torch.empty(shape, dtype = torch.float32, device = "cpu").exponential_(generator = a)
                 r = _exponential(shape, torch.float32, b)
                 if not torch.equal(q, r) or not torch.equal(a.get_state(), b.get_state()):
                     ok = False
