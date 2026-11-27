@@ -5376,7 +5376,6 @@ def grpo_accumulated_loss(
                         ).view(total_rows, _pack_L)[:, -_pack_W:]
                     _pack_tgts = _pack_sels = _pack_ents = None
                     if _sc_pack_parts:
-                        # Every bin's centering head in the padded [rows, W, k] layout the term reads.
                         _sc_r = torch.cat([_x[0] for _x in _sc_pack_parts])
                         _sc_c = torch.cat([_x[1] for _x in _sc_pack_parts])
                         _sc_ph = torch.cat([_x[2] for _x in _sc_pack_parts])

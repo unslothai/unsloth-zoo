@@ -121,7 +121,6 @@ def _run(monkeypatch, packing, bins = None):
     )
     assert seen.get("sc") is not None, "the centering term did not reach the loss"
     mask = seen["mask"].to(D64)
-    # A scalar that depends on both loss inputs, for the gradient check.
     total = (seen["new"].to(D64) * mask).sum() + (seen["sc"].to(D64) * mask).sum()
     params = [model.emb, model.mix, model.head.weight]
     grads = torch.autograd.grad(total, params)
