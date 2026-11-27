@@ -145,8 +145,13 @@ def test_fused_linear_vs_fp64(ggml_type, M):
     # negative control: a 2^-7 relative error must fail the same bound
     bad_ok, _ = _fp64_bound_ok(got * (1 + 2 ** -7), x, w32, stock)
     assert not bad_ok
+    # bias: fp64 bound too (two cuBLAS calls differ by more than an absolute tolerance on A100: bf16 split-K partials)
     got_b = gguf_linear(x, packed, ggml_type, (N, K), bias)
-    assert torch.allclose(got_b.float(), got.float() + bias.float(), atol = 1e-2, rtol = 1e-2)
+    ref_b = x.double() @ w32.double().t() + bias.double()
+    e_got = (got_b.double() - ref_b).abs()
+    e_stock = (torch.nn.functional.linear(x, w32.to(dtype), bias).double() - ref_b).abs()
+    assert e_got.mean() <= 1.5 * e_stock.mean() + 1e-12
+    assert e_got.max() <= e_stock.max() + torch.finfo(dtype).eps * ref_b.abs().max().item()
     gy = torch.randn(M, N, device = "cuda", dtype = dtype, generator = g)
     dx = gguf_linear_backward_input(gy, packed, ggml_type, (N, K))
     ok_b, _ = _fp64_bound_ok(dx, gy, w32.t().contiguous(), gy @ w32.to(dtype))
