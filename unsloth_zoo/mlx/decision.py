@@ -285,8 +285,7 @@ def _load_network(folder, compute_dtype):
             module.set_dtype(mx.float32)
     model.eval()
     mx.eval(model.parameters())
-    # eval returns before the command buffer drops the cast's source tensors, so wait, then clear the process-wide
-    # cache; it is shared, so drain generation streams first.
+    # Wait for the cast's sources to drop; cache is shared, so drain generation streams first.
     from .generate import _drain_generation_streams
 
     _drain_generation_streams(mx)
@@ -776,8 +775,7 @@ def _layers_owner(name):
 
 
 def _off_decoder(stem, owners):
-    """Whether an adapter stem names a tower, projector or talker, which the `_lora_key` prefix drops; `owners` holds
-    the decoder's layers, stored as `model` or `language_model`."""
+    """Whether an adapter stem names a tower, projector or talker, which `_lora_key` drops."""
     from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
 
     prefix = stem.partition("layers.")[0] if "layers." in stem else stem.rpartition(".")[0]
@@ -919,7 +917,6 @@ class _QwenModel(DecisionPipeline):
             from .utils import _AUDIO_QUALIFIED_FAMILIES, _installed_mlx_vlm_version
 
             owner = self._TOWERS[self._architecture]
-            # Audio only on the mlx-vlm releases the trainer qualifies for this architecture's processing.
             qualified = _AUDIO_QUALIFIED_FAMILIES.get(self._architecture)
             if tower == "audio_tower" and not (qualified and qualified.admits(_installed_mlx_vlm_version())):
                 return False
@@ -1104,9 +1101,7 @@ class _QwenModel(DecisionPipeline):
         return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 
     def _hidden_states(self, prompts, media = None, images_end = 0):
-        """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt.
-
-        The images of the prompts, which end at token `images_end`, are read in the shared pass."""
+        """Hidden states per prompt; the shared prefix, through `images_end`, runs once."""
         from .utils import _forward_text_hidden_states, _get_text_model
 
         # Every prompt keeps at least one token of its own to continue with.
@@ -1412,7 +1407,6 @@ class _KevModel(_QwenModel):
         return ((keys @ query) * self.scale).tolist()
 
 
-# The head's type embedding rows.
 _TYPE_IDS = ("noul", "choice", "score")
 
 
@@ -1508,7 +1502,6 @@ class _JointHead(nn.Module):
         )
         for layer in self.evidence_layers:
             options = layer(options, memory)
-        # Each question starts from its own text plus a summary of its options, weighted by how well each matches it.
         fields = self.question_projection(questions)
         own = mx.array(owner)[None, :] == mx.arange(len(question_spans))[:, None]
         match = mx.where(own, (fields @ options.T) / math.sqrt(options.shape[-1]), -mx.inf)
@@ -1686,7 +1679,6 @@ class ClefModel(_QwenModel):
         """One logit per option of the prompt, in question order; `types` index `_TYPE_IDS`."""
         output = output or self._output_head()
         hidden = self._hidden(ids, media).astype(mx.float32)
-        # The head reads the output embedding but does not train it.
         lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
         return self.head(hidden, lexical, question_spans, option_spans, types)
 
@@ -1889,14 +1881,9 @@ def _refuse_untrusted_model_file():
 
 
 def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None, load_in_4bit = False):
-    """Load a decision model from its source repo: a local folder, or a Hugging Face repo id that is downloaded.
-
-    `compute_dtype` is an MLX dtype or its name (default: float32 for the encoder models, the base model's own for the
-    others); `family` names the model family when the files that identify it are missing; `subfolder` selects one checkpoint
-    of a repo that ships several; `base_model` replaces the base an adapter names (a folder or repo id). `load_in_4bit`
-    quantizes a Clef's decoder as it loads, to train LoRA adapters over: `save_clef_model` merges them into the
-    checkpoint's own full-precision weights.
-    """
+    """compute_dtype defaults to float32 for encoders, else the base's; family names the model if
+    identifying files are missing; base_model replaces an adapter's base; load_in_4bit quantizes
+    a Clef's decoder for LoRA, which save_clef_model merges into full-precision weights."""
     _refuse_untrusted_model_file()
     source, folder = folder, Path(folder)
     if not folder.is_dir():
@@ -1923,9 +1910,8 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
 
 
 def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None, head_config = None, seed = 3407, token = None, load_in_4bit = False):
-    """Load a plain language model with a new untrained joint head to train as a Clef; the head is 1024 wide for hidden
-    size 3072+ (else 512) unless head_width or head_config says otherwise; seed reseeds MLX's random state;
-    load_in_4bit quantizes the decoder for LoRA training."""
+    """Plain model plus an untrained joint head: 1024 wide for hidden size 3072+ (else 512) unless
+    head_width or head_config overrides; seed reseeds MLX; load_in_4bit quantizes for LoRA."""
     _refuse_untrusted_model_file()
     folder = Path(path)
     if not folder.is_dir():
@@ -2161,8 +2147,7 @@ def _apart(folder, source):
 
 
 def _clef_head(pipeline, config, exact = False):
-    """The joint head's tensors as saved, with `head_temperature` folded in when they can absorb it; `exact` keeps
-    float32 with nothing folded, for resuming training."""
+    """Head tensors; head_temperature folds in if absorbable; exact keeps float32 unfolded."""
     head = dict(tree_flatten(pipeline.head.parameters()))
     if exact:
         return {name: value.astype(mx.float32) for name, value in head.items()}
@@ -2194,8 +2179,7 @@ def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",
             shutil.copyfile(item, staging / item.name)
     for item in staging.iterdir():
         keep_mode(item, folder / item.name)  # a re-save keeps weights the user restricted restricted
-    # The head's file makes a folder a checkpoint: it is removed first and written last, so an interrupted save over an
-    # earlier checkpoint never reads as complete.
+    # Head file removed first and written last; an interrupted re-save never reads as complete.
     (folder / "joint_head.safetensors").unlink(missing_ok = True)
     staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
     for item in staged:
@@ -2275,9 +2259,8 @@ def save_clef_model(pipeline, folder, source, config = None):
 
 
 def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None, config = None, exact = False):
-    """Write a LoRA-trained Clef as PEFT adapters beside its joint head; `source` is the decoder's checkpoint,
-    `base_model` the repo id or folder load_decision_model puts them back on; `exact` keeps the head float32 with no
-    temperature folded in."""
+    """Writes a LoRA Clef as PEFT adapters beside its joint head; source is the decoder checkpoint;
+    base_model is the repo or folder they reload onto; exact keeps head float32, unfolded."""
     (folder, source), decoder, stored = _apart(folder, source), pipeline.model, _stored_tensors(source)
     adapters = [(path, module) for path, module in decoder.named_modules() if "lora_a" in module]
     whole = [path for path, _ in tree_flatten(decoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
@@ -2312,8 +2295,7 @@ _ENCODER_LINEARS = ("attn.Wqkv", "attn.Wo", "mlp.Wi", "mlp.Wo")
 
 
 def load_trainable_decision_model(folder, full_finetuning = False, gradient_checkpointing = True):
-    """Load a Laya checkpoint for training: a full fine-tune trains every weight in float32; otherwise the encoder is
-    frozen with float16 matmuls, ready for add_lora_adapters, and only the float32 head trains."""
+    """Full fine-tune trains float32; else float16 encoder frozen, only float32 head trains."""
     # The trainer works on the network; the loaded pipeline around it only serves requests.
     model = load_decision_model(folder, compute_dtype = mx.float32 if full_finetuning else mx.float16).model
     model.freeze()
@@ -2392,9 +2374,7 @@ def collate_decisions(items, pad_token_id):
 
 
 def _decision_losses(logits, target, mask, objective = None):
-    """Each decision's loss (cross-entropy with smoothing toward uniform over its options, plus Brier) and its expected
-    distance from the gold level; objective is (label_smoothing, brier_weight, ordinal_weight); logits hold -1e4
-    where mask is off."""
+    """Smoothed cross-entropy, Brier and expected distance from gold; off-mask logits are -1e4."""
     smoothing, brier, ordinal = objective or (0.0, 0.0, 0.0)
     log_p = nn.log_softmax(logits, axis = -1)
     options = mask.sum(-1, keepdims = True)
@@ -2417,8 +2397,7 @@ def _soft_cross_entropy(model, batch, objective = None):
 
 
 class _LayerwiseStep:
-    """Soft cross-entropy and gradients with the encoder run and differentiated one layer at a time, bounding MLX's
-    buffer-cache working set; layer inputs are kept and each layer recomputed on backward."""
+    """Layer-wise soft cross-entropy to cap MLX's buffer cache; layers recomputed on backward."""
 
     def __init__(self, model, compile = False, objective = None):
         self.model = model
@@ -2590,12 +2569,10 @@ _TRAINABLE = "trainable.safetensors"
 
 
 class ClefNetwork(nn.Module):
-    """A loaded Clef pipeline's decoder (`encoder`) and joint head as the one parameter tree the trainer optimizes.
-
-    `origin` is `(source, base_model, base_revision, config)` as `save_clef_adapter` takes them. With it, a checkpoint
-    of a LoRA Clef is those adapters and the head, which `load_decision_model` loads; without it, or for a full
-    fine-tune, a checkpoint holds the trainable parameters alone.
-    """
+    """The decoder (`encoder`) and joint head as one trainable tree; with `origin` (as
+    save_clef_adapter takes it), a LoRA checkpoint is those adapters and the head, loaded by
+    load_decision_model; without it, or for a full fine-tune, the checkpoint holds the trainable
+    parameters alone."""
 
     def __init__(self, pipeline, gradient_checkpointing = True, origin = None):
         super().__init__()
@@ -2676,9 +2653,8 @@ class ClefNetwork(nn.Module):
 def clef_training_network(
     pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, origin = None, **lora
 ):
-    """Prepare a loaded Clef for training, returning its ClefNetwork; the float32 head always trains; the decoder trains
-    whole under full_finetuning, else via LoRA; a Clef loaded from adapters keeps training them whatever r,
-    lora_alpha, target_modules say; origin lets checkpoints be saved as adapters."""
+    """Returns ClefNetwork; float32 head always trains; decoder whole if full_finetuning, else LoRA;
+    adapter-loaded Clefs ignore r, lora_alpha, target_modules; origin allows adapter saves."""
     _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modules, **lora)
     pipeline.head.unfreeze()
     network = ClefNetwork(pipeline, gradient_checkpointing, origin)
@@ -2704,7 +2680,6 @@ def _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modul
     if full_finetuning and pipeline._experts_apart:
         raise ValueError("Unsloth: this checkpoint stores each expert of its mixture apart, so it trains through LoRA adapters only; pass full_finetuning = False.")
     if any("lora_a" in module for _, module in pipeline.model.named_modules()):
-        # Adapters the checkpoint was loaded with go on training as they are.
         if full_finetuning:
             raise ValueError("Unsloth: a Clef loaded from LoRA adapters trains through them; pass full_finetuning = False.")
         pipeline.model.unfreeze(keys = ["lora_a", "lora_b"], strict = False)
@@ -2733,8 +2708,7 @@ def _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modul
 
 
 def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0, capture = None):
-    """Loss summed over one record's questions; ordinal_scale weighs score questions' ordinal term and kl_weight the
-    divergence of each distribution from the reference logits' distribution."""
+    """Per-record sum; ordinal_scale weighs score ordinal terms, kl_weight the KL to reference."""
     spans = item["option_spans"]
     logits = _item_logits(network._pipeline, item)
     target = np.zeros((len(spans), logits.shape[0]), np.float32)
@@ -2840,9 +2814,8 @@ def clef_option_keys(pipeline, question):
 
 
 def clef_training_item(pipeline, state, questions, max_length = None, images = None, audio = None):
-    """Tokenize one record as a Clef training item; the caller adds targets over clef_option_keys; images are PIL or
-    data URLs, merged with state image parts as in a request; audio clips are data URLs or decoded {array,
-    sampling_rate} at 16 kHz mono; source keeps the record for permute_fields."""
+    """Tokenizes a record as a Clef item; caller adds clef_option_keys targets; images PIL or data
+    URLs merged with state images; audio data URLs or {array, sampling_rate} at 16 kHz mono."""
     parsed = pipeline._parse_questions(questions)
     given = list(images or ())
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])
@@ -2921,7 +2894,6 @@ def d1_training_item(pipeline, state, questions, images = None, audio = None):
     if len(parsed) > engine.set_size:
         raise DecisionRequestError(f"too many questions for one record, the maximum is {engine.set_size}")
     asked = [engine.ask(pipeline._question(question)) for question in parsed]
-    # Merged with the state's image parts, as a request is served.
     given = list(images or ())
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])
     images, audio = given + urls[sum(isinstance(image, str) for image in given):], list(audio or ())
@@ -2969,9 +2941,7 @@ def d1_answer(pipeline, question, probabilities):
 
 
 def save_d1_model(pipeline, folder, source = None, temperatures = None):
-    """Write a trained d1 as a d1 checkpoint mlx-vlm and `load_decision_model` read. LoRA adapters are merged into the
-    source's weights. A source's calibration describes the model before training, so it is not kept; `temperatures`,
-    fitted after training by question type, are written as its calibration instead."""
+    """Writes a d1 checkpoint, LoRA merged; `temperatures` replace the source's calibration."""
     folder, source = _apart(folder, source or pipeline.source)
     folder.mkdir(parents = True, exist_ok = True)
     staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))

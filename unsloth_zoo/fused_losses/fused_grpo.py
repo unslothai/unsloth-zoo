@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO loss with gradient taken in the forward: sum_i w_i*l(logp_i) + e_i*H_i, so the logits
-recompute is dropped (trainable head 4 to 3 GEMMs, frozen with entropy grad 3 to 2); GSPO, VESPO,
-off-policy and top-entropy masks keep the log-prob op."""
+"""GRPO gradient in forward: sum_i w_i*l(logp_i) + e_i*H_i; no logits recompute (trainable head 4 to
+3 GEMMs; frozen, entropy grad 3 to 2); GSPO/VESPO/off-policy/top-entropy keep log-prob op."""
 
 import math
 import os
@@ -29,8 +28,7 @@ from . import fused_linear as fl
 __all__ = ["fused_linear_grpo_loss", "grpo_token_weights", "grpo_loss_token_weights", "GRPO_FWD_GRAD"]
 
 GRPO_FWD_GRAD = os.environ.get("UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD", "1") != "0"
-# A trainable half lm_head gradient accumulates across row chunks in float32 (one float32 copy of the head while the
-# loss runs), matching the per-tile float32 accumulation of the fused_linear_logprobs backward. "0" trades it for memory.
+# Half head grad sums in fp32 over chunks like fused_linear_logprobs; "0" trades it for memory.
 GRPO_FP32_HEAD_GRAD = os.environ.get("UNSLOTH_FUSED_LINEAR_GRPO_FP32_HEAD_GRAD", "1") != "0"
 _OP = "fused_linear_grpo_v1"
 # 0: clipped surrogate (grpo, bnpo, dr_grpo, dapo, luspo), 1: cispo, 2: sapo.
@@ -282,9 +280,8 @@ def fused_linear_grpo_loss(
     fp32_head_grad = None,
     token_weights = None, entropy_weights = None,
 ):
-    """TRL GRPO token-level loss on hidden [B, T, H]; logps and entropy are metrics, the loss
-    carries the gradient; UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 builds the same loss from
-    fused_linear_logprobs plus torch."""
+    """TRL GRPO loss on hidden [B, T, H]; logps/entropy are metrics, the loss carries the gradient;
+    UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 builds it from fused_linear_logprobs plus torch."""
     if loss_type not in _KIND:
         raise ValueError(f"Unsloth: GRPO loss type {loss_type} has no forward gradient.")
     device = weight.device
@@ -318,8 +315,7 @@ def fused_linear_grpo_loss(
                                           entropy_requires_grad = bool(entropy_coef) or entropy_weights is not None,
                                           rows_per_chunk = rows_per_chunk)
         lp, en = lp.reshape(B, T).float(), en.reshape(B, T).float()
-        # Masked tokens may hold any old / ref / ratio (padding): zero them before the ratio, as the op skips them,
-        # so an overflowed exp cannot turn the weighted sum (or its gradient) into NaN.
+        # Zero masked tokens first so an overflowed exp on padding cannot make the loss NaN.
         live = mask.to(device = device, dtype = torch.bool).reshape(B, T)
         z = lambda x: torch.where(live, x, torch.zeros_like(x)) if x is not None else None  # noqa: E731
         ell, _ = _token_terms(z(lp), adv, z(old), z(ref), z(isr), kind, *args)

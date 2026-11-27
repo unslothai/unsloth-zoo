@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sliding window mask for "hybrid_sliding" layers when generate prebuilds StaticCache masks. Self-contained (only
-.common): the CPU backend loads this file alone."""
+"""hybrid_sliding StaticCache sliding mask; self-contained (only .common) for CPU backend."""
 
 import logging
 import os

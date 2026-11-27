@@ -134,10 +134,8 @@ scan_ops()
 
 
 def _chunked(q, k, v, g, beta, scale, initial_state, output_final_state, mm_dtype, seg = None):
-    """q / k [B,T,H,K] (l2-normalised already if asked, H == HV), v [B,T,H,V], g / beta [B,T,H]; returns o [B,T,H,V]
-    in float32 and the final state [B,H,K,V] float32 or None. ``seg`` [B,T] (packed documents, B = 1): document id per
-    token. Chunks stay 64 tokens of the packed row; masks keep pairs, the carried state and the state update inside
-    one document, so no host sync and no per-document loop."""
+    """q/k [B,T,H,K] (l2-normalised if asked, H == HV), v [B,T,H,V], g/beta [B,T,H]; float32 o
+    [B,T,H,V], state [B,H,K,V] or None; seg [B,T] packs docs (B=1), masks state; no host sync."""
     scan, _ = scan_ops()
     B, T, H, K = q.shape
     V = v.shape[-1]
@@ -211,8 +209,7 @@ def torch_chunk_gated_delta_rule(
         raise ValueError("Unsloth: packed gated delta (cu_seqlens) runs with B = 1 and no initial / final state.")
     out_dtype = q.dtype
     if mm_dtype is None:
-        # float16 inputs: float16 matmul operands (tensor cores), what fla's kernels read too. Anything else
-        # (bfloat16 has no sm75 tensor cores and a range float16 cannot hold): float32.
+        # float16 inputs use float16 matmuls; others float32 (bf16 has no sm75 tensor cores).
         mm_dtype = torch.float16 if q.dtype == torch.float16 else torch.float32
     if use_qk_l2norm_in_kernel:
         # fla's l2norm: x * rsqrt(sum(x^2) + 1e-6), reduced in float32, per head (before the repeat).

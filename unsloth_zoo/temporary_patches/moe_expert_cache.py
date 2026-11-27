@@ -277,9 +277,8 @@ def expert_cache_offer(param, weight):
         free, total, peak = m
         need = weight.numel() * weight.element_size()
         cached = _cached_bytes(device)
-        # Budget against the peak seen before the first admission (one full uncached step), so every cached byte
-        # adds to that peak and the margin stays free at it. Kept through evictions and OOM clears: the allocator peak
-        # by then includes the cache and would shrink the budget for good.
+        # Budget against the peak before the first admission (one uncached step), so cached bytes
+        # add to it; kept through evictions/OOM clears, else the cache would shrink the budget.
         idx = device.index if device.index is not None else -1
         if idx not in _PEAK0:
             _PEAK0[idx] = peak

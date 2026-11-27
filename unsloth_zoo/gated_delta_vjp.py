@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Memory-efficient custom VJP for GatedDeltaNet (Qwen3.5): backward recomputes states instead of keeping all T graph
-states; patch_gated_delta() monkey-patches mlx_lm's gated_delta module."""
+"""Memory-saving GatedDeltaNet VJP (recomputes states); patch_gated_delta() patches mlx_lm."""
 
 from functools import lru_cache
 from typing import NamedTuple, Optional, Tuple
@@ -92,8 +91,7 @@ def gated_delta_ops_efficient(
         chunk_T = q_c.shape[1]
         _has_mask = mask_chunk is not None and mask_chunk.shape[-1] >= chunk_T
 
-        # Returned post-mask states, where(mask, state_new, state_prev), so masked steps give states[t+1]==states[t];
-        # used only as each step's state_prev, and the y-path recomputes state_new below.
+        # Post-mask states: masked steps keep states[t+1]==states[t]; y recomputes state_new.
         states = [state_in]
         s = state_in
         for t in range(chunk_T):
@@ -135,8 +133,7 @@ def gated_delta_ops_efficient(
             delta = (v_t - kv_mem) * beta_t[..., None]
             state_new = state_decayed + k_t[..., None, :] * delta[..., None]
 
-            # state_returned = where(mask, state_new, state_prev); d_state_returned goes to d_state_new when mask=True
-            # and passes through to d_state_prev when mask=False.
+            # d_state_returned flows to state_new when mask is set, else to state_prev.
             if _has_mask:
                 m = mask_chunk[:, t]
                 m_exp = mx.expand_dims(m, axis=(1, 2, 3))
@@ -155,7 +152,6 @@ def gated_delta_ops_efficient(
             d_q_t = (dy_t[..., None].astype(mx.float32) * state_new).sum(axis=-2)
             d_q_steps.append(d_q_t.astype(q_c.dtype))
 
-            # state_new = state_decayed + k[..., None, :] * delta[..., None]
             d_kd = d_state_new
             d_state_decayed = mx.array(d_state_new)
 
@@ -163,20 +159,17 @@ def gated_delta_ops_efficient(
             d_k_t_from_update = (d_kd * delta[..., None].astype(mx.float32)).sum(axis=-2)
             d_delta = (d_kd * k_t[..., None, :].astype(mx.float32)).sum(axis=-1)
 
-            # delta = (v - kv_mem) * beta[..., None]
             d_v_minus_kv = d_delta * beta_t[..., None].astype(mx.float32)
             d_beta_t = (d_delta * (v_t.astype(mx.float32) - kv_mem)).sum(axis=-1)
             d_v_t = d_v_minus_kv
             d_kv_mem = -d_v_minus_kv
 
-            # kv_mem = (state_decayed * k[..., None, :]).sum(-1)
             d_state_decayed = (
                 d_state_decayed
                 + d_kv_mem[..., None].astype(mx.float32) * k_t[..., None, :].astype(mx.float32)
             )
             d_k_t_from_kv = (d_kv_mem[..., None].astype(mx.float32) * state_decayed).sum(axis=-2)
 
-            # state_decayed = state_prev * decay
             d_state_prev_via_recurrence = d_state_decayed * decay.astype(mx.float32)
             d_decay = (d_state_decayed * state_prev).sum(axis=-2)
             if g_t.ndim == 2:
@@ -202,7 +195,6 @@ def gated_delta_ops_efficient(
         d_mask = mx.zeros_like(mask_chunk) if mask_chunk is not None else None
         return d_q, d_k, d_v, d_g, d_beta, d_state, d_mask
 
-    # Run chunked forward
     all_ys = []
     s = state
     for c in range(num_chunks):
@@ -236,9 +228,8 @@ def _is_training_call(state, use_kernel):
         return True
     if state is not None and use_kernel:
         return False
-    # Absolute import (enforced by test_relative_imports_resolve.py): custom_object_save copies this file beside a
-    # checkpoint, where mlx.utils.py does not exist; lazy since it runs once per layer per decode step, so pure
-    # inference skips unsloth_zoo.mlx.utils unless a call site is ambiguous.
+    # Lazy absolute import (test_relative_imports_resolve.py): the file is copied beside
+    # checkpoints.
     from unsloth_zoo.mlx.utils import mlx_training_patches_active
     return mlx_training_patches_active()
 
@@ -370,8 +361,7 @@ def _rebind_vlm_gated_delta_consumers(original, patched):
 
 
 def patch_gated_delta_vlm():
-    """Patches mlx_vlm's own qwen3_5 gated_delta_update (a distinct copy over non-differentiable
-    gated_delta_kernel) that the identity sweep skips."""
+    """Patch mlx_vlm qwen3_5's gated_delta_update: a distinct copy the identity sweep skips."""
     import sys
     # Importing it here would drag the mlx-vlm model packages into a text-only run.
     if not any(name.startswith("mlx_vlm.models.qwen3_5") for name in sys.modules):
@@ -1053,8 +1043,7 @@ def _blocked_shares_q_dtype(q, *others):
 
 
 def gated_delta_blocked_forward(q, k, v, g, beta, state):
-    """Forward half, or None when it does not apply; matches gated_delta_kernel's unmasked contract: y [B, T, Hv, Dv] in
-    q.dtype, state_out shaped and typed like state."""
+    """Forward half or None; y [B,T,Hv,Dv] in q.dtype, state_out like state (kernel contract)."""
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
     layouts = _blocked_layouts(q, g, v)
@@ -1113,15 +1102,8 @@ def gated_delta_blocked_backward(q, k, v, g, beta, state, dy, d_state_out):
 
 
 def gated_delta_kernel_supported(q, g, mask, v=None, k=None) -> bool:
-    """Whether the fused-kernel VJP path can handle this call.
-
-    A caller omitting `v` or `k` gets False, not a yes the dispatch would refuse.
-
-    Device first: _blocked_layouts reads `dtype.size`, which only a real mx.Dtype
-    has, so off Metal this has to answer False before reaching it rather than
-    raise. tests/mlx_simulation hands out torch dtypes, so a training call under
-    the shim died in the layout search instead of falling back to the ops VJP.
-    """
+    """Device check first: False off Metal and when v or k is omitted, before _blocked_layouts reads
+    dtype.size (only a real mx.Dtype has it; torch dtypes made a training shim call die)."""
     return (
         mx.metal.is_available()
         and mx.default_device() == mx.gpu

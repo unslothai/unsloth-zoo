@@ -24,15 +24,13 @@ from .moe_utils import (
     get_forward_moe_backend,
     extract_moe_lora_weights_for_grouped_mm,
 )
-# Reuse the Qwen-MoE standard-layout LoRA extractor: Gemma4TextExperts shares the (E, out, in) layout and attribute
-# names, and Gemma4TextRouter.forward folds per_expert_scale into top_k_weights.
+# Reuse Qwen-MoE LoRA extractor: same (E, out, in) layout; router folds per_expert_scale.
 from .qwen3_moe import _make_qwen_moe_lora_extractor
 
 
 def _register_gemma4_lora_extractor(experts_cls):
-    """Attach _unsloth_lora_extractor_fn to a Gemma-4 experts class (idempotent; returns False for None); without it,
-    _extract_lora_from_wrapper falls to the canonical-permutation branch, which mismatches torch._grouped_mm dims on
-    PEFT 0.19+; the Qwen extractor handles PEFT 0.18 and 0.19."""
+    """Attaches _unsloth_lora_extractor_fn to Gemma-4 experts (idempotent; False for None); without
+    it PEFT 0.19+ mismatches torch._grouped_mm dims; Qwen extractor covers PEFT 0.18/0.19."""
     if experts_cls is None:
         return False
     if getattr(experts_cls, "_unsloth_lora_extractor_registered", False):
@@ -274,7 +272,6 @@ def _patch_gemma4_moe_legacy():
     _moe_backend = get_forward_moe_backend()
 
     def _gemma4_moe_forward(self, hidden_states, top_k_index, top_k_weights):
-        # Fold per_expert_scale into routing weights before grouped_mm.
         router_ref = getattr(self, "_router_ref", None)
         if router_ref is not None:
             pes = router_ref.per_expert_scale

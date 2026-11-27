@@ -39,8 +39,7 @@ from unsloth_zoo.flex_attention.sparse import probe_flex_backward, sparse_indexe
 
 # family -> modeling module, bound at patch time
 _MODELING = {}
-# Maps family to its within-budget indexer forward (exact skip, else upstream) and class name to family; module level,
-# since Unsloth's compiler rebuilds the classes from source.
+# Module level since the compiler rebuilds classes; within budget: exact skip, else upstream.
 _INNER_INDEXER = {}
 _DSA_FAMILY = {"DeepseekV32Indexer": "deepseek_v32", "GlmMoeDsaIndexer": "glm_moe_dsa"}
 
@@ -99,8 +98,7 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
         probe_flex_backward(_sb._failure_key(kind, query, key, value), fn, args)
         return fn(*args)
     except Exception as error:
-        # Under CUDA graph capture a failure has already invalidated the graph and the dense path cannot rescue it; the
-        # shape class is not at fault, so nothing is latched.
+        # Under CUDA graph capture the graph is invalid; re-raise, shape class is not at fault.
         if query.is_cuda and torch.cuda.is_current_stream_capturing():
             raise
         _sb.record_failure(kind, query, key, value, error)

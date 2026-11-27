@@ -79,8 +79,7 @@ def _staged_ids(x):
 
 
 def read_staged():
-    """Read the rows this thread's forward staged, then submit what it held back for them. Anything about to read
-    the forward's arrays on the host calls this first: they could read rows not yet filled."""
+    """Fill staged rows, submit what it held; call before host reads, as rows may be unfilled."""
     fills = getattr(STAGED_FILLS, "fills", None)
     if not fills:
         return
@@ -318,8 +317,7 @@ class _RowTable:
         return rows * sum(field.row_bytes for field in self.fields)
 
     def fill(self, local, buffers, at, jobs):
-        """Puts rows local (unique, past the held prefix) into buffers at at: rows read earlier and still in the page
-        cache are copied now; the rest are queued on jobs and returned."""
+        """Rows read before, still in page cache, are copied now; the rest are queued on jobs."""
         if local.size == 1:
             row, position = int(local[0]), int(at[0])
             seen = (int(self.seen[row >> 3]) >> (row & 7)) & 1
@@ -332,8 +330,7 @@ class _RowTable:
             return local
         seen = (self.seen[local >> 3] >> (local & 7).astype(np.uint8)) & 1 == 1
         if seen.any():
-            # Through the map an evicted row is a page fault taken with the GIL held; a check walks every page its rows
-            # span, so a spread sample is checked row by row before all rows are.
+            # Map faults hold the GIL: a spread sample is checked row by row before all rows.
             rows = local[seen]
             sample = rows[np.linspace(0, rows.size - 1, min(rows.size, _RESIDENCY_SAMPLE)).astype(np.int64)]
             if not all(_in_core(field.map, sample[i:i + 1], field.row_bytes)[0] for field in self.fields for i in range(sample.size)):
@@ -362,8 +359,7 @@ def _by_shard(shard):
 
 
 class DiskEmbedding(nn.Module):
-    """Stands in for nn.Embedding or nn.QuantizedEmbedding (or a row-sharded one) with rows left on disk; each row goes
-    through the same dequantize, so output matches the module bit for bit."""
+    """Stand-in for nn.Embedding, nn.QuantizedEmbedding or sharded; same dequantize, bit-exact."""
 
     def __init__(self, tables, quantization, dims, normalize_zero):
         super().__init__()
@@ -396,8 +392,7 @@ class DiskEmbedding(nn.Module):
         return values.reshape(*x.shape, self.dims)
 
     def _staged(self, x):
-        """(lookup, fill): lazy staged reads; fill runs first. None when x is too big or a table is
-        resident."""
+        """(lookup, fill): fill runs first; None when x is too big or a table is resident."""
         tables, offsets = self._tables, self._offsets
         fields = tables[0].fields
         if (x.size > _STAGED_ROWS or any(table.resident for table in tables)
@@ -627,9 +622,7 @@ def _replace_module(model, path, replacement):
     setattr(parent, keys[-1], replacement)
 
 
-# Routed experts: the slot cache follows oMLX's MoE expert offload (Apache-2.0, omlx/patches/moe_expert_offload.py) with
-# per-layer slot arrays, decayed-frequency eviction that never evicts the call's own experts, and expert-by-expert runs
-# over capacity.
+# Follows oMLX's MoE expert offload (Apache-2.0); eviction spares the call's own experts.
 
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 # DeepSeek's reference names for them, which DeepSeek V4.1 checkpoints keep.
@@ -646,8 +639,7 @@ _PREFILL_STEP = 2048
 
 
 def _deepseek_v4_step_mask(layer, arguments):
-    """DeepSeek V4 builds one sliding-window mask for the whole call; each step rebuilds it from the block's rotating
-    cache, as chunked prefill does; image-token calls are not causal."""
+    """Mask is rebuilt per step from the rotating cache; image-token calls are not causal."""
     if not arguments.get("causal") or arguments.get("position_offset") is not None:
         return None
     from mlx_vlm.models.base import create_attention_mask
@@ -718,9 +710,8 @@ class _DeepseekV41Steps:
         return cls._snapshot(cache, cache.offset + rows, {name: list(getattr(cache, name)) for name in cls._layer_lists(cache)})
 
 
-# Layers with calls wider than a prefill step may run as consecutive steps on their own cache; token axes of
-# token-indexed arguments; either its causal masks or a function (layer, arguments) giving the mask of each step from
-# hidden states (None if not causal); array if a cache asks for arrays; a class stepping state the layers share, if any.
+# Wider-than-prefill calls step on its cache. Entries: token axes; masks (causal, 'array' for array
+# caches, or a (layer, arguments) function, None if not causal); optional stepping class.
 _WIDE_LAYERS = {
     "mlx_vlm.models.deepseek_v41.language.DeepseekV41Block": (
         {"h": 1, "pre_mix": 1, "image_mask": 1}, (None,), _DeepseekV41Steps),
@@ -781,8 +772,7 @@ def _picks_rhs(rows, routes, experts):
 
 
 class _FullTableKernels:
-    """Mixed into a slot table's QuantizedSwitchLinear: MLX picks a sorted call's kernel by table size, so a call the
-    full table would run per-route runs unsorted, computing each route alone."""
+    """Sorted-call kernels depend on table size, so per-route full-table calls run unsorted."""
 
     def __call__(self, x, indices, sorted_indices = False):
         if sorted_indices and not _picks_rhs(x.shape[-2], indices.size, self.full_experts):
@@ -812,8 +802,7 @@ def _slot_projection(projection, arrays, full_experts):
 
 
 class _ExpertSlots:
-    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x``decay[0]``
-    every ``decay[1]`` calls) among experts the call does not use."""
+    """Experts in capacity slots; misses evict lowest decayed route count not used by the call."""
 
     def __init__(self, fields, experts, capacity, decay = (_SCORE_DECAY, _SCORE_DECAY_EVERY)):
         self.fields = fields  # [(projection, name, _Field)]
@@ -913,9 +902,8 @@ class _GLUPart:
 
 
 class OffloadSwitchGLU(nn.Module):
-    """Stands in for a SwitchGLU of quantized experts kept in the checkpoint: a call reads routed experts into slots and
-    runs a copy of the original module on them; over capacity it runs expert by expert, reading each expert once per
-    position where stock runs decode block positions one at a time."""
+    """Stand-in for a SwitchGLU of quantized checkpoint experts: reads routed experts into slots and
+    runs a copy of the original module; over capacity, expert by expert, once per position."""
 
     def __init__(self, glu, slots, experts):
         super().__init__()
@@ -943,9 +931,7 @@ class OffloadSwitchGLU(nn.Module):
         return routes, np.unique(routes)
 
     def _table(self, spare = None):
-        """The stock module on spare or a new table of all the layer's experts, plus the function filling it (resident
-        experts copied from slots, others read in runs); None when a field is cast at load, since its bytes on disk
-        are then not the table's."""
+        """Stock module with resident-expert fill; None if cast at load (disk bytes differ)."""
         slots = self._slots
         if any(field.cast is not None for _, _, field in slots.fields):
             return None
@@ -1072,8 +1058,7 @@ class OffloadSwitchGLU(nn.Module):
         return up, gate, activated, glu.down_proj.gather(activated, slots, sort)
 
     def _by_expert(self, row_of_route, routes, run):
-        """Runs run(experts, rows) over every route expert by expert in slot-sized chunks, each evaluated before the
-        next is read; outputs come back as [routes, dims] in route order."""
+        """Slot-size chunks, each evaluated before next; outputs [routes, dims] in route order."""
         slots = self._slots
         resident = slots.slot_of[routes] >= 0
         # Resident experts first, so a chunk's misses evict only experts already used.
@@ -1092,9 +1077,8 @@ class OffloadSwitchGLU(nn.Module):
         return tuple(mx.concatenate(column)[inverse] for column in zip(*outputs))
 
     def _gather_run(self, rows, compute, sort, weights = None):
-        """Chunks as stock gathers, one route per row; sort keeps a chunk on gather_qmm_rhs by sorting and padding it to
-        the slot table's minimum for that kernel; with weights ([..., top_k]) sources are routes and compute gets
-        them too."""
+        """One route per row, as stock; sort keeps each on gather_qmm_rhs, sorted and padded to the
+        slot table's minimum; with weights ([..., top_k]), sources and compute get routes."""
         slots = self._slots
         floor = max(16, 4 * slots.capacity)
 
@@ -1122,9 +1106,8 @@ class OffloadSwitchGLU(nn.Module):
         return run
 
     def _block_run(self, glu, rows, dtype):
-        """Chunks as mlx-vlm decode blocks of the chunk's tokens; those kernels give a route the same result whatever
-        the block's other positions and routes are, so each token's routes form a position, padded by repeating one,
-        at least two positions per block."""
+        """Chunks run as mlx-vlm decode blocks: each token's routes form a position, padded by
+        repeating one to at least two per block, since a route's result ignores other positions."""
         slots = self._slots
         from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
 
@@ -1235,9 +1218,8 @@ def _is_cache_mask(mask, built):
 
 
 class _WideLayer:
-    """Mixed into a _WIDE_LAYERS decoder layer of a stack with offloaded experts: a call wider than _PREFILL_STEP runs
-    as consecutive steps on the layer's cache, with all its experts read once per call (next layer read ahead) and
-    decode slots left alone."""
+    """Mixed into a _WIDE_LAYERS layer of an offloaded stack: a call wider than _PREFILL_STEP runs
+    as steps on its cache, reading all experts once per call; decode slots left alone."""
 
     def __call__(self, *args, **kwargs):
         axes = self._wide_axes
@@ -1311,8 +1293,7 @@ _prefill_capture = threading.local()
 
 
 def wide_prefill_step(model):
-    """The step every wide single-row prefill call of model runs in, as a prefill chunked at it; None when a layer may
-    run a call whole (unregistered layer, DeepSeek V4 image rows)."""
+    """Step for wide single-row prefill; None for unregistered layer or DeepSeek V4 image rows."""
     modules = dict(model.named_modules())
     switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
     wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
@@ -1395,8 +1376,7 @@ def _top_k(model, path):
 
 
 def _expert_tensors(store, path, projection, name, expected):
-    """(names, None) of a stacked expert parameter's per-expert tensors when stored apart (mlx-vlm stacks them at load,
-    as for GLM-5); (None, reason) on mismatch; None if absent."""
+    """(names, None) of apart-stored experts; (None, reason) on mismatch; None if absent."""
     if not path.endswith(".switch_mlp"):
         return None
     base = path[:-len("switch_mlp")] + "experts."
@@ -1476,9 +1456,7 @@ def offloadable(model, model_dir, *, cast_dtype = None):
 
 
 def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
-    """Replace every SwitchGLU of quantized experts in model with an OffloadSwitchGLU reading model_dir's shards into
-    slots for 1-fraction of each layer's experts (at least max(8, top_k)); run before any evaluation; cast_dtype as
-    offload_ple; returns {layers, on_disk_bytes, resident_bytes, skipped}."""
+    """Offloads quantized SwitchGLU; run before any evaluation; slots at least max(8, top_k)."""
     cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     report = {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}
@@ -1636,9 +1614,8 @@ def offload_footprint(inventory, ple, experts):
 
 
 def context_bytes(model_dir, tokens, prefill_step = PREFILL_STEPS[0], dtype_bytes = 2):
-    """Bytes for tokens of context, from the config: attention KV cache doubled (with its growing transients), a prefill
-    step's logits and a reserve; fitted above Qwen3.8-Flash-Next's measured peaks (13.7 GiB over the weights at 262K
-    tokens)."""
+    """Context bytes from config: attention KV cache doubled (with transients), prefill logits, a
+    reserve; fitted above Qwen3.8-Flash-Next's peaks (13.7 GiB over weights at 262K tokens)."""
     config = _text_config(model_dir)
     layers = config.get("num_hidden_layers", 0)
     types = config.get("layer_types")

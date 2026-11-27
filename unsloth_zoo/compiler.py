@@ -106,7 +106,6 @@ try:
 except:
     ScriptFunction = None
 
-# Compiled cache location
 global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
@@ -121,7 +120,6 @@ if "UNSLOTH_COMPILE_LOCATION" not in globals():
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
 
-# Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 
 # device capability
@@ -177,7 +175,6 @@ del _forward_adapter
 
 OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
 
-# Check if Unsloth Studio is allowed
 import importlib.util
 
 if importlib.util.find_spec("unsloth_studio") is None:
@@ -187,7 +184,6 @@ else:
 pass
 
 
-# Ignore logging messages
 class HideLoggingMessage(logging.Filter):
     def __init__(self, text):
         self.text = text
@@ -249,9 +245,8 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
 
-    # Locally defined grid helpers get their own compile decorators unless listed (listing disables their compile and
-    # allows graph breaks in their callers); keep temporal_merge_index listed: it fails on supported torch 2.9.1 though
-    # it traces on 2.10.0 and 2.13.0.
+    # Local grid helpers get own compile decorators unless listed (listing allows caller graph
+    # breaks); keep temporal_merge_index listed: fails on torch 2.9.1, traces on 2.10.0/2.13.0.
     "get_vision_pixel_shuffle_index",   # muse_glimmer
     "get_vision_frame_index",           # kimi_k25
     "get_vision_temporal_merge_index",  # kimi_k25
@@ -328,9 +323,8 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 }
 
 
-# {model_type: {class: ((old, new), ...)}}: forward rewrites applied whether or not the class compiles; the eager mixer
-# saves its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
-# One (old, new) pair per transformers layout; the first that occurs exactly once is applied.
+# Rewrites hit uncompiled classes too; eager mixers save FP32 upcast for backward (compiled blocks
+# don't); helper keeps stock math under torch.compile; first occurring exactly once applies.
 MODULE_FORWARD_EAGER_REWRITES = {
     "deepseek_v4": {"DeepseekV4HyperConnection": MHC_PROJECTION_REWRITES},
     "deepseek_v41": {
@@ -341,8 +335,7 @@ MODULE_FORWARD_EAGER_REWRITES = {
 }
 
 
-# Modeling code that lives outside transformers, {model_type: module name}: Unsloth's own implementations
-# (unsloth/models/<model_type>/modeling.py by default) when the installed transformers lacks the model.
+# Modules for types missing from transformers; default unsloth/models/<model_type>/modeling.py.
 NATIVE_MODELING_MODULES = {}
 
 
@@ -431,8 +424,7 @@ def module_forward_source_rewrites(modeling_file, model_type):
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
             if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
-                # Block compile rebinds a layer's forward to its modeling module's globals, so the helper a rewritten
-                # forward calls must also resolve there, not only in the generated module.
+                # Rebound block forwards need their helpers in the modeling module's globals.
                 from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp
 
                 modeling_file.unsloth_sinkhorn_knopp = unsloth_sinkhorn_knopp
@@ -829,7 +821,6 @@ pass
 
 """
 
-# Patch Layernorm, Conv
 _patch_functions = [
     "Conv1d",
     "Conv2d",
@@ -869,7 +860,6 @@ def make_no_update_causal_mask(original):
     return _update_causal_mask
 
 
-# Patch SDPA
 _SYMBOOL_IS_CAUSAL = re.compile(
     r"^(?P<pad>[ \t]*)is_causal = (?P<b>bool\()?(?P<mask>[A-Za-z_][A-Za-z0-9_]*) is None and "
     r"(?P<len>[A-Za-z_][A-Za-z0-9_]*) > 1(?(b)\))[ \t]*$",
@@ -1051,8 +1041,7 @@ def _owns_its_lines(node, lines):
     return not after or after.startswith("#")
 
 
-# The AMD aiter marker is emitted into every rewritten block and checked before rewriting, so a second pass is a no-op;
-# without it the two emitted SDPA fallbacks would match and triple the block.
+# Marker makes a second pass a no-op; without it, SDPA fallbacks match and triple the block.
 _AITER_MARKER = "# AMD aiter Flash Attention"
 
 
@@ -1283,7 +1272,6 @@ def get_compile_folder(use_tempfile=False):
 pass
 
 
-# Mask creation functions
 @functools.lru_cache(1)
 def get_mask_functions():
     try:
@@ -1579,9 +1567,7 @@ def higher_precision_layernorms(modeling_file):
         return modeling_file
     norm_module = norm_modules[0]
     start, end = norm_module.span(0)
-    # The match runs into the next class's name, so searching from its end lands one class too
-    # far and lets a neighbour's markers decide. The regex guarantees a later "\nclass", so -1
-    # is only future proofing.
+    # Search from start + 1: match runs into the next class; regex guarantees a later class.
     end = modeling_file.find("\nclass", start + 1)
     if end == -1: end = len(modeling_file)
     norm_module = modeling_file[start:end]
@@ -1882,16 +1868,14 @@ def _moe_utils_copy_is_importable(folder):
     """
     if not folder:
         return False
-    # A verbatim moe_utils.py does not settle it: `from moe_utils import` resolves by name, so a planted moe_utils/
-    # package or moe_utils.so in the same directory wins; same check as the generated module.
+    # Import resolves by name, so a planted moe_utils/ package or .so in the folder wins.
     try:
         _reject_shadowing_import_candidates(folder, "moe_utils")
     except Exception:
         return False
     try:
-        # Absolute import, not the relative .temporary_patches.moe_utils: transformers joins the raw dotted capture onto
-        # the directory, so custom_object_save fails on every remote-code save; see
-        # tests/test_relative_imports_resolve.py.
+        # Absolute import: transformers joins the raw dotted capture onto the directory, breaking
+        # custom_object_save on remote-code saves (tests/test_relative_imports_resolve.py).
         from unsloth_zoo.temporary_patches.moe_utils import cached_copy_is_importable
     except Exception:
         return False
@@ -1964,8 +1948,7 @@ def _verified_moe_utils_binding(folders):
                 continue
         except Exception:
             continue
-        # A verified copy is there. Bind ours, or block the name if ours will
-        # not import: what must not happen is the file being resolved again.
+        # Bind ours if it imports, else block the name: the file must not be resolved again.
         return _installed_moe_utils()
     return _NO_MOE_UTILS_BINDING
 
@@ -1992,9 +1975,8 @@ def _untrusted_cache_kept_out_of_imports(*folders):
         if binding is _NO_MOE_UTILS_BINDING:
             yield
             return
-    # Only the outermost guard touches sys.modules, or an inner one saves the outer entry and restores it permanently;
-    # mutations sit inside the try, depth is bumped before the name, since a signal lands between bytecodes, so an
-    # interrupt restores what was recorded.
+    # Only the outermost guard touches sys.modules (inner ones would save outer entry); mutations
+    # sit in the try, depth bumped before the name so an interrupt restores what was recorded.
     entered = False
     try:
         with _MOE_UTILS_BLOCK_LOCK:
@@ -2124,8 +2106,7 @@ def _replace_compiled_cache_file(function_location, new_write_bytes):
         dir = directory,
     )
     try:
-        # Write via the descriptor, not by reopening the name: mkstemp settles who created the file, and reopening would
-        # put the write and mode wherever the name resolves by then.
+        # Write via the mkstemp descriptor; reopening could misplace the write and mode.
         with os.fdopen(descriptor, "wb") as file:
             descriptor = None
             file.write(new_write_bytes)
@@ -4810,9 +4791,8 @@ custom_gradient_checkpointing_replacements = [
         None,
         ("rotary_pos_emb",),
     ),
-    # transformers >= 5.0 spelling. `max_seqlen` leaves the positional argument
-    # list and comes back as a keyword bound into the checkpointed callable (the
-    # third element below). Must stay after the 4.x entries.
+    # transformers >= 5.0 spelling: max_seqlen leaves the positional args and returns as a keyword
+    # bound into the checkpointed callable; must stay after the 4.x entries.
     (
         """hidden_states = blk(
                 hidden_states,
@@ -5844,7 +5824,6 @@ def fixup_dropped_logit_scale(source, module = None):
     )
 
 
-# Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
     # PaliGemma (transformers 5.23): the softcap is read through getattr, since PaliGemma 1's Gemma text config has
     # none. Keep the getattr (a plain attribute read raises there) in the space-free form the softcap pattern takes.
@@ -6037,8 +6016,7 @@ pass
 
 
 def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING=False):
-    # For Liquid, Falcon and other Mamba type models
-    # We disable compiling on them!
+    # Liquid, Falcon and other Mamba-type models: compiling is disabled on them.
     try:
         import mamba_ssm
 
@@ -6184,8 +6162,7 @@ DISABLE_COMPILE_MODULES = [
     "Inkling2LoopBlockAttentionResidual",
 ]
 
-# Disabled modules that stay eager inside an enclosing compiled graph through an opaque custom op (eager forward and
-# backward) instead of a graph break, which fullgraph = True refuses.
+# Eager (fwd and bwd) via an opaque custom op, not a graph break (fullgraph=True refuses).
 DISABLE_COMPILE_EAGER_OP_MODULES = [
     "Inkling2BlockAttentionResidual",
     "Inkling2LoopBlockAttentionResidual",
@@ -6254,8 +6231,7 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
 
 def calls_output_capture_target(init, source, target_names):
     """Detect direct calls to submodules targeted by Transformers output hooks."""
-    # A forward decorated with @capture_outputs installs the hooks itself, even
-    # when its captured submodules are built indirectly (e.g. via helpers).
+    # @capture_outputs installs the hooks itself, even if submodules are built indirectly.
     if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
         return True
     for target_name in target_names:
@@ -6383,9 +6359,7 @@ def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False
         return original_forward(self, tensor, *rest, **kwargs).to(original_dtype)
 
     forward.__unsloth_dtype_wrapped__ = True
-    # `disable` is baked into the closure above, so a later load in the same
-    # process with the other setting needs a new wrapper built from the same
-    # original rather than one stacked on this one.
+    # `disable` is baked into the closure; a same-process reload wraps the original, not this.
     forward.__unsloth_dtype_disable__ = disable
     forward.__unsloth_dtype_original__ = original_forward
     return forward
@@ -6628,8 +6602,7 @@ def _reconcile_lora_forwards():
 
 # model_location -> {(dict name or None, key): original}, recorded before the first replacement.
 _MODELING_FILE_ORIGINALS = {}
-# model_location -> _compiled_source_key() of its last pass. Not a module attribute:
-# dir(modeling_file) feeds an unstable argsort, so one more name reorders the imports.
+# model_location -> _compiled_source_key(); not an attribute: dir() argsort reorders imports.
 _MODELING_FILE_KEYS = {}
 
 

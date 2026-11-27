@@ -70,7 +70,6 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
             if i >= 100: break
         pass
 
-        # Check ratio
         if seen_bad == 0 and seen_good == 0: return
 
         elif seen_bad / (seen_bad + seen_good) == 1:
@@ -371,8 +370,7 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
 
     instance_forward = model.__dict__.get("forward")
     if instance_forward is not None:
-        # An instance-level forward shadows the class override, so swapping __class__ alone won't intercept it; move it
-        # off the instance and route via instance_mode so forward stays a class attribute (picklable/deepcopy-safe)
+        # Instance forward shadows class override; keep it a class attr (picklable/deepcopy).
         model._unsloth_autocast_orig_forward = instance_forward
         del model.__dict__["forward"]
         model.__class__ = _make_bf16_autocast_subclass(
@@ -418,9 +416,7 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
-# Marks a config with no use_cache, distinct from None; a class not object() because deepcopy/pickle keep a class's
-# identity but not an instance's, which broke the is check and wrote an unserializable object into cfg.use_cache (TRL
-# deepcopies a prepared model for its ref model)
+# Marks a config with no use_cache (not None); a class so deepcopy/pickle keep its identity.
 class _ABSENT:
     """Marker type; never instantiated."""
 
@@ -449,8 +445,7 @@ def disable_use_cache(model):
             # first baseline wins; _ABSENT so restore deletes rather than invents
             originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
             recorded.add(id(cfg))
-        # Set it even when absent: transformers 5 sub-configs inherit no default, so a forward reading
-        # self.config.use_cache raises AttributeError instead (stepfun-ai/Step-3.7-Flash ships such a text config)
+        # Set even if absent: transformers 5 sub-configs lack defaults, avoiding AttributeError
         cfg.use_cache = False
     if originals:
         try:
@@ -634,8 +629,7 @@ def prepare_model_for_training(
                 # _keep_param_dtype keeps the loaded dtype since fp32 breaks the matmul on a bf16/fp16 Linear;
                 # modules_to_save is excluded so a frozen head is not partly trained via its bias (ref 2343 review)
                 requires_grad = True
-                # float16: GradScaler refuses fp16 grads, so use a float32 master cast back in forward.
-                # Skip ".weight" (T5's relative_attention_bias is a weight).
+                # GradScaler refuses fp16 grads: fp32 master for fp16 biases; skip .weight (T5)
                 if _loaded_float16 and param.dtype == torch.float16 and not name.endswith(".weight"):
                     upcast = True
                     _float32_bias_param_ids.add(id(param))
@@ -679,8 +673,7 @@ def prepare_model_for_training(
 
     _owner_names = {}
     if _float32_bias_param_ids:
-        # Find owners by identity: upcast storage hides aliases from a float16 check (BERT/RoBERTa
-        # heads).
+        # Find owners by id: upcast storage hides aliases from fp16 check (BERT/RoBERTa heads)
         for _name, _param in model.named_parameters(remove_duplicate=False):
             if id(_param) in _float32_bias_param_ids:
                 _owner, _, _leaf = _name.rpartition(".")
@@ -730,7 +723,6 @@ def prepare_model_for_training(
         if use_gradient_checkpointing in (True, "unsloth"):
             model._set_gradient_checkpointing()
         else:
-            # Ensure checkpointing stays disabled if explicitly requested.
             for module in model.modules():
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
@@ -745,14 +737,12 @@ def prepare_model_for_training(
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
-                # Deliberately NOT guarded on is_compiling(), like the peft_utils pre hook: this is the only thing
-                # making a frozen embedding's output require grad, so skipping it would silently starve adapters of
-                # gradients
+                # Deliberately not guarded on is_compiling() (like peft_utils' pre hook): the only
+                # thing making a frozen embedding's output require grad, so adapters starve.
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
 
-    # Upcast modules_to_save
     if patch_modules_to_save:
         try:
             from peft.utils import ModulesToSaveWrapper
@@ -864,7 +854,6 @@ def unsloth_train(trainer):
         )
     pass
 
-    # Separate weight decay for parameters
     optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
     decay_parameters = frozenset(Trainer.get_decay_parameter_names(None, model))
     yes_decay, no_decay = [], []
@@ -987,12 +976,10 @@ def unsloth_train(trainer):
                 n_batches = leftover_ga if j == (max_iters_per_epoch-1) else ga
                 batches = [next(train_dataloader_iterator) for j in range(n_batches)]
 
-                # Count non zeros before loss calc
                 n_items = torch.stack([
                     torch.count_nonzero(x["labels"][..., 1:] != -100) for x in batches
                 ]).sum()
 
-                # Gradient accumulation
                 for batch in batches:
                     input_ids = batch["input_ids"]
                     labels    = batch["labels"]

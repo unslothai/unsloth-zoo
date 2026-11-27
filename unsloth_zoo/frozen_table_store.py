@@ -285,8 +285,7 @@ def resolve_tensor_locations(
 _PAGE = mmap.PAGESIZE
 _FILES_LOCK = threading.Lock()
 _FILES: Dict[str, "_MappedFile"] = {}
-# Releases waiting for _FILES_LOCK. A table's finalizer can run inside any allocation, including one made while this
-# thread already holds the lock (a cyclic GC pass inside _acquire_file), so it queues instead of blocking on itself.
+# Finalizers can run in any allocation, even under _FILES_LOCK; queue releases, don't block.
 _PENDING_RELEASES: List[List["_MappedFile"]] = []
 
 
@@ -338,8 +337,7 @@ class _MappedFile:
         return self._whole
 
     def close(self):
-        # Never unmap explicitly: frombuffer tensors would dangle; drop our reference so the last
-        # tensor release unmaps it.
+        # Never unmap explicitly (frombuffer tensors would dangle); the last tensor unmaps it.
         self._whole = None
         self.mm = None
         if self.fd is not None:
@@ -460,8 +458,7 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
     def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         values = planes[weight_plane].view(torch.float8_e4m3fn)
         scales = planes[scale_plane]
-        # e8m0 bytes (the released files), or the same powers of two widened to fp32 (Unsloth's converted
-        # DeepSeek-V4.1 checkpoints, for transformers without F8_E8M0): told apart by the bytes per row.
+        # e8m0 bytes or fp32 powers of two (no F8_E8M0 in transformers); split by bytes per row
         if scales.dtype == torch.uint8 and values.shape[-1] and scales.shape[-1] == 4 * (values.shape[-1] // block_size):
             scales = scales.view(torch.float32)
         elif not (scales.is_floating_point() and scales.element_size() > 1):
@@ -767,7 +764,6 @@ class FrozenTableStore:
         jobs = []
         for s, local, a, b in self._segments(plane, uniq):
             ids = local.tolist()
-            # coalesce consecutive rows into one read
             run_start = 0
             for j in range(1, len(ids) + 1):
                 if j == len(ids) or ids[j] != ids[j - 1] + 1:
@@ -807,8 +803,7 @@ class FrozenTableStore:
         pin = device.type == "cuda" and torch.cuda.is_available()
         if not pin:
             return self._gather_raw_unique(uniq_cpu, device, False)
-        # The pinned staging buffers are shared by every caller of this store (threads, deep copies): one gather owns
-        # them from acquisition until the event fencing its copies out of them is recorded.
+        # Pinned staging, shared by all callers, is owned until the copy event is recorded.
         with self._staging_lock:
             return self._gather_raw_unique(uniq_cpu, device, True)
 
@@ -826,8 +821,7 @@ class FrozenTableStore:
                 self._read_mmap(plane, uniq_cpu, buf)
             out[name] = buf.to(device, non_blocking=True) if pin else (buf if device.type == "cpu" else buf.to(device))
         if pin:
-            # On the destination card's stream, where the non_blocking copies out of the staging buffer were queued:
-            # the current device can be another card (ids on cuda:1 of a device-mapped model).
+            # Record on the destination card's stream; the current device may be another card.
             with torch.cuda.device(device):
                 ev = torch.cuda.Event()
                 ev.record(torch.cuda.current_stream(device))
@@ -919,8 +913,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
         self.memo_slots = _default_memo_slots()
         self._handle = _register_module(self)
 
-    # Upstream forwards read ``self.<table>.weight.device`` to pick where to run the lookup; a
-    # meta tensor tells them "not placed", so they leave the ids where they are.
+    # Upstream reads weight.device to pick the lookup device; meta means not placed, ids stay.
     @property
     def weight(self) -> torch.Tensor:
         return torch.empty((self.num_embeddings, *self.row_shape), dtype=self.table_dtype, device="meta")
@@ -1010,11 +1003,9 @@ class UnslothFrozenTableEmbedding(nn.Module):
         return f"{self.num_embeddings}, {self.embedding_dim}, dtype={self.table_dtype}, store={self.frozen_table_store!r}"
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        # One opaque op: torch.compile (and block compile) sees a lookup of known shape and dtype, not the host-side
-        # unique / page-in / copy, so the caller's graph neither breaks nor recompiles on it.
+        # Hides host unique/page-in/copy from torch.compile; no graph break or recompile.
         if _LOOKUP_OP is not None:
-            # The dtype is an argument, not state the fake reads: a cast after compile (.double(), .half()) then
-            # fails the graph's guard and recompiles, instead of a stale graph reading the new rows as the old dtype.
+            # dtype is an argument: a cast after compile recompiles rather than going stale.
             return _LOOKUP_OP(ids, self._handle, self.table_dtype)
         return self._lookup(ids)
 
@@ -1050,8 +1041,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
             rows = store.gather(ids, dtype=self.table_dtype, host_ids=host)
             snapshot = ids.detach().clone() if host is None else host
         _bump(memo_misses=1)
-        # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
-        # (an in-place update of ids must not make the equality check compare the tensor with itself).
+        # Hold ids (address not reused while keyed); a value snapshot guards in-place edits.
         slots = max(1, int(getattr(self, "memo_slots", 1)))
         self._memo = [(ids, snapshot, key, rows), *(self._memo or ())][:slots]
         return rows
@@ -1448,8 +1438,7 @@ def install_frozen_table_load_hook() -> bool:
     original = PreTrainedModel.__dict__.get("_load_pretrained_model")
     if original is None:
         return False
-    # transformers 5: staticmethod (model, state_dict, checkpoint_files, load_config, ...);
-    # transformers 4.5x: classmethod (cls, model, state_dict, checkpoint_files, ..., hf_quantizer = ...).
+    # transformers 5: staticmethod; transformers 4.5x: classmethod taking cls first.
     is_classmethod = isinstance(original, classmethod)
     original_fn = original.__func__ if isinstance(original, (staticmethod, classmethod)) else original
     if getattr(original_fn, "_unsloth_frozen_table_hook", False):

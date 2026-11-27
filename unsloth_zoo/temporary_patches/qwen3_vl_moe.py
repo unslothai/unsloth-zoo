@@ -74,10 +74,7 @@ def _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_wei
 
 
 def _native_experts_in_linear_layout(experts_class):
-    """True when transformers' own Qwen3VLMoeTextExperts builds gate_up_proj as (E, 2I, H) (F.linear layout,
-    transformers 5.x), which Unsloth re-lays out to (E, H, 2I) so PEFT factors the stacks over swapped dims;
-    False when transformers already builds (E, H, 2I) (4.x): vanilla PEFT then factors them as Unsloth does and
-    the saved factors must stay as trained. Unknown (the probe raised) keeps the swap."""
+    """5.x (E, 2I, H) re-laid to (E, H, 2I); 4.x keeps saved factors as trained; unknown keeps the swap."""
     # This Unsloth Zoo code section is licensed under AGPL3
     try:
         from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeTextConfig

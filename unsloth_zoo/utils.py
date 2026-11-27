@@ -194,11 +194,8 @@ pass
 
 
 import functools
-# ROCm on Windows ships a stubbed torch.distributed missing these attributes
-# entirely (https://github.com/ROCm/TheRock/issues/3284). Bind the real
-# functions directly when present; only the stub hits the AttributeError path.
-# Avoids per-name getattr and the throwaway lambdas it builds on every other
-# platform.
+# ROCm on Windows ships a torch.distributed stub missing these attributes
+# (https://github.com/ROCm/TheRock/issues/3284), so only the stub takes the AttributeError path.
 try:
     torch_distributed_is_initialized = dist.is_initialized
     torch_distributed_is_torchelastic_launched = dist.is_torchelastic_launched
@@ -231,10 +228,8 @@ pass
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
-    # Run independently when the process group isn't initialized: not
-    # distributed, or torchrun launched but init_process_group() not yet
-    # called (e.g. during module imports).
-    # Ref: https://github.com/unslothai/unsloth/issues/3703
+    # Runs without an initialized process group (not distributed, or torchrun before
+    # init_process_group(), e.g. at import); see https://github.com/unslothai/unsloth/issues/3703
     if not torch_distributed_is_initialized():
         out = function(*args, **kwargs)
         return out if n == 1 else out

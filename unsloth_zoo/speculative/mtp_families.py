@@ -39,8 +39,7 @@ class MTPFamily:
     layer_cls: str
     norm_cls: str
     rotary_cls: str = None       # None = NoPE attention
-    # Checkpoint layout by style: layers = model.layers.{N+i}.* (DeepSeek / GLM), qwen = mtp.fc / mtp.layers.0.*,
-    # nemotron = mtp.layers.{j}.* sub-blocks of one head.
+    # Keys: layers=model.layers.{N+i}.*, qwen=mtp.fc/mtp.layers.0.*, nemotron=mtp.layers.{j}.*
     style: str = "layers"
     count_keys: tuple = ("num_nextn_predict_layers",)
     # "final" = target hidden after the final norm, "last_layer" = before it (step35 / mimo2).
@@ -62,8 +61,7 @@ class MTPFamily:
     config_overrides: tuple = ()     # (attribute, value) set on the head config
     # Per-layer head-count override for sliding MTP layers (Step's per_layer_config).
     sliding_heads_attr: str = None
-    # llama.cpp status from drafting tiny random models via convert_hf_to_gguf.py + llama-server draft-mtp: drafts (our
-    # drafts match), partial, no_graph (no MTP graph or converter drops the head), unverified.
+    # llama.cpp: drafts (ours match), partial, no_graph (no graph or head dropped), unverified.
     llama_cpp: str = "drafts"
 
     def num_heads(self, config):
@@ -332,8 +330,7 @@ _register(MTPFamily(
     renames = ((r"mlp\.e_score_correction_bias", "mlp.gate.e_score_correction_bias"),),
     llama_cpp = "no_graph",
 ))
-# Step-3.5/3.7: three chained sliding-window heads with dense MLPs; trunk feeds and feeds back the pre-norm residual
-# (llama.cpp step35.cpp, vLLM step3p5_mtp.py).
+# Step-3.5/3.7: three chained sliding-window heads, dense MLPs; raw pre-norm residual fed back.
 _register(MTPFamily(
     name = "step3p5", model_types = ("step3p5",), module = "step3p7",
     layer_cls = "Step3p7DecoderLayer", norm_cls = "Step3p7RMSNorm", rotary_cls = "Step3p7RotaryEmbedding",

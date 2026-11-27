@@ -33,8 +33,7 @@ def _expand_env_path(value: str) -> Path:
 
 
 def _is_writable(path: Path) -> bool:
-    # Any failure to create the dir or a throwaway file means not writable; symlinks are allowed (users symlink caches
-    # to large volumes); fallbacks are hardened in _is_safe_private_dir.
+    # Failed mkdir or temp file means unwritable; symlinked caches are allowed (large volumes).
     try:
         path.mkdir(parents = True, exist_ok = True)
         with tempfile.NamedTemporaryFile(dir = path):
@@ -49,8 +48,7 @@ def _is_safe_private_dir(path: Path) -> bool:
     # so cached models and the HF_HOME token stay private; ownership check is POSIX-only.
     try:
         if hasattr(os, "getuid"):
-            # /tmp is race-safe thanks to the sticky bit; a group- or world-writable non-sticky ancestor we do not own
-            # is not (anyone it lets write can rename our folder away and plant their own), so refuse a fallback there.
+            # Non-sticky writable ancestors we do not own allow rename-and-plant; refuse them.
             for ancestor in (path, *path.parents):
                 if not ancestor.exists():
                     continue
@@ -109,8 +107,7 @@ def _resolve_hf_home() -> Path | None:
 
 
 def _active_caches() -> tuple[Path | None, Path | None, Path | None]:
-    # Resolve (hf_home, hub_cache, xet_cache) as Hub will; explicit env vars come first so they never depend on home
-    # resolution, and legacy HUGGINGFACE_HUB_CACHE is still honored by Hub.
+    # Resolve as Hub (env vars first, not home); legacy HUGGINGFACE_HUB_CACHE still honored.
     hf_home = _resolve_hf_home()
     hub_cache_env = os.environ.get("HF_HUB_CACHE")
     if hub_cache_env is None:
@@ -150,7 +147,6 @@ def redirect_hf_cache_if_readonly() -> str | None:
         reason = "xet cache location could not be resolved"
     else:
         reason = f"xet cache '{xet_cache}' is not writable"
-    # An explicitly set writable HF_XET_CACHE is kept as the user chose.
     keep_explicit_xet = xet_ok and "HF_XET_CACHE" in os.environ
 
     for base in _fallback_bases():

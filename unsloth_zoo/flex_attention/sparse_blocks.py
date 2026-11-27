@@ -46,8 +46,7 @@ def _count(kind, model_type):
 
 
 def _q_ranges(q_len, per_row):
-    """Query chunks for the indexers; under torch.compile a single chunk, since a loop over the sequence length
-    specialises one graph per length and mark_dynamic fails."""
+    """Under torch.compile: one chunk (a loop specialises per length; mark_dynamic fails)."""
     if torch.compiler.is_compiling():
         return [(0, q_len)]
     chunk = _q_chunk(per_row)
@@ -63,9 +62,8 @@ def _wants_attentions(module, kwargs):
 
 
 def in_unsloth_block():
-    """True only inside Unsloth's per-decoder-layer compile region (fullgraph=False, where graph breaks are legal);
-    _IN_BLOCK is also set under a user's fullgraph=True compile, so only _IN_COMPILED_REGION counts; a missing flag
-    keeps the model's path in every compile."""
+    """True only in the per-decoder-layer compile region (fullgraph=False); _IN_BLOCK also covers
+    user fullgraph=True, so only _IN_COMPILED_REGION counts; missing flag keeps model path."""
     block = sys.modules.get("unsloth.models._block_compile")
     flag = getattr(block, "_IN_COMPILED_REGION", None)
     return bool(flag) and bool(flag[0])
@@ -77,8 +75,7 @@ def _compiled_without_break():
 
 
 def _eager_only(name):
-    # BlockMask tables and flex calls miscompile silently inside an enclosing compiled graph (MiniMax output 95% off);
-    # patched forwards keep the model path there.
+    # Flex silently miscompiles inside an enclosing compile; patched forwards keep model path.
     if torch.compiler.is_compiling():
         raise RuntimeError(f"Unsloth: {name} runs outside torch.compile only.")
 
@@ -141,8 +138,7 @@ def _virtual_kv_heads(query, key, value):
 
 def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
-    # Shared dynamic=None compile: the first length keeps a static kernel (much faster than dynamic for fixed-length
-    # packed or padded training); varying lengths settle on the dynamic kernel.
+    # dynamic=None: static for first length (much faster if fixed), varying lengths go dynamic.
     from unsloth_zoo.flex_attention.utils import flex_attention, decode_kernel_kwargs
     # Queries under 128 rows can go to flex_decoding, which cannot compile on some torch / Triton pairs.
     return flex_attention(
@@ -180,8 +176,7 @@ def _pad_to(x, dim, size, value):
 
 
 def _broadcast_mask(mask, batch, q_len, kv_len):
-    """Callers' masks may broadcast over batch, queries or keys ([1|B, 1, 1|S, 1|T]) as upstream allows; padding or
-    chunking a singleton dimension would not broadcast it."""
+    """Masks broadcast over batch/query/key like upstream; never pad or chunk singleton dims."""
     shape = (batch, *mask.shape[1:-2], q_len, kv_len)
     return mask if tuple(mask.shape) == shape else mask.expand(shape)
 
@@ -373,9 +368,8 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
 
 
 def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling, model_type = "dsa"):
-    """Flex attention over top-k AND base mask, returns [B, S, H, D_v]; the BlockMask is cached on topk_indices so GLM's
-    shared layers reuse it; float mask entries at or below half the dtype minimum (and -inf) are masked, other
-    nonzero values are added to the score."""
+    """Flex attention over top-k AND base mask ([B, S, H, D_v]); BlockMask cached on topk_indices
+    for GLM's shared layers; float mask: <= half dtype min or -inf masked, else added."""
     _eager_only("dsa_flex_attention")
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:

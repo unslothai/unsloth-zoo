@@ -19,9 +19,8 @@
 __all__ = ["FORCE_FLOAT32"]
 
 
-# Architectures whose activations overflow fp16 (~6.5e4) and need bf16 or fp32, else NaN/Inf in training; entries are
-# config.json model_type strings shared by CUDA and MLX loaders; trailing comma stops gemma3 prefix-matching gemma3n;
-# MLX strips -, _ and the comma.
+# Architectures overflowing fp16 (~6.5e4) need bf16 or fp32; entries are config.json model_type
+# strings; MLX strips -, _ and the comma; trailing comma stops gemma3 prefix-matching gemma3n.
 FORCE_FLOAT32 = [
     "embedding_gemma2",  # fp16 unsupported upstream; text-only loads have no gemma4 sub-config to match
     "embedding_gemma2_text",  # explicit entry for the MLX exact-match helper

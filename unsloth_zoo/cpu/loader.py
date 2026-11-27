@@ -511,8 +511,7 @@ def _compile_layers(model):
 
 
 def _is_control_flow(error):
-    """Exceptions torch raises on purpose through a layer call: non-reentrant checkpointing stops a recomputation
-    early with _StopRecomputationError once it has every saved tensor."""
+    """Deliberate torch exception: _StopRecomputationError ends non-reentrant recompute early."""
     import torch.utils.checkpoint as checkpoint
     stop = getattr(checkpoint, "_StopRecomputationError", None)
     return stop is not None and isinstance(error, stop)
@@ -1234,8 +1233,7 @@ class FastCPUModel:
     @staticmethod
     def _prepare(model, use_gradient_checkpointing):
         if use_gradient_checkpointing in (True, "unsloth") and not _non_reentrant_checkpointing_on(model):
-            # "unsloth" offloads activations to host RAM on GPUs; on CPU they already live there,
-            # so it is plain recomputation.
+            # unsloth" offloads activations to RAM on GPU; on CPU it is plain recomputation.
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
@@ -1391,8 +1389,7 @@ _FUSED_PROJECTIONS = {"q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv
 
 
 def _with_fused_projections(target_modules, leaf_names):
-    """Add the fused projection a split name maps to when the model has it, so a Llama-style target list does not
-    silently leave Phi-3's Q/K/V and MLP input projections frozen."""
+    """Add fused projections for split names, else Llama-style targets freeze Phi-3's Q/K/V."""
     out = list(target_modules)
     for name in target_modules:
         fused = _FUSED_PROJECTIONS.get(name)
@@ -1652,8 +1649,7 @@ _SAFETENSORS_DTYPES = {
 
 
 def _safetensors_dtype_rank():
-    """safetensors' save_file lays tensors out by dtype (its own order, widest first) then name: read that order from
-    the installed safetensors so the streamed file is byte-identical to save_file's."""
+    """Reads save_file's dtype-then-name order live, so streamed output is byte-identical."""
     import json
     import struct
     try:
@@ -1668,9 +1664,8 @@ def _safetensors_dtype_rank():
 
 
 def _write_safetensors(path, entries, rank = None):
-    """A safetensors file written one tensor at a time: the header comes from shapes / dtypes, then each tensor is
-    made, written and dropped, so at most one merged tensor is alive (safetensors' save_file holds the whole file as
-    bytes). Same layout as save_file (metadata first, dtype then name order). Returns the payload size in bytes."""
+    """Streams safetensors one tensor at a time, header from shapes/dtypes, unlike save_file's
+    whole-file buffer; same layout (dtype, then name); returns payload bytes."""
     import json
     import struct
     rank = rank or _safetensors_dtype_rank()
@@ -1941,8 +1936,7 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
-    # Stage merged weights unrounded: the converter casts once per requested type instead of rounding through fp16/bf16
-    # first; fp16 without native bf16 would also clip bf16's range.
+    # Merged weights stay fp32 so converter casts once; fp16 (no native bf16) clips bf16 range.
     unrounded = [m for m in methods if m in ("f32", "f16")]
     _save_merged(self, merged_directory, "merged_32bit")
     if tokenizer is not None:

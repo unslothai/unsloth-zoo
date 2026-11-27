@@ -52,11 +52,9 @@ UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0")
 # conversion_mapping_rescope.py and read by bitsandbytes.py before it blames the transformers version.
 RESCOPE_PATCH_FLAG = "_unsloth_zoo_patched_composite_prefix_renaming"
 
-# Links a wrapper to the callable it wraps; deliberately not __wrapped__, because rescope unwraps __wrapped__ to pick
-# its target and would replace a surviving wrapper, dropping its behaviour.
+# Not __wrapped__: rescope unwraps it to find its target and would replace a surviving wrapper.
 WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 
-# Get only allowed options
 import inspect
 import torch
 # torch 2.4 does not load torch._inductor.config on `import torch`.
@@ -237,8 +235,7 @@ def allow_inductor_pool_aliasing():
     custom op is still checked.
     """
     try:
-        # Import torch._dynamo first: importing runtime_wrappers alone is a circular import that leaves torch._dynamo
-        # half initialised, which breaks torch.compile for the whole process.
+        # Import torch._dynamo first; runtime_wrappers' circular import breaks torch.compile.
         import torch._dynamo
         import torch._functorch._aot_autograd.runtime_wrappers as runtime_wrappers
     except Exception:
@@ -278,7 +275,6 @@ def get_torch_compile_options(
     multi_kernel = 1 if multi_kernel else 0
     if memory_planning: allow_inductor_pool_aliasing()
 
-    # Relabel Inductor's compile progress bar
     try:
         import torch._inductor.async_compile
         from torch.hub import tqdm
@@ -350,11 +346,9 @@ from typing import Any, Callable, TypeVar
 F = TypeVar("F", bound=Callable[..., Any])
 def noop(*args: Any, **kwargs: Any):
     """No-op decorator/adapter usable as @noop, @noop(...), or noop(func, ...)."""
-    # @noop / noop(func, ...): first positional arg is the function.
     if args and callable(args[0]):
         return torch.compiler.disable(args[0]) # type: ignore[return-value]
 
-    # @noop(...): return a decorator.
     def _decorator(func: F) -> F:
         return torch.compiler.disable(func)
     return _decorator
@@ -395,8 +389,7 @@ def unwrap_already_compiled(function):
     """
     seen = set()
     while callable(function) and hasattr(function, "get_compiler_config"):
-        # A bound method forwards attribute lookups, so __wrapped__ is the UNBOUND original and following it would drop
-        # the receiver; torch's innermost_fn stops on a bound method for that reason.
+        # Stop at bound methods: __wrapped__ is unbound, so following it drops the receiver.
         if getattr(function, "__self__", None) is not None: break
         inner = getattr(function, "__wrapped__", None)
         # No __wrapped__ (an OptimizedModule, say) or a cycle: leave it and let the caller's guard deal with whatever torch makes of it.
@@ -407,8 +400,7 @@ def unwrap_already_compiled(function):
 pass
 
 
-# Warn once per call site, not per compile attempt: temporary patches re-run at every phase and for every model, so
-# repeats would print the same line several times per load.
+# Warn once per call site, not per compile attempt; patches re-run for every phase and model.
 _UNCOMPILED_CALL_SITES: set = set()
 
 

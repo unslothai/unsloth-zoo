@@ -99,8 +99,7 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
     supervised = data_labels != -100
     teacher_ids_all = None
     if args.mtp_label_source == "teacher":
-        # Step k's teacher rows are final_hidden[:, k:k + length]: one [rows, V] projection per batch serves every
-        # depth (shifted below), not one per depth. Same logits budget as chunked_lm_loss.
+        # One [rows, V] projection shared by all depths; same logits budget as chunked_lm_loss.
         w = target_lm_head_weight
         per_row = w.shape[0] * w.element_size()
         rows = max(1, min(args.mtp_chunk_size, losses.LOGITS_BUDGET_BYTES // per_row))
@@ -143,8 +142,7 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
 
 
 def token_average_scale(trainer, num_items_in_batch):
-    """Scale Trainer.compute_loss applies to a loss when num_items_in_batch counts tokens across ranks (DDP's gradient
-    mean cancels it); compute_loss overrides must match."""
+    """Scale if ranks count tokens (DDP's mean cancels it); compute_loss overrides must match."""
     args = trainer.args
     if num_items_in_batch is None or not getattr(args, "average_tokens_across_devices", False):
         return 1

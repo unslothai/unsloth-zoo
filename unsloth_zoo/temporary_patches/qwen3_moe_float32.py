@@ -66,8 +66,7 @@ from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
-# Set by each decoder layer forward: the dtype its projections take when no autocast is active. Per thread, so a
-# float16 and a float32 Qwen3-MoE running at once never read each other's decision.
+# Per-thread projection dtype without autocast, set per decoder layer; fp16 and fp32 never mix
 _QWEN3_MOE_BOUNDARY = threading.local()
 
 

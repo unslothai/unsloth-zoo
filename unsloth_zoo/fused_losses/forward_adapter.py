@@ -59,8 +59,7 @@ def lm_head_fake_quantize(lm_head, hidden_states):
     if type(lm_head) is torch.nn.Linear:
         return hidden_states, lm_head.weight
     if lm_head_needs_module_forward(lm_head):
-        # The loss calls lm_head(hidden_states), whose (per-row) heads fake-quantize once themselves; no weight
-        # read either, which on a TrainableTokensWrapper would build the merged [V, H] weight for nothing.
+        # Module heads fake-quantize; .weight would build a merged [V, H] weight for nothing.
         return hidden_states, None
     weight = lm_head.weight
     activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)

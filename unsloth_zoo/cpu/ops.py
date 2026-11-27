@@ -329,8 +329,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         grad_hidden, grad_weight = ctx.saved_tensors[:2]
-        # All labels ignored: loss is NaN like F.cross_entropy(mean) but its gradient is zero; likewise
-        # num_items_in_batch == 0 (fully masked accumulation group), where stock CE's gradient is zero.
+        # All labels ignored: NaN loss like mean CE, zero grad; num_items_in_batch == 0 too.
         if ctx.divisor is None:
             divisor = ctx.saved_tensors[2]
             empty = torch.isnan(divisor) | (divisor == 0)
@@ -583,9 +582,7 @@ def patch_trl_fused_lm_head():
 
 
 def patch_cpu_sdpa_gqa():
-    """Lets CPU SDPA take a mask with enable_gqa = True (torch >= 2.5), so transformers skips
-    repeating K / V (CUDA GQA rejects masks); Qwen3-0.6B at 2 x 2048 saves 16 MiB per layer. CPU
-    tensors only; idempotent; returns True when installed."""
+    """CPU SDPA takes enable_gqa masks (torch >= 2.5) to skip K/V repeats; CUDA rejects them."""
     try:
         from transformers.integrations import sdpa_attention
     except Exception:
@@ -716,8 +713,7 @@ def _lora_input_cast_is_undone(layer, x, dtype):
 
 
 def patch_peft_lora_autocast_input():
-    """PEFT upcasts each LoRA input to the fp32 adapter dtype and CPU autocast casts it straight back (exact round
-    trip): two activation copies per module in forward, one in backward, and lora_A saves its own copy. Skip it there."""
+    """Skip PEFT's fp32 LoRA input upcast that CPU autocast casts back exactly (extra copies)."""
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
     except Exception:
@@ -790,8 +786,7 @@ def store_frozen_linears_in_bf16(model):
 
 
 def set_bf16_stored_dtype(model, dtype):
-    """Moves Bf16StoredLinear weights to fp32 or back to bf16 (lossless: bf16 checkpoint values),
-    returns count; only frozen upcast weights go back, so modules_to_save is never rounded."""
+    """Bf16StoredLinear to dtype (lossless); frozen upcasts revert; modules_to_save kept exact."""
     moved = 0
     for module in model.modules():
         weight = getattr(module, "weight", None)
@@ -1006,10 +1001,8 @@ def _forward_takes_index_logits_to_keep(cls):
 
 
 def _logits_to_keep_as_index(model, input_ids, inputs_embeds, logits_to_keep):
-    """An int logits_to_keep slices hidden[:, -k:] as a strided view, which torch < 2.14 does not fold into one GEMM
-    for a bf16 / fp16 head: matmul expands the [V, H] head per row and copies it ([B, H, V], 4.6 s and 1.2 GB for
-    Qwen3-0.6B at B = 4, every generate() prefill and GRPO log-prob pass). The same positions as an index tensor
-    gather a contiguous [B, k, H] and run one GEMM: bit-identical logits. fp32 heads already fold."""
+    """Int logits_to_keep is a strided view torch < 2.14 won't fold into one GEMM for bf16/fp16
+    heads (matmul copies head per row); an index tensor avoids it, bit-identical; fp32 folds."""
     if not isinstance(logits_to_keep, int) or isinstance(logits_to_keep, bool) or logits_to_keep <= 0:
         return logits_to_keep
     tokens = input_ids if input_ids is not None else inputs_embeds
@@ -1036,8 +1029,7 @@ def patch_chunked_causal_lm_loss(model):
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     original_forward = model.forward
-    # Call the class forward on self, not the bound method: deepcopy (TRL reference models, merged copies) rebinds the
-    # outer method, and a bound original would run the source model's weights.
+    # Call class forward on self: deepcopy rebinds the outer method, else source weights run.
     original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
     inner_name = _inner_model_name(model)
     try:
@@ -1063,8 +1055,7 @@ def patch_chunked_causal_lm_loss(model):
         softcap, logit_scale = transform or (None, 1.0)
         logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
         if logps_targets is not None and head_weight is not None and labels is None and shift_labels is None:
-            # A preference trainer's next-token log-probs from the last hidden state in row chunks (trainer.py). The
-            # head runs here, inside the forward, so DDP / FSDP see a trainable lm_head as used in this forward.
+            # Head runs in forward so DDP / FSDP see a trainable lm_head as used (trainer.py).
             kwargs.pop("return_dict", None)
             outputs = getattr(self, inner_name)(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,

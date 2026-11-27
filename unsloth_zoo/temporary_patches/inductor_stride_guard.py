@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Backport of pytorch/pytorch 190965 (commit 93879b11) to torch 2.13; gated on `left % right` in the body, since SymPy
-% on compound symbolic strides emits x**-1 that value ranges reject with 'Exponent must be non-negative' (fixed in
-2.14)."""
+"""Backport of pytorch/pytorch 190965 (commit 93879b11) to torch 2.13, gated on `left % right` in
+the body; SymPy % on compound strides emits x**-1 that value ranges reject; fixed in 2.14."""
 
 import inspect
 

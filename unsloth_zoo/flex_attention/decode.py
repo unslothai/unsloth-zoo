@@ -328,8 +328,7 @@ def _strict_compile():
 
 
 def _shape_key(query, key, kernel_options, softcap):
-    # Every dimension a compile specialises on (batch is static, see below): a later specialisation must still go
-    # through the failure handling below, not the cached-success path.
+    # Every specialised dim is in the key; new specialisations go through failure handling.
     return (
         query.shape[0], key.shape[-2], query.shape[-1], query.shape[1], key.shape[1], query.dtype, query.device,
         bool(softcap),
