@@ -373,6 +373,55 @@ def test_record_lookup_align_roundtrip():
         assert torch.equal(a[..., slot], align_logprobs_with_mask(logps[..., slot], cmask, float("-inf")))
 
 
+def _trl1_sampled_logprobs(outputs):
+    """TRL >= 1.x vllm_generation.extract_logprobs + grpo_trainer: sort each position by rank, keep entry 0."""
+    rows = []
+    for o in outputs:
+        for c in o.outputs:
+            rows.append([sorted(lp.items(), key = lambda x: x[1].rank)[0][1].logprob for lp in c.logprobs])
+    return rows
+
+
+@pytest.mark.parametrize("asked", [0, None, 2, 8])
+def test_wrapped_generate_returns_the_requested_logprobs(asked):
+    # Centering raises logprobs to k for its head; TRL must still read the sampled token's logprob.
+    sc.reset_score_centering()
+    gen = torch.Generator().manual_seed(3)
+    V, k = 50, 4
+    completion = [7, 21, 33, 2, 40]
+    outs, truth = zip(*[_fake_output([1, 2, 3], completion, V, k, gen), _fake_output([4, 5], completion[:3], V, k, gen)])
+    seen = {}
+
+    class _LLM:
+        def generate(self, prompts, sampling_params = None):
+            seen["logprobs"] = sampling_params.logprobs
+            return list(outs)
+
+    llm = sc.wrap_vllm_generate_topk(_LLM(), k)
+    params = types.SimpleNamespace(logprobs = asked)
+    got = llm.generate(["a", "b"], sampling_params = params)
+    assert seen["logprobs"] == (k if asked is None or asked < k else asked)
+    assert params.logprobs == asked  # a reused SamplingParams asks for its own value on the next call
+    assert sc.score_centering_stats()["recorded"] == 2
+    # The head was recorded before the cut.
+    head_ids, _ = sc._lookup(sc._make_key([1, 2, 3] + completion, None), None)
+    assert head_ids[0].tolist() == truth[0][0][1]
+    if asked is None:
+        assert all(c.logprobs is None for o in got for c in o.outputs)
+        return
+    if asked == 0:  # what TRL asks for: entry 0 after the rank sort is the sampled token again
+        sampled = [[float(pos[0][tok].logprob) for pos, tok in zip(t, o.outputs[0].token_ids)]
+                   for t, o in zip(truth, got)]
+        assert _trl1_sampled_logprobs(got) == sampled
+    for o in got:
+        for lp, tok in zip(o.outputs[0].logprobs, o.outputs[0].token_ids):
+            assert tok in lp
+            if asked < k:
+                assert all(t == tok or v.rank <= asked for t, v in lp.items())
+            else:
+                assert len(lp) >= k
+
+
 def test_raise_logprobs_and_env():
     p = types.SimpleNamespace(logprobs = 0)
     sc._raise_logprobs(p, 32)
