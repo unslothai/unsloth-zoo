@@ -33,6 +33,7 @@ def zen3(monkeypatch):
     monkeypatch.setattr(runtime, "_THREADS_FITTED", (2, "default"))
     monkeypatch.setattr(runtime.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(runtime, "_cpu_vendor", lambda: "authenticamd")
+    monkeypatch.setattr(runtime, "_cpu_family_model", lambda: (25, 1))  # EPYC 7763
     monkeypatch.setattr(runtime, "cpu_bf16_supported", lambda: False)
     monkeypatch.setattr(runtime, "_logical_cpus", lambda: 4)
     yield monkeypatch
@@ -43,13 +44,19 @@ def test_amd_without_bf16_widens_to_the_siblings(zen3):
     assert runtime.rollout_threads() == 4
 
 
-@pytest.mark.parametrize("case", ["intel", "native_bf16", "arm", "user_threads", "quota", "ranks", "no_smt",
+@pytest.mark.parametrize("case", ["intel", "native_bf16", "zen4_masked", "zen2", "family_unknown", "arm", "user_threads", "quota", "ranks", "no_smt",
                                   "unfitted", "threads_changed"])
 def test_other_hosts_keep_the_training_count(zen3, case):
     if case == "intel":
         zen3.setattr(runtime, "_cpu_vendor", lambda: "genuineintel")
     elif case == "native_bf16":
         zen3.setattr(runtime, "cpu_bf16_supported", lambda: True)
+    elif case == "zen4_masked":  # an EPYC 9V74 VM exposing only AVX2: no bf16 flag, still Zen 4
+        zen3.setattr(runtime, "_cpu_family_model", lambda: (25, 0x11))
+    elif case == "zen2":
+        zen3.setattr(runtime, "_cpu_family_model", lambda: (23, 0x31))
+    elif case == "family_unknown":
+        zen3.setattr(runtime, "_cpu_family_model", lambda: None)
     elif case == "arm":
         zen3.setattr(runtime.platform, "machine", lambda: "arm64")
     elif case == "user_threads":
@@ -86,17 +93,27 @@ def test_env_zero_turns_it_off_on_amd(zen3):
     assert runtime.rollout_threads() is None
 
 
+@pytest.mark.parametrize("model,zen3", [(0x01, True), (0x21, True), (0x50, True), (0x11, False), (0x61, False),
+                                         (0xA0, False)])
+def test_zen3_models(monkeypatch, model, zen3):
+    monkeypatch.setattr(runtime, "_cpu_family_model", lambda: (25, model))
+    assert runtime._zen3() is zen3
+
+
 def test_vendor_from_windows_processor_string(monkeypatch):
     runtime._cpu_vendor.cache_clear()
+    runtime._cpu_family_model.cache_clear()
     try:
         def no_cpuinfo(*a, **k):
             raise OSError
         monkeypatch.setattr("builtins.open", no_cpuinfo)
         monkeypatch.setattr(runtime.platform, "processor", lambda: "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD")
         assert "authenticamd" in runtime._cpu_vendor()
+        assert runtime._cpu_family_model() == (25, 1)
     finally:
         monkeypatch.undo()
         runtime._cpu_vendor.cache_clear()
+        runtime._cpu_family_model.cache_clear()
 
 
 def _tiny_attached():
