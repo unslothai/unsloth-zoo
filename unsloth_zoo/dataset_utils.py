@@ -2598,6 +2598,17 @@ def train_on_responses_only(
             if (_same_class or _padding_class or _trl_rounding)
             and hasattr(_collator, name)
         }
+        # `padding = "max_length"` with no `max_length` makes `tokenizer.pad`
+        # pad the inputs to `model_max_length`, but DataCollatorForSeq2Seq pads
+        # the labels to the longest row, so the two widths differ. Pin the
+        # tokenizer's real maximum; with no real one (the int(1e30) sentinel)
+        # `tokenizer.pad` would not pad at all, so pad dynamically instead.
+        if _kept.get("padding") == "max_length" and _kept.get("max_length") is None:
+            _model_max = getattr(tokenizer, "model_max_length", None)
+            if isinstance(_model_max, int) and 0 < _model_max < int(1e20):
+                _kept["max_length"] = _model_max
+            else:
+                _kept["padding"] = True
         _text_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
         # Only when a media-capable collator was displaced. Everywhere else the
         # replacement is the whole point and there is nothing to fall back to.

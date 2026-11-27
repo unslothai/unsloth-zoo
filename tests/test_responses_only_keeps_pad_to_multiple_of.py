@@ -144,3 +144,19 @@ def test_a_custom_collator_attribute_is_not_read_as_a_setting():
 
     assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
     assert out.data_collator.pad_to_multiple_of is None
+
+
+@pytest.mark.parametrize("model_max_length, expected", [(32, 32), (int(1e30), None)])
+def test_max_length_padding_without_a_max_length(model_max_length, expected):
+    """padding = "max_length" with no max_length: inputs and labels end at the same width.
+
+    A real model_max_length is the target. The no-limit sentinel pads to the longest row instead.
+    """
+    tokenizer = _tokenizer()
+    tokenizer.model_max_length = model_max_length
+    collator = DataCollatorWithPadding(tokenizer, padding = "max_length")
+
+    out = train_on_responses_only(_Trainer(collator, tokenizer), INSTRUCTION_PART, RESPONSE_PART)
+
+    width = _width(out)
+    assert width == (expected or len(out.train_dataset[1]["input_ids"]))
