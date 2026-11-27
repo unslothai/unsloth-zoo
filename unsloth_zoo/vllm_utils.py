@@ -1631,7 +1631,9 @@ pass
 
 # GRPO IS correction: temperature-scaled logprobs from before min_p / top_k / top_p, so the trainer skips
 # rebuilding the kept set (+27% to +67% s/step on Qwen3-0.6B).
-UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS = {"on": False, "installed": False, "calls": 0}
+# "calls" counts swapped logprobs; "unfiltered" counts steps passed through because no top_k / top_p / min_p was
+# active, where the processed logprobs already are the untruncated ones.
+UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS = {"on": False, "installed": False, "calls": 0, "unfiltered": 0}
 _UNTRUNCATED_CAPTURE = {"on": False, "scaled": None}
 
 
@@ -1652,6 +1654,19 @@ def patch_vllm_untruncated_logprobs():
         original_temperature = descriptor.__func__ if is_static else descriptor
         original_sample = V1Sampler.sample
 
+        def v1_unfiltered(sampling_metadata):
+            # No top_k / top_p and min_p as vLLM's only argmax-invariant processor with no request using it: the
+            # processed logprobs are log_softmax(logits / T) already. Anything unknown takes the capture path.
+            if getattr(sampling_metadata, "top_k", True) is not None or getattr(sampling_metadata, "top_p", True) is not None:
+                return False
+            processors = getattr(getattr(sampling_metadata, "logitsprocs", None), "argmax_invariant", None)
+            if processors is None:
+                return False
+            return all(
+                type(processor).__name__ == "MinPLogitsProcessor" and getattr(processor, "min_p_count", 1) == 0
+                for processor in processors
+            )
+
         # Static from vLLM 0.11.2, instance method on 0.11.0.
         def apply_temperature(*args, **kwargs):
             out = original_temperature(*args, **kwargs)
@@ -1668,6 +1683,9 @@ def patch_vllm_untruncated_logprobs():
                 # Token-specific logprobs (generative scoring) are gathered elsewhere on some versions.
                 and not getattr(sampling_metadata, "logprob_token_ids", None)
             ):
+                return original_sample(self, logits, sampling_metadata, *args, **kwargs)
+            if v1_unfiltered(sampling_metadata):
+                state["unfiltered"] += 1
                 return original_sample(self, logits, sampling_metadata, *args, **kwargs)
             capture.update(on = True, scaled = None)
             try:
@@ -1715,12 +1733,31 @@ def patch_vllm_untruncated_logprobs():
             except Exception:
                 return True
 
+        def v2_unfiltered(sampler, input_batch):
+            # Every request of the batch at vLLM's no-op top_k (vocab_size), top_p (1) and min_p (0).
+            idx = getattr(input_batch, "idx_mapping_np", None)
+            if idx is None:
+                return False
+            try:
+                states = sampler.sampling_states
+                return bool(
+                    (states.min_p.np[idx] == 0.0).all()
+                    and (states.top_p.np[idx] == 1.0).all()
+                    and (states.top_k.np[idx] == states.vocab_size).all()
+                )
+            except Exception:
+                return False
+
         @functools.wraps(original_call)
         def __call__(self, *args, **kwargs):
+            input_batch = args[1] if len(args) > 1 else kwargs.get("input_batch")
             if not (
                 state["on"] and str(getattr(self, "logprobs_mode", "")) in ("processed_logprobs", "processed_logits")
-                and wants_logprobs(self, args[1] if len(args) > 1 else kwargs.get("input_batch"))
+                and wants_logprobs(self, input_batch)
             ):
+                return original_call(self, *args, **kwargs)
+            if v2_unfiltered(self, input_batch):
+                state["unfiltered"] += 1
                 return original_call(self, *args, **kwargs)
             capture.update(on = True, scaled = None)
             try:
