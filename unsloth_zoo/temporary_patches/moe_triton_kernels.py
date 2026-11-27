@@ -95,6 +95,9 @@ def _disable(where, exc):
 
 
 def _kernels():
+    # Triton < 3.4 resolves names in a kernel body from the module globals, not the enclosing function, so a
+    # function-local `tl` is a NameError at compile there and the kernels would turn off.
+    global tl
     import triton
     import triton.language as tl
 

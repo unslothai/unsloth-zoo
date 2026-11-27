@@ -25,6 +25,7 @@ import torch
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
+from _torch_version_tag import drop_rocm_tag  # noqa: E402
 
 _HAS_CUDA = torch.cuda.is_available()
 requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
@@ -293,6 +294,8 @@ def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch, hip):
     modeling = _real_gdn_modeling(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", hip)
+    if not hip:
+        drop_rocm_tag(monkeypatch, torch)
     assert not gcc._is_marked(modeling.causal_conv1d_fn)
 
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
@@ -397,6 +400,7 @@ def test_legacy_modeling_imported_at_patch_time(monkeypatch):
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
     pytest.importorskip("triton")
     imported = []
@@ -478,6 +482,7 @@ def test_install_mamba_ssm_triton_conv_only_fills_missing_functions(monkeypatch)
     monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: object() if name == "mamba_ssm" else real_find(name, *a, **k))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
     monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
 
@@ -822,6 +827,7 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
         monkeypatch.setattr(modeling, attr, layer)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     gcc.patch_gdn_causal_conv1d()
     assert gcc._is_marked(modeling.causal_conv1d_fn)
     assert gcc._is_marked(modeling.causal_conv1d_update)
@@ -842,6 +848,7 @@ def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
     modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     gcc.patch_gdn_causal_conv1d()
     assert gcc._is_marked(modeling.causal_conv1d_fn)
     assert gcc._is_marked(modeling.causal_conv1d_update)

@@ -37,6 +37,7 @@ import math
 import os
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 logger = logging.getLogger(__name__)
 
@@ -608,7 +609,7 @@ def _unwrap(param):
 
 
 def _device_ok(device, mode) -> bool:
-    if device.type != "cuda" or getattr(torch.version, "hip", None) is not None:
+    if device.type != "cuda" or is_rocm_torch(torch):
         return False
     if mode == "force":
         return True

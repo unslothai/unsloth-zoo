@@ -160,15 +160,39 @@ def test_import_time_rocm_flags_on_an_sdk_wheel():
 
 
 # Files whose ROCm gates go through is_rocm_torch; a raw torch.version.hip read here is a regression.
+# Every non-vendored @triton.jit file is listed (test_every_kernel_file_is_guarded keeps it that way).
 _GUARDED = (
-    "unsloth_zoo/rocm_flex_static.py",
+    "unsloth_zoo/block_swap_codec.py",
+    "unsloth_zoo/block_swap_disk.py",
     "unsloth_zoo/fused_losses/chunked_logprob.py",
     "unsloth_zoo/fused_losses/fused_linear.py",
     "unsloth_zoo/fused_losses/preference_loss.py",
-    "unsloth_zoo/score_centering.py",
+    "unsloth_zoo/gguf_kernels/triton_kernels.py",
+    "unsloth_zoo/gpt_oss_decode_fused.py",
+    "unsloth_zoo/merged_rollout_exact.py",
+    "unsloth_zoo/mxfp4_dequant.py",
+    "unsloth_zoo/mxfp4_gemm.py",
+    "unsloth_zoo/packed_experts.py",
     "unsloth_zoo/rl_replacements.py",
+    "unsloth_zoo/rocm_flex_static.py",
+    "unsloth_zoo/score_centering.py",
+    "unsloth_zoo/sparse_mqa_kernel.py",
     "unsloth_zoo/temporary_patches/fla_vendor.py",
+    "unsloth_zoo/temporary_patches/gdn_causal_conv1d.py",
+    "unsloth_zoo/temporary_patches/gpt_oss_fused_glue.py",
+    "unsloth_zoo/temporary_patches/gpt_oss_grouped_qlora.py",
+    "unsloth_zoo/temporary_patches/moe_fp8_grouped.py",
+    "unsloth_zoo/temporary_patches/moe_fused_swiglu.py",
+    "unsloth_zoo/temporary_patches/moe_grouped_fp16.py",
+    "unsloth_zoo/temporary_patches/moe_nf4_grouped.py",
+    "unsloth_zoo/temporary_patches/moe_routed.py",
+    "unsloth_zoo/temporary_patches/moe_router_triton.py",
+    "unsloth_zoo/temporary_patches/moe_routing_triton.py",
+    "unsloth_zoo/temporary_patches/moe_triton_kernels.py",
     "unsloth_zoo/temporary_patches/moe_utils.py",
+    "unsloth_zoo/temporary_patches/moe_utils_sonic.py",
+    "unsloth_zoo/triton_ptxas.py",
+    "unsloth_zoo/vllm_deepseek_v41.py",
 )
 
 
@@ -188,6 +212,15 @@ def _raw_hip_reads(path):
 def test_guarded_files_never_read_version_hip_directly():
     raw = {p: _raw_hip_reads(ROOT / p) for p in _GUARDED}
     assert not any(raw.values()), f"use unsloth_zoo.device_type.is_rocm_torch: {raw}"
+
+
+def test_every_kernel_file_is_guarded():
+    kernels = {
+        p.relative_to(ROOT).as_posix()
+        for p in (ROOT / "unsloth_zoo").rglob("*.py")
+        if "_vendored" not in p.parts and "@triton.jit" in p.read_text(encoding = "utf-8")
+    }
+    assert not kernels - set(_GUARDED), f"add to _GUARDED: {sorted(kernels - set(_GUARDED))}"
 
 
 def test_the_raw_read_check_can_fail(tmp_path):
@@ -262,3 +295,16 @@ def test_grpo_scorer_fp32_defaults_agree_with_score_centering(wheel, want, reque
         assert default is want, fn.__name__
     mode, _ = _score_centering_head_mode(monkeypatch)
     assert (mode != "plain") is want
+
+
+def test_is_rocm_torch_traces_under_fullgraph():
+    # Called from compiled code (mxfp4 / MoE gates): torch.__version__ is a TorchVersion whose C str() Dynamo
+    # cannot trace, so the version-tag fallback must read the plain-str torch.version.__version__.
+    from unsloth_zoo.rocm_build import is_rocm_torch
+    torch._dynamo.reset()
+
+    def fn(x):
+        return x + int(is_rocm_torch(torch))
+
+    x = torch.zeros(2)
+    assert torch.equal(torch.compile(fn, backend = "eager", fullgraph = True)(x), fn(x))

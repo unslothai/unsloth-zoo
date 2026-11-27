@@ -1330,6 +1330,97 @@ def _select_cpu_assets(tag, assets, manifest):
     ]
 
 
+def _cuda_bundle_major(asset_name):
+    """CUDA runtime major a Linux fork CUDA bundle links against ("12" / "13"), from
+    its app-*-linux-*-cudaNN-* name; None for every other asset."""
+    match = re.search(r"-linux-(?:x64|arm64)-cuda(\d+)-", asset_name or "")
+    return match.group(1) if match else None
+
+
+def _cuda_runtime_candidate_dirs():
+    """Directories that may hold the CUDA runtime + cuBLAS a fork CUDA bundle needs
+    but does not ship: PyTorch's NVIDIA wheels first (the runtime torch itself loads),
+    then CUDA toolkit installs."""
+    import glob
+    dirs = []
+    for root in sys.path:
+        if root and os.path.isdir(os.path.join(root, "nvidia")):
+            dirs.extend(sorted(glob.glob(os.path.join(root, "nvidia", "*", "lib"))))
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        home = os.environ.get(env_name)
+        if home:
+            dirs.extend([os.path.join(home, "lib64"), os.path.join(home, "lib")])
+    dirs.extend(["/usr/local/cuda/lib64"])
+    dirs.extend(sorted(glob.glob("/usr/local/cuda/targets/*/lib")))
+    dirs.extend(sorted(glob.glob("/usr/local/cuda-*/lib64"), reverse = True))
+    return list(dict.fromkeys(dirs))
+
+
+def _list_cuda_devices(install_folder):
+    """CUDA devices the installed llama.cpp itself sees (`--list-devices`), so a bundle
+    whose CUDA backend cannot load on this host (missing runtime, old driver) reads as
+    zero devices. Any failure to run the probe is also zero."""
+    for name in ("llama-cli", "llama-server", "llama-completion"):
+        binary = os.path.join(install_folder, name)
+        if not os.path.isfile(binary):
+            continue
+        try:
+            result = subprocess.run(
+                [binary, "--list-devices"], capture_output = True, text = True,
+                encoding = "utf-8", errors = "replace", timeout = 120,
+            )
+        except Exception:
+            return 0
+        return len(re.findall(r"^\s*CUDA\d+\s*:", result.stdout + "\n" + result.stderr, re.MULTILINE))
+    return 0
+
+
+def _link_cuda_runtime(install_folder, major):
+    """Symlink libcudart / libcublas / libcublasLt .so.<major> next to the bundle's
+    libggml-cuda.so (RUNPATH $ORIGIN) when the dynamic loader cannot already find
+    them, so llama-cli / llama-server started from a shell load the CUDA backend
+    without LD_LIBRARY_PATH. Returns the link paths created."""
+    created = []
+    for lib in (f"libcudart.so.{major}", f"libcublas.so.{major}", f"libcublasLt.so.{major}"):
+        link = os.path.join(install_folder, lib)
+        if os.path.lexists(link):
+            continue
+        for directory in _cuda_runtime_candidate_dirs():
+            source = os.path.join(directory, lib)
+            if os.path.isfile(source):
+                try:
+                    os.symlink(os.path.realpath(source), link)
+                    created.append(link)
+                except OSError as e:
+                    logger.warning("Unsloth: Could not link %s into llama.cpp (%s).", lib, e)
+                break
+    return created
+
+
+def _enable_cuda_bundle(install_folder, asset_name, require_device = False):
+    """After staging a Linux fork CUDA bundle: confirm its CUDA backend sees a GPU,
+    linking the CUDA runtime in from PyTorch's wheels / the toolkit when that is what
+    is missing. require_device raises when no CUDA device shows up, so the caller
+    moves on to the next bundle (the CPU one) instead of keeping a CUDA build that
+    would silently run on the CPU."""
+    major = _cuda_bundle_major(asset_name)
+    if major is None or platform.system() != "Linux":
+        return
+    if _list_cuda_devices(install_folder) > 0:
+        return
+    created = _link_cuda_runtime(install_folder, major)
+    if created and _list_cuda_devices(install_folder) > 0:
+        return
+    for link in created:
+        try: os.unlink(link)
+        except OSError: pass
+    message = (f"Unsloth: The llama.cpp CUDA bundle {asset_name} sees no CUDA device here "
+               f"(CUDA {major} runtime / driver not usable).")
+    if require_device:
+        raise RuntimeError(message)
+    logger.warning(message)
+
+
 def _open_new_sibling(directory, mode):
     """Create a uniquely named file in `directory` with `mode`, returning (fd, path).
 
@@ -2147,11 +2238,12 @@ def _write_prebuilt_marker(install_folder, tag, asset_name, repo = LLAMA_CPP_FOR
         logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
 
 
-def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = LLAMA_CPP_FORK_REPO, source_assets = None, checksums = None):
+def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = LLAMA_CPP_FORK_REPO, source_assets = None, checksums = None, require_cuda_device = False):
     """Download one prebuilt asset, verify, hydrate, validate in staging,
     then activate into llama_cpp_folder. Raises on any failure. source_assets is
     the release's asset map, used so the converter sources hydrate from the fork's
-    own source tarball for "mix" tags (see _hydrate_converter_sources)."""
+    own source tarball for "mix" tags (see _hydrate_converter_sources).
+    require_cuda_device: a Linux CUDA bundle must see a CUDA device (_enable_cuda_bundle)."""
     parent_dir = os.path.dirname(llama_cpp_folder) or "."
     os.makedirs(parent_dir, exist_ok = True)
     # Stage next to the target so activation is an atomic same-filesystem move, and validate before touching the real folder.
@@ -2174,12 +2266,14 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
         )
         _write_prebuilt_marker(staged_install, tag, asset_name, repo = repo)
         check_llama_cpp(llama_cpp_folder = staged_install)
+        _enable_cuda_bundle(staged_install, asset_name, require_device = require_cuda_device)
 
         if not os.path.exists(llama_cpp_folder):
             shutil.move(staged_install, llama_cpp_folder)
         else:
             # Folder exists with broken or missing binaries: merge into it rather than deleting a tree the user may own.
-            shutil.copytree(staged_install, llama_cpp_folder, dirs_exist_ok = True)
+            # symlinks=True keeps _link_cuda_runtime's links as links (copy2 placed no other symlinks).
+            shutil.copytree(staged_install, llama_cpp_folder, dirs_exist_ok = True, symlinks = True)
         return check_llama_cpp(llama_cpp_folder = llama_cpp_folder)
     finally:
         shutil.rmtree(staging, ignore_errors = True)
@@ -2189,7 +2283,9 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
     """Install prebuilt llama.cpp binaries plus same-tag converter sources into
     llama_cpp_folder, only ever from unslothai/llama.cpp fork releases. Tries, in
     order: the fork GPU bundle (CUDA/ROCm/Metal) when a GPU target is present, then
-    the fork CPU bundle (its app-*-cpu archive also ships llama-quantize). Returns
+    the fork CPU bundle (its app-*-cpu archive also ships llama-quantize). A CPU
+    request (gpu_support=False) on a Linux CUDA host tries the CUDA bundle first and
+    keeps it only when its CUDA backend sees a GPU, so llama-cli -ngl offloads. Returns
     (quantizer, converter) on the first asset that installs, else None so the
     caller compiles from source as before."""
     try:
@@ -2198,16 +2294,16 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
         # staging verifies the right sha256 and hydrates the converter from the
         # matching source. (repo, asset_name) dedups the macOS bundle, which both
         # fork selectors return.
-        attempts = []          # [(repo, tag, checksums, source_assets, name, url), ...]
+        attempts = []          # [(repo, tag, checksums, source_assets, name, url, needs_cuda), ...]
         seen = set()           # {(repo, asset_name)}
 
-        def _extend(repo, tag, checksums, source_assets, selected):
+        def _extend(repo, tag, checksums, source_assets, selected, needs_cuda = False):
             for asset_name, asset_url in selected:
                 key = (repo, asset_name)
                 if key in seen:
                     continue
                 seen.add(key)
-                attempts.append((repo, tag, checksums, source_assets, asset_name, asset_url))
+                attempts.append((repo, tag, checksums, source_assets, asset_name, asset_url, needs_cuda))
 
         fork_repo = LLAMA_CPP_FORK_REPO
         resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
@@ -2218,10 +2314,19 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
             fork_checksums = fork_checksums.get("artifacts", {})
             # 1: GPU bundle, only with a usable GPU target (or macOS Metal).
             # Probe the GPU target once and reuse it inside _select_gpu_assets.
-            gpu_target = _detect_gpu_target() if (gpu_support and not is_darwin) else None
+            is_linux = platform.system() == "Linux"
+            gpu_target = _detect_gpu_target() if (not is_darwin and (gpu_support or is_linux)) else None
             if gpu_support and (is_darwin or gpu_target is not None):
                 _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
                         _select_gpu_assets(fork_tag, fork_assets, manifest, target = gpu_target))
+            elif is_linux and gpu_target is not None and gpu_target[0] == "cuda":
+                # 1b: a CPU-oriented install (GGUF export) on a Linux CUDA host. The CUDA
+                # bundle ships the same llama-quantize plus llama-cli / llama-server that
+                # then offload with -ngl; the CPU bundle only computes on the CPU. Kept only
+                # if its CUDA backend sees a GPU here, else the CPU bundle below is next.
+                _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
+                        _select_gpu_assets(fork_tag, fork_assets, manifest, target = gpu_target),
+                        needs_cuda = True)
             # 2: CPU bundle -- the final prebuilt fallback for CPU-oriented
             # installs. Skipped for an explicit GPU request so a failed GPU
             # prebuilt compiles a GPU-enabled build (the pre-prebuilt behavior)
@@ -2241,7 +2346,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                            "falling back to source build.")
             return None
 
-        for repo, tag, checksums, source_assets, asset_name, asset_url in attempts:
+        for repo, tag, checksums, source_assets, asset_name, asset_url, needs_cuda in attempts:
             print(f"Unsloth: Installing prebuilt llama.cpp {tag} ({asset_name}) - skipping compilation.")
             try:
                 result = _stage_prebuilt_install(
@@ -2250,6 +2355,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                     repo = repo,
                     source_assets = source_assets,
                     checksums = checksums,
+                    **({"require_cuda_device": True} if needs_cuda else {}),
                 )
             except Exception as e:
                 logger.warning("Unsloth: Prebuilt %s failed (%s) - trying next option.", asset_name, e)

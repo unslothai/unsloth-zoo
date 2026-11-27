@@ -38,6 +38,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 try:
     import triton
@@ -94,7 +95,7 @@ def fused_swiglu_supported(gate_up: torch.Tensor) -> bool:
         and (_STATE["compiled"] or not torch.compiler.is_compiling())
         and gate_up.is_cuda
         and (torch.compiler.is_compiling() or type(gate_up) is torch.Tensor)  # no DTensor / subclasses
-        and torch.version.hip is None
+        and not is_rocm_torch(torch)
         and gate_up.dtype in _DTYPES
         and (gate_up.dtype != torch.bfloat16 or _bf16_capable(gate_up))
         and gate_up.dim() >= 1

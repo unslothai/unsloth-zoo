@@ -45,6 +45,7 @@ import sys
 from typing import Tuple
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 import triton
 import triton.language as tl
 
@@ -422,7 +423,7 @@ def sparse_mqa_supported(q, kv):
     of two in [16, 512]."""
     if q.dim() != 4 or kv.dim() != 3 or kv.shape[0] != q.shape[0] or kv.shape[-1] != q.shape[-1]:
         return False
-    if not (q.is_cuda and kv.is_cuda and q.device == kv.device and torch.version.hip is None):
+    if not (q.is_cuda and kv.is_cuda and q.device == kv.device and not is_rocm_torch(torch)):
         return False
     if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
         return False

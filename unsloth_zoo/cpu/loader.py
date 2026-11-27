@@ -1379,6 +1379,9 @@ class FastCPUModel:
         # CPU / MPS decode (GRPO rollouts too): KV written in place, not torch.cat of the whole cache per token.
         from .kv_cache import install as _install_growable_kv
         _install_growable_kv(model)
+        # do_sample on CPU: torch.multinomial's one draw without the serial exponential_ fill (same samples).
+        from .sampling import install as _install_fast_multinomial
+        _install_fast_multinomial()
         model.for_training = types.MethodType(lambda self, *a, **k: FastCPUModel.for_training(self, *a, **k), model)
         model.for_inference = types.MethodType(lambda self: FastCPUModel.for_inference(self), model)
         model.save_pretrained_merged = types.MethodType(save_pretrained_merged, model)

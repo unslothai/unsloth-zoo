@@ -35,6 +35,7 @@ __all__ = [
 import os
 from collections import OrderedDict
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 DEEPSEEK_V41_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -114,7 +115,7 @@ def deepseek_v41_attention_backend(capability = None):
     if chosen: return chosen
     if capability is None:
         try:
-            if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None: return None
+            if not torch.cuda.is_available() or is_rocm_torch(torch): return None
             capability = torch.cuda.get_device_capability()
         except Exception:
             return None

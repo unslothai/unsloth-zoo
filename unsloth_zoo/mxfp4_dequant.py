@@ -19,6 +19,7 @@
 import os
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 __all__ = [
     "mxfp4_dequantize",
@@ -46,7 +47,7 @@ _TORCH_CHUNK_BYTES = 256 << 20
 
 # bf16 x bf16 lowers to v_dot2_bf16_bf16 (flushes subnormals, -0 to +0) and fp32-then-fp16 to v_fma_mixlo_f16 (-0 to
 # +0); on ROCm Triton (gfx11, Triton 3.6) the kernel multiplies in fp32 and rounds to 16 bits with integer ops.
-_IS_HIP = torch.version.hip is not None
+_IS_HIP = is_rocm_torch(torch)
 
 # torch < 2.12's ldexp forms 2^e in the input dtype: inf from 2^16 in fp16, and from 2^128 (e8m0 255) in fp32 (0 -> NaN).
 _LDEXP_EXACT = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 12)

@@ -20,10 +20,12 @@ import pytest
 import torch
 
 import unsloth_zoo.mxfp4_gemm as mg
+from _torch_version_tag import drop_rocm_tag  # noqa: E402
 
 
 def _fake_gpu(monkeypatch, capability, cvt = False):
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(mg, "_cvt_ok", lambda index, eager = False: cvt)
     monkeypatch.setattr(mg, "_ASM_OK", {})
@@ -94,6 +96,7 @@ def test_capture_on_either_device_defers_the_probe(monkeypatch):
     import contextlib
     monkeypatch.setenv("UNSLOTH_MXFP4_CVT", "1")
     monkeypatch.setattr(torch.version, "hip", None)
+    drop_rocm_tag(monkeypatch, torch)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: (10, 0))
     current = {"index": 0}
 

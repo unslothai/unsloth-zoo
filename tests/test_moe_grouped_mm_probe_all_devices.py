@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from unsloth_zoo.temporary_patches import moe_utils
+from _torch_version_tag import drop_rocm_tag  # noqa: E402
 
 
 @pytest.fixture(autouse = True)
@@ -49,6 +50,8 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
         monkeypatch.setattr(torch.cuda, "current_device", lambda: current)
         monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+        if not hip:
+            drop_rocm_tag(monkeypatch, torch)
         monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_AVAILABLE", True)
         monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
