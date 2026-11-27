@@ -1059,7 +1059,7 @@ def packed_grouped_mm(x, codes, scales, glob, counts, fmt, transpose_b = True, m
     grid = (-(-M // BM) + min(E, M), -(-N // BN))
     with torch.cuda.device(x.device):
         _packed_grouped_mm_kernel[grid](
-            x, codes.contiguous(), scales.contiguous(), g, out, counts.to(device = x.device, dtype = torch.int32),
+            x, codes.contiguous(), scales.contiguous(), g, out, counts.to(device = x.device, dtype = torch.int32).contiguous(),
             E, NR, KC, K, N, M, NR // parts, parts,
             x.stride(0), out.stride(0),
             TRANS_B = bool(transpose_b), E_POW2 = 1 << (E - 1).bit_length(),

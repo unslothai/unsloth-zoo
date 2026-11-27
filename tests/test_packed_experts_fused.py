@@ -228,3 +228,16 @@ def test_large_expert_count_and_row_offsets():
     dense = param.dequantize(torch.bfloat16, transpose = False).float()[rows.cuda()]
     want = torch.bmm(x.float().unsqueeze(1), dense.transpose(1, 2)).squeeze(1)
     assert (got.float() - want).abs().max() <= 1e-2 * want.abs().max()
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
+def test_strided_counts_match_contiguous(fmt):
+    # A counts view with a stride (every other element of a larger buffer) must route rows as its values say.
+    E, N, K = 4, 64, 96
+    param = _param(fmt, E, N, K)
+    x, counts, _ = _route([3, 0, 5, 2], K, torch.bfloat16)
+    storage = torch.zeros(2 * E, dtype = torch.int32, device = "cuda")
+    storage[::2] = counts
+    strided = storage[::2]
+    assert not strided.is_contiguous()
+    assert torch.equal(_call(param, x, strided, True), _call(param, x, counts, True))
