@@ -500,7 +500,26 @@ def test_existing_loss_types_unchanged_by_reinforce_edit():
 
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA head precision path")
+def _cuda_head_precision_path(torch_mod = torch):
+    """The fp32 head default the next test checks: an NVIDIA CUDA build. ROCm keeps the head in its own dtype
+    (score_centering._head_projection, is_rocm_torch), and torch.cuda.is_available() is True there too."""
+    from unsloth_zoo.rocm_build import is_rocm_torch
+    return torch_mod.cuda.is_available() and not is_rocm_torch(torch_mod)
+
+
+@pytest.mark.parametrize("hip, version, cuda, expected", [
+    (None, "2.11.0+cu130", True, True),
+    ("7.13.99004", "2.11.0+rocm7.13.0", True, False),  # Linux ROCm wheel
+    (None, "2.11.0+rocm7.14.0", True, False),          # AMD SDK wheel: version.hip unset
+    (None, "2.11.0+cpu", False, False),
+])
+def test_cuda_head_precision_skip_excludes_rocm(hip, version, cuda, expected):
+    fake = types.SimpleNamespace(version = types.SimpleNamespace(hip = hip), __version__ = version,
+                                 cuda = types.SimpleNamespace(is_available = lambda: cuda))
+    assert _cuda_head_precision_path(fake) is expected
+
+
+@pytest.mark.skipif(not _cuda_head_precision_path(), reason = "NVIDIA CUDA head precision path (ROCm keeps the head dtype)")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_head_logprobs_match_policy_scorer_cuda(dtype):
     # Same projection precision as the sampled-token scorer, so p and the loss describe one policy.

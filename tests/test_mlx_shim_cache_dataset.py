@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The torch shim's mlx_lm CacheDataset keeps mlx-lm's contract: an item is ``data.process(data[idx])``, computed once.
-Returning the raw row instead made every text plan built through the shim empty."""
+"""The shim's CacheDataset yields data.process(data[idx]); raw rows empty every text plan."""
 
 from __future__ import annotations
 

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unsloth's top_entropy_quantile mask and entropy bonus (grpo_compute_loss, UnslothGRPOEntropyBonus) must match TRL's
-unmodified _compute_loss in float64: losses and grads."""
+"""Entropy mask and bonus must match unmodified TRL _compute_loss in float64 (losses, grads)."""
 import inspect
 from collections import defaultdict
 from types import SimpleNamespace

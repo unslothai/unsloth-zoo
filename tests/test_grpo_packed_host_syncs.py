@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO sequence-packed logp path: the host-sized index build must select exactly what the boolean masks did,
-with one device-to-host read per batch instead of one per mask."""
+"""GRPO packed logp: host-sized index selects what the masks did, one D2H read per batch."""
 
 import inspect
 

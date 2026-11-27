@@ -48,11 +48,9 @@ def _run(body: str, timeout: int = 900):
     cache = Path(os.environ.get("UNSLOTH_WORKSPACE", ROOT.parent)) / "temp" / "gen_test_cache"
     cache.mkdir(parents=True, exist_ok=True)
     env["UNSLOTH_COMPILE_LOCATION"] = str(cache)
-    # conftest sets UNSLOTH_ALLOW_CPU=1 suite-wide, which makes PatchFastRL return early; inherited here it would
-    # guarantee a plain SFTTrainer and fail this file.
+    # conftest's UNSLOTH_ALLOW_CPU=1 makes PatchFastRL return early, leaving plain SFTTrainer.
     env.pop("UNSLOTH_ALLOW_CPU", None)
-    # With no accelerator unsloth loads its CPU backend, which uses trl's SFTTrainer, so the generated class is never
-    # built; UNSLOTH_DISABLE_CPU_FALLBACK=1 keeps the GPU path or abort.
+    # CPU fallback skips generated class; UNSLOTH_DISABLE_CPU_FALLBACK=1 keeps GPU or aborts.
     env["UNSLOTH_DISABLE_CPU_FALLBACK"] = "1"
     return subprocess.run([sys.executable, "-c", script], capture_output=True,
                           text=True, timeout=timeout, env=env)

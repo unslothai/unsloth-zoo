@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""vLLM < 0.13: a FLASHINFER backend an earlier load_vllm set in this process is not a user choice, and the head size
-is read in vLLM's own order (head_dim, hidden_size_per_head, then hidden_size // heads)."""
+"""vLLM < 0.13: earlier load_vllm FLASHINFER backend is no user choice; head size: head_dim first."""
 
 import ast
 import importlib

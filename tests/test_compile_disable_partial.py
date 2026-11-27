@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_COMPILE_DISABLE=partial must also switch off the temporary patches; common.py tested only == '1' while
-compiler.py also accepted 'partial'; flag read at import, so probed in a subprocess"""
+"""UNSLOTH_COMPILE_DISABLE=partial must also switch off temporary patches; read at import."""
 
 import json
 import os
@@ -48,8 +47,7 @@ _SCRIPT = textwrap.dedent("""
 
 
 def _probe_env(value):
-    # Without unsloth installed, unsloth_zoo/__init__ raises 'Please install Unsloth' before the probe prints;
-    # UNSLOTH_COMPILE_DISABLE selects the light import path instead
+    # Without unsloth, unsloth_zoo/__init__ raises first; UNSLOTH_COMPILE_DISABLE bypasses it.
     return dict(
         os.environ,
         PYTHONPATH = str(ROOT),

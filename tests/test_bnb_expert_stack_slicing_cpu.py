@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert-stack slicing arithmetic without CUDA or bitsandbytes, against a stand-in for the 4-bit contract (whole
-blocks, one absmax per block, two weights per byte); compares sliced output byte for byte with one unsliced call and
-records each call's element count."""
+"""Expert-stack slicing without CUDA or bitsandbytes, against 4-bit stand-in (whole blocks, one
+absmax per block, two weights per byte); sliced output matches one unsliced call byte for byte."""
 from __future__ import annotations
 
 import importlib.util
@@ -141,8 +140,7 @@ def _install_fake_bitsandbytes(monkeypatch):
 
 @pytest.fixture
 def M(monkeypatch):
-    """Private copy of moe_utils_bnb4bit bound to the stand-in, loaded under its own name so reloading does not leak the
-    double into other tests; package prefix keeps from .common import resolving."""
+    """Package-prefixed private moe_utils_bnb4bit copy so reloads don't leak; .common resolves."""
     _install_fake_bitsandbytes(monkeypatch)
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
 
@@ -242,8 +240,7 @@ def test_declines_a_one_dimensional_tensor(M):
 
 
 def test_declines_an_expert_that_is_not_whole_blocks(M):
-    """A block straddling two slices is rescaled by the wrong absmax when packed bytes are concatenated; 2 elements per
-    expert is even, so only the block check can decline it, while an odd count would hide a dropped check."""
+    """Straddling blocks get wrong absmax; 2 per expert is even, so only block check declines."""
     value = torch.zeros(8, 1, 2, dtype = torch.bfloat16)
     per_expert = value[0].numel()
     assert per_expert % BLOCKSIZE != 0 and per_expert % 2 == 0
@@ -374,8 +371,7 @@ def test_round_trip_through_both_sliced_paths(M):
 # ---------------------------------------------------------------------------
 
 class _PretendCuda(torch.Tensor):
-    """CPU tensor whose is_cuda returns True, so the gate in _make_expert_params4bit runs without a GPU; only the gate
-    reads it, the rest is the same integer arithmetic."""
+    """CPU tensor whose is_cuda is True, so the _make_expert_params4bit gate runs GPU-free."""
 
     @property
     def is_cuda(self):
@@ -383,15 +379,13 @@ class _PretendCuda(torch.Tensor):
 
 
 def test_the_cap_is_the_measured_bitsandbytes_limit():
-    """bitsandbytes 0.50.2: quantize_4bit takes 2**31 - 64 and aborts at 2**31 (csrc/ops.cu line 74); dequantize_4bit
-    takes 2146435072 and aborts at 2**31 (line 93); raising re-enables the abort, lowering slices stacks needlessly"""
+    """0.50.2 aborts at 2**31 (csrc/ops.cu); higher caps re-abort, lower caps slice needlessly."""
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     assert real._BNB_MAX_QUANTIZE_NUMEL == 2 ** 31
 
 
 def test_every_threshold_comparison_is_inclusive_at_the_cap():
-    """Inkling-Small's w2_weight (256, 4096, 2048) is exactly 2**31 elements, so the cap is inclusive: using > instead
-    of >= at any gate leaves that stack aborting; checked over the source for future gates."""
+    """Cap is inclusive: Inkling-Small's w2_weight is exactly 2**31 elements, so > would abort."""
     import ast
 
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
@@ -412,7 +406,6 @@ def test_every_threshold_comparison_is_inclusive_at_the_cap():
         f"{seen}. A rename would empty this test rather than fail it."
     )
     for lineno, text, ops in seen:
-        # numel >= CAP slices at the cap and numel < CAP declines below it; > or <= would let a stack of exactly CAP reach the aborting call.
         assert ops in (["GtE"], ["Lt"]), (
             f"line {lineno}: `{text}` is exclusive at the cap, so a stack of "
             f"exactly {2 ** 31} elements reaches the bitsandbytes call that aborts"
@@ -463,9 +456,7 @@ def test_dequant_slices_a_stack_of_exactly_the_cap(M):
 
 
 def test_a_plain_tuple_original_shape_counts_the_same(M):
-    """The size check uses torch.Size.numel() when available and multiplies dims otherwise, so a plain tuple
-    _original_shape must count the same; the load path always sets a torch.Size, and other tests all take that route,
-    so a broken fallback would go unnoticed."""
+    """Plain tuple _original_shape must count like torch.Size; others miss a broken fallback."""
     value = _stack(experts = 8)
     assert value.numel() > SMALL_CAP
 

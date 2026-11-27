@@ -1,5 +1,4 @@
-"""Fresh streaming datasets (load_dataset(streaming = True), to_iterable_dataset()) have no batch_size until mapped, so
-reads use getattr with datasets' default (1000) instead of raising AttributeError."""
+"""Fresh streaming datasets lack batch_size until mapped, so reads default to 1000 via getattr."""
 
 import sys
 from pathlib import Path

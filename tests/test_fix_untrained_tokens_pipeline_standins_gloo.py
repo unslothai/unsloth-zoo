@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens on a per-stage pipeline load must match a one-process run on each rank's held matrix,
-without copying the whole lm_head to the host (11 GiB on Qwen3.8-27B)."""
+"""Per-stage fix_untrained_tokens matches a one-process run without copying lm_head to host."""
 
 import multiprocessing
 import os

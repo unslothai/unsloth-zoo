@@ -12,9 +12,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A removed PARENT package must read as upstream drift: ModuleNotFoundError.name is the deepest missing package, so
-matching only the full path or top-level name misread the removal as a broken dependency and skipped, letting a hard
-gate pass with the target gone."""
+"""A removed parent package is drift; ModuleNotFoundError.name is the deepest missing package."""
 
 import importlib
 import pathlib
@@ -22,8 +20,7 @@ import sys
 
 import pytest
 
-# Import by path, not via tests.: this repo's tests/ is not a package, and unsloth itself ships tests/__init__.py, so in
-# CI the absolute form resolved to a sibling project's package and failed collection.
+# tests/ is not a package; unsloth's tests/__init__.py made CI resolve a sibling's package.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from test_temporary_patches_exhaustive import (  # noqa: E402
@@ -74,8 +71,7 @@ def test_every_package_prefix_counts_as_the_target(predicate, missing):
 @PREDICATES
 @pytest.mark.parametrize("missing", ["timm", "timm.data", "torchvision"])
 def test_a_broken_dependency_still_does_not_count(predicate, missing):
-    """A broken dependency must not count as drift: gemma3n's config imports ImageNetInfo from timm.data, which newer
-    timm dropped; eight tests blamed transformers for classes it still ships."""
+    """Broken deps are not drift: gemma3n imports ImageNetInfo, which newer timm dropped."""
     assert not predicate(_module_not_found(missing), "transformers.models.gemma3n.configuration_gemma3n")
 
 

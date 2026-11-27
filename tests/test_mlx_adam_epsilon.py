@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""adam_epsilon on the MLX trainer (HF TrainingArguments parity); asserts the kwargs _build_optimizer passes, so it
-holds under real MLX and the torch simulation shim."""
+"""adam_epsilon on the MLX trainer (HF parity); holds under real MLX and the torch shim."""
 
 from __future__ import annotations
 

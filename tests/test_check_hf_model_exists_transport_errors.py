@@ -79,7 +79,6 @@ def test_transport_failure_raises_instead_of_reporting_absent(monkeypatch, error
         saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct")
 
     message = str(excinfo.value)
-    # Names the real cause, not the model.
     assert "connectivity" in message or "rate limiting" in message
     assert "unsloth/Llama-3.2-1B-Instruct" in message
     assert excinfo.value.__cause__ is error

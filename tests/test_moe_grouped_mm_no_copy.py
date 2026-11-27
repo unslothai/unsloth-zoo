@@ -1,6 +1,5 @@
-"""Copy elimination in _grouped_mm_with_backward_fix: the frozen base stack goes to torch._grouped_mm as a transposed
-view when the view-safety probe passes (else a copy); the probe must leave global RNG untouched; view == contiguous
-bit-exactly"""
+"""Copy elimination in _grouped_mm_with_backward_fix: frozen base stack as a transposed view if the
+view-safety probe passes (else a copy); probe must leave RNG untouched; view is bit-exact."""
 import pytest
 import torch
 
@@ -173,8 +172,7 @@ def test_the_routing_signature_sees_an_arbitrary_permutation():
 
 
 def test_the_routing_signature_does_not_upcast_the_whole_input():
-    """The routing signature must not upcast the whole input: a [routed_tokens, hidden] transient for one number per row
-    is 512MB at 32K x 4096, on memory-constrained runs"""
+    """No whole-input upcast in the routing signature: 512MB transient at 32K x 4096."""
     import inspect
 
     from unsloth_zoo.temporary_patches.moe_utils import _routing_signature

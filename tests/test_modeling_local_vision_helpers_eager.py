@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grid helpers in modeling files need the same eager fallback as vision_utils; helpers are discovered from source and
-only matching modules are imported to probe tracing."""
+"""Grid helpers need the eager fallback of vision_utils; only matching modules are imported."""
 
 import inspect
 import os
@@ -62,7 +61,6 @@ def _locally_defined_grid_helpers():
         except OSError:
             continue
         for name in _DEFINITION.findall(source):
-            # Exclude the definition while retaining calls before and after it.
             callers = re.sub(r"^def " + re.escape(name) + r"\s*\(", "", source, flags = re.MULTILINE)
             if not re.search(r"[^\w.]" + re.escape(name) + r"\s*\(", callers):
                 continue

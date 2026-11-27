@@ -307,13 +307,23 @@ def _load_cached_moe_utils_module():
 
 
 def _select_moe_backend_eagerly(module):
-    # Selecting inside a trace sets a guarded global and recompiles the graph once.
-    if torch.compiler.is_compiling():
+    # Selecting inside a trace sets a guarded global and recompiles the graph once. While unsloth imports, a worker
+    # that picks its card afterwards would probe (and open a context on) GPU 0: warm_moe_backend_selection selects at
+    # model load instead.
+    if torch.compiler.is_compiling() or _unsloth_importing():
         return
     try:
         module.select_moe_backend()
     except Exception:
         pass
+
+
+def warm_moe_backend_selection():
+    """Probe and select the MoE backend at model load (a temporary patch), before any trace; never during import."""
+    module = _load_cached_moe_utils_module()
+    for target in (module, sys.modules[__name__]):
+        if target is not None and hasattr(target, "select_moe_backend"):
+            _select_moe_backend_eagerly(target)
 
 
 def get_forward_moe_backend():
@@ -663,6 +673,14 @@ _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 6):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
     (7, 5):  {"lora": 64, "many": 0,    "few": 0,   "dw": 0,   "dw_few": 0},
 }
+# ROCm, keyed by the gcnArch capability torch reports. There torch._grouped_mm is a per-expert mm loop, and on gfx1151
+# ROCm 7.13 / 7.14 it fails the training-shaped probe, so the LoRA GEMMs ran as about 3.8k per-expert mm per step.
+# gfx1151 (Strix Halo) LoRA GEMMs on Triton, Qwen3-30B-A3B layer shape (E 128, top-8), r16, bf16: 1.26x step speed on
+# Linux. Windows (triton-windows) timed 1.76x on one box and 0.94x on another, so auto keeps it on the loop there.
+# Base-sized classes are not timed yet and stay on torch; other ROCm archs keep the loop. =1 forces Triton anywhere.
+_TRITON_GROUPED_MM_AUTO_ROWS_ROCM = {
+    (11, 5): {"lora": -1, "many": 0, "few": 0, "dw": 0, "dw_few": 0},
+}
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
 _GROUPED_MM_TRITON_STANDIN = False
@@ -703,8 +721,9 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = F
         mode = "1"
     if mode in ("0", "false", "off") or disabled == "1":
         return 0
-    if is_rocm_torch(torch) or _GROUPED_MM_TRITON_OP is None or index is None:
+    if _GROUPED_MM_TRITON_OP is None or index is None:
         return 0
+    rocm = is_rocm_torch(torch)
     try:
         from unsloth_zoo.temporary_patches.moe_grouped_fp16 import triton as _triton
         if _triton is None:
@@ -714,9 +733,13 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override, standin = F
         return 0
     if mode in ("1", "true", "on"):
         # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
-        limit = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
+        limit = -1 if rocm or cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     else:
-        limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
+        if rocm:
+            table = {} if sys.platform == "win32" else _TRITON_GROUPED_MM_AUTO_ROWS_ROCM
+        else:
+            table = _TRITON_GROUPED_MM_AUTO_ROWS
+        limit = table.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
         try:
             limit = int(override)
@@ -2267,7 +2290,13 @@ def _run_grouped_mm_crash_probe(device):
     return False
 
 
+def _is_out_of_memory(exc):
+    oom = getattr(torch, "OutOfMemoryError", None)
+    return (isinstance(oom, type) and isinstance(exc, oom)) or "out of memory" in str(exc).lower()
+
+
 def _grouped_mm_runs_on(device):
+    """True / False, or None when the probe ran out of memory (no verdict: callers must not cache it)."""
     _GROUPED_MM_LAST_REFUSAL[0] = None
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
@@ -2280,8 +2309,9 @@ def _grouped_mm_runs_on(device):
 
         torch._grouped_mm(x, w, offs=offs)
         del x, w, offs
-    except Exception:
-        return False
+    except Exception as exc:
+        # Out of memory says nothing about the kernel: no verdict, so the next call probes again.
+        return None if _is_out_of_memory(exc) else False
     _GROUPED_MM_LAST_REFUSAL[0] = _grouped_mm_trains_on(device)
     return _GROUPED_MM_LAST_REFUSAL[0] is None
 
@@ -2354,6 +2384,7 @@ def _probe_torch_grouped_mm_supported(device = None):
         supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
+            if supported is None: return False  # out of memory: loop for now, probe again next call
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
             # Same eager region: a traced first use of this model must not break again on the view check.
             if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
@@ -2367,7 +2398,9 @@ def _probe_torch_grouped_mm_supported(device = None):
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
-        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+        supported = _grouped_mm_runs_on(device)
+        if supported is None: return False  # out of memory: loop for now, probe again next call
+        _TORCH_GROUPED_MM_SUPPORTED = supported
     _GROUPED_MM_TRAINING_PROBE_FAILURE = _GROUPED_MM_LAST_REFUSAL[0]
     # Answer the view check here so a cold compiled block does not graph-break on it.
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
@@ -2687,6 +2720,9 @@ def _select_moe_backend():
             return "sonic_moe"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
+    if _rocm_arch_prefers_unsloth_triton() and _check_grouped_gemm_available():
+        _log_info("Unsloth: Using MoE backend 'unsloth_triton' (ROCm gfx1151: torch._grouped_mm is a synced per-expert loop)")
+        return "unsloth_triton"
     if _check_torch_grouped_mm_supported():
         _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
@@ -2699,6 +2735,26 @@ def _select_moe_backend():
     if _GROUPED_MM_TRAINING_PROBE_FAILURE is not None:
         _log_grouped_mm_fallback(_GROUPED_MM_TRAINING_PROBE_FAILURE, f"MoE backend '{backend}'")
     return backend
+
+
+# ROCm archs whose auto MoE backend is unsloth_triton even when torch._grouped_mm passes the training probe. There
+# torch._grouped_mm is its per-expert mm loop with a host sync per expert (CK grouped GEMM only on opt-in gfx942 /
+# gfx950 / gfx90a). gfx1151 (Strix Halo), Qwen3-30B-A3B layer shape (E 128, top-8), LoRA r16, bf16, exclusive GPU:
+# 0.4960 s/step on grouped_mm vs 0.4246 on unsloth_triton (1.17x; 5637 vs 5 aten::item per step), same distance to
+# an fp64 oracle. UNSLOTH_MOE_BACKEND=grouped_mm still selects grouped_mm.
+_ROCM_UNSLOTH_TRITON_ARCHS = ("gfx1151",)
+
+
+def _rocm_arch_prefers_unsloth_triton():
+    if not is_rocm_torch(torch):
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        arch = str(getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "gcnArchName", "") or "")
+    except Exception:
+        return False
+    return arch.split(":", 1)[0] in _ROCM_UNSLOTH_TRITON_ARCHS
 
 
 def _unsloth_triton_beats_loop():

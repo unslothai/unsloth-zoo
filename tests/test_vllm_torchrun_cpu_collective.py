@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference = True under torchrun: init_process_group(backend = None) on CUDA registers only nccl, so
-_all_reduce_int on a CPU int raised No backend type associated with device type cpu."""
+"""On CUDA, init_process_group(backend = None) registers only nccl; CPU _all_reduce_int fails."""
 
 import json
 import os

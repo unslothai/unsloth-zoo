@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for the import-time hf_transfer default: unsloth_zoo/__init__.py enables HF_HUB_ENABLE_HF_TRANSFER,
-which fails every download on Windows ARM; the detector, assignment and enablement block are AST-extracted and
-executed against a fake platform and fake ctypes."""
+"""Tests the import default of HF_HUB_ENABLE_HF_TRANSFER; Windows ARM fails every download."""
 
 from __future__ import annotations
 
@@ -243,9 +241,8 @@ class TestWiring:
 
 
 class TestHfTransferNotInstalled:
-    """huggingface_hub < 1.0 refuses every download when the flag is on without hf_transfer installed (broke
-    tests/test_gemma3_processor_token_type_ids.py on transformers 4.57.6); leaving the flag off keeps the plain
-    download path working."""
+    """huggingface_hub < 1.0 refuses every download when HF_HUB_ENABLE_HF_TRANSFER is on without
+    hf_transfer (broke a test on transformers 4.57.6); leave the flag off."""
 
     def test_missing_hf_transfer_leaves_the_flag_off(self):
         env = _resolve(platform_name = "linux", machine = "x86_64", environ = {}, hf_transfer_installed = False)

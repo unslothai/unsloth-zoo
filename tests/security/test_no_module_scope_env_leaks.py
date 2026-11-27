@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A module-scope os.environ write of an import-time global such as UNSLOTH_ZOO_DISABLE_GPU_INIT must be restored after
-the import; otherwise it leaks to the whole xdist worker."""
+"""Module-scope env writes must be restored after import, else they leak to the xdist worker."""
 
 from __future__ import annotations
 

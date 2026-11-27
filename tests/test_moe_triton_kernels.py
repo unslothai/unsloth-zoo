@@ -53,8 +53,7 @@ def _ptxas_fuses_rn_mul_add():
 
 
 def _max_fp32_bit_distance(out, ref, step = 1 << 24):
-    """Largest |int bits(out) - int bits(ref)|, in int64: int32 wraps a sign flip (2**31) to a negative distance.
-    Sliced so the int64 copies stay small next to multi-GB weights."""
+    """Max bit distance in int64: int32 would wrap a sign flip (2**31) to a negative value."""
     a, b = out.reshape(-1).view(torch.int32), ref.reshape(-1).view(torch.int32)
     worst = 0
     for i in range(0, a.numel(), step):
@@ -78,8 +77,7 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
     numel = 1
     for s in shape:
         numel *= s
-    # Peak is the weight, or the 4-bit bytes plus both decodes and the bitsandbytes workspace; the largest shape needs
-    # ~5.5 GB fp32, so it skips only on a short card (e.g. a shared 15 GB T4) and never shrinks.
+    # Largest shape needs ~5.5 GB fp32: skip only on a short card (15 GB T4), never shrink.
     need = numel * dtype.itemsize * 2 + numel // 2 + (512 << 20)
     free = torch.cuda.mem_get_info()[0]
     if free < need:

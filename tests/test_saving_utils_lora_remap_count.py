@@ -125,7 +125,6 @@ def test_remap_mixed_language_reorder_and_vision_strip():
             f"model.language_model.layers.0.self_attn.{p}"
         assert out.get(f"vision_tower.transformer.layers.0.attention.{p}") == \
             f"model.vision_tower.transformer.layers.0.attention.{p}"
-    # Every remapped target backs a real on-disk tensor; no invented keys.
     for tgt in out:
         if isinstance(tgt, str):
             assert (tgt + ".weight") in set(disk)

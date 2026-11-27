@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused CE on an lm_head carrying a live PEFT adapter must match lm_head.forward(): the kernel reads only
-lm_head.weight (the base weight on a tuner layer), so the adapter got no gradient and the loss was the base head's.
-unsloth_fused_ce_loss(lm_head_module=...) now scores such a head through its own forward with the kernel's
-reduction; plain heads, modules_to_save and fully merged adapters stay on the kernel (CPU)."""
+"""Fused CE on an lm_head with a live PEFT adapter must match lm_head.forward(): the kernel reads
+only the base weight, so the adapter got no gradient; such heads now score via their own forward
+with the kernel's reduction; plain heads, modules_to_save and merged adapters stay fused."""
 
 import inspect
 import os

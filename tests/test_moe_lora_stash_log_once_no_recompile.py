@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The once-only "stash unread" message must not guard the traced MoE forward on its logged-set contents: the first
-traced call added its key and the next call recompiled the whole block (DeepSeek-V4.1 SparseMoeBlock)."""
+"""Stash-unread log must not gate traced MoE forward: adding its key recompiles the next call."""
 
 import torch
 

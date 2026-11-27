@@ -98,9 +98,8 @@ def test_logits_past_half_range_stay_finite(capturing):
 
 
 def test_eager_keeps_small_entries_of_a_scaled_row(capturing):
-    # The bound is worst case: a +-16384 row with a 1e-4 entry trips it though the result is small; scaling the row
-    # would flush that entry below fp16 subnormal range (result 0 instead of 6.55), so eager mode takes the exact fp32
-    # GEMM; capture cannot sync, keeps the scaled path, stays finite.
+    # Bound is worst case: a +-16384 row with a 1e-4 entry trips it; scaling would flush that entry
+    # to 0, so eager takes exact fp32 GEMM; capture cannot sync: scaled path, still finite.
     a = torch.tensor([[-16384.0, 16384.0, 1e-4, 0, 0, 0, 0, 0]], dtype = torch.float16)
     b = torch.zeros(8, 1, dtype = torch.float16)
     b[2] = 65504.0

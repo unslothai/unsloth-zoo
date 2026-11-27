@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Peak-memory tests: the forced-float32 cast must not double a multi-GiB parameter (module.to keeps the source live;
-the device map cannot foresee it); gemma-4 E4B embed_tokens_per_layer is 5.25 GiB, where the doubling decides fit vs
-OOM on two T4s with a student and teacher."""
+"""Forced-float32 casts must not double multi-GiB params (module.to keeps source live; device map
+can't see it); gemma-4 E4B embed_tokens_per_layer (5.25 GiB) decides fit or OOM on two T4s."""
 import os
 
 import pytest
@@ -27,8 +26,7 @@ from unsloth_zoo.patching_utils import _FORCED_FLOAT32_STAGE_BYTES
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 
-# Real 1 GiB threshold plus the negative control's full extra copy needs ~2 GiB free VRAM, so the suite would OOM
-# instead of skip; staging reads the constant at call time, so a 4 MiB stand-in covers the same path.
+# Real 1 GiB threshold needs ~2 GiB free VRAM; a 4 MiB stand-in hits the same call-time path.
 _TEST_STAGE_BYTES = 4 * 1024 ** 2
 
 
@@ -73,8 +71,7 @@ def test_a_large_parameter_is_not_doubled():
     size = big.weight.numel() * big.weight.element_size()
     peak = _peak_for(big, torch.float16)
     assert big.weight.dtype == torch.float16
-    # Measured above a baseline holding the original: the naive cast costs a full extra copy (see negative control), the
-    # staged cast almost none since the device original is freed first.
+    # Staged cast frees the GPU original first: almost no extra peak; naive costs a full copy.
     assert peak < 0.25 * size, (
         f"staged cast needed {peak/2**30:.2f} GiB extra for a "
         f"{size/2**30:.2f} GiB parameter")

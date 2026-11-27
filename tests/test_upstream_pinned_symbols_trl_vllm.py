@@ -6,9 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Pinned-symbol regression tests for TRL and vLLM APIs that unsloth_zoo.rl_replacements rewrites; a renamed dispatch
-key silently no-ops the rewrite, while a moved import raises ImportError. Anchors TRL 0.22.2, 0.27.1, 1.0.0;
-CPU-safe, importorskip-skippable."""
+"""Pinned-symbol tests for TRL/vLLM APIs rewritten by unsloth_zoo.rl_replacements (TRL 0.22.2,
+0.27.1, 1.0.0); renamed dispatch key silently no-ops, moved import raises ImportError; CPU-safe."""
 
 from __future__ import annotations
 
@@ -30,9 +29,7 @@ TRL_ANCHOR_TAGS = ("v0.22.2", "v0.27.1", "v1.0.0")
 # Optional fetch shim: reuse the sibling audit suite's _fetch.py if it is on this machine; if missing, network-based checks skip instead of failing.
 # ---------------------------------------------------------------------------
 def _try_load_fetch_shim():
-    """Returns _fetch.py helpers or None; path must be derived from __file__ (a hardcoded absolute path made collection
-    machine-dependent); OSError caught per candidate since is_file() can raise PermissionError, a fatal session-wide
-    collection error."""
+    """Returns _fetch.py helpers or None; OSError caught: is_file() can raise PermissionError."""
     candidates = [
         Path(__file__).resolve().parents[2] / "_postmerge_audit/tests/version_compat/_fetch.py",
     ]
@@ -101,9 +98,8 @@ def test_trl_trainer_utils_pad_installed():
         "unsloth_zoo rl_replacements compile cell ImportError"
     )
     sig = inspect.signature(trl_utils.pad)
-    # `pad(tensors, padding_value, padding_side="left")` is the
-    # signature unsloth-zoo's emit relies on (we don't pass padding_side
-    # by name but it must accept the same first 2 positional args).
+    # unsloth-zoo's emit relies on `pad(tensors, padding_value, padding_side="left")`; pad must
+    # accept the first 2 positional args and we don't pass padding_side by name.
     params = list(sig.parameters.values())
     assert len(params) >= 2, (
         f"trl.trainer.utils.pad signature shrunk: {sig}; "
@@ -167,8 +163,7 @@ def test_trl_grpo_trainer_installed():
     """Installed TRL must keep `from trl import GRPOTrainer, GRPOConfig` resolvable and the canonical path trl.trainer.grpo_trainer.GRPOTrainer."""
     pytest.importorskip("trl")
     trl = pytest.importorskip("trl")
-    # importorskip uses exc_type=ImportError so a broken downstream import (e.g. vLLM mismatch) skips instead of
-    # failing; matches pytest>=8.2 and silences the pytest 9.1 deprecation.
+    # exc_type=ImportError skips broken downstream imports; pytest>=8.2 quiets 9.1 deprecation.
     pytest.importorskip("trl.trainer.grpo_trainer", exc_type=ImportError)
     assert hasattr(trl, "GRPOTrainer"), "from trl import GRPOTrainer broken"
     assert hasattr(trl, "GRPOConfig"), "from trl import GRPOConfig broken"
@@ -205,7 +200,6 @@ def test_trl_dpo_vision_mapping_attr_installed():
         "trl.trainer.dpo_trainer.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES; "
         "if TRL renames this constant, the patch silently no-ops"
     )
-    # DPOTrainer must stay importable from trl.trainer.dpo_trainer; the VLM patch entry point assumes that module exists.
     assert hasattr(dpo_mod, "DPOTrainer"), (
         "trl.trainer.dpo_trainer.DPOTrainer missing -- "
         "unsloth_zoo VLM patch entry point broken"
@@ -249,8 +243,7 @@ def test_trl_constant_length_dataset_soft():
 
 
 # ===========================================================================
-# grpo_update_SamplingParams filters user kwargs by inspect.signature(SamplingParams); if vLLM stops exposing a proper
-# signature, every key is dropped silently and generation breaks.
+# User kwargs are filtered by inspect.signature(SamplingParams); if broken, all drop silently.
 # ===========================================================================
 
 

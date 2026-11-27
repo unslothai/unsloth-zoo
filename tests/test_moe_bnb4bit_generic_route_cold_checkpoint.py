@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gradient checkpoint recompute must retrace the first block-compiled bnb 4-bit experts graph; recording the backend
-log key while tracing made Dynamo guard on it, so recompute missed the forward graph and raised CheckpointError on
-the first backward."""
+"""Checkpoint recompute must retrace the first block-compiled bnb 4-bit graph; recording the backend
+key while tracing made Dynamo guard on it, so the first backward raised CheckpointError."""
 
 import os
 import subprocess

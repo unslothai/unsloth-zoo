@@ -124,6 +124,5 @@ def test_prequant_checkpoint_lora_trains(repo, tmp_path):
     reloaded, _ = FastMLXModel.from_pretrained(str(tmp_path / "adapter"), max_seq_length=256)
     reloaded_loss = text_loss(reloaded)
     print(f"{repo} base/trained/reloaded loss: {base_loss} {trained_loss} {reloaded_loss}")
-    # The reloaded adapter must carry the training: near the trained loss, far below the base's.
     assert reloaded_loss < 0.5 * base_loss, (base_loss, trained_loss, reloaded_loss)
     assert abs(reloaded_loss - trained_loss) < 0.25 * base_loss, (base_loss, trained_loss, reloaded_loss)

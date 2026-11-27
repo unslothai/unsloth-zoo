@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A left-padded batch must train on the same targets as its rows collated alone (batch size 2 equals 2 accumulation
-steps of batch size 1); CPU only, fake processor."""
+"""Left-padded batch trains on the same targets as its rows alone; fake processor, CPU only."""
 
 import pytest
 import torch
@@ -77,7 +76,6 @@ def make_collator(padding_side):
     return collator
 
 
-# Unequal lengths, so the batch pads the second row.
 EXAMPLES = [
     {"prompt": "<bos> a b", "completion": "x y z w"},
     {"prompt": "<bos> a", "completion": "x"},

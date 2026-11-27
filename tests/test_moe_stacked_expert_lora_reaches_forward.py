@@ -39,8 +39,7 @@ from unsloth_zoo.temporary_patches import moe_utils as MU
 
 
 def _moe_utils_copies():
-    """Every loaded moe_utils copy that can hold the saved PEFT forward; patch_param_wrapper_for_moe prefers the
-    unsloth_cached_moe_utils copy from install_to_cache over the imported module."""
+    """Every loaded moe_utils copy is checked; unsloth_cached_moe_utils wins over the import."""
     copies = [MU]
     for name in ("unsloth_cached_moe_utils", "moe_utils"):
         module = sys.modules.get(name)
@@ -51,8 +50,7 @@ def _moe_utils_copies():
 
 @pytest.fixture
 def restore_param_wrapper():
-    """Starts each test from PEFT's own ParamWrapper.forward and restores it after; importing
-    unsloth_zoo.temporary_patches already patches it, else before/after checks pass vacuously."""
+    """Restores PEFT's ParamWrapper.forward; unpatched, before/after checks pass vacuously."""
     peft_layer = pytest.importorskip("peft.tuners.lora.layer")
     ParamWrapper = getattr(peft_layer, "ParamWrapper", None)
     if ParamWrapper is None:
@@ -450,9 +448,7 @@ def test_the_measurement_happens_once_and_costs_one_forward_afterwards(restore_p
 
 
 def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold(monkeypatch):
-    """PEFT folds by adding a delta, which needs a real float, so Params4bit, MXFP4 and FP8 expert weights must decline
-    the reroute; MXFP4 GPT-OSS gets False because _get_lora_wrapper_for_param resolves to None under
-    target_parameters."""
+    """PEFT fold needs a real float: Params4bit, MXFP4 and FP8 expert weights decline the reroute."""
     # Set through monkeypatch: a saved forward left behind would be called by every later test, and a None stand-in would look like a model producing no output.
     monkeypatch.setattr(
         MU,
@@ -483,8 +479,7 @@ def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold(monkeypatch)
 
 
 def test_the_probe_retains_no_autograd_graph_for_the_second_forward():
-    """The probe runs under torch.no_grad() with its return value unbound, so no autograd graph outlives it; an in-band
-    probe kept a graph alive and doubled peak memory on the first step."""
+    """Probe runs under torch.no_grad() unbound, else its graph doubles peak memory."""
     import ast
     import inspect
 
@@ -621,8 +616,7 @@ def test_the_probe_still_reports_a_raising_forward_as_no_evidence(monkeypatch):
 
 
 def test_the_probe_names_the_backend_rather_than_letting_fork_rng_guess(monkeypatch):
-    """fork_rng's devices are within device_type, which otherwise comes from torch.accelerator.current_accelerator()
-    (cuda fallback); unnamed, XPU forks ask the wrong module for RNG state."""
+    """Pass device_type to fork_rng: unnamed, XPU forks ask the wrong module for RNG state."""
     seen = {}
 
     def _record(devices = None, enabled = True, device_type = None, **kwargs):
@@ -663,8 +657,7 @@ def test_a_fork_that_cannot_be_set_up_leaves_the_forward_running(monkeypatch):
 
 
 def test_the_probe_does_not_run_at_all_while_dynamo_is_tracing(monkeypatch):
-    """Under Dynamo the probe would be traced and run the experts forward three times per call (six einsums, not two;
-    PyTorch 2.12 fullgraph), so it returns None while tracing."""
+    """Under Dynamo the probe would run three experts forwards per call, so it returns None."""
     experts = _RNGConsumingExperts()
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert _run_probe(monkeypatch, experts) is None
@@ -754,8 +747,7 @@ def test_a_compiled_first_call_keeps_the_stash_path_for_a_stash_reading_family(
 
 
 def test_the_static_answer_recognises_a_stash_reading_forward():
-    """_forward_statically_reads_stash finds take_moe_lora_stash in a forward's code object; assuming unread hard-fails
-    fullgraph for supported families, assuming read drops the LoRA from stash-ignoring ones."""
+    """Scan for take_moe_lora_stash; a wrong guess breaks fullgraph or drops LoRA."""
     assert MU._forward_statically_reads_stash(_StashReadingExperts(4, 8, 4)) is True
     assert MU._forward_statically_reads_stash(_StashIgnoringExperts(4, 8, 4)) is False
 
@@ -776,8 +768,7 @@ def test_the_static_answer_recognises_a_stash_reading_forward():
 
 
 def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper):
-    """The reroute must not cost full-graph compilation: PEFT _activate_lora registers a parametrization and calls set_
-    on the stored parameter, which Dynamo refuses under fullgraph; the fold must match PEFT numbers and gradients."""
+    """Fold must match PEFT and compile fullgraph; Dynamo refuses PEFT's set_ on the parameter."""
     skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
@@ -810,8 +801,7 @@ def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper)
 
 
 def test_the_fold_swaps_inside_parameters_and_never_shadows_through_dunder_dict(restore_param_wrapper):
-    """Swap the value inside _parameters, not the instance __dict__: Dynamo cannot trace removing the shadow from
-    __dict__ (Unsupported on torch 2.10); _parameters traces on the whole range."""
+    """Swap in _parameters, not __dict__ (Dynamo cannot trace removing shadow on torch 2.10)."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(
@@ -882,8 +872,7 @@ def _install_peft_main_delta_factors(model):
 
 
 def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_wrapper):
-    """Fold via low-rank factors in one baddbmm as PEFT does; get_delta_weight plus the add allocate two dense
-    expert-stack tensors per projection (64 experts on OlmoE)."""
+    """Fold via low-rank factors in one baddbmm, avoiding dense per-projection expert stacks."""
     skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
@@ -902,8 +891,7 @@ def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_w
 
 
 def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper, monkeypatch):
-    """NEGATIVE CONTROL: get_delta_factors is newer than the oldest PEFT with target_parameters, so its absence must
-    fall back to the dense delta, not to nothing; 0.21.0 ships it, so the test simulates the absence."""
+    """Without get_delta_factors (PEFT 0.21.0 has it) fold uses the dense delta, not nothing."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(m for m in model.modules() if type(m).__name__ == "ParamWrapper")
@@ -983,8 +971,7 @@ def test_the_scan_terminates_on_a_recursive_call_graph():
 
 
 def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
-    """param + delta raises for all five float8 dtypes, including the fnuz pair ROCm uses; _FLOAT8_STORAGE_DTYPES must
-    track PEFT's UPCAST_DTYPES, not a hand-written pair."""
+    """Every float8 dtype, including fnuz (ROCm), must be refused; track PEFT's UPCAST_DTYPES."""
     import torch
     from unsloth_zoo.temporary_patches.moe_utils import _FLOAT8_STORAGE_DTYPES
 
@@ -1002,7 +989,6 @@ def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
     )
     assert len(_FLOAT8_STORAGE_DTYPES) >= 2
 
-    # The reason each one is excluded, rather than an appeal to the list.
     for dtype in _FLOAT8_STORAGE_DTYPES:
         assert dtype.is_floating_point, f"{dtype} would already be refused by the float check"
         with pytest.raises(RuntimeError):
@@ -1035,8 +1021,7 @@ def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
 
 
 def test_the_static_scan_takes_no_id_at_all():
-    """The scan takes no id(): id(forward) wedges Dynamo, id(code) is rejected on some torch versions, and code-object
-    keys collapse equal ones; identity via is survives all three."""
+    """Scan takes no id(): id(forward) wedges Dynamo, and id(code) is rejected by some torch."""
     import ast
     import inspect
     import textwrap
@@ -1094,8 +1079,7 @@ def test_the_scan_terminates_on_mutual_recursion():
 
 
 def test_equal_but_distinct_code_objects_are_both_scanned():
-    """The visited map is keyed by identity; equal-but-distinct code objects (same source, different __globals__) must
-    both be scanned or a stash reader answers False."""
+    """Keyed by identity: equal code objects with other __globals__ must both be scanned."""
     import torch.nn as nn
 
     source = "def helper(m): return target(m)\n"

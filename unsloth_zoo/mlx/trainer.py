@@ -541,6 +541,7 @@ from .utils import (
     _validate_output_token_mask,
     _model_carries_audio_modules,
     _vlm_batch_carries_audio,
+    apply_gelu_approx_finite_grad,
     audio_merge_patch_needed,
     freeze_audio_modules,
     install_audio_merge_patch,
@@ -2809,6 +2810,8 @@ class MLXTrainer:
         processor=None,
         callbacks=None,
     ):
+        # A caller-built model skips from_pretrained, which installs zoo's gelu_approx; training traces it first.
+        apply_gelu_approx_finite_grad()
         self.model = model
         self.tokenizer = tokenizer
         self.processor = processor
@@ -6735,8 +6738,7 @@ class MLXTrainer:
             # Carried as state across loop iterations, or reduced eagerly
             # outside mx.compile under DDP.
             grad = tree_map(mx.stop_gradient, grad)
-            # Not stop_gradient: mlx 0.32.4's compile drops one whose input has an equal twin, as this cast does.
-            toks_f = toks_f + 0
+            toks_f = mx.stop_gradient(toks_f)
             return lvalue, toks, stats, (grad, toks_f)
 
         # Unified step for VLM (dict batch) and text (tuple batch) training.
@@ -6756,7 +6758,7 @@ class MLXTrainer:
                 return lvalue, toks, stats, None, grad_norm
 
             grad = tree_map(mx.stop_gradient, grad)
-            toks_f = toks_f + 0  # see _local_grad_step
+            toks_f = mx.stop_gradient(toks_f)
             return lvalue, toks, stats, (grad, toks_f), None
 
         def _skipped_grpo_step(stats, prev_state, do_update):

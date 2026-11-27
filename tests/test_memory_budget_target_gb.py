@@ -51,8 +51,7 @@ def test_target_gb_xpu_uses_free_memory_not_constant():
 
 
 def test_target_gb_xpu_unsupported_uses_bounded_default_not_host():
-    # Some Intel GPUs (Arc B580, Lunar Lake) raise on mem_get_info: must not crash or size from host RAM (activations
-    # live on the XPU, so a big-RAM/small-VRAM box would still OOM); use a bounded GPU-safe default.
+    # Intel GPUs that raise on mem_get_info get a bounded default; host RAM would OOM the XPU.
     fake_cuda = mock.MagicMock()
     fake_cuda.is_available.return_value = False
     fake_xpu = mock.MagicMock()

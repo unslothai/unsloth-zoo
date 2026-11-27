@@ -89,9 +89,7 @@ def test_cache_copy_registration_lands_in_the_package(cache_copy):
 def test_bare_moe_utils_copy_shares_the_registry(cache_copy, monkeypatch):
     # A third copy: compiler.py puts the compile location on sys.path, so the bare `from moe_utils import ...` in generated modules is its own module too.
     monkeypatch.syspath_prepend(os.environ["UNSLOTH_COMPILE_LOCATION"])
-    # Restore by hand, not monkeypatch: delitem on an absent name records nothing and setitem records the bare-import
-    # module, so undo reinstates a tmp-dir copy that every later test resolves moe_utils to; this broke
-    # test_compiled_cache_collective.py.
+    # Restore by hand: monkeypatch undo would reinstate a tmp-dir moe_utils copy for later tests.
     previous = sys.modules.pop("moe_utils", None)
     key = "unit_test_registry_shared_arch_bare"
     fn = lambda weight, proj_type, hidden_dim: weight

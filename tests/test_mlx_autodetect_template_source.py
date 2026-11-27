@@ -1,6 +1,4 @@
-"""_resolve_autodetect_template_source must detect markers from the template that renders the batches (the VLM
-processor, or after a chat_template override); hermetic, and skips, never fails, when the tokenizer cache or
-unsloth_zoo is unavailable."""
+"""Autodetect template-source tests; skip, never fail, without tokenizer cache or unsloth_zoo."""
 import pytest
 
 
@@ -131,7 +129,6 @@ def test_vlm_processor_only_template_is_used_for_detection():
     with pytest.raises(Exception):
         get_parts(resolved)
 
-    # NEW behavior: the resolver hands back the processor for detection.
     tr = _Trainer(proc, _Args(), is_vlm=True, processor=proc)
     detect = T._resolve_autodetect_template_source(tr, proc, resolved)
     assert detect is proc
@@ -222,8 +219,7 @@ def test_chat_template_override_clears_stale_cached_markers():
 
 
 def test_unsloth_template_override_preserves_fresh_markers(monkeypatch):
-    """An Unsloth template name/tuple override sets fresh markers via get_chat_template, which must survive; only stale
-    markers are dropped, and only before the override applies."""
+    """Unsloth template override keeps fresh markers and drops stale ones before it applies."""
     T, _ = _load()
     tok = _new_tok(); tok.chat_template = CHATML
     tok._unsloth_input_part = "STALE_U"; tok._unsloth_output_part = "STALE_A"

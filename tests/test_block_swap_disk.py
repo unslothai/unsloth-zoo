@@ -179,6 +179,26 @@ def test_host_limit_caps_the_host_fit(monkeypatch):
         _mod._check_host_fit([400_000] * 3)
 
 
+def test_host_limit_refusal_names_the_cap_not_the_system_reserve(monkeypatch):
+    # Plenty of free RAM: only UNSLOTH_OFFLOAD_HOST_LIMIT can refuse, so the message must name it.
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 << 30, 32 << 30))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "1MB")
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([400_000] * 3)
+    msg = str(e.value)
+    assert "UNSLOTH_OFFLOAD_HOST_LIMIT caps the offloaded layers at 1.0 MiB" in msg
+    assert "free for the system" not in msg and "At most 2 layers" in msg
+
+
+def test_free_ram_refusal_under_a_looser_cap_still_names_the_reserve(monkeypatch):
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 << 30, 1 << 20))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "1GB")
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([400_000] * 3)
+    msg = str(e.value)
+    assert "free for the system" in msg and "caps the offloaded layers" not in msg
+
+
 def test_auto_swap_indices_names_the_disk_tier():
     # CPU layers: auto_swap_indices plans CUDA cards only, so its picks go through the helper directly.
     layers = nn.ModuleList([nn.Linear(64, 64, bias = False).requires_grad_(False) for _ in range(10)])
@@ -193,6 +213,38 @@ def test_auto_swap_indices_names_the_disk_tier():
         assert _mod._disk_tier_indices(layers, idx, host_free_bytes = 6 * per) == list(range(3, 10))
     finally:
         del os.environ["UNSLOTH_OFFLOAD_DISK_PLACEMENT"]
+
+
+@pytest.mark.parametrize("world, want", [(1, []), (2, [0, 1, 3, 5, 7, 8, 9])])
+def test_disk_tier_indices_plan_for_this_ranks_share_of_host_ram(monkeypatch, world, want):
+    """Local ranks read the same free RAM: each plans its disk tier for free // LOCAL_WORLD_SIZE."""
+    # Meta layers: none of their bytes are in host RAM yet.
+    layers = nn.ModuleList([nn.Linear(64, 64, bias = False, device = "meta").requires_grad_(False) for _ in range(10)])
+    per = 64 * 64 * 4
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 * per, 12 * per))
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_HOST_LIMIT", raising = False)
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_DISK_PLACEMENT", raising = False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(world))
+    assert _mod._disk_tier_indices(layers, list(range(10))) == want
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_plan_disk_budgets_this_ranks_share_of_host_ram(monkeypatch, world):
+    """BlockSwap's disk fallback keeps in host RAM only what this local rank's share of free RAM holds."""
+    from types import SimpleNamespace
+    per = 1 << 20
+    blocks = [SimpleNamespace(disk = None, sizes = [per], params = [object()], nbytes = lambda: per) for _ in range(10)]
+    stub = SimpleNamespace(blocks = blocks, _host_credit = [], depth = 1)
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 * per, 12 * per))
+    monkeypatch.setattr(_disk, "disk_tier_reason", lambda: None)
+    monkeypatch.setattr(_disk, "host_limit_bytes", lambda: None)
+    monkeypatch.setattr(_disk, "_shared_spill", lambda nbytes: None)
+    monkeypatch.setattr(_disk, "_round_up", lambda n: n)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(world))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_PLACEMENT", "tail")
+    assert BlockSwap._plan_disk(stub, "refused") is True
+    # 12 blocks of free RAM (world 1) or 6 (world 2), less the staging ring (2) and a block of lag (1).
+    assert len(stub._to_spill) == 10 - (12 // world - 3)
 
 
 # GPU -------------------------------------------------------------------------------------------------------------

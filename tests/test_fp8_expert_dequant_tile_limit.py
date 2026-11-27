@@ -31,9 +31,8 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 
 def _needs_the_triton_kernel():
-    """Skip, not fail, when unsloth.kernels.fp8 is not importable: the helper then returns None for every input and
-    blames the guard (transformers 4.57.6, unsloth installed --no-deps); checked inside the test, not as a marker, so
-    GPU-less runners never import unsloth."""
+    """Skip, not fail, if unsloth.kernels.fp8 is not importable: the helper blames the guard
+    (transformers 4.57.6, --no-deps); checked in-test so GPU-less runners never import unsloth."""
     try:
         from unsloth.kernels.fp8 import weight_dequant_block  # noqa: F401
     except Exception as e:  # noqa: BLE001
@@ -46,8 +45,7 @@ def _weight(E, M, N, device):
 
 @pytest.mark.parametrize("M,N", [(2048, 2048), (4096, 4096), (1088, 1088)])
 def test_per_tensor_expert_scale_declines_instead_of_failing_to_compile(M, N):
-    """p == q == 1 derives BLOCK_SIZE = M, illegal above 1024; decided before any kernel launch so no GPU is needed;
-    1088 is the first multiple of 64 past the limit, pinning the boundary."""
+    """p == q == 1: BLOCK_SIZE = M, illegal above 1024; 1088 pins the boundary; no GPU needed."""
     limit = F._triton_max_tensor_numel()
     assert M * N > limit
     w = _weight(2, M, N, "cpu")
@@ -156,8 +154,7 @@ def test_finer_scales_still_go_through_triton_and_agree():
 
 
 def test_a_per_expert_scalar_scale_is_broadcast_not_materialized(monkeypatch):
-    """Broadcast the (E, 1, 1) scale, never expand to (E, M, N): at the Mistral layout that extra 4.00 GiB turns the
-    crash into an OOM; assert on the call, as allocator reuse hides peak memory."""
+    """Never expand the (E,1,1) scale (OOMs at Mistral); allocator reuse hides peak memory."""
     E, M, N = 4, 256, 512
     w = torch.zeros(E, M, N).to(torch.float8_e4m3fn)
     s = torch.full((E, 1, 1), 0.05)

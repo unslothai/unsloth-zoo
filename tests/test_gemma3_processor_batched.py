@@ -1,5 +1,4 @@
-"""Gemma3 batched padding regression: _fix_double_bos_and_pad strips the duplicate BOS on every row and pads all
-sequence fields; follows the HF padding contract for do_not_pad, list output and max_length."""
+"""_fix_double_bos_and_pad strips duplicate BOS and pads fields per the HF padding contract."""
 from unsloth_zoo.temporary_patches.gemma import _fix_double_bos_and_pad, _resolve_truncation
 
 BOS, PAD, IMG = 2, 0, 99

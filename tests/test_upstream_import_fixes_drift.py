@@ -156,9 +156,7 @@ def test_trl_cached_available_flags_are_not_tuples():
 
 
 def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
-    """patch_enable_input_require_grads: HF PR 41993 made it call get_input_embeddings() on every module, raising
-    NotImplementedError on vision submodules; healthy if the code predates HF PR 41993 or the try/except
-    NotImplementedError wrapper is installed."""
+    """OK if pre-41993 or wrapped; HF PR 41993 get_input_embeddings() raises on vision modules."""
     pytest.importorskip("transformers")
     from transformers import PreTrainedModel
 
@@ -182,8 +180,7 @@ def test_pretrained_model_enable_input_require_grads_uses_old_pattern():
 
 
 def test_transformers_torchcodec_available_flag_is_present():
-    """disable_torchcodec_if_broken needs the pre-5.x _torchcodec_available flag or the 5.x is_torchcodec_available
-    function; that is the patch site for missing FFmpeg."""
+    """Needs _torchcodec_available (<5.x) or is_torchcodec_available (5.x): FFmpeg patch site."""
     tf_iu = pytest.importorskip("transformers.utils.import_utils")
     has_flag = hasattr(tf_iu, "_torchcodec_available")
     has_func = callable(getattr(tf_iu, "is_torchcodec_available", None))
@@ -216,8 +213,7 @@ def test_transformers_is_causal_conv1d_available_symbol_present():
 
 
 def test_transformers_and_accelerate_is_wandb_available_callable():
-    """disable_broken_wandb patches is_wandb_available in three modules (transformers.integrations.integration_utils,
-    accelerate.utils.imports, accelerate.utils); all must exist."""
+    """disable_broken_wandb patches is_wandb_available in three modules; all must exist."""
     pytest.importorskip("transformers")
     pytest.importorskip("accelerate")
     from transformers.integrations import integration_utils as tf_integration
@@ -243,9 +239,8 @@ def test_transformers_and_accelerate_is_wandb_available_callable():
 
 
 def test_peft_transformers_weight_conversion_importable_and_signature():
-    """patch_peft_weight_converter_compatibility wraps build_peft_weight_mapping; module must import and keep
-    (weight_conversions, adapter_name, peft_config=None); unimportable is drift, since the bare except in the fix
-    silently no-ops"""
+    """patch_peft_weight_converter_compatibility wraps build_peft_weight_mapping(weight_conversions,
+    adapter_name, peft_config=None); unimportable is drift; bare except silently no-ops."""
     pytest.importorskip("peft")
     try:
         from peft.utils import transformers_weight_conversion as twc
@@ -310,7 +305,6 @@ def test_triton_compiled_kernel_has_num_ctas_and_cluster_dims():
     )
 
 
-# torch + torchvision pairing table
 
 
 # Mirrors TORCH_TORCHVISION_COMPAT in import_fixes.py torchvision_compatibility_check.
@@ -472,7 +466,6 @@ def test_xformers_is_post_num_splits_key_fix_or_not_installed():
         )
 
 
-# transformers (PreTrainedModel base import sanity)
 
 
 def test_transformers_pretrained_model_has_get_input_embeddings():
@@ -486,14 +479,12 @@ def test_transformers_pretrained_model_has_get_input_embeddings():
     )
 
 
-# accelerate -- ``is_X_available`` API stability used across the fixes
 
 
 def test_accelerate_utils_imports_module_present():
     """disable_broken_wandb and fix_trl_vllm_ascend both reach into accelerate.utils.imports; a restructuring there silently no-ops their monkey-patches."""
     pytest.importorskip("accelerate")
     mod = pytest.importorskip("accelerate.utils.imports")
-    # is_wandb_available is the representative symbol disable_broken_wandb targets.
     assert hasattr(mod, "is_wandb_available"), (
         "accelerate.utils.imports.is_wandb_available is gone; "
         "disable_broken_wandb cannot patch the source module."

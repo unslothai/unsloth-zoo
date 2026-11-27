@@ -128,8 +128,7 @@ def test_single_segment_rejection_is_recognised_by_its_message(monkeypatch):
 
 @pytest.mark.parametrize("name", ["hf://gpt2", "hf://bert-base-uncased"])
 def test_a_single_segment_id_wearing_the_uri_scheme_is_still_absent(monkeypatch, name):
-    """hf://gpt2 is unaddressable like gpt2; 1.16+ names the stripped id, so counting slashes before stripping would
-    misreport it as a connectivity failure and skip local priorities."""
+    """Strip hf:// before counting slashes: hf://gpt2 must not read as a connectivity failure."""
     _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
     assert saving_utils.check_hf_model_exists(name) is False
 
@@ -147,8 +146,7 @@ def test_the_uri_scheme_does_not_smuggle_a_transport_failure_past_the_check(monk
     "openai-community/gpt2@refs/pr/1",
 ])
 def test_a_revision_suffix_is_still_addressed_as_a_repo(name):
-    """namespace/name@revision is documented HfFileSystem syntax; validate_repo_id rejects the @ and refs/pr/1 trips the
-    depth rule, so split the revision before any prefilter."""
+    """Split @revision first: validate_repo_id rejects @, and refs/pr/1 trips the depth rule."""
     assert saving_utils._is_hub_repo_id(name) is True
 
 
@@ -236,8 +234,7 @@ def test_the_capability_probe_asks_about_the_resolver_not_just_the_parser(monkey
     "/models/org/repo", "./models/org/repo", "~/models/org/repo", "models/a/b/c",
 ])
 def test_the_typed_prefix_never_launders_a_path(monkeypatch, name):
-    """With the capability forced on, a path that merely starts with models stays a path: parse_hf_uri would read
-    models/a/b/c as repo a/b, so path rules are not delegated to it."""
+    """Even forced on, models/a/b/c stays a path: parse_hf_uri would read it as repo a/b."""
     monkeypatch.setattr(saving_utils, "_hub_addresses_typed_model_uris", lambda: True)
     assert saving_utils._is_hub_repo_id(name) is False
 
@@ -268,8 +265,7 @@ def test_a_trailing_slash_on_an_hf_uri_is_not_depth(given, expected):
     "outputs/nested/mymodel/",
 ])
 def test_a_trailing_slash_without_the_scheme_still_reads_as_a_directory(given):
-    """Only an explicit hf:// makes a trailing slash a Hub root; bare, it marks a local directory, and stripping it
-    would send outputs/mymodel/ to the Hub as a repo id."""
+    """Only hf:// makes a trailing slash a Hub root; bare outputs/mymodel/ stays local."""
     assert saving_utils._is_hub_repo_id(given) is False
 
 
@@ -290,9 +286,7 @@ def test_a_root_uri_is_probed_rather_than_reported_absent(monkeypatch):
 
 @pytest.mark.parametrize("save_method", ["merged_4bit", "forced_merged_4bit", "merged_16bit", None])
 def test_an_at_sign_in_a_local_directory_changes_nothing(monkeypatch, tmp_path, save_method):
-    """Splitting on @ offers local outputs/my@model to the Hub as outputs/my, no different from an ordinary one-slash
-    directory, so the outcome must match before and after the split; asserted as an equivalence, so it survives a
-    policy change for local bases."""
+    """Local outputs/my@model must behave like a plain one-slash directory, not be sent to the Hub."""
     import huggingface_hub as _hub
 
     def _local_nf4(directory):
@@ -340,8 +334,7 @@ def test_rejection_message_on_a_namespaced_name_still_raises(monkeypatch):
 
 
 def test_a_bare_valueerror_with_no_rejection_wording_always_raises(monkeypatch):
-    """A bare ValueError without the guard's wording must raise: a major >= 1 gate answered False for live-socket
-    ValueErrors on 1.0-1.15, so the merge wrote nothing."""
+    """Bare ValueError without guard wording must raise: 1.0-1.15 live sockets raise one too."""
     _patch_ls(monkeypatch, ValueError("boom"))
     with pytest.raises(RuntimeError) as excinfo:
         saving_utils.check_hf_model_exists("gpt2")
@@ -350,8 +343,7 @@ def test_a_bare_valueerror_with_no_rejection_wording_always_raises(monkeypatch):
 
 
 def test_classification_never_consults_the_installed_version(monkeypatch):
-    """Classification uses the message alone, never huggingface_hub.__version__: a version check hid the 1.0-1.15 gap
-    from a test that recomputed the same expression."""
+    """Classify by message alone, not __version__: a version check hid the 1.0-1.15 gap."""
     _patch_ls(monkeypatch, ValueError(_REJECTION_MESSAGE))
     assert saving_utils.check_hf_model_exists("gpt2") is False
 

@@ -148,7 +148,6 @@ def test_fp32_output_keeps_overflowing_sums_finite():
     y = mg.grouped_gemm(x, w.half(), counts, F32, b_trans = True, a_mode = mg.A_SPLIT)
     # All-positive sums: tensor-core fp32 accumulation truncates (not RNE), a ~2e-5 bias here.
     assert bool(torch.isfinite(y).all()) and _rel(y, ref) < 1e-4
-    # Negative control: the same GEMM stored in fp16 overflows.
     y16 = mg.grouped_gemm(x, w.half(), counts, F16, b_trans = True, a_mode = mg.A_SPLIT)
     assert not bool(torch.isfinite(y16).all())
 
@@ -167,7 +166,6 @@ def test_backward_dx_from_fp32_dy(dy_mode, magnitude):
     assert dx.dtype == F32 and bool(torch.isfinite(dx).all())
     tol = 1e-5 if dy_mode == "split" else 2e-3
     assert _rel(dx, ref) < tol, _rel(dx, ref)
-    # Rows at the small scale are as accurate as the others.
     assert _rel(dx[::7], ref[::7]) < tol
     if magnitude == 1e-9:
         # Negative control: a plain fp16 cast of dY flushes it to (nearly) zero.

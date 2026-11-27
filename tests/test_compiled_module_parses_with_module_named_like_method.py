@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The compiled module must parse when modeling does `import copy` and calls `state.copy()`: the compiler
-pasted the stdlib module's source into the generated file (SyntaxError)."""
+"""Compiled module must parse with `import copy` and `state.copy()`; stdlib source not pasted."""
 
 import ast
 import json

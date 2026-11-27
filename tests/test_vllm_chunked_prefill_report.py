@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks load_vllm's startup banner reads the chunked prefill budget and swap space from engine_args after the
-good_keys filter, which drops swap space on vLLM >= 0.18.0; AST-based, no GPU."""
+"""Banner reads swap space after good_keys, which drops it on vLLM >= 0.18.0; AST-based, no GPU."""
 
 import ast
 import pathlib
@@ -85,8 +84,7 @@ def test_banner_is_printed_after_the_unsupported_key_filter():
 
 
 def test_budget_is_clamped_when_chunked_prefill_is_off():
-    # vLLM raises when max_num_batched_tokens < max_model_len and cannot chunk; the clamp is gated, since a blanket
-    # floor would disable chunking for text models.
+    # vLLM raises when budget < max_model_len and cannot chunk; clamp only if chunking is off.
     for node in ast.walk(_load_vllm_node()):
         if not isinstance(node, ast.If): continue
         if not (isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)

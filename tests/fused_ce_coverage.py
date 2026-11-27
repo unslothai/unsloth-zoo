@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Census of fused lm_head + CE loss routes on installed transformers: hook (import-hook rewrite), regex/ast
-(compiler.fused_lm_head_forward would fuse it), or None (full logits); fresh process so the import hook sees every
-modeling import; --update writes tests/fused_ce_coverage.json."""
+"""Fused lm_head+CE route census per installed transformers: hook, regex/ast or None (full logits);
+fresh process for the import hook; --update writes tests/fused_ce_coverage.json."""
 import argparse
 import importlib
 import inspect

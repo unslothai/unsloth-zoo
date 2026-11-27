@@ -47,7 +47,6 @@ GLM_LIKE = (
     "[gMASK]<sop>{%- for m in messages -%}{{- '<|' + m.role + '|>' + m.content -}}{%- endfor -%}"
     "{%- if add_generation_prompt -%}{{- '<|assistant|>' -}}{%- endif -%}"
 )
-# Hunyuan: bos opens every user turn.
 HUNYUAN_LIKE = (
     "{%- for m in messages -%}{%- if m.role == 'user' -%}{{- bos_token + m.content + '<|extra_0|>' -}}"
     "{%- else -%}{{- m.content + eos_token -}}{%- endif -%}{%- endfor -%}"
@@ -139,13 +138,11 @@ def test_autodetect_keeps_assistant_end_of_turn(family):
     fn = train_on_responses_only(None, tokenizer = tok, return_function = True)
     segments, kept = _kept_segments(tok, fn)
 
-    # (b) no user / system text is trained on
     for t in USER_TEXTS + ("Thinking effort", "user", "system"):
         assert t not in kept, f"{family}: kept text leaks {t!r}: {kept!r}"
     # Each answer is kept exactly once, inside its own segment
     for a in ANSWERS:
         assert kept.count(a) == 1, f"{family}: {a!r} not kept once: {kept!r}"
-    # (a) every assistant turn's kept text ends with the template's end-of-turn token(s)
     for a in ANSWERS:
         seg = next(s for s in segments if a in s)
         tail = seg[seg.index(a) + len(a):].strip()
@@ -159,8 +156,7 @@ NEXT = [{"role": "system", "content": NEXT_SYS}, {"role": "user", "content": NEX
 
 @pytest.mark.parametrize("family", list(FAMILIES))
 def test_autodetect_packed_row_stops_at_next_sample(family):
-    """Two samples packed into one row: the first sample's last answer must not run into the next
-    sample's system prompt or user turn (GLM-4.x has no assistant end token, only "[gMASK]<sop>")."""
+    """Packed: GLM-4.x has no assistant end token, so answers must stop at the next sample."""
     try:
         from unsloth_zoo.dataset_utils import train_on_responses_only
     except ImportError as e:

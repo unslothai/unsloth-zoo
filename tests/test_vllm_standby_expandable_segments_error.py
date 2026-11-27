@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins vLLM load-failure classification in standby mode: expandable-segments config clashes and memory profiling races
-are not OOMs (loose 'alloc', 'memory' and 'free memory' substring checks caught them); real OOMs still are; load_vllm
-wiring is checked."""
+"""Standby load-failure classification: expandable-segments clashes and profiling races are not OOMs
+(loose 'alloc'/'memory'/'free memory' substring checks misfired); real OOMs still are."""
 
 from __future__ import annotations
 
@@ -80,9 +79,7 @@ _REAL_OOM_ERRORS = (
     "CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of "
     "79.15 GiB of which 1.06 GiB is free.",
     "torch.OutOfMemoryError: CUDA out of memory.",
-    # ROCm / HIP
     "HIP out of memory. Tried to allocate 512.00 MiB",
-    # vLLM engine-side
     "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
     "utilization (0.9, 71.24 GiB). Decrease GPU memory utilization or reduce GPU memory used "
     "by other processes.",
@@ -90,7 +87,6 @@ _REAL_OOM_ERRORS = (
     "To serve at least one request with the model's max seq len (8192), (18.00 GiB KV cache "
     "is needed, which is larger than the available KV cache memory (4.00 GiB).",
     _KV_CACHE_OOM,
-    # C++ level
     "std::bad_alloc",
 )
 
@@ -156,7 +152,6 @@ def test_message_names_the_offending_env_var_on_every_platform(env_var):
         assert vllm_utils._expandable_segments_env_vars() == [env_var]
         message = vllm_utils._expandable_segments_standby_message(_unsloth_assertion(env_var))
     assert env_var in message
-    # Never claim the GPU ran out of memory for a config clash.
     assert "ran out of memory" not in message
     assert "NOT an out of memory error" in message
     assert "expandable_segments" in message
@@ -195,8 +190,7 @@ def test_profiling_race_and_kv_cache_oom_classify_differently():
 
 
 def test_free_memory_marker_still_covers_the_real_startup_shortfall():
-    # Dropping the 'free memory' marker would silently lose the real startup shortfall; its text never says 'out of
-    # memory' (vllm/v1/worker/utils.py request_memory).
+    # Dropping 'free memory' loses the startup shortfall; its text never says 'out of memory'.
     shortfall = (
         "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
         "utilization (0.9, 71.24 GiB). Decrease GPU memory utilization or reduce GPU memory "
@@ -267,7 +261,6 @@ def test_profiling_race_retries_do_not_spend_the_generic_retry_budget():
     race_at = source.index("_is_memory_profiling_race_error(error)")
     bump_at = source.index("            trials += 1")
     standby_at = source.index("if trials >= 2 or unsloth_vllm_standby:")
-    # The generic counter is bumped only after the race branch has passed on it.
     assert race_at < bump_at < standby_at
     assert source.count("            trials += 1") == 1
     race_branch = source[race_at:bump_at]

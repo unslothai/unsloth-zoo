@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO batches are lists of rows (identity collator): the .get check from unsloth-zoo 1217 raised AttributeError on TRL
-0.22.2 and 1.13.0; .get plus .ndim declines non-tensor labels because in cannot tell tensor from non-tensor labels;
-CPU only."""
+"""Identity-collator batches are lists: .get raised AttributeError on TRL 0.22.2 and 1.13.0
+(unsloth-zoo 1217); .get plus .ndim declines non-tensor labels, which 'in' cannot tell; CPU only."""
 
 import inspect
 
@@ -113,8 +112,7 @@ def test_grpo_identity_collator_batch_is_a_list_of_dicts():
 
 
 def test_a_list_batch_is_not_countable_and_does_not_raise():
-    """Regression: a list batch raised AttributeError ('list' object has no attribute 'get') on every GRPO step; before
-    unsloth-zoo 1217 the in test was False and training ran."""
+    """Regression: list batch raised AttributeError on every GRPO step since unsloth-zoo 1217."""
     pytest.importorskip("torch")
     batches = [_grpo_rows(), _grpo_rows()]
     samples, count = _call(_fake_trainer(_causal_model()), batches)
@@ -160,16 +158,14 @@ def test_a_mapping_batch_still_counts_exactly_what_it_counted_before():
 
 
 def test_a_mapping_with_non_tensor_labels_declines_instead_of_raising():
-    """A mapping with non-tensor labels must be declined, not counted: a 'labels' in guard would enter the try, where
-    labels[..., 1:] fails and is re-raised as RuntimeError; .get plus .ndim declines it."""
+    """Non-tensor labels must be declined: 'in' would enter a try that re-raises RuntimeError."""
     pytest.importorskip("torch")
     _, count = _call(_fake_trainer(_causal_model()), [{"labels": [[1, 2, 3]]}])
     assert count is None, "labels with no .ndim must be declined, not counted"
 
 
 def test_a_mapping_that_is_not_a_dict_subclass_still_counts():
-    """The guard must accept a Mapping, not isinstance dict: transformers BatchEncoding is a UserDict, and rejecting it
-    would silently stop DataCollatorForLanguageModeling batches being counted."""
+    """Accept any Mapping, not just dict: BatchEncoding is a UserDict and must be counted."""
     torch = pytest.importorskip("torch")
     from transformers.tokenization_utils_base import BatchEncoding
 

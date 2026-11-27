@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""Unpatch must drop every staging buffer before emptying the cache: resize_(0) keeps the storage, so a buffer still
-referenced (e.g. by a loop variable) stays reserved after unpatch returns."""
+"""Unpatch must drop every staging buffer before emptying cache: resize_(0) keeps storage."""
 
 import sys
 import types

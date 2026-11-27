@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A frame that keeps a caught exception while sitting on that exception's own traceback is a reference cycle: every
-tensor on the failed call stack then lives until the cycle collector runs instead of being freed by refcount."""
+"""A frame holding a caught exception on its traceback forms a cycle; tensors wait for the GC."""
 import contextlib
 import gc
 import warnings

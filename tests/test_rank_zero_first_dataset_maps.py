@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Under DDP, dataset preparation on a file-backed split runs on rank 0 first and the other ranks
-load its Arrow cache; an in-memory split (no cache file) keeps every rank running at once.
-Two CPU ranks over gloo."""
+"""Under DDP, a file-backed split's map runs on rank 0 first and other ranks load its Arrow cache."""
 
 import json
 import os

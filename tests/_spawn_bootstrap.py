@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Import-time test setup for spawned worker processes. A spawn child starts a fresh interpreter, so the
-device-type preload and CPU shims in tests/conftest.py never ran there; call bootstrap() in the worker
-before importing unsloth_zoo."""
+"""Spawned workers never run conftest's shims; call bootstrap() before importing unsloth_zoo."""
 
 import importlib.util
 import os

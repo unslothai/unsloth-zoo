@@ -19,11 +19,14 @@ forwards. TRL 1.x has neither forward (its fused LM head is already chunked on C
 
 import dataclasses
 import os
+import sys
 
 import pytest
 import torch
 
-TINY = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tiny_qwen3 import tiny_snapshot  # noqa: E402
+
 
 
 def _trl_cls(kind):
@@ -51,11 +54,8 @@ def _trainer(tmp_path, kind, dtype = torch.float32, bf16 = False, lora = True, *
     from unsloth_zoo.cpu import loader
     from unsloth_zoo.cpu.trainer import install_cpu_training_defaults
     install_cpu_training_defaults()
-    try:
-        model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = not lora,
-                                                               load_in_4bit = False)
-    except OSError as error:  # offline without the tiny model cached
-        pytest.skip(f"{TINY} unavailable: {error}")
+    model, tokenizer = loader.FastCPUModel.from_pretrained(tiny_snapshot(), dtype = dtype, full_finetuning = not lora,
+                                                           load_in_4bit = False)
     assert getattr(model, "_unsloth_cpu_chunked_ce", False)
     if lora:  # frozen lm_head; the reference forward runs with the adapters disabled
         model = loader.FastCPUModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"])
@@ -161,8 +161,7 @@ def _compare(trainer, model, method, tol, grad_tol, chunk_rows = None, monkeypat
     assert metrics_c.keys() == metrics_s.keys()
     for key in metrics_s:
         if "accuracies" in key and (tol > 1e-4 or abs(metrics_s.get("rewards/margins", 1.0)) < 1e-4):
-            # chosen > rejected flips on rounding: bf16, or a full finetune's first step (policy == reference
-            # copy, every reward about 0; the trainable-head policy and the frozen reference use different kernels)
+            # Accuracy flips on rounding: bf16, or a full finetune's first step (rewards ~0).
             continue
         _close(metrics_c[key], metrics_s[key], tol * (10 if "logits" in key else 1), key)
     assert grads_c.keys() == grads_s.keys() and len(grads_s) > 0
@@ -211,9 +210,7 @@ def test_chunked_bf16_close_to_trl(tmp_path, kind):
 
 @pytest.mark.parametrize("preference", ["1", "0"], ids = ["chunked", "trl"])
 def test_bf16_kto_lora_step_trains_the_adapters(tmp_path, monkeypatch, preference):
-    """KTO scores the KL completions under no_grad before the policy pass, inside the trainer's one autocast region:
-    a cached cast of the fp32 adapters left them without gradients, and gradient checkpointing's recompute failed.
-    UNSLOTH_CPU_BF16=1 forces bf16 so runners without native bf16 run it too (emulated, slower)."""
+    """KTO no_grad: a cached fp32 adapter cast broke grads; UNSLOTH_CPU_BF16=1 forces bf16."""
     from unsloth_zoo.cpu import runtime
     monkeypatch.setenv("UNSLOTH_CPU_BF16", "1")
     monkeypatch.setenv("UNSLOTH_CPU_CHUNKED_PREFERENCE", preference)

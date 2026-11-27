@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""float16 load leaves no bfloat16 params behind (unsloth issue 3459): pre-quantized checkpoints keep skipped layers and
-biases in bf16; on T4 Inductor skips every graph reading one, so non-reentrant checkpoint recompute diverged and
-multi-GPU training died at step 0."""
+"""float16 load leaves no bf16 params (unsloth issue 3459): pre-quantized bf16 layers and biases
+make T4 Inductor skip graphs; non-reentrant recompute diverged, so multi-GPU died at step 0."""
 
 import pytest
 import torch

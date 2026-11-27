@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dense expert beside stale bnb stats loads dense; on transformers v5 its bf16 bytes were read as
-nf4 (transformers 4.x ignores the stray keys and keeps the expert exact)."""
+"""Dense experts beside stale bnb stats load dense; v5 misreads bf16 as nf4; 4.x ignores them."""
 import os
 import shutil
 
@@ -35,8 +34,7 @@ LAYER = "model.layers.0.mlp.experts.gate_up_proj"
 def _require_v5_moe_quantization():
     common = pytest.importorskip("unsloth_zoo.temporary_patches.common")
     if not common.is_transformers_v5_moe_quantization_available():
-        # Capability check, not a version pin: transformers 4.x has no WeightConverter
-        # pipeline, so the expert deserializer under test is never registered there.
+        # Feature check, not a version pin: transformers 4.x has no WeightConverter pipeline.
         pytest.skip(reason = "transformers lacks the v5 WeightConverter MoE loading API this deserializer plugs into")
 
 
@@ -44,8 +42,7 @@ def _deserializer(monkeypatch, recorded):
     _require_v5_moe_quantization()
     M = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     import transformers.quantizers.quantizers_utils as qutils
-    # Import before patching: this module binds get_module_from_name at import time, and
-    # a first import under the fake below would keep it for every later real load.
+    # Import before patch: get_module_from_name binds at import, so a fake import would stick.
     import transformers.integrations.bitsandbytes  # noqa: F401
 
     class _FakeParams4bit:

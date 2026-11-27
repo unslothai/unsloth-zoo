@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tiny MoE LoRA steps with trainable router, UNSLOTH_MOE_FUSED_ROUTER off vs on; prints one JSON line per model with
-per-step loss, router and LoRA grad deltas, and engagement."""
+"""Tiny MoE LoRA steps, trainable router, UNSLOTH_MOE_FUSED_ROUTER off vs on; per-model JSON."""
 
 import copy
 import json

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Runs pytest then os._exit to skip finalization: mlx 0.32.1 segfaults at shutdown when a fused Metal kernel was the
-last thing touched (0.32.0 is clean), not fixable in Python; pytest's exit code is kept so failures still fail; drop
-once mlx ships a fix."""
+"""Runs pytest then os._exit to skip finalization: mlx 0.32.1 segfaults at shutdown after a fused
+Metal kernel (0.32.0 is clean); pytest's exit code is kept; drop once mlx ships a fix."""
 
 import os
 import sys

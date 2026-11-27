@@ -253,8 +253,7 @@ def test_block_expand_backward_sums_half_copies_without_overflow(dtype):
 
 
 def test_zero3_partitioned_towers_never_dedup(monkeypatch):
-    # ZeRO-3 all-gathers every partitioned parameter per forward: the first deduplicated call's
-    # self-check encode runs only on ranks that saw a duplicate image, so the others would hang.
+    # ZeRO-3 all-gathers each forward, so a self-check on only some ranks would hang the rest.
     import unsloth_zoo.temporary_patches.utils as tp
     monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: True)
     _, model = _load("qwen2_5_vl")
@@ -283,8 +282,7 @@ def test_ds_id_parameters_never_dedup():
 
 
 def test_tower_sharded_after_install_never_self_checks(tmp_path):
-    # FSDP2 shards inside train(), after the trainer installed dedup: the wrapper must see the DTensor
-    # parameters at call time and run one per-row encode, never a rank-local self-check forward.
+    # Sharding after install: wrapper sees DTensor params; per-row encode, never self-check.
     import torch.distributed as dist
     try:
         from torch.distributed.fsdp import fully_shard
@@ -331,8 +329,7 @@ def test_drop_path_layers_count_as_stochastic():
 
 
 def test_sharding_a_child_after_the_first_probe_is_seen():
-    # The answer was cached against the first parameter's identity; sharding only a later child (the tower)
-    # kept that parameter, so a stale False sent ranks into rank-local self-check encodes (collective mismatch).
+    # Cached on the first parameter: sharding a later child leaves a stale False; ranks desync.
     import pathlib
     import unsloth_zoo.vision_dedup as vision_dedup
     assert pathlib.Path(vision_dedup.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])

@@ -2759,8 +2759,10 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
     by_file = {}
     for key in keys: by_file.setdefault(weight_map[key], []).append(key)
     loaded = 0
+    from .safetensors_pread import pread_backend_kwargs
     for file, file_keys in by_file.items():
-        with safe_open(file, framework = "pt") as f:
+        # each tensor is copied once to the model's device: pread where mmap -> GPU is slow
+        with safe_open(file, framework = "pt", device = "cpu", **pread_backend_kwargs()) as f:
             for key in file_keys:
                 old = params.get(key, buffers.get(key))
                 if old is None: continue
@@ -7365,9 +7367,10 @@ pass
 
 
 def _strip_lora_adapter_name(state_dict, name):
-    """vLLM reads lora_A.weight, PEFT names it lora_A.<adapter>.weight; other adapters' tensors stay out."""
+    """vLLM reads lora_A.weight, PEFT names it lora_A.<adapter>.weight; other adapters' tensors stay out.
+    Same anchored rule for "default": a blind replace kept e.g. DPO's "ref" adapter and renamed module names
+    such as "default_mlp"."""
     # All Unsloth Zoo code licensed under LGPLv3
-    if name == "default": return {k.replace(".default", ""):v for k, v in state_dict.items()}
     segment = re.compile(r"\.lora_([AB])\." + re.escape(name) + r"(?=\.|$)")
     return {segment.sub(r".lora_\1", k):v for k, v in state_dict.items() if segment.search(k)}
 pass

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""merged_16bit on a DeepSeek-V4.1 released-layout checkpoint must place every native adapter; before, only names
-both layouts share were merged and other deltas were dropped silently."""
+"""merged_16bit on DeepSeek-V4.1 released-layout checkpoints must place every native adapter."""
 
 from __future__ import annotations
 

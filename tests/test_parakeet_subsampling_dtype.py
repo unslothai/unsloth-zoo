@@ -86,7 +86,6 @@ def test_subsampling_runs_16_bit_and_matches_bitwise(unsloth_conv_wrapper):
     assert set(after) == {torch.bfloat16}
     assert got.dtype == expected.dtype
     assert torch.equal(got, expected)
-    # keyword call path
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
         assert torch.equal(module(input_features = features, attention_mask = mask), expected)
 

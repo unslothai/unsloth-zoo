@@ -63,8 +63,7 @@ TRL_MASK = torch.tensor([[1, 1, 1], [0, 0, 0], [1, 1, 0]])
 
 
 def _forward_arguments(args):
-    """Binds the arguments grpo_accumulated_loss passes to UnslothEfficientGRPO.apply against the real forward: a stale
-    call fails, but a new trailing parameter (unsloth-zoo 1399 added upstream_scale) does not break stubs."""
+    """Stale apply() args fail on the real forward; trailing params (unsloth-zoo 1399) pass."""
     return inspect.signature(_REAL_FORWARD).bind(None, *args).arguments
 
 

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The automatic dequant chunk decision under torch's own non-reentrant checkpoint (Inkling 2 pipeline stages): the
-recompute must repeat its forward's decision even when free memory moved in between, else it saves a different number
-of tensors and backward raises CheckpointError. CPU only: the headroom reading is patched."""
+"""Dequant chunk decision under torch's non-reentrant checkpoint: recompute must repeat the
+forward's choice even if free memory changed, else backward raises CheckpointError; CPU only."""
 
 import os
 
@@ -110,8 +109,7 @@ def test_non_reentrant_recompute_repeats_the_forward_decision(
 
 @needs_hook_query
 def test_in_flight_microbatches_keep_their_own_decisions(monkeypatch):
-    """Pipeline schedules run several checkpointed forwards before their backwards, in either order: each recompute
-    takes its own forward's decision, not the latest one on the module."""
+    """Each recompute must use its own forward's decision, not the latest one on the module."""
     torch.manual_seed(0)
     layer = _Experts()
     xs = [torch.randn(3, 4, requires_grad=True) for _ in range(2)]

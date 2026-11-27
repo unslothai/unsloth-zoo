@@ -14,22 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO packed path fed raw logits into the lm_head matmul.
-
-`grpo_accumulated_loss` sets UNSLOTH_RETURN_HIDDEN_STATES=1, but `.logits`
-carries hidden states only when the forward is the Unsloth generated one. The
-padded path copes via the `new_hidden_states_chunk.shape[-1] == lm_head.shape[1]`
-dispatch in `compute_logprobs_chunk`; the packed path -- default-on,
-`UNSLOTH_GRPO_SEQ_PACKING=1` -- had none, so vocab-wide logits hit the matmul:
-
-    a and b must have same reduction dim, but got
-    [((s47*s87 + 255)//256), s33] X [1536, 151936]
-
-That is not a guard failure -- `Eq(s33, 1536)` is simply False. So this file
-covers both halves: the packed call site dispatches on width, and a genuine
-mismatch still names both operands, unlike the message-less `torch._check` that
-would replace it (Dynamo rejects a message-carrying one).
-"""
+"""Packed GRPO path (UNSLOTH_GRPO_SEQ_PACKING=1) fed vocab-wide logits to lm_head; it must dispatch
+on hidden width as compute_logprobs_chunk does, and a real mismatch must still name both operands
+(a message-less torch._check would not; Dynamo rejects message-carrying ones)."""
 
 import ast
 import sys
@@ -45,12 +32,9 @@ SRC = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding = "utf-8"
 TREE = ast.parse(SRC)
 
 
-# the message
 
 def _mismatched_call(fn, torch):
-    """Vocab-wide logits where hidden states are expected, as an unpatched forward returns; lm_head is an nn.Parameter
-    like get_output_embeddings().weight, so shape-static (the real report printed a concrete [1536, 151936] beside a
-    symbolic s33)."""
+    """Vocab-wide logits for hidden states; real report [1536, 151936] beside symbolic s33."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     hidden, vocab = 32, 128
     logits  = torch.randn(2, 8, vocab, device = dev, dtype = torch.float32)
@@ -75,7 +59,6 @@ def test_the_width_mismatch_names_both_operands():
     assert "32" in message and "128" in message, message
 
 
-# the dispatch
 
 def _packed_block():
     """Locates the packed call inside grpo_accumulated_loss by AST, so reformatting cannot make the test vacuous."""

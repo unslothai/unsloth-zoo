@@ -2,9 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Unified-memory GPUs (AMD APUs gfx1150/1151, NVIDIA GB10): "unsloth" gradient checkpointing keeps the checkpointed
-inputs on the device instead of copying them into host RAM, which is the same DRAM there. Detection runs on stub
-device properties; the checkpoint paths run on CPU with streams stubbed (as test_gc_retained_graph_slots.py does)."""
+"""Unified-memory GPUs (gfx1150/1151, GB10) keep checkpointed inputs on device, not host RAM."""
 import contextlib
 
 import pytest
@@ -84,7 +82,6 @@ def test_carveout_decides_the_pool(monkeypatch, platform, carveout, total, pool)
     assert info["pool"] == pool and info["carveout"] == carveout and info["total_memory"] == total
     assert D.device_shares_host_memory(0) is (pool == "shared")
     assert D.unified_memory_device_indices() == (frozenset({0}) if pool == "shared" else frozenset())
-    # The env override still forces either way.
     monkeypatch.setenv(D.KEEP_ON_DEVICE_ENV, "1")
     assert D.unified_memory_device_indices() == frozenset({0})
 
@@ -340,9 +337,8 @@ def test_free_memory_is_re_read_periodically(G, monkeypatch):
 
 
 def test_offloaded_checkpoint_initializes_once_when_every_device_keeps(G, monkeypatch):
-    """unsloth_offloaded_gradient_checkpoint (patch_unsloth_gradient_checkpointing) took an empty CPU_BUFFERS for
-    "not initialized", but every device keeping its inputs leaves it empty on purpose: each checkpoint call
-    re-initialized, resetting the streams, GPU buffers and the free-memory budget (one driver read per call)."""
+    """The checkpoint reads empty CPU_BUFFERS as not initialized, but stays empty when every device
+    keeps inputs; re-init per call resets streams, GPU buffers and free-memory budget."""
     monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
     monkeypatch.setattr(G, "_visible_device_count", lambda: 1)
     stubs = {n: getattr(G, n) for n in ("GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",
@@ -395,9 +391,8 @@ def test_keep_message_names_the_reason(G, monkeypatch, capsys, forced, expect):
 
 
 def test_reset_after_training_when_every_device_keeps(G, monkeypatch):
-    """Every device keeping its inputs leaves CPU_BUFFERS empty on purpose. reset_unsloth_gradient_checkpointing_buffers
-    took that for "not initialized" and returned early: the next run inherited FIRST_PASS = False and the previous
-    model's LAST_GC_INDEX, and the allocator cache was never emptied after training."""
+    """Reset must not return early on empty CPU_BUFFERS (empty on purpose): that leaked FIRST_PASS
+    and LAST_GC_INDEX, and the allocator cache was never emptied after training."""
     monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
     monkeypatch.setattr(G, "_visible_device_count", lambda: 1)
     stubs = {n: getattr(G, n) for n in ("GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",
@@ -415,7 +410,6 @@ def test_reset_after_training_when_every_device_keeps(G, monkeypatch):
     assert (G.FIRST_PASS, G.LAST_GC_INDEX, G.CURRENT_GC_INDEX, G.BACKWARD_PASS) == (True, 0, 0, True)
     assert G.CPU_BUFFERS == []  # still no pinned pool
     assert emptied == [1]
-    # The next run counts its own checkpointed layers again and trains exactly.
     got = _grads(G, ckpt = True)
     assert G.LAST_GC_INDEX == L
     ref = _grads(G, ckpt = False)

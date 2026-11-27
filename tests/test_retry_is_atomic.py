@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins that the recompile-limit retry stays atomic: re-running compiled_func is safe only because a direct
-fullgraph=True compile raises at frame entry before any op runs; a non-atomic callable silently gives wrong gradients
-under non-reentrant checkpoint recomputation."""
+"""Retry stays atomic: re-running compiled_func is safe only because fullgraph=True raises at frame
+entry before any op runs; non-atomic callables corrupt grads under non-reentrant recompute."""
 
 import inspect
 import sys
@@ -30,8 +29,7 @@ from unsloth_zoo.temporary_patches import utils as U  # noqa: E402
 
 
 def test_the_only_production_entry_point_compiles_the_function_directly():
-    """compile_with_eager_fallback must wrap a compile OF the given function, not a caller of one, or the retry stops
-    being atomic; read from source, as a real Dynamo run is slow and flaky."""
+    """Must compile the function itself, not a caller of one, or the retry stops being atomic."""
     source = inspect.getsource(U.compile_with_eager_fallback)
     assert "_raw_torch_compile(" in source, (
         "compile_with_eager_fallback no longer compiles the function itself"
@@ -59,8 +57,7 @@ def test_nothing_else_in_the_package_applies_the_fallback():
 
 
 def _run_region(restart_once, trailing):
-    """A checkpointed region whose inner callable optionally restarts itself; no compilation, as a plain exception
-    reproduces the cost of re-running and stays fast and deterministic."""
+    """Checkpointed region whose inner call may restart; eager, so fast and deterministic."""
     state = {"recomputing": False, "fired": False}
 
     def inner(x):
@@ -91,8 +88,7 @@ def _run_region(restart_once, trailing):
 
 
 def test_restarting_a_call_inside_a_recompute_silently_corrupts_gradients():
-    """Makes the silent corruption visible: same inputs and seed, but one run's inner callable restarts itself once
-    during recomputation; no exception is raised, yet gradients disagree."""
+    """A restart inside recompute raises no error, yet gradients silently disagree."""
     for trailing in (0, 1, 3, 8):
         clean = _run_region(restart_once = False, trailing = trailing)
         restarted = _run_region(restart_once = True, trailing = trailing)

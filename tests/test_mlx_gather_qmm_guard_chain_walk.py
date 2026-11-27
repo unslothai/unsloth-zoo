@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the bound on is_gather_qmm_nax_guard_applied's walk of _unsloth_index_original: a permissive stand-in (the mlx
-test shim, a Mock) never yields None, so the walk would hang."""
+"""Pins the walk bound in is_gather_qmm_nax_guard_applied; permissive stubs would hang it."""
 
 import threading
 

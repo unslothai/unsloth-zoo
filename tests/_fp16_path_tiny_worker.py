@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Worker for test_fp16_path_tiny_models.py, in its own process as temporary patches rewrite transformers process-wide;
-runs every arch in bf16, then the T4 path with UNSLOTH_FORCE_FLOAT32=1 (float32 cast or fp16, plus fp16 autocast);
-prints one JSON line per (mode, arch)."""
+"""Worker for test_fp16_path_tiny_models.py in its own process (temp patches rewrite transformers
+process-wide); runs bf16 then T4 with UNSLOTH_FORCE_FLOAT32=1, one JSON line per mode/arch."""
 
 import importlib
 import importlib.util

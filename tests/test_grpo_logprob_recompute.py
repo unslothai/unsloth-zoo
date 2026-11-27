@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""chunked_hidden_states_selective_log_softmax_recompute vs float64 oracle; softmax runs in float32 whatever the input
-dtype, so float32 tolerances, with the plain chunked function error as the bar; source runs standalone with only
-torch, os, typing, math."""
+"""chunked_hidden_states_selective_log_softmax_recompute vs float64 oracle; float32 tolerances, with
+the plain chunked function error as the bar; standalone (torch, os, typing, math)."""
 import inspect
 import math
 import os
@@ -179,8 +178,7 @@ def test_frozen_head_and_no_grad():
 
 
 def test_saves_no_logits_for_backward():
-    # Unlike the plain chunked function (rows x vocab logits kept per chunk for backward), this one saves only its
-    # inputs and per-row statistics, whatever the vocabulary.
+    # Saves no rows x vocab logits, unlike plain chunked; per-row stats for any vocab.
     function = _standalone()
     vocab, hidden, rows = 4096, 8, 64
     head = torch.randn(vocab, hidden, dtype = torch.float64, requires_grad = True)
@@ -259,8 +257,7 @@ def test_cuda_autocast_matches_plain_function(rows, head_dtype, fused_linear):
 
 
 def test_cached_function_survives_a_missing_compiled_flag():
-    # A monkeypatch of _use_compiled, undone after the autograd function is cached, deletes the flag; later calls must
-    # fall back to the default instead of raising.
+    # Deleted _use_compiled flag (monkeypatch undone after caching) must fall back, not raise.
     function = _standalone()
     head, states, _, index, weights, _ = _inputs(rows = 6, bias = False, seed = 3)
     function(states, head, index, 2, 0.0, 0.0, 0.0, 1.0, fused_linear = False)
@@ -350,8 +347,7 @@ def test_cold_outer_fullgraph_compile():
 
 @pytest.mark.parametrize("compiled", [False, True])
 def test_fp32_head_under_fp16_autocast_does_not_nan(compiled):
-    # fp32 trainable head, fp16 autocast, loss scale 65536, hidden 4, two 512-row chunks with opposite upstream signs:
-    # each fp16 product overflowed to +-inf before the float32 sum, leaving NaN.
+    # fp16 products overflow to +-inf before the fp32 sum, giving NaN on opposite-sign chunks.
     function = _standalone(compiled = compiled)
     rows, hidden_size, vocab = 1024, 8, 64
     sign = torch.ones(rows)

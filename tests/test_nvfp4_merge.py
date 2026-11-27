@@ -155,8 +155,7 @@ def test_nvfp4_checkpoints_are_detected_for_dequant(tmp_path, fmt):
 
 @pytest.mark.parametrize("global_shape", [(1,), (3,), (3, 1)])
 def test_fused_expert_nvfp4_merges_per_expert(tmp_path, global_shape):
-    # A 3-D fused-expert weight_packed (E, rows, cols / 2) must merge like three separate 2-D weights,
-    # with or without per-expert global scales, even when no LoRA targets the experts.
+    # 3-D (E, rows, cols/2) weight_packed merges per expert; global scales and LoRA optional.
     from unsloth_zoo.saving_utils import _nvfp4_dequantize
 
     experts = [_nvfp4(32, 64, seed) for seed in range(3)]

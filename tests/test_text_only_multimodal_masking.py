@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only on a text-only fine-tune of a multimodal model must not hit the vision-collator check;
-already-tokenized rows keep dataset-level masking; CPU-only with a stub tokenizer."""
+"""train_on_responses_only: no vision-collator check on text-only; tokenized rows keep masking."""
 
 import pytest
 from datasets import Dataset
@@ -107,9 +106,8 @@ def test_pretokenized_rows_get_dataset_level_masking():
 
 
 def test_raw_text_rows_are_tokenized_and_masked():
-    """Raw text must be tokenized and masked, not refused: with TRL 0.22.2 the text column is gone after
-    _maybe_tokenize_dataset, leaving nothing for a collator to rebuild labels from; refusing would have broken four
-    shipped notebooks."""
+    """Raw text must be tokenized and masked, not refused: with TRL 0.22.2 the text column is gone
+    after _maybe_tokenize_dataset, so refusing would have broken four shipped notebooks."""
     processor = StubProcessor()
     trainer = StubTrainer(TextCollator(processor), _raw_text())
 

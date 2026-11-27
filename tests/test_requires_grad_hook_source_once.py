@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The requires-grad hook search reads each ancestor forward's source once per call, not once per
-trainable parameter (an MoE LoRA has tens of thousands), and still picks the same hook targets."""
+"""Hook search reads each ancestor's forward source once, not per parameter; same targets."""
 
 import functools
 import inspect

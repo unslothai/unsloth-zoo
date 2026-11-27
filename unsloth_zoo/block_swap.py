@@ -204,6 +204,11 @@ def _pin_budget():
         return 0
 
 
+def _host_share(free):
+    """This local rank's share of the host's free RAM: every local rank reads the same `free`."""
+    return free // _local_world_size()
+
+
 # Re-reads of free RAM and the peers' reservations before refusing, while a peer may be mid-copy.
 _PEER_RETRIES = 8
 _PEER_RETRY_S = 0.25
@@ -291,6 +296,14 @@ def _end_host_session():
     _publish_host_pending(0)
 
 
+def _size_text(nbytes):
+    """GiB with one decimal, or MiB / KiB below 0.1 GiB, so a small cap does not read as 0.0 GiB."""
+    for unit, scale in (("GiB", 2**30), ("MiB", 2**20)):
+        if nbytes >= scale // 10:
+            return f"{nbytes / scale:.1f} {unit}"
+    return f"{nbytes / 2**10:.1f} KiB"
+
+
 def _check_host_fit(sizes, on_host = 0, slack = 0):
     """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
     freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
@@ -309,6 +322,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
         avail = free - others + on_host
     limit = _disk().host_limit_bytes()
+    capped = limit is not None and limit < avail
     if limit is not None:
         avail = min(avail, limit)
     # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
@@ -323,6 +337,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
             return None
         others = _others_host_pending(own)
         avail = free - (others or 0) + on_host
+        capped = limit is not None and limit < avail
         if limit is not None:
             avail = min(avail, limit)
     if need <= avail:
@@ -334,9 +349,19 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         if used + size > avail:
             break
         used, fit = used + size, fit + 1
-    raise ValueError(
+    asked = (
         f"Unsloth: offload_layers asked for {len(sizes)} layers in host RAM, which needs "
-        f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
+        f"{_size_text(need)}, but "
+    )
+    if capped:
+        # The cap, not free RAM, is what ran out: naming the system reserve would send the user after the wrong knob.
+        raise ValueError(
+            asked + f"UNSLOTH_OFFLOAD_HOST_LIMIT caps the offloaded layers at {_size_text(avail)}. "
+            f"At most {fit} layers would fit; raise UNSLOTH_OFFLOAD_HOST_LIMIT, lower offload_layers, "
+            "or enable the disk tier."
+        )
+    raise ValueError(
+        asked + f"only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
         f"{_host_reserve(total) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
         "lower offload_layers or free host RAM."
     )
@@ -1242,7 +1267,7 @@ class BlockSwap:
             _, free = _host_free()
         except Exception:
             return False
-        budget = free + sum(self._host_credit)
+        budget = _host_share(free) + sum(self._host_credit)
         limit = mod.host_limit_bytes()
         if limit is not None:
             budget = min(budget, limit)
@@ -1517,9 +1542,31 @@ class BlockSwap:
         return True
 
     def _release(self, block):
+        held = self.__dict__.get("_held")
+        if held and id(block) in held:
+            # Layer-major gradient accumulation runs every micro-batch through this block before letting it go.
+            held[id(block)] = True
+            return
         freed = block.evict()
         if freed is not None:
             self.free[block.sig].append(freed)
+
+    def hold(self, idx):
+        """Keep decoder layer `idx` on the card across its calls until `unhold(idx)` (layer-major gradient
+        accumulation: one fetch serves every micro-batch). A no-op for a layer that is not swapped."""
+        i = self.pos.get(idx, -1)
+        if 0 <= i < len(self.blocks):
+            self.__dict__.setdefault("_held", {}).setdefault(id(self.blocks[i]), False)
+
+    def unhold(self, idx):
+        """Stop holding layer `idx`; a release requested while it was held happens now."""
+        i = self.pos.get(idx, -1)
+        held = self.__dict__.get("_held")
+        if not held or not 0 <= i < len(self.blocks):
+            return
+        b = self.blocks[i]
+        if held.pop(id(b), False):
+            self._release(b)
 
     def _keep(self, block):
         """Backward is done with the block, but it stays on the card for the next forward."""
@@ -1527,10 +1574,13 @@ class BlockSwap:
 
     def _acquire(self, block, steal):
         free = self.free[block.sig]
+        held = self.__dict__.get("_held") or ()
         if not free and steal:
             # Only after an interrupted step, since prefetches never steal (could evict the running block); a pending
             # block's slot is still read by backward, so reuse corrupts gradients silently.
             for b in self.blocks:
+                if id(b) in held:
+                    continue
                 if b is not block and b.sig == block.sig and b.resident and b.slot is not None and not b.pending:
                     self._release(b)
                     break
@@ -1606,6 +1656,8 @@ class BlockSwap:
             return inner(run, *args, **kw)
 
         run_in_checkpoint._unsloth_block_swap = self
+        # Identity marker (functools.wraps copies attributes, not this self-reference's target).
+        run_in_checkpoint._unsloth_block_swap_wrapper = run_in_checkpoint
         run_in_checkpoint.__wrapped__ = inner
         if hasattr(inner, "_unsloth_replay_checkpoint"):   # routing replay then sees it as wrapped, not rewrapping
             run_in_checkpoint._unsloth_replay_checkpoint = inner._unsloth_replay_checkpoint
@@ -1735,7 +1787,20 @@ class BlockSwap:
     def _clear_step_queued(self):
         self._step_queued = False
 
+    @contextmanager
+    def layer_major_window(self):
+        """A layer-major window splits one step's backward into several autograd graphs: the step ends once,
+        when the caller calls _end_step after the window, not at each graph's end."""
+        self._layer_major_active = True
+        try:
+            yield
+        finally:
+            self._layer_major_active = False
+
     def _end_step(self):
+        if self.__dict__.get("_layer_major_active", False):
+            self._step_queued = False
+            return
         # Backward is done: a wait sample whose forward hook never ran (a recompute that stopped early) is complete.
         for b in self.blocks:
             if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
@@ -1816,11 +1881,13 @@ class BlockSwap:
                 self._arm(forward = True)
 
     def reset(self):
+        self.__dict__.pop("_held", None)
         for b in self.blocks:
             self._release(b)
         self._arm(forward = True)
 
     def remove(self):
+        self.__dict__.pop("_held", None)
         for h in self.handles:
             h.remove()
         self.handles = []
@@ -2131,8 +2198,13 @@ class BlockSwap:
             transient += reserve.get(_cuda_index(dv), 0)
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
-        for s in want:
-            self.free[s].append(self._new_slot(s))
+        try:
+            slots = [(s, self._new_slot(s)) for s in want]
+        except torch.cuda.OutOfMemoryError:
+            # Optional: a deeper lookahead that does not fit keeps the current depth (and the step's results).
+            return False
+        for s, slot in slots:
+            self.free[s].append(slot)
         return True
 
     def _shrink_pool(self):
@@ -2376,7 +2448,7 @@ def _disk_tier_indices(layers, indices, host_free_bytes = None, prefetch_depth =
     sizes = [sum(p.nbytes for _, p in _swappable(layers[i])) for i in indices]
     if host_free_bytes is None:
         try:
-            host_free_bytes = _host_free()[1] + sum(
+            host_free_bytes = _host_share(_host_free()[1]) + sum(
                 p.nbytes for i in indices for _, p in _swappable(layers[i]) if p.device.type == "cpu")
         except Exception:
             return []

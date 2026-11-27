@@ -696,7 +696,7 @@ def _attention_block(gqa, rows, keys, dtype = mx.bfloat16, heads = 8):
 
 
 def _mlx_vector_launch_fits(simds):
-    # Before M3, MLX 0.32.4's unrolled head-dim-512 vector kernel holds 448 threads per threadgroup.
+    # Before M3, MLX's unrolled head-dim-512 vector kernel holds 448 threads per threadgroup.
     return decode._gpu_generation() >= 15 or 32 * simds <= 448
 
 
@@ -714,13 +714,13 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
         _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
             queries[:, :, i : i + 1], keys[..., : horizon(i), :], values[..., : horizon(i), :], scale = 1.0)
             for i in range(rows)], axis = 2))
-    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # MLX's own vector kernel over each launch's rows
     step = decode._launch_simds(dtype) // gqa
     if _mlx_vector_launch_fits(gqa * min(step, rows)):
-        _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
-            queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
-            values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
-            for i in range(0, rows, step)], axis = 2))
+        with mx.config.scoped_update(MLX_SDPA_D512_MIN_KL = 0):   # MLX's own vector kernel over each launch's rows
+            _equal(out, mx.concatenate([mx.fast.scaled_dot_product_attention(
+                queries[:, :, i : i + step], keys[..., : 4500 - rows + min(i + step, rows), :],
+                values[..., : 4500 - rows + min(i + step, rows), :], scale = 1.0, mask = "causal")
+                for i in range(0, rows, step)], axis = 2))
     assert not mx.array_equal(out[:, :, :1], out[:, :, 1:2]).item()
 
 
@@ -771,8 +771,7 @@ def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch)
     launched, kernel = [], decode._vector_attention
     monkeypatch.setattr(decode, "_vector_attention", lambda *args: launched.append(args[0].shape[2]) or kernel(*args))
     native = lambda *args: _attend(gemma4, full, *args, call = gemma4.Attention.__call__)
-    with monkeypatch.context() as patch:
-        patch.setenv("MLX_SDPA_D512_MIN_KL", "0")   # the native call on MLX's vector kernel
+    with mx.config.scoped_update(MLX_SDPA_D512_MIN_KL = 0):   # the native call on MLX's vector kernel
         vector = native(x) if _mlx_vector_launch_fits(8 * 3) else None
     with decode.fused_verify_attention(layers):
         assert type(sliding) is gemma4.Attention and type(full) is not gemma4.Attention
@@ -839,7 +838,7 @@ def test_a_launch_straddling_a_block_count_boundary_is_not_judged(monkeypatch):
         assert decode._VERIFY_ATTENTION_VERDICTS == admitted
 
 
-wide_decode_only = pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "MLX 0.32.4 decode dispatch")
+wide_decode_only = pytest.mark.skipif(mx.__version__ != "0.32.5", reason = "MLX 0.32.5 decode dispatch")
 
 
 @wide_decode_only
@@ -847,25 +846,25 @@ wide_decode_only = pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "MLX 
 @pytest.mark.parametrize("rows", [1, 2])   # 16 simdgroups fit every GPU's F16 limit (576 threads before M3)
 @pytest.mark.parametrize("reverse", [False, True])
 def test_vector_attention_preserves_bits_when_feature_layouts_change(dtype, rows, reverse, monkeypatch):
-    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
-    monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
-    arrays = _attention_block(8, rows, 4500, dtype)
-    # Before M3, MLX's own launch for 2 rows exceeds its threadgroup limit, so the contiguous layout is the reference.
-    reference = (mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
-                 if _mlx_vector_launch_fits(8 * rows) else
-                 decode._vector_attention(*arrays, 1.0, decode._vector_blocks(8 * rows, 4500)))
-    strided = [mx.stack([x, mx.full(x.shape, -7, dtype)], axis = -1).reshape(
-        *x.shape[:-1], 2 * x.shape[-1])[..., ::2] for x in arrays]
-    layouts = [(False, False, False), (True, False, False), (False, True, False),
-               (False, False, True), (True, True, True), (False, False, False)]
-    for layout in reversed(layouts) if reverse else layouts:
-        inputs = [strided[i] if use_stride else arrays[i] for i, use_stride in enumerate(layout)]
-        if rows == 1 and dtype == mx.bfloat16:
-            out = decode._wide_head_decode_attention(*inputs, 1.0, "causal")
-            assert out is not None and all(decode._WIDE_ATTENTION_VERDICTS.values())
-        else:
-            out = decode._vector_attention(*inputs, 1.0, decode._vector_blocks(8 * rows, 4500))
-        _equal(out, reference)
+    with mx.config.scoped_update(MLX_SDPA_D512_MIN_KL = 0):
+        monkeypatch.setattr(decode, "_WIDE_ATTENTION_VERDICTS", {})
+        arrays = _attention_block(8, rows, 4500, dtype)
+        # Before M3, MLX's own launch for 2 rows exceeds its threadgroup limit, so the contiguous layout is the reference.
+        reference = (mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal")
+                     if _mlx_vector_launch_fits(8 * rows) else
+                     decode._vector_attention(*arrays, 1.0, decode._vector_blocks(8 * rows, 4500)))
+        strided = [mx.stack([x, mx.full(x.shape, -7, dtype)], axis = -1).reshape(
+            *x.shape[:-1], 2 * x.shape[-1])[..., ::2] for x in arrays]
+        layouts = [(False, False, False), (True, False, False), (False, True, False),
+                   (False, False, True), (True, True, True), (False, False, False)]
+        for layout in reversed(layouts) if reverse else layouts:
+            inputs = [strided[i] if use_stride else arrays[i] for i, use_stride in enumerate(layout)]
+            if rows == 1 and dtype == mx.bfloat16:
+                out = decode._wide_head_decode_attention(*inputs, 1.0, "causal")
+                assert out is not None and all(decode._WIDE_ATTENTION_VERDICTS.values())
+            else:
+                out = decode._vector_attention(*inputs, 1.0, decode._vector_blocks(8 * rows, 4500))
+            _equal(out, reference)
 
 
 @wide_decode_only
@@ -887,6 +886,18 @@ def test_wide_decode_attention_is_native_bitwise_over_strided_caches(heads, keys
                                             scale, decode._vector_blocks(8, keys)))
 
 
+@wide_decode_only
+@pytest.mark.parametrize("extra", [5, 100])
+def test_vector_blocks_follow_a_scoped_mlx_setting(extra):
+    arrays = _attention_block(8, 1, 4500)
+    forced = decode._vector_blocks(8, 4500) + extra
+    with mx.config.scoped_update(MLX_SDPA_D512_MIN_KL = 0, MLX_SDPA_BLOCKS = forced):
+        blocks = decode._vector_blocks(8, 4500)
+        assert blocks == (forced + 31) // 32 * 32
+        _equal(decode._vector_attention(*arrays, 1.0, blocks),
+               mx.fast.scaled_dot_product_attention(*arrays, scale = 1.0, mask = "causal"))
+
+
 def test_wide_decode_attention_keeps_unsupported_calls_native(monkeypatch):
     q, k, v = _attention_block(8, 1, 4500)
     calls = [(q, k, v, mx.ones((1, 4500), mx.bool_)), (q, k, v, "invalid"),
@@ -898,10 +909,9 @@ def test_wide_decode_attention_keeps_unsupported_calls_native(monkeypatch):
     monkeypatch.setattr(decode, "_vector_attention", lambda *args: pytest.fail("unsupported attention launched"))
     for a, b, c, mask in calls:
         assert decode._wide_head_decode_attention(a, b, c, 1.0, mask) is None
-    monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "8192")
-    assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
-    monkeypatch.delenv("MLX_SDPA_D512_MIN_KL")
-    monkeypatch.setattr(mx, "__version__", "0.32.5")
+    with mx.config.scoped_update(MLX_SDPA_D512_MIN_KL = 8192):
+        assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
+    monkeypatch.setattr(mx, "__version__", "0.32.6")
     assert decode._wide_head_decode_attention(q, k, v, 1.0, None) is None
 
 
@@ -1842,7 +1852,7 @@ def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowr
 
 
 @_needs_qwen4
-@pytest.mark.skipif(mx.__version__ != "0.32.4", reason = "the ordered route pins MLX 0.32.4")
+@pytest.mark.skipif(mx.__version__ != "0.32.5", reason = "the ordered route pins MLX 0.32.5")
 @pytest.mark.parametrize("dtype, bits, group_size", [(mx.bfloat16, 4, 32), (mx.float16, 8, 64)])
 def test_qwen4_ordered_decode_projects_each_row_and_partial_tile_bitwise(dtype, bits, group_size):
     mx.random.seed(0)

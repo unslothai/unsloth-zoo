@@ -53,6 +53,7 @@ from .moe_utils import (
     forward_native_moe_loop,
     select_moe_backend,
     patch_param_wrapper_for_moe,
+    _unsloth_importing,
 )
 from .qwen3_moe import _make_qwen_moe_lora_extractor
 
@@ -327,76 +328,90 @@ def patch_qwen3_vl_moe():
         # vanilla's when the storage above differs from transformers' own layout.
 
 
-        backend = select_moe_backend()
+        def _experts_forward_for(backend):
+            forward_sonic_moe = None
+            if backend == "sonic_moe":
+                try:
+                    from .moe_utils_sonic import forward_sonic_moe
+                except ImportError:
+                    backend = "grouped_mm"
 
-        forward_sonic_moe = None
-        if backend == "sonic_moe":
-            try:
-                from .moe_utils_sonic import forward_sonic_moe
-            except ImportError:
-                backend = "grouped_mm"
+            if backend == "sonic_moe":
 
-        if backend == "sonic_moe":
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    top_k_index: torch.Tensor,
+                    top_k_weights: torch.Tensor,
+                ) -> torch.Tensor:
+                    """sonic-moe forward; falls back to grouped_mm where sonic does not support the weights."""
+                    output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                    if output is not None:
+                        return output
+                    return forward_sonic_moe(
+                        self, hidden_states, top_k_index, top_k_weights
+                    )
 
-            def forward(
-                self,
-                hidden_states: torch.Tensor,
-                top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor,
-            ) -> torch.Tensor:
-                """sonic-moe forward; falls back to grouped_mm where sonic does not support the weights."""
-                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
-                if output is not None:
-                    return output
-                return forward_sonic_moe(
-                    self, hidden_states, top_k_index, top_k_weights
-                )
+            elif backend == "grouped_mm":
 
-        elif backend == "grouped_mm":
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    top_k_index: torch.Tensor,
+                    top_k_weights: torch.Tensor,
+                ) -> torch.Tensor:
+                    """Native PyTorch grouped-GEMM MoE forward (torch._grouped_mm, no Triton)."""
+                    return forward_native_grouped_mm(
+                        self, hidden_states, top_k_index, top_k_weights
+                    )
 
-            def forward(
-                self,
-                hidden_states: torch.Tensor,
-                top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor,
-            ) -> torch.Tensor:
-                """Native PyTorch grouped-GEMM MoE forward (torch._grouped_mm, no Triton)."""
-                return forward_native_grouped_mm(
-                    self, hidden_states, top_k_index, top_k_weights
-                )
+            elif backend == "unsloth_triton":
 
-        elif backend == "unsloth_triton":
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    top_k_index: torch.Tensor,
+                    top_k_weights: torch.Tensor,
+                ) -> torch.Tensor:
+                    """Grouped-GEMM MoE forward via Triton kernels (fused permutation, cached configs)."""
+                    output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                    if output is not None:
+                        return output
+                    return forward_triton_grouped_gemm(
+                        self, hidden_states, top_k_index, top_k_weights
+                    )
 
-            def forward(
-                self,
-                hidden_states: torch.Tensor,
-                top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor,
-            ) -> torch.Tensor:
-                """Grouped-GEMM MoE forward via Triton kernels (fused permutation, cached configs)."""
-                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
-                if output is not None:
-                    return output
-                return forward_triton_grouped_gemm(
-                    self, hidden_states, top_k_index, top_k_weights
-                )
+            else:
+                # Fallback
+                @torch.compiler.disable
+                def forward(
+                    self,
+                    hidden_states: torch.Tensor,
+                    top_k_index: torch.Tensor,
+                    top_k_weights: torch.Tensor,
+                ) -> torch.Tensor:
+                    # Same loop fallback logic as Qwen3MoeExperts
+                    output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                    if output is not None:
+                        return output
+                    return forward_native_moe_loop(
+                        self, hidden_states, top_k_index, top_k_weights
+                    )
+            return forward
 
+        if _unsloth_importing():
+            # A worker that picks its card after `import unsloth` would probe (and open a context on) GPU 0 here: resolve
+            # on first use instead. The patch runs again at model load, which installs the resolved forward.
+            _resolved = {}
+
+            def forward(self, hidden_states, top_k_index, top_k_weights):
+                backend = select_moe_backend()
+                experts_forward = _resolved.get(backend)
+                if experts_forward is None:
+                    experts_forward = _resolved[backend] = _experts_forward_for(backend)
+                return experts_forward(self, hidden_states, top_k_index, top_k_weights)
         else:
-            # Fallback
-            @torch.compiler.disable
-            def forward(
-                self,
-                hidden_states: torch.Tensor,
-                top_k_index: torch.Tensor,
-                top_k_weights: torch.Tensor,
-            ) -> torch.Tensor:
-                # Same loop fallback logic as Qwen3MoeExperts
-                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
-                if output is not None:
-                    return output
-                return forward_native_moe_loop(
-                    self, hidden_states, top_k_index, top_k_weights
-                )
+            forward = _experts_forward_for(select_moe_backend())
 
         # SparseMoeBlock forward not compiled due to dynamic routing
         @torch.compiler.disable

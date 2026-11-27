@@ -137,8 +137,7 @@ def test_legacy_all_kept_equals_no_exclusion_for_any_spg_ga(loss_type, num_proce
 @pytest.mark.parametrize("prompt_level", [False, True])
 @pytest.mark.parametrize("spg,ga", [(8, 2), (1, 1)])
 def test_legacy_partial_exclusion_matches_fp64_oracle(prompt_level, spg, ga):
-    # sample_weight as _unsloth_grpo_sample_weight: keep / kept tokens, or prompt-level keep / (group tokens * kept
-    # groups); the bonus is independent of SPG / GA.
+    # Weight: keep/kept tokens, or prompt keep/(group tokens*kept groups); bonus SPG/GA-free.
     gen = torch.Generator().manual_seed(11)
     num_generations, groups, length = 2, 4, 5
     rows = num_generations * groups

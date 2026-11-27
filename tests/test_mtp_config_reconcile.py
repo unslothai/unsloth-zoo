@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Exported configs must not declare an MTP head the weights lack: transformers drops Qwen3.5's `mtp.*` tensors on load,
-so `mtp_num_hidden_layers` stays set (unsloth#7681)."""
+"""Never declare an MTP head the weights lack: transformers drops mtp.* (unsloth#7681)."""
 
 import json
 import os
@@ -112,7 +111,6 @@ def test_mtp_tensor_names_are_recognised(name):
 
 
 @pytest.mark.parametrize("name", [
-    # Body, visual tower, then two near misses.
     "model.language_model.layers.0.mlp.up_proj.weight",
     "model.visual.blocks.0.attn.qkv.weight",
     "mtptower.fc.weight",

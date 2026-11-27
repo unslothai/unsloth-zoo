@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert-count precedence for per-expert MoE merges: module or fused-LoRA count always wins; a shard header may only
-raise a missing or too-low count, never lower it (a shard may hold only some experts)."""
+"""Module or fused-LoRA count wins; shard headers only raise it (shards may hold some experts)."""
 
 from __future__ import annotations
 

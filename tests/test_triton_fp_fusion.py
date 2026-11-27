@@ -39,6 +39,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
     # Lazy safetensors readers keyed by tensor name: `tensors[key]()` loads one tensor.
     "block_swap.py": {"tensors"},
+    # The routing weight formulas, plain torch functions keyed by name: `_formulas()[formula](logits, ids)`.
+    "routing_replay.py": {"_formulas()"},
 }
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
@@ -73,8 +75,7 @@ def _assigned_names(scope_body):
 
 
 def _kwargs_dicts(tree):
-    """id(launch call) -> the dict(...) / {...} each `**name` it splats was assigned in its function, or at
-    module level (a function-local name wins). `a if cond else b` contributes both branches."""
+    """Maps launch-call ids to their **name splat dicts; locals first; ternary arms both count."""
     module = _assigned_names(tree.body)
     out = {}
     for func in ast.walk(tree):
@@ -173,8 +174,7 @@ def _module_trees():
 
 
 def _launcher_entry_points(trees):
-    """{module dotted name: {function}} for functions taking **options in a module whose launches
-    forward options: calling one of them is a launch."""
+    """Module -> {function} taking **options, where calls forward them and are launches."""
     out = {}
     for rel, _src, tree in trees:
         func_of, _ = _enclosing(tree)

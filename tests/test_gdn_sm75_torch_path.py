@@ -68,8 +68,7 @@ def _inputs(B, T, H, HV, K, V, seed = 0, dtype = torch.float64):
 @pytest.mark.parametrize("T", [1, 63, 64, 130])
 @pytest.mark.parametrize("H,HV", [(2, 2), (2, 4)])
 def test_torch_chunk_matches_fp64_recurrence_forward_and_backward(T, H, HV):
-    """float64 runs the same code in float64: forward, final state and the grads of q, k, v, g, beta, h0
-    agree with the token recurrence to rounding. Covers padding (T % 64), one token, GVA (H < HV)."""
+    """Forward, final state and grads match the fp64 token recurrence; covers padding and GVA."""
     ins = [x.requires_grad_() for x in _inputs(2, T, H, HV, 16, 8)]
     ref_ins = [x.detach().clone().requires_grad_() for x in ins]
     o, ht = G.torch_chunk_gated_delta_rule(*ins[:5], scale = 0.3, initial_state = ins[5], output_final_state = True,
@@ -87,8 +86,7 @@ def test_torch_chunk_matches_fp64_recurrence_forward_and_backward(T, H, HV):
 
 @pytest.mark.parametrize("lengths", [[70, 50], [1, 63, 64, 65, 1, 7], [128, 64], [200]])
 def test_torch_chunk_packed_documents_match_fp64_per_document(lengths):
-    """cu_seqlens (B = 1): each document equals its own recurrence from a zero state, forward and every grad.
-    Documents shorter than a chunk, ending on a chunk edge, one token long, and one spanning several chunks."""
+    """Each packed document matches its own zero-state recurrence, forward and grads (B=1)."""
     T = sum(lengths)
     ins = [x.requires_grad_() for x in _inputs(1, T, 2, 4, 16, 8, seed = len(lengths))[:5]]
     ref_ins = [x.detach().clone().requires_grad_() for x in ins]
@@ -151,8 +149,7 @@ def test_compiles_fullgraph_one_graph_for_every_length():
 
 
 def test_packed_rows_compile_fullgraph_across_document_counts():
-    """cu_seqlens: document ids from a bucketize, masks from them: no host sync, so no graph break, and new
-    lengths / document counts reuse the graph."""
+    """No host sync via bucketize, so no graph break; new lengths and counts reuse the graph."""
     from torch._dynamo.utils import counters
     torch._dynamo.reset()
     counters.clear()
@@ -169,7 +166,6 @@ def test_packed_rows_compile_fullgraph_across_document_counts():
     assert counters["stats"]["unique_graphs"] <= 2
 
 
-# Routing: a fake fla with fla's public signature, whose kernel records each call.
 def _fake_fla(monkeypatch):
     calls = []
 
@@ -242,8 +238,7 @@ def test_sm75_routes_packed_rows(monkeypatch):
 
 
 def test_repeated_patch_passes_wrap_once(monkeypatch):
-    """patch_vendor_fla runs more than once: the CPU and sm75 installers each wrap the kernel once in total, so the
-    kernel-hub closure and Unsloth's caller walk see one sm75 router over one CPU wrapper over fla."""
+    """Repeated patch_vendor_fla wraps the kernel once: sm75 router over CPU wrapper over fla."""
     package, chunk, modeling, calls = _fake_fla(monkeypatch)
     _sm75_host(monkeypatch)
     kernel = package.chunk_gated_delta_rule
@@ -259,8 +254,7 @@ def test_repeated_patch_passes_wrap_once(monkeypatch):
 
 
 def test_sm75_calls_over_the_memory_budget_keep_fla(monkeypatch):
-    """The torch path's workspace estimate (tokens x value heads x bytes) over the budget: fla, counted; under it:
-    the torch path. The edge is exact, so the decision is a pure function of the shape."""
+    """Torch workspace (tokens x value heads x bytes) over budget keeps fla; the edge is exact."""
     package, _, _, calls = _fake_fla(monkeypatch)
     per = fla_vendor._SM75_BYTES_PER_TOKEN_HEAD["float16"]
     B, T, HV = 2, 70, 4

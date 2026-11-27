@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grouped MoE readiness verdicts and NF4 pointer tables reused across expert-state changes (transformers < 5
-ModuleList, gpt-oss NF4); bitwise equal to UNSLOTH_MOE_FAST_READY=0; verdicts match full checks after changes; steady
-state is one lean re-read per block per step."""
+"""MoE readiness verdicts and NF4 pointer tables survive expert-state changes (transformers < 5
+ModuleList, gpt-oss NF4); verdicts match full checks; bitwise equal to UNSLOTH_MOE_FAST_READY=0."""
 import contextlib
 import os
 import sys
@@ -32,8 +31,7 @@ from unsloth_zoo.temporary_patches import moe_ready_epoch as RE  # noqa: E402
 from peft import LoraConfig  # noqa: E402
 from unsloth_zoo.temporary_patches import gpt_oss_grouped_qlora as GQ  # noqa: E402
 
-# NF4 pointer-table stack kernel is CUDA-only (HIP has no libdevice mul_rn); elsewhere the ModuleList path keeps the
-# bitsandbytes builder and never builds _unsloth_nf4_stack_tables.
+# NF4 stack kernel is CUDA-only (no libdevice mul_rn on HIP); tables are not built elsewhere.
 NF4_TABLES = torch.cuda.is_available() and GQ.stacked_dequant_available(
     torch.device("cuda", torch.cuda.current_device()))
 needs_nf4_tables = pytest.mark.skipif(not NF4_TABLES, reason = "stacked NF4 dequant kernel is CUDA-only")

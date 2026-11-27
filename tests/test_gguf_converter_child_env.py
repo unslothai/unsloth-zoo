@@ -62,7 +62,6 @@ def _make_gguf_py(root, *, package=True, symbols=(), version=None):
     return gguf_py
 
 
-# --- _converter_child_env ---
 
 def test_child_env_is_a_copy_of_the_parent_environment(mod, monkeypatch):
     monkeypatch.setenv("UNSLOTH_CHILD_ENV_CANARY", "kept")
@@ -116,7 +115,6 @@ def test_child_env_does_not_duplicate_an_entry_already_present(mod, monkeypatch,
     assert env["PYTHONPATH"].split(os.pathsep) == [str(gguf_py), "/x"]
 
 
-# --- _importable_gguf_py ---
 
 def test_importable_gguf_py_accepts_a_real_package(mod, tmp_path):
     gguf_py = _make_gguf_py(tmp_path)
@@ -134,7 +132,6 @@ def test_importable_gguf_py_handles_missing_and_empty_input(mod, tmp_path):
     assert mod._importable_gguf_py(None) is None
 
 
-# --- requirement scanning ---
 
 def test_module_level_imports_are_certain(mod):
     source = b"from gguf.vocab import MistralTokenizerType\nimport gguf.utility\n"
@@ -244,7 +241,6 @@ def test_conversion_package_is_scanned_only_when_imported(mod, tmp_path):
     assert "gguf.vocab.MistralTokenizerType" not in certain
 
 
-# --- architecture scoping of the requirement scan ---
 
 def _make_conversion_tree(tmp_path):
     """An entrypoint plus a conversion/ package shaped like llama.cpp's own."""
@@ -379,7 +375,6 @@ def test_the_diagnosis_names_the_symbol_that_actually_stopped_the_import(
     assert "gguf.MODEL_ARCH.AFMOE" not in note
 
 
-# --- the child probe ---
 
 def test_probe_reports_the_tree_the_entrypoint_would_self_locate(mod, tmp_path):
     """The probe resolves gguf through the entrypoint's own sibling gguf-py."""
@@ -442,7 +437,6 @@ def test_probe_returns_none_when_it_cannot_run(mod):
     assert mod._probe_child_gguf("/nonexistent/python", dict(os.environ), ("gguf.X",)) is None
 
 
-# --- candidate ranking ---
 
 def test_candidates_start_with_the_requested_pair_untouched(mod, tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
@@ -576,7 +570,6 @@ def test_the_best_candidate_wins_not_the_first_that_clears_the_certain_bar(
     # Clears every certain name but not the advisory one.
     plausible = tmp_path / "plausible"
     _make_gguf_py(plausible, symbols=("Metadata", "OnlyNew"))
-    # Clears everything.
     coversioned = tmp_path / "coversioned"
     _make_gguf_py(coversioned, symbols=("Metadata", "OnlyNew", "RunsInPractice"))
 
@@ -606,7 +599,6 @@ def test_resolver_keeps_the_request_when_nothing_satisfies_it(mod, tmp_path, mon
     assert "gguf.NeverExists" in report["missing"]
 
 
-# --- failure diagnosis ---
 
 @pytest.mark.parametrize("text", [
     "ImportError: cannot import name 'MistralTokenizerType' from 'gguf.vocab' (/x/gguf/vocab.py)",
@@ -681,7 +673,6 @@ def test_report_summary_handles_every_shape(mod):
     assert mod._gguf_report_summary({"missing": []}, ()) == "reason unknown"
 
 
-# --- wiring ---
 
 def test_every_converter_launch_passes_an_explicit_env(mod):
     """A launch site without env= silently reintroduces the bug."""
@@ -704,7 +695,6 @@ def test_failure_path_attaches_the_diagnosis(mod):
     assert "_looks_like_gguf_skew(captured)" not in source
 
 
-# --- end to end, skipped unless the real toolchain is staged ---
 
 _TOOLCHAIN = Path(os.environ.get("UNSLOTH_TEST_LLAMACPP_DIR") or os.devnull)
 _MODEL = Path(os.environ.get("UNSLOTH_TEST_GGUF_MODEL") or os.devnull)
@@ -764,7 +754,6 @@ def test_the_preflight_returns_a_pin_not_a_frozen_environment(mod, tmp_path, mon
     assert pin is None or isinstance(pin, str)
 
 
-# --- The installed gguf wheel as a candidate ---
 
 def test_the_installed_gguf_wheel_is_used_when_the_sibling_tree_is_too_old(
     mod, tmp_path, monkeypatch, capsys,
@@ -817,8 +806,7 @@ def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tm
     (tree / "gguf" / "__init__.py").write_text("# gguf\n")
     # A real one is on sys.path, and only a tree with that provenance is accepted.
     monkeypatch.syspath_prepend(str(tree))
-    # `_importing_gguf_tree` asks `find_spec`, which answers from `sys.modules` before `sys.path`, so cached gguf
-    # modules must be cleared or the call returns None.
+    # find_spec reads sys.modules first: cached gguf modules must be cleared or it gives None.
     monkeypatch.delitem(sys.modules, "gguf", raising = False)
     for cached in [name for name in sys.modules if name.startswith("gguf.")]:
         monkeypatch.delitem(sys.modules, cached, raising = False)

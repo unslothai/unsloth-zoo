@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tier 0 LoRA merge tests for saving_utils.py (_active_merge_device, _merge_lora, 5 MoE expert merges) against a numpy
-reference; run on Linux CUDA/XPU without an MLX shim."""
+"""Tier 0 LoRA merge tests for saving_utils.py against numpy; run on CUDA/XPU, no MLX shim."""
 
 from __future__ import annotations
 
@@ -48,9 +47,7 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
     return LoraStats(module=None, lora_A=lora_A, lora_B=lora_B, alpha=alpha)
 
 
-# PEFT packs fused MoE LoRA differently: lora_A is expert-slowest (rows e*rank:(e+1)*rank), lora_B expert-fastest
-# (columns e::num_experts); written out, not imported from moe_utils, because an expectation calling the merge's own
-# helper could never fail.
+# PEFT packs lora_A expert-slowest, lora_B expert-fastest; expectation is not from moe_utils.
 
 def _peft_expert_lora_b(lora_B: torch.Tensor, expert_idx: int, num_experts: int) -> torch.Tensor:
     """Expert `expert_idx`'s `(out, rank)` block of a fused `lora_B`, as PEFT packs it."""
@@ -58,8 +55,7 @@ def _peft_expert_lora_b(lora_B: torch.Tensor, expert_idx: int, num_experts: int)
 
 
 def _expert_slowest_lora_b(lora_B: torch.Tensor, expert_idx: int, rank_per: int) -> torch.Tensor:
-    """Pre-fix reading of lora_B as one contiguous rank-wide column block per expert; it never raises and barely moves
-    the delta norm, kept so a test can assert the merge does not produce it."""
+    """Pre-fix lora_B read, contiguous per-expert blocks; silent, kept so a test catches it."""
     return lora_B[:, expert_idx * rank_per:(expert_idx + 1) * rank_per]
 
 
@@ -166,8 +162,7 @@ def test_merge_lora_returns_W_when_lora_missing():
 def test_merge_moe_gate_expert():
     """gate_W shape (inter_dim, hidden_dim).  delta = (B @ gate_a).T."""
     torch.manual_seed(SEED)
-    # num_experts != rank_per so confusing the two axes cannot pass unnoticed; factors are scaled so the delta is large
-    # against atol, since at 0.05 either lora_B packing passed.
+    # num_experts != rank_per so axes cannot be confused; scaled factors keep delta above atol.
     num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
     total_rank = num_experts * rank_per
     two_inter = 2 * inter_dim
@@ -289,8 +284,7 @@ def test_merge_moe_fused_gate_up_expert(is_transposed):
 
 @pytest.mark.parametrize("is_transposed", [True, False])
 def test_merge_moe_fused_down_proj_expert(is_transposed):
-    """Fused 3D down weight (E, dim1, dim2): layout is detected by matching A.shape[1] to dim1 when transposed or dim2
-    otherwise; delta (dim_B, dim_A) is transposed when use_transpose."""
+    """A.shape[1] picks dim1 if transposed, else dim2; delta is transposed when use_transpose."""
     torch.manual_seed(SEED)
     num_experts, rank_per = 4, 3
     total_rank = num_experts * rank_per

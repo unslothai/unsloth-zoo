@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt-oss inference must never get a None causal mask: the flex-training skip keys on the training flag, not
-requires_grad (enable_input_require_grads() sets it at inference too); the patch is skipped under
-UNSLOTH_COMPILE_DISABLE; CPU-only."""
+"""gpt-oss inference must never get a None causal mask: the flex skip keys on the training flag, not
+requires_grad (set at inference too); skipped under UNSLOTH_COMPILE_DISABLE; CPU-only."""
 import os
 import sys
 import types
@@ -24,8 +23,7 @@ import types
 import pytest
 import torch
 
-# Installing the patch pulls transformers' lazy quantization imports (bitsandbytes.nn among them) into sys.modules;
-# conftest blames the first test touching them, so warm them at collection time.
+# Warm lazy imports (bitsandbytes.nn too) at collection: conftest blames the first toucher.
 for _warm in ("transformers.models.gpt_oss.modeling_gpt_oss", "bitsandbytes.nn"):
     try:
         __import__(_warm)
@@ -64,8 +62,7 @@ def wrapper(monkeypatch):
     import transformers.generation.utils as generation_utils
     import transformers.models.gpt_oss.modeling_gpt_oss as modeling
 
-    # The patch writes to three modules and GptOssModel, creating new names: snapshot all of them or leftovers point
-    # later forwards at `factory`; re-patching is gated on `__patched_causal_mask__`, so it must go too.
+    # Snapshot all names, else later forwards hit `factory`; drop __patched_causal_mask__.
     touched = [
         (masking_utils, "create_causal_mask"),
         (masking_utils, "create_sliding_window_causal_mask"),
@@ -177,8 +174,7 @@ def test_flex_training_still_skips_the_dense_mask(wrapper, flex_installed):
 
 
 def test_eager_config_training_still_skips_when_flex_will_run(wrapper, flex_installed):
-    """forward_function picks flex_attention_with_sink from self.training alone, so an eager _attn_implementation in
-    training still gets flex; a dense mask would be built and thrown away (unsloth-zoo issue 1212)."""
+    """self.training alone picks flex: eager training still gets it (unsloth-zoo issue 1212)."""
     with torch.enable_grad():
         got = wrapper.fn(
             config = _config("eager", training = True),

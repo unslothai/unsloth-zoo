@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A replacement assigned straight onto the class (Qwen4ExpTextPLELayer.forward = qwen4_exp_ple_layer_forward) still
-declares `past_key_values`; the standalone class keeps the stock 5.24 `cache` definition, so the call must pass `cache`."""
+"""Class-assigned forwards keep past_key_values; standalone 5.24 declares cache, so pass cache."""
 
 import importlib.util
 import sys

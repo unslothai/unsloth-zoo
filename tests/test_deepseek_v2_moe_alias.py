@@ -1,5 +1,4 @@
-"""Tests patch_deepseek_v2_moe_alias: aliases DeepseekV2MoE to DeepseekV2Moe only when just the new name exists
-(transformers 5.x); no-op otherwise; uses a fake sys.modules module."""
+"""Tests patch_deepseek_v2_moe_alias: alias only if just new name exists (transformers 5.x)."""
 
 from __future__ import annotations
 
@@ -48,7 +47,6 @@ def test_aliases_new_name_to_old(monkeypatch):
 
 
 def test_skips_eager_import_on_transformers_4(monkeypatch):
-    # On 4.x the version gate returns before importing the module at all.
     _set_tf_version(monkeypatch, "4.57.6")
     monkeypatch.setitem(sys.modules, _LEAF, None)  # import would raise if reached
 

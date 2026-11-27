@@ -1,6 +1,5 @@
-"""Checks _banded_sdpa_core (block-local O(S*w) sliding-window SDPA) matches full SDPA with the band mask on CPU, incl.
-GQA; the gemma4_flash_sliding router falls back to it without flash-attn, and UNSLOTH_BANDED_SDPA=1 forces it even if
-flash-attn is present."""
+"""Checks _banded_sdpa_core matches full SDPA on CPU, incl. GQA; the gemma4_flash_sliding router
+falls back to it without flash-attn; UNSLOTH_BANDED_SDPA=1 forces it even with flash-attn."""
 
 import pytest
 import torch
@@ -112,7 +111,6 @@ def test_mask_is_plain_band_detection():
     S, w = 128, 32
     band = _band_mask_full(S, w)[None, None]
     assert _mask_is_plain_band(band, S, w)
-    # Padding one token out of the band pattern must be rejected.
     padded = band.clone()
     padded[..., S - 1, 0:1] = True
     assert not _mask_is_plain_band(padded, S, w)
@@ -159,7 +157,6 @@ def test_mask_is_plain_band_rejects_inband_bias():
 
 
 def test_mask_is_plain_band_chunked_equals_single_block():
-    # Row-chunked verification must agree with a single-block scan on every mask.
     S, w = 96, 16
     band = _band_mask_full(S, w)
     packed = band.clone(); packed[50, 40] = False

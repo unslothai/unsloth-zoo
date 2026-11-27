@@ -220,8 +220,7 @@ def test_input_signature_stays_fp32_under_autocast():
 
 
 def test_softmax_renorm_survives_underflowed_forced_experts():
-    # Forced experts with logits ~200 below the natural top-k underflow in a full-vocab softmax, so
-    # gather-then-renormalise gave 0 / 0 = NaN; softmax over gathered logits is the same function.
+    # Gather-then-renormalise gives 0/0 NaN on underflow; softmax over gathered logits matches.
     logits = torch.tensor([[200.0, 199.0, 0.0, -1.0], [1.0, 2.0, 0.5, -0.3]], requires_grad = True)
     ids = torch.tensor([[2, 3], [1, 2]])
     got = rr._formulas()["softmax_renorm"](logits, ids)

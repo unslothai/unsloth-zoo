@@ -32,8 +32,7 @@ _OMIT = object()
 
 
 def _emit(tmp_path, monkeypatch, overwrite=_OMIT, model_location=TRL_LOCATION, source=PROBE_SOURCE):
-    """Runs create_new_function on an isolated cache dir and returns the path; omitting overwrite exercises the
-    default-argument call sites, which take a different path than overwrite=False"""
+    """Omitting overwrite hits the default-argument call sites, not the overwrite=False path."""
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
     kwargs = {} if overwrite is _OMIT else {"overwrite": overwrite}
@@ -217,8 +216,7 @@ def test_a_trl_body_is_invalidated_even_from_a_non_trl_location(tmp_path, monkey
 
 
 def test_a_relocated_experimental_trainer_is_still_invalidated(tmp_path, monkeypatch):
-    """TRL moves trainers to trl.experimental (BCO on trl 0.25.1), so the dependency signal keys on the top-level trl
-    package, not a trl.trainer. prefix that would skip them"""
+    """Trainers moved to trl.experimental must be invalidated by the top-level trl signal."""
     location = "trl.experimental.bco.bco_trainer"
     path = _emit(tmp_path, monkeypatch, overwrite=True, model_location=location)
     installed_trl = _stamp_lines(path)[3]

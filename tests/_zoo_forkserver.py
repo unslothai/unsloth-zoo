@@ -1,22 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`python -c CODE` children forked from a pre-warmed server, for tests whose subject is a fresh `import unsloth_zoo`.
-
-A cold `import unsloth_zoo` spends ~7 s (~11 s on a CI runner) importing torch, torchvision, transformers, peft and
-friends, and well under a second in unsloth_zoo itself. Tests that import the zoo once per case in a fresh interpreter
-(the allocator matrices) pay that per case. The server imports the third-party packages once, then forks a child per
-request; the child gets the request's environment, cwd and code, so unsloth_zoo (never imported by the server) runs
-its import-time code fresh, exactly as in a new interpreter, against already-loaded dependencies.
-
-Only for children that assert on what unsloth_zoo's own import-time code does (the allocator matrices read the env
-it writes): transformers, datasets and peft fix HF_HOME at their import, and torch._dynamo / torch._inductor are
-already loaded when the zoo patches them, so a child that depends on either is not equivalent to a fresh interpreter.
-Children exit through os._exit, so atexit hooks they register do not run. Also only for children whose result does
-not depend on those dependencies being imported in this process for the first time: a case that asserts torch is NOT yet imported, or that torch reads a thread variable at its own import, must
-keep `subprocess.run`. Falls back to `subprocess.run` where fork is unavailable, when UNSLOTH_TESTS_FORKSERVER=0,
-or when the server dies.
-"""
+"""Runs `python -c CODE` in children forked from a pre-warmed server so unsloth_zoo's import-time
+code runs fresh; children exit via os._exit, so atexit hooks do not run; cases needing HF_HOME,
+torch._dynamo, torch thread vars or torch unimported keep subprocess.run; falls back when fork is
+unavailable, UNSLOTH_TESTS_FORKSERVER=0, or the server dies."""
 
 from __future__ import annotations
 
@@ -105,8 +93,7 @@ class _Server:
         )
         self.lock = threading.Lock()
         self.seq = 0
-        # A server that hangs while importing must not hang the test: wait at most STARTUP_TIMEOUT_S for READY, then
-        # kill it and let run_python fall back to a plain subprocess.
+        # A hang at server startup: wait STARTUP_TIMEOUT_S for READY, then kill and fall back.
         ready, _, _ = select.select([self.proc.stdout], [], [], STARTUP_TIMEOUT_S)
         if not ready or self.proc.stdout.readline() != b"READY\n":
             self.proc.kill()
@@ -123,8 +110,7 @@ class _Server:
         if not line:
             raise RuntimeError("fork server died")
         reply = json.loads(line)
-        # A call interrupted mid-wait (pytest-timeout, KeyboardInterrupt) leaves its reply unread; the id keeps the
-        # next call from taking that stale exit code as its own.
+        # An interrupted call leaves a reply unread; the id stops the next call taking it.
         if reply.get("id") != self.seq:
             raise RuntimeError("fork server reply out of sync")
         rc = reply["rc"]
@@ -149,8 +135,7 @@ def _enabled():
 
 
 def run_python(code, *, env, cwd, timeout, preload=PRELOAD_THIRD_PARTY):
-    """subprocess.run([sys.executable, '-c', code], env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    from a fork of a server that already imported `preload`."""
+    """Like subprocess.run, but may fork from a server that already imported `preload`."""
     if _enabled():
         import tempfile
         key = (tuple(preload), cwd)

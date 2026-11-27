@@ -59,8 +59,7 @@ def official_gpt_oss_sdpa(Q, K, V, S, sm_scale, sliding_window = 0):
 
 
 def visible(mask_2d, window, kv_offset = 0, kv_length = None):
-    """[B, kv_length] the rule every decode mask must follow for the query at mask_2d's last column: causal, within W
-    tokens including the query, a real (written, unpadded) token."""
+    """[B, kv_length]: causal, within W tokens incl. query, real unpadded token (last query)."""
     q = mask_2d.shape[1] - 1
     kv = kv_offset + torch.arange(kv_length or q + 1)
     ok = (kv <= q) & torch.nn.functional.pad(mask_2d.bool(), (0, max(0, int(kv[-1]) - q)))[:, kv]
@@ -307,8 +306,7 @@ def test_registration_adds_a_custom_key_and_installs_the_device_transfer(monkeyp
 
 
 class _HostTensorSpy(torch.utils._python_dispatch.TorchDispatchMode):
-    """Records every op that reads or makes a CPU tensor. With the work on the meta device, any hit is a tensor built
-    on the host or copied from it: under CUDA graph capture that is a pageable host-to-device copy, which raises."""
+    """Logs CPU tensor ops; under CUDA graph capture these are pageable H2D copies that raise."""
 
     def __enter__(self):
         self.hits = []
@@ -403,8 +401,7 @@ def test_reference_fallback_keeps_an_elided_causal_mask_and_attention_dropout(wh
 
 @pytest.mark.parametrize("change", ["batch", "scale"])
 def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(monkeypatch, change, request):
-    # A success must not send a later specialisation (batch is static; scale, strides, the mask closure) down an
-    # unguarded path where a suppressed compile failure would silently run eager flex.
+    # Later specialisations after a success stay guarded, or suppressed errors run eager flex.
     calls = []
 
     def compiled_flex(query, key, value, **kwargs):

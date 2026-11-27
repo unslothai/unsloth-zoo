@@ -25,8 +25,7 @@ import pytest
 import torch
 
 
-# Imported at module level on purpose: this CI hard gate needs neither GPU nor vLLM (tests/conftest.py probes the
-# device), so an import failure must fail, not skip.
+# Module-level import: CI gate needs no GPU or vLLM, so an import failure must fail, not skip.
 import unsloth_zoo.vllm_utils as vllm_utils
 
 

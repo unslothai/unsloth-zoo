@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 implementations for the tests: the transformers port and Unsloth's native module, loaded
-without importing the unsloth package (no GPU init, no global patches)."""
+"""DeepSeek-V4.1 test implementations, loaded without unsloth: no GPU init, no global patches."""
 
 import importlib
 import importlib.util
