@@ -300,14 +300,66 @@ def record_rollout_topk(request_outputs, k):
 
 
 def _raise_logprobs(params, k):
-    # TRL asks for logprobs=0 (the sampled token); a larger request is left alone.
+    """Raise logprobs to k; returns each params' prior value (False = no logprobs field)."""
     items = params if isinstance(params, (list, tuple)) else [params]
+    asked = []
     for p in items:
         if p is None or not hasattr(p, "logprobs"):
+            asked.append(False)
             continue
         current = getattr(p, "logprobs", None)
+        asked.append(current)
         if current is None or current < k:
             p.logprobs = k
+    return asked
+
+
+def _lower_logprobs(params, asked, k):
+    items = params if isinstance(params, (list, tuple)) else [params]
+    for p, before in zip(items, asked):
+        if before is not False and (before is None or before < k) and getattr(p, "logprobs", None) == k:
+            p.logprobs = before
+
+
+def _as_requested(completion, asked):
+    """Keep only the sampled token plus ranks <= asked: TRL >= 1.x reads rank-sorted entry 0 as the sampled logprob."""
+    positions = getattr(completion, "logprobs", None)
+    if positions is None:
+        return
+    if asked is None:
+        completion.logprobs = None
+        return
+    token_ids = list(getattr(completion, "token_ids", None) or [])
+    cut = []
+    for j, position in enumerate(positions):
+        if position is None or j >= len(token_ids):
+            cut.append(position)
+            continue
+        sampled = int(token_ids[j])
+        kept = {}
+        for token_id, logprob in position.items():
+            rank = getattr(logprob, "rank", None)
+            if int(token_id) == sampled or (rank is not None and rank <= asked):
+                kept[token_id] = logprob
+        cut.append(kept)
+    completion.logprobs = cut
+
+
+def _restore_requested(outputs_list, asked, k):
+    asked = [a for a in asked if a is not False]
+    if not asked:
+        return 0
+    if len(asked) != 1 and len(asked) != len(outputs_list):
+        return 0
+    done = 0
+    for i, request_output in enumerate(outputs_list):
+        want = asked[0] if len(asked) == 1 else asked[i]
+        if want is not None and want >= k:
+            continue
+        for completion in getattr(request_output, "outputs", None) or []:
+            _as_requested(completion, want)
+            done += 1
+    return done
 
 
 def _lift_engine_max_logprobs(llm, k):
@@ -333,16 +385,30 @@ def wrap_vllm_generate_topk(llm, k):
 
     @functools.wraps(generate)
     def generate_with_topk_record(*args, **kwargs):
+        asked, params = [], None
         if "sampling_params" in kwargs:
-            _raise_logprobs(kwargs["sampling_params"], k)
+            params = kwargs["sampling_params"]
         elif len(args) > 1:
-            _raise_logprobs(args[1], k)
-        outputs = generate(*args, **kwargs)
+            params = args[1]
+        if params is not None:
+            asked = _raise_logprobs(params, k)
         try:
-            outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+            outputs = generate(*args, **kwargs)
+        finally:
+            if params is not None:
+                _lower_logprobs(params, asked, k)
+        outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+        try:
             record_rollout_topk(outputs_list, k)
         except Exception as error:
             warnings.warn(f"Unsloth: score centering could not record the sampler top-k head: {error}")
+        try:
+            _restore_requested(outputs_list, asked, k)
+        except Exception as error:
+            warnings.warn(
+                "Unsloth: score centering could not cut vLLM's logprobs back to the sampled token, so TRL may "
+                f"read the top-1 token's logprob as the sampled one: {error}"
+            )
         return outputs
 
     generate_with_topk_record._unsloth_score_centering = True
