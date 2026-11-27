@@ -271,11 +271,11 @@ def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
                 raise
             _warn_fallback("fused GEMM", err)
     w = _dequantize_impl(packed, ggml_type, (N, K), x.dtype)
-    if trans_b:
-        y = torch.nn.functional.linear(x, w, bias)
-    else:
-        y = x @ w
-    return y
+    if not trans_b:
+        return x @ w
+    y = torch.nn.functional.linear(x, w)
+    # bias outside the GEMM: on A100 (torch 2.14) F.linear(x, w, bias) gave x @ w^T + 2 * bias at 16 x 72 x 512 bf16
+    return y if bias is None else y + bias
 
 
 @torch.library.custom_op("unsloth_zoo::gguf_linear", mutates_args = ())
