@@ -263,3 +263,76 @@ def test_kill_switch_scales_out_of_place(stored, monkeypatch):
     w = weight.clone().requires_grad_()
     (_loss(hidden.clone().requires_grad_(), w, labels) * 0.5).backward()
     assert len(stored) == 1 and w.grad.data_ptr() != stored[0]
+
+
+def _batch(seed):
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(0, 96, (2, 12), generator = g)
+    ids[0, :3] = 5
+    return ids, ids.clone()
+
+
+def _grads_both_ways(run, monkeypatch, name = "qwen3"):
+    out = []
+    for reuse in ("1", "0"):
+        monkeypatch.setenv("UNSLOTH_CPU_HEAD_GRAD_REUSE", reuse)
+        model = _tied_model(name)
+        run(model)
+        out.append({n: p.grad.clone() for n, p in model.named_parameters()})
+    return out
+
+
+@needs_keep_graph
+def test_two_forwards_summed_before_one_backward_keep_every_gradient(monkeypatch):
+    def run(model):
+        loss = sum(model(input_ids = ids, labels = labels).loss for ids, labels in (_batch(1), _batch(2)))
+        loss.backward()
+    folded, dense = _grads_both_ways(run, monkeypatch)
+    for n in dense:
+        torch.testing.assert_close(folded[n], dense[n], rtol = 1e-6, atol = 1e-7, msg = n)
+
+
+@needs_keep_graph
+def test_weight_regulariser_on_the_tied_weight_keeps_every_gradient(monkeypatch):
+    def run(model):
+        ids, labels = _batch(3)
+        w = model.get_output_embeddings().weight
+        (model(input_ids = ids, labels = labels).loss + 0.5 * w.square().sum()).backward()
+    folded, dense = _grads_both_ways(run, monkeypatch)
+    for n in dense:
+        torch.testing.assert_close(folded[n], dense[n], rtol = 1e-6, atol = 1e-7, msg = n)
+
+
+@needs_keep_graph
+def test_autograd_grad_on_the_tied_weight_only(monkeypatch):
+    got = []
+    for reuse in ("1", "0"):
+        monkeypatch.setenv("UNSLOTH_CPU_HEAD_GRAD_REUSE", reuse)
+        model = _tied_model("qwen3")
+        ids, labels = _batch(4)
+        w = model.get_output_embeddings().weight
+        got.append(torch.autograd.grad(model(input_ids = ids, labels = labels).loss, [w])[0])
+    assert torch.equal(got[0], got[1])
+
+
+@needs_keep_graph
+def test_head_grad_is_kept_when_the_embedding_backward_does_not_run(monkeypatch):
+    # The inner model cuts its input embeddings from the graph: the CE must keep its own head gradient.
+    real = transformers_qwen3_forward = __import__("transformers").Qwen3Model.forward
+
+    def detached(self, input_ids = None, inputs_embeds = None, **kwargs):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        return real(self, inputs_embeds = inputs_embeds.detach(), **kwargs)
+
+    monkeypatch.setattr(__import__("transformers").Qwen3Model, "forward", detached)
+    ids, labels = _batch(5)
+    grads = []
+    for reuse in ("1", "0"):
+        monkeypatch.setenv("UNSLOTH_CPU_HEAD_GRAD_REUSE", reuse)
+        model = _tied_model("qwen3")
+        model(input_ids = ids, labels = labels).loss.backward()
+        grads.append(model.get_output_embeddings().weight.grad)
+    assert grads[0] is not None and float(grads[0].abs().sum()) > 0
+    assert torch.equal(grads[0], grads[1])
+    del transformers_qwen3_forward
