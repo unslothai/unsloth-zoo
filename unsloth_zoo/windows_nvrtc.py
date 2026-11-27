@@ -47,16 +47,22 @@ def _torch_lib_dir() -> Optional[str]:
     return None
 
 
-def _loads_by_name(name: str) -> bool:
-    """Whether a bare-name LoadLibrary finds ``name``, as NVRTC's own call does (winmode=0 keeps PATH in the
-    search; ctypes' default mode leaves it out)."""
-    try:
-        import ctypes
-
-        ctypes.WinDLL(name, winmode = 0)
-        return True
-    except OSError:
-        return False
+def _loads_by_name(name: str, environ = os.environ) -> bool:
+    """Whether a bare-name LoadLibrary, as NVRTC's own call does, finds ``name`` in the executable's folder, the
+    system folders or PATH. Looked up on disk, never loaded: a load probe also searches the current folder, so an
+    import from a folder another account can write would run whatever DLL of that name was left there."""
+    dirs = [os.path.dirname(exe) for exe in (sys.executable, getattr(sys, "_base_executable", None)) if exe]
+    root = environ.get("SystemRoot") or environ.get("windir")
+    if root:
+        dirs += [os.path.join(root, "System32"), os.path.join(root, "System"), root]
+    dirs += [entry for entry in environ.get("PATH", "").split(os.pathsep) if entry]
+    for folder in dirs:
+        try:
+            if os.path.isfile(os.path.join(os.path.expandvars(folder.strip('"')), name)):
+                return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
 
 
 def expose_torch_lib_to_nvrtc(
