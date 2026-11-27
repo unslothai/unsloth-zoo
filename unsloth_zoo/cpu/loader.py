@@ -30,6 +30,7 @@ import weakref
 
 import torch
 from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
+from unsloth_zoo.utils import _is_out_of_memory
 
 from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
@@ -663,6 +664,8 @@ def _fall_back_to_eager_on_compile_error(layers):
                 if state["eager"]:
                     drop(_layer)
                 return _compiled(*args, **kwargs)
+            if _layer.__dict__.pop("_unsloth_eager_once", False):
+                return _layer._call_impl(*args, **kwargs)  # the restart after an out-of-memory compiled call
             if state["eager"] or _carries_cache(args, kwargs):
                 # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one
                 # failed could not be undone by a retry, so cached forwards (inference) always run eagerly.
@@ -676,6 +679,12 @@ def _fall_back_to_eager_on_compile_error(layers):
             except Exception as error:
                 if _is_control_flow(error) or isinstance(error, _RestartEagerly):
                     raise
+                if _is_out_of_memory(error):
+                    # Not a compile failure: this call reruns eagerly (restarted like below), the next one compiles.
+                    if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
+                        _layer.__dict__["_unsloth_eager_once"] = True
+                        raise _RestartEagerly() from error
+                    return _layer._call_impl(*args, **kwargs)
                 disable(error)
                 if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
                     # A compiled segment before a graph break may already have saved tensors into this call's

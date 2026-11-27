@@ -78,6 +78,9 @@ def exact_merge_available(device, dtype = torch.bfloat16):
         try:
             _SELF_CHECK[key] = _self_check(torch.device("cuda", key[0]), dtype)
         except Exception as error:
+            from .utils import _is_out_of_memory
+            if _is_out_of_memory(error):
+                return False  # no verdict: the unfused path for now, checked again on the next call
             _SELF_CHECK[key] = repr(error)
     return _SELF_CHECK[key] is True
 pass
