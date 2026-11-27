@@ -17,7 +17,8 @@
 """A cat input that is a NonOwningLayout view of the cat buffer must not be reused in place (wrong output on
 torch < 2.16 without the guard). CPU Inductor shows it, so no GPU is needed."""
 
-import shutil
+import os
+import sys
 
 import pytest
 
@@ -25,9 +26,22 @@ torch = pytest.importorskip("torch")
 
 from torch._inductor import scheduler  # noqa: E402
 
-from unsloth_zoo.temporary_patches import inductor_nonowning_inplace as guard  # noqa: E402
+from unsloth_zoo import inductor_nonowning_inplace as guard  # noqa: E402
 
-needs_cpp = pytest.mark.skipif(shutil.which("g++") is None and shutil.which("c++") is None, reason = "no C++ compiler")
+sys.path.insert(0, os.path.dirname(__file__))
+from _cpu_compiler_skip import skip_without_cpu_inductor  # noqa: E402
+
+
+@pytest.fixture(autouse = True)
+def _guard_enabled(monkeypatch):
+    # A caller's opt-out must not change what these tests check.
+    monkeypatch.delenv("UNSLOTH_INDUCTOR_NONOWNING_GUARD", raising = False)
+
+
+def _upstream_fixed():
+    import inspect
+    method = scheduler.BaseSchedulerNode.decide_inplace_update
+    return "NonOwningLayout" in inspect.getsource(getattr(method, "_unsloth_original", method))
 
 
 def _graph(a, b, w1, w2, w3):
@@ -64,7 +78,7 @@ def _compiled_error(decide_inplace_update):
 def test_guard_installed_exactly_below_2_16():
     installed = guard.patch_inductor_nonowning_inplace()
     method = scheduler.BaseSchedulerNode.decide_inplace_update
-    if guard._torch_below_2_16():
+    if guard._torch_below_2_16() and not _upstream_fixed():
         assert installed and getattr(method, guard._FLAG, False)
         assert guard.patch_inductor_nonowning_inplace() is True
         assert scheduler.BaseSchedulerNode.decide_inplace_update is method
@@ -111,7 +125,6 @@ def test_kill_switch_and_installed_state(monkeypatch):
 
 
 def test_cache_tag_is_set_once_and_reaches_workers():
-    import os
     import threading
     if not guard.patch_inductor_nonowning_inplace():
         pytest.skip("guard not installed on this torch")
@@ -127,14 +140,14 @@ def test_cache_tag_is_set_once_and_reaches_workers():
     assert guard.NONOWNING_INPLACE_CACHE_TAG in seen[0].split(",")
 
 
-@needs_cpp
 def test_compiled_cat_matches_eager():
+    skip_without_cpu_inductor()
     guard.patch_inductor_nonowning_inplace()
     assert _compiled_error(scheduler.BaseSchedulerNode.decide_inplace_update) < 1e-3
 
 
-@needs_cpp
 def test_unguarded_inductor_reuses_the_cat_slice():
+    skip_without_cpu_inductor()
     # Proves the test above can fail: the same graph without the guard is wrong.
     if not guard.patch_inductor_nonowning_inplace():
         pytest.skip("torch already excludes NonOwningLayout")
@@ -163,3 +176,16 @@ def test_torch_2_16_is_never_patched(monkeypatch):
     monkeypatch.setattr(torch, "__version__", "2.16.0")
     assert guard.patch_inductor_nonowning_inplace() is False
     assert not getattr(node.decide_inplace_update, guard._FLAG, False)
+
+
+def test_cpu_compile_path_installs_the_guard():
+    import inspect
+    from unsloth_zoo.cpu import loader
+    source = inspect.getsource(loader.compile_cpu_layers)
+    assert "patch_inductor_nonowning_inplace()" in source
+    assert source.index("patch_inductor_nonowning_inplace()") < source.index("_compile_layers(model)")
+
+
+def test_temporary_patches_reexports_the_installer():
+    from unsloth_zoo.temporary_patches import inductor_nonowning_inplace as shim
+    assert shim.patch_inductor_nonowning_inplace is guard.patch_inductor_nonowning_inplace

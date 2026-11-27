@@ -803,6 +803,9 @@ def compile_cpu_layers(model, explicit = False):
             _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
         return 0
     _parallel_kernel_builds()
+    # CPU Inductor has the torch < 2.16 cat in-place bug too, and this path never imports temporary_patches.
+    from unsloth_zoo.inductor_nonowning_inplace import patch_inductor_nonowning_inplace
+    patch_inductor_nonowning_inplace()
     count = _compile_layers(model)
     model._unsloth_cpu_compiled = True
     _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
