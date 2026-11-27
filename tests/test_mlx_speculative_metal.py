@@ -1278,6 +1278,67 @@ def test_a_lone_greedy_row_verifies_draft_trees_and_keeps_its_tokens_and_scores(
     assert not commits
 
 
+def test_dspark_drafts_trees_over_its_markov_lattice_and_keeps_its_replies(qwen_4bit, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, speculative as S
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        drafter = S._built(S.ContextDrafter, _tiny_companion(model, "RadixArk/Qwen3.8-27B-DSpark"), model.language_model)
+        dspark, block = drafter.model, drafter.trained_depth + 1
+        assert isinstance(drafter._draft, inference._MarkovTreeDrafter) and drafter.tree_widths == (block,)
+        context = drafter.features(model.language_model(mx.array([ids[0][:24]]), **drafter.capture))
+        anchor, stash, logits = ids[0][24], [], dspark._logits
+        monkeypatch.setattr(dspark, "_logits", lambda h: stash.append(logits(h)) or stash[-1])
+        for quantized in (False, True):
+            mx.random.seed(0)
+            markov = type(dspark.markov_head)(dspark.config.vocab_size, 64)
+            markov.markov_w1.weight = markov.markov_w1.weight * 64
+            markov.set_dtype(mx.bfloat16)   # as checkpoints ship it
+            if quantized:
+                markov.markov_w1, markov.markov_w2 = nn.QuantizedEmbedding.from_embedding(markov.markov_w1, 64, 4), nn.QuantizedLinear.from_linear(markov.markov_w2, 64, 4)
+            dspark.markov_head, dspark.confidence_head = markov, None
+            stash.clear()
+            chain = dspark.draft_block(anchor, context, dspark.make_cache(), block, lambda x: mx.argmax(x, axis = -1))
+            tree = drafter._draft.tree(anchor, context, dspark.make_cache(), block, 16)
+            tokens, parents, depths, logq = (a.tolist() for a in (tree.tokens, tree.parent, tree.block.depth, tree.logq))
+            first = next((i for i in range(1, 16) if parents[i] != i - 1), 16)
+            assert tokens[0] == anchor and first > 2 and tokens[1:first] == chain[0, : first - 1].tolist()
+            pairs = [(a, b) for a in range(1, 16) for b in range(a + 1, 16) if parents[a] == parents[b]]
+            assert any(depths[a] > 1 for a, _ in pairs)
+            for a, b in pairs:
+                up = parents[a]
+                step = markov.apply_step_logits(stash[0][:, depths[a] - 1], mx.array([tokens[up]]))[0].astype(mx.float32)
+                # Under the chain's token, exactly DSpark's own step; elsewhere within float32 against its rounding.
+                native = depths[up] == 0 or tokens[up] == chain[0, depths[up] - 1].item()
+                assert abs((logq[a] - logq[b]) - (step[tokens[a]] - step[tokens[b]]).item()) < (1e-3 if native else 0.05)
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        drafter.predraft_rows, rounds = 0, []
+        engine = S.SpeculativeEngine(model, _script(("draft", 4), ("plain", 2)), drafter)
+        engine.controller.max_depth = drafter.trained_depth
+        drafter.tree_budget = SimpleNamespace(choose = lambda: block, observe = lambda *args: None)
+        tree_round = engine._tree_round
+        monkeypatch.setattr(engine, "_tree_round", lambda *args: rounds.append(1) or tree_round(*args))
+        assert _scored_reply(model, ids, engine, 48)[0] == _solo(model, ids[0], 48, SamplingParams()) and rounds
+        # Ties go to the lower token as argmax breaks them: an exact tie, and two sums only bf16 rounds level.
+        vocab = mx.arange(dspark.config.vocab_size)
+        for (base3, base7), (lift3, lift7) in (((1.0, 0.0), (0.0, 1.0)), ((0.0, 3 * 2.0 ** -22), (-16.0, -16.0))):
+            markov = type(dspark.markov_head)(dspark.config.vocab_size, 64)
+            markov.markov_w1.weight = mx.zeros_like(markov.markov_w1.weight).at[:, 0].add(1.0)
+            markov.markov_w2.weight = mx.zeros_like(markov.markov_w2.weight).at[3, 0].add(lift3).at[7, 0].add(lift7)
+            markov.set_dtype(mx.bfloat16)
+            dspark.markov_head = markov
+            base = mx.where(vocab == 3, base3, mx.where(vocab == 7, base7, -30.0)).astype(mx.bfloat16)
+            monkeypatch.setattr(dspark, "_logits", lambda h, base = base: base * mx.ones(logits(h).shape, mx.bfloat16))
+            chain = dspark.draft_block(anchor, context, dspark.make_cache(), block, lambda x: mx.argmax(x, axis = -1))
+            tree = drafter._draft.tree(anchor, context, dspark.make_cache(), block, 16)
+            tokens, parents = tree.tokens.tolist(), tree.parent.tolist()
+            first = next((i for i in range(1, 16) if parents[i] != i - 1), 16)
+            assert set(chain[0].tolist()) == {3} and first > 2 and tokens[1:first] == chain[0, : first - 1].tolist(), (base7, tokens)
+    sparse = S._built(S.ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2"), model.language_model)
+    assert not isinstance(sparse._draft, inference._MarkovTreeDrafter)
+
+
 def test_tree_and_chain_rounds_commit_on_the_engines_stream(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams

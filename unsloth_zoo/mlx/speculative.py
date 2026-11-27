@@ -3076,8 +3076,8 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
-    from .inference import (fused_drafter_layers, fused_drafter_ops, lane_drafter_head, lane_drafter_projections, sparse_drafter,
-                            submitted_drafter_layers)
+    from .inference import (fused_drafter_layers, fused_drafter_ops, lane_drafter_head, lane_drafter_projections, markov_tree_drafter,
+                            sparse_drafter, submitted_drafter_layers)
 
     fused_drafter_ops(model)
     fused_drafter_layers(model)
@@ -3088,8 +3088,8 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
     language = getattr(target, "language_model", target)
     lane_drafter_head(model, getattr(target, "lm_head", None) or getattr(language, "lm_head", None))
     if isinstance(drafter, ContextDrafter):
-        drafter._draft = sparse_drafter(model, target, drafter._draft)
-        from .inference import _SparseDrafter, _VERIFY_GDN_MAX_ROWS, fast_verify_covers, lane_tile_rows
+        drafter._draft = markov_tree_drafter(model, sparse_drafter(model, target, drafter._draft))
+        from .inference import _MarkovTreeDrafter, _SparseDrafter, _VERIFY_GDN_MAX_ROWS, fast_verify_covers, lane_tile_rows
 
         if (isinstance(drafter._draft, _SparseDrafter) and fast_verify_covers(target)
                 and drafter.predraft_rows >= _VERIFY_GDN_MAX_ROWS):
@@ -3107,6 +3107,10 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
             else:
                 drafter.sized_trees = True
                 drafter.tree_widths = tuple(range(_MIN_SIZED_TREE, drafter.trained_depth + 2))
+        if (isinstance(drafter._draft, _MarkovTreeDrafter) and fast_verify_covers(target)
+                and not any(hasattr(module, "switch_mlp") for _, module in target.named_modules())):
+            # The block's width verifies at the chain's cost; wider trees cross the next row tile and cost more than they gain.
+            drafter.tree_widths = (drafter.trained_depth + 1,)
         if not lazy and fast_verify_covers(target):
             language.__dict__["_unsloth_warm_drafter"] = weakref.ref(drafter)  # for `warm_speculative_rounds`
     drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
