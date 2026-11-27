@@ -1,5 +1,4 @@
-"""enable_grouped_moe skips the grouped_mm probe on dense models (nothing to patch or restore), while MoE configs,
-ModuleList MoE blocks, experts submodules and an earlier grouped patch still reach it. CPU only."""
+"""Dense models skip the grouped_mm probe; any MoE signal still reaches it. CPU only."""
 import types
 
 import pytest

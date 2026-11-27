@@ -1102,8 +1102,7 @@ def _config_has_experts(config, depth=0):
 
 
 def _may_have_moe(model) -> bool:
-    """False only when nothing marks the model as MoE: no expert count in its config, no ModuleList MoE block,
-    no experts submodule and no grouped forward of ours to restore. Dense models then skip the grouped_mm probe."""
+    """False only if no config expert count, MoE block, experts submodule or prior grouped patch exists."""
     try:
         if _config_has_experts(getattr(model, "config", None)):
             return True
@@ -1126,7 +1125,7 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
         for module in model.modules():
             _restore_block(module)
         return 0
-    if not _may_have_moe(model):   # dense model: nothing to patch or restore, so no probe at load
+    if not _may_have_moe(model):   # dense: skip the grouped_mm probe
         return 0
     if not _grouped_mm_supported():
         return 0
