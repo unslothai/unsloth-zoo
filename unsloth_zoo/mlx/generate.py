@@ -621,8 +621,7 @@ def _unpadded_lengths(mask) -> list[int] | None:
 
 
 def _embedded_columns(embeds, tokens: int) -> int:
-    """Positions one row's embedding fills: a model that splices an image's features in place
-    of its single placeholder id feeds more than the ids name."""
+    """Columns one row's embedding fills: a splicing model (FastVLM) fills more than its ids."""
     shape = getattr(embeds, "shape", None)
     return int(shape[1]) if shape is not None and len(shape) > 1 else tokens
 
@@ -3638,8 +3637,7 @@ class _VLMBatchAdapter:
                     row_sampler.bind_uids(uids)
                     row_sampler.bind_generator(generator)
                 counts = _unpadded_lengths(mask)
-                # A model may strip and re-pad padded rows, so the embedded width is each row's only
-                # when no row is padded and every row splices as many placeholders.
+                # The width is each row's only with no padded row and equal placeholders: models may re-pad.
                 width = len(prompt_ids[0])
                 spliced = (
                     _embedded_columns(gen_kwargs.get("inputs_embeds"), width) - width
@@ -4392,8 +4390,7 @@ class _SpeculativeBatchSession:
 
     @contextmanager
     def _embedded(self, tokens: int):
-        """Note whether the prompt ``generate_step`` embeds has one column per token, yielding
-        ``[columns]`` it filled."""
+        """Yield ``[columns]`` the prompt ``generate_step`` embeds fills; note if one per token."""
         model = self.adapter.model
         embed, own = model.get_input_embeddings, vars(model).get("get_input_embeddings")
         fed = [tokens]
