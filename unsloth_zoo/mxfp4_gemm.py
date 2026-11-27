@@ -24,6 +24,7 @@ values per ``r``. Rows of ``x`` are sorted by expert (``counts[e]`` rows each, l
 (no expert schedule), e.g. a packed MXFP4 Linear."""
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 from .triton_specialize import jit_any_alignment as _jit_any_alignment
 
 __all__ = [
@@ -560,7 +561,7 @@ def _big_tiles(device):
     ok = _BIG_TILES.get(device.index)
     if ok is None:
         index = device.index if device.index is not None else torch.cuda.current_device()
-        ok = _BIG_TILES[device.index] = torch.version.hip is None and torch.cuda.get_device_capability(index)[0] == 10
+        ok = _BIG_TILES[device.index] = not is_rocm_torch(torch) and torch.cuda.get_device_capability(index)[0] == 10
     return ok
 
 
@@ -577,7 +578,7 @@ def _asm_ok(device, eager = False):
         import os
         index = key if key is not None else torch.cuda.current_device()
         ok = (
-            torch.version.hip is None
+            not is_rocm_torch(torch)
             and torch.cuda.get_device_capability(index) >= (8, 0)
             and os.environ.get("UNSLOTH_MXFP4_ASM", "1") != "0"
         )
@@ -595,7 +596,7 @@ def _cvt_ok(index, eager = False):
     so auto only enables sm_120. None = cannot probe here (inside a trace or a CUDA graph capture)."""
     import os
     mode = os.environ.get("UNSLOTH_MXFP4_CVT", "auto").strip().lower()
-    if torch.version.hip is not None:
+    if is_rocm_torch(torch):
         return False  # inline PTX; ROCm reports gfx11 as capability 11.x
     major = torch.cuda.get_device_capability(index)[0]
     if mode == "0" or major < 10 or (mode != "1" and major != 12):
@@ -767,7 +768,7 @@ _never_a_root_frame(_resolve_decode_mode)
 def mxfp4_grouped_mm_compiled(x, blocks, scales, counts, transpose_b):
     """``mxfp4_grouped_mm_op`` for compiled regions. The GEMV / tile choice is made here, where dynamo guards on the
     row count; inside the op the trace-time shape would freeze it for every later size."""
-    if x.is_cuda and torch.version.hip is None:
+    if x.is_cuda and not is_rocm_torch(torch):
         _resolve_decode_mode(x.device.index)
     if mxfp4_grouped_gemv_op is not None and _gemv_rows(x.shape[0], blocks.shape[0], transpose_b):
         return mxfp4_grouped_gemv_op(x, blocks, scales, counts)
@@ -951,7 +952,7 @@ def _available_in_trace(name, dtype, tiles, mode):
             with torch.autocast(device.type, enabled = False), torch.no_grad():
                 ok = _probe_dense(device, dtype)
         if ok and len(key) == 3:
-            ok = torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+            ok = is_rocm_torch(torch) or torch.cuda.get_device_capability(device) >= (8, 0)
     except Exception:
         ok = False  # the eager call repeats the check and warns
     _TRACE_AVAILABLE[key] = ok
@@ -1005,7 +1006,7 @@ def _available(device, dtype, tiles):
         return True
     if len(key) == 3:
         ok = _available(device, dtype, False) and (
-            torch.version.hip is not None or torch.cuda.get_device_capability(device) >= (8, 0)
+            is_rocm_torch(torch) or torch.cuda.get_device_capability(device) >= (8, 0)
         )
         _AVAILABLE_DTYPE[key] = ok
         return ok

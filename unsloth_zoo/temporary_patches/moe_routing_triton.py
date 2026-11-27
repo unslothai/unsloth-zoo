@@ -33,6 +33,7 @@ import os
 from typing import Tuple
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 try:
     import triton
@@ -252,7 +253,7 @@ def triton_routing_available(device) -> bool:
         or _KILLED
         or _DISABLED_REASON is not None
         or getattr(device, "type", None) != "cuda"
-        or (torch.version.hip is not None and not _FORCED)
+        or (is_rocm_torch(torch) and not _FORCED)
         or os.environ.get("TRITON_INTERPRET", "0") == "1"
     )
 
@@ -344,7 +345,7 @@ def moe_routing_sort(top_k_index, num_experts):
         _OP is not None
         and not _KILLED
         and top_k_index.is_cuda
-        and (torch.version.hip is None or _FORCED)
+        and (not is_rocm_torch(torch) or _FORCED)
         and not top_k_index.is_floating_point()
     ):
         if torch.compiler.is_compiling():

@@ -55,6 +55,7 @@ import contextlib
 import os
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 try:
     import triton
@@ -412,7 +413,7 @@ _SMEM = {}
 def _generic_family(device):
     """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's; ROCm (64 KB LDS) sm120's."""
     cap = _capability(device)
-    if cap[0] == 12 or torch.version.hip is not None or "rocm" in torch.__version__:
+    if cap[0] == 12 or is_rocm_torch(torch):
         return "sm120"
     if cap[0] >= 9 or cap == (8, 0):
         return "sm80"
@@ -745,7 +746,7 @@ def fp16_grouped_available(device) -> bool:
         or _DISABLED_REASON is not None
         or os.environ.get("UNSLOTH_GPTOSS_GROUPED_FP16", "1") == "0"
         or getattr(device, "type", None) != "cuda"
-        or torch.version.hip is not None
+        or is_rocm_torch(torch)
         or os.environ.get("TRITON_INTERPRET", "0") == "1"
     ):
         return False
@@ -772,7 +773,7 @@ def unavailable_reason():
         return f"float16 grouped GEMM disabled: {_DISABLED_REASON}"
     if os.environ.get("UNSLOTH_GPTOSS_GROUPED_FP16", "1") == "0":
         return "UNSLOTH_GPTOSS_GROUPED_FP16=0"
-    if torch.version.hip is not None:
+    if is_rocm_torch(torch):
         return "float16 grouped GEMM is CUDA-only"
     return "float16 grouped GEMM unavailable on this device"
 

@@ -29,6 +29,7 @@ import os
 import warnings
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 try:
     import triton
@@ -49,7 +50,7 @@ def fused_glue_enabled(t) -> bool:
         and not _STATE["failed"]
         and os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") != "0"
         and t.is_cuda
-        and torch.version.hip is None
+        and not is_rocm_torch(torch)
         and type(t) is torch.Tensor
     )
 

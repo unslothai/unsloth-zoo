@@ -32,6 +32,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+from unsloth_zoo.rocm_build import is_rocm_torch
 
 __all__ = [
     "disk_tier_enabled",
@@ -70,7 +71,7 @@ _GET_LAST_ERROR = []
 def _resolve_get_last_error():
     """cudaGetLastError (hipGetLastError on ROCm) of the runtime torch already loaded; torch does not expose it."""
     import ctypes
-    hip = bool(getattr(torch.version, "hip", None))
+    hip = is_rocm_torch(torch)
     sym = "hipGetLastError" if hip else "cudaGetLastError"
     if sys.platform == "win32":
         import glob
@@ -87,7 +88,7 @@ def _resolve_get_last_error():
     if fn is not None:
         return fn
     lib = "libamdhip64.so" if hip else "libcudart.so"
-    major = ((torch.version.hip if hip else torch.version.cuda) or "").split(".")[0]
+    major = (getattr(torch.version, "hip" if hip else "cuda", None) or "").split(".")[0]
     mapped = []
     try:
         with open("/proc/self/maps", encoding = "utf-8") as maps:

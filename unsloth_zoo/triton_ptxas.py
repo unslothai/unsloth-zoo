@@ -55,7 +55,8 @@ def keep_newest_blackwell_ptxas():
         if find_spec("flashinfer") is None or find_spec("triton") is None:
             return None
         import torch
-        if getattr(torch.version, "hip", None) is not None or getattr(torch.version, "cuda", None) is None:
+        from unsloth_zoo.rocm_build import is_rocm_torch
+        if is_rocm_torch(torch) or getattr(torch.version, "cuda", None) is None:
             return None
         from triton.backends.nvidia.compiler import get_ptxas
         tool = get_ptxas(100)  # env unset, so this is Triton's bundled ptxas-blackwell

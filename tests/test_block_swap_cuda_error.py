@@ -24,6 +24,7 @@ import types
 
 import pytest
 import torch
+from _torch_version_tag import drop_rocm_tag  # noqa: E402
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _dspec = importlib.util.spec_from_file_location(
@@ -82,6 +83,8 @@ def test_the_resolver_asks_the_runtime_torch_runs_on(monkeypatch, hip, want):
             return name
 
     monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    if not hip:
+        drop_rocm_tag(monkeypatch, torch)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(ctypes, "CDLL", _Lib)
     assert _disk._resolve_get_last_error() == want
