@@ -24,6 +24,7 @@ import functools
 import importlib.util
 import os
 import sys
+import threading
 import warnings
 
 import pytest
@@ -1070,6 +1071,172 @@ def test_out_of_memory_ending_the_step_keeps_the_window():
     assert why is None and losses == [0, 1]
     assert Swap.resets == 1
     assert all(p.grad is not None for p in layers.parameters())
+
+
+# ---------------------------------------------------------------- round 3 review fixes
+class _CkptToy(_Toy):
+    """A decoder layer with its own checkpoint wrapper, as transformers' GradientCheckpointingLayer."""
+    def __init__(self, func = None):
+        super().__init__()
+        self.gradient_checkpointing = True
+        self._gradient_checkpointing_func = func or functools.partial(torch.utils.checkpoint.checkpoint,
+                                                                     use_reentrant = True)
+
+    def _inner(self, x, past_key_value = None):
+        if past_key_value is not None:
+            past_key_value.n += 1
+        return torch.tanh(self.lin(x))
+
+    def forward(self, x, **kwargs):
+        if self.gradient_checkpointing and self.training:
+            return self._gradient_checkpointing_func(functools.partial(self._inner, **kwargs), x)
+        return self._inner(x, **kwargs)
+
+
+def _ckpt_fns(layers, n = 2, **call):
+    def fn(m):
+        x = _toy_x(m).requires_grad_(True)
+        for layer in layers:
+            x = layer(x, **call)
+        x.square().sum().backward()
+    return [functools.partial(fn, m) for m in range(n)]
+
+
+@pytest.mark.parametrize("how", ["context_fn", "unrecognised"])
+def test_checkpoint_wrappers_the_window_cannot_reproduce_are_refused(how):
+    """A checkpoint context_fn (autocast in the checkpointed region) or a wrapper the window does not know: the
+    window bypasses the wrapper, so it would train without what the wrapper does."""
+    if how == "context_fn":
+        def ctx():
+            return contextlib.nullcontext(), torch.autocast("cpu", dtype = torch.bfloat16)
+        func = functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant = False, context_fn = ctx)
+    else:
+        def func(f, *args):
+            with torch.autocast("cpu", dtype = torch.bfloat16):
+                return torch.utils.checkpoint.checkpoint(f, *args, use_reentrant = True)
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_CkptToy(func) for _ in range(3)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        losses, why = _toy_run(layers, _ckpt_fns(layers))
+    assert losses is None and "checkpoint" in why, why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_unsloth_checkpoint_shims_count_as_reentrant():
+    def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
+        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant = True)
+    unsloth_gradient_checkpoint.__module__ = "unsloth_zoo.gradient_checkpointing"
+    layer = _CkptToy(functools.partial(unsloth_gradient_checkpoint, use_reentrant = False))
+    assert lm._checkpoint_mode(layer) == (True, None)
+    layer.gradient_checkpointing = False
+    assert lm._checkpoint_mode(layer) == (False, None)
+
+
+def test_live_cache_under_a_cleared_keyword_aborts():
+    """A cache under a keyword the checkpoint wrapper clears (the deprecated past_key_value alias, which the decoder
+    still reads): checked on the call as made, before clearing."""
+    class DynamicCache:
+        n = 0
+
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_CkptToy() for _ in range(3)])
+    cache = DynamicCache()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        losses, why = _toy_run(layers, _ckpt_fns(layers, past_key_value = cache))
+    assert losses is None and "live KV cache" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_trainable_weights_shared_between_decoder_layers_are_refused():
+    layers = _toy_stack()
+    layers[2].lin = layers[0].lin
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "share a trainable weight" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_an_error_ending_the_step_restores_gradients_rng_and_swapper():
+    layers = _toy_stack()
+    head = torch.nn.Parameter(torch.ones(16))
+    owner = torch.nn.ModuleList(list(layers))
+    owner.head = torch.nn.Module()
+    owner.head.w = head
+
+    class Swap(_Holds):
+        resets = 0
+
+        @contextlib.contextmanager
+        def layer_major_window(self):
+            yield
+
+        def _end_step(self):
+            raise RuntimeError("prefetch failed")
+
+        def reset(self):
+            Swap.resets += 1
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        (x * head).sum().backward()
+        torch.rand(3)
+
+    head.grad = torch.full((16,), 7.0)
+    rng = torch.get_rng_state()
+    with pytest.raises(RuntimeError, match = "prefetch failed"):
+        lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], swapper = Swap(), model = owner)
+    assert torch.equal(head.grad, torch.full((16,), 7.0))
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert Swap.resets == 1
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_an_interrupted_submission_leaves_no_worker_waiting():
+    layers = _toy_stack()
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+        return m
+
+    fns = [functools.partial(fn, m) for m in range(2)]
+    assert _toy_run(layers, fns)[1] is None   # two workers exist
+
+    class Interrupting:
+        def __init__(self, real):
+            self.real, self.fired = real, False
+
+        def put(self, job):
+            if not self.fired:
+                self.fired = True
+                raise KeyboardInterrupt
+            self.real.put(job)
+
+    real = lm._WORKERS.queues[1]
+    lm._WORKERS.queues[1] = Interrupting(real)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _toy_run(layers, fns)
+    finally:
+        lm._WORKERS.queues[1] = real
+    assert all(p.grad is None for p in layers.parameters())
+    out = []
+    t = threading.Thread(target = lambda: out.append(_toy_run(layers, fns)), daemon = True)
+    t.start()
+    t.join(30)
+    assert out and out[0][1] is None and out[0][0] == [0, 1]
 
 
 def test_boundary_bytes():

@@ -305,32 +305,35 @@ def _kv_shared_layers(layers):
 _CKPT_SHIMS = ("unsloth_checkpoint", "unsloth_gradient_checkpoint", "unsloth_offloaded_gradient_checkpoint")
 
 
-def _forward_without_grad(layer):
-    """Whether standard training runs this layer's forward without gradients: a reentrant checkpoint wrapper
-    (torch's checkpoint with use_reentrant True or unset, or Unsloth's, autograd Functions). The window's no-grad
-    forward and grad-mode recompute are then exactly standard accumulation's, also where the two differ in the
-    last bit (a compiled block's inference and training graphs). False for a non-reentrant checkpoint, no
-    checkpointing, or a wrapper not recognised here: the forward would run under grad mode there."""
+def _checkpoint_mode(layer):
+    """(no_grad_forward, problem) for the layer's own checkpoint wrapper, which the window bypasses.
+    no_grad_forward: standard training runs this layer's forward without gradients, a reentrant checkpoint (torch's
+    checkpoint with use_reentrant True or unset, or Unsloth's shims, autograd Functions whatever use_reentrant says).
+    The window's no-grad forward and grad-mode recompute are then exactly standard accumulation's, also where the two
+    differ in the last bit (a compiled block's inference and training graphs). problem: a wrapper the window cannot
+    reproduce (checkpoint options such as a context_fn, an unrecognised wrapper), refused."""
     if not (getattr(layer, "gradient_checkpointing", False) and getattr(layer, "training", False)):
-        return False
+        return False, None
     fn, reentrant = getattr(layer, "_gradient_checkpointing_func", None), None
     pristine = getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
     for _ in range(8):
         if fn is None:
-            return False
+            break
         if isinstance(fn, functools.partial):
+            if fn.args or set(fn.keywords) - {"use_reentrant"}:
+                return False, "a decoder layer's checkpoint has custom options (context_fn and the like)"
             if reentrant is None and "use_reentrant" in fn.keywords:
                 reentrant = fn.keywords["use_reentrant"]
             fn = fn.func
             continue
         name, module = getattr(fn, "__name__", ""), getattr(fn, "__module__", "") or ""
         if name in _CKPT_SHIMS and module.startswith("unsloth_zoo"):
-            return reentrant is not False
+            return True, None
         if fn is torch.utils.checkpoint.checkpoint or fn is pristine or \
                 (name == "checkpoint" and module == "torch.utils.checkpoint"):
-            return reentrant is None or reentrant is True   # torch: unset means reentrant
+            return reentrant is None or reentrant is True, None   # torch: unset means reentrant
         fn = getattr(fn, "__wrapped__", None)   # block swap's checkpoint wrapper, torch's dynamo-disable wrapper
-    return False
+    return False, "a decoder layer's checkpoint wrapper is not one the window can reproduce"
 
 
 _INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
@@ -388,7 +391,7 @@ class _Window:
         self.signatures = [self._call_signature(l) for l in range(self.L)]
         self.layer_devices = [{p.device for p in layer.parameters() if p.is_cuda} for layer in self.layers]
         # Layers whose standard forward runs under grad mode: the window's no-grad forward must match its recompute.
-        self.check_values = [True] * self.L
+        self.check_values = [False] * self.L
         self.in_backward = False
         self.input_used = [False] * n
 
@@ -468,16 +471,16 @@ class _Window:
             self.input_hooks.append(h.register_hook(functools.partial(self._input_grad, m)))
         # Same requires_grad as the input a reentrant checkpoint passes its no-grad forward (compiled guards).
         x = h.detach().requires_grad_(h.requires_grad)
-        kwargs = _uncached(layer, dict(kwargs))
-        if not getattr(layer, "_can_checkpoint_with_cache", False) and (
-                any(_is_cache(v) for v in (args[1:] if where == 0 else args))
-                or any(_is_cache(v) for k, v in kwargs.items() if k != where)):
-            # A live KV / state cache, positional or keyword (use_cache without checkpointing, cache_params):
-            # the recompute would update it a second time.
+        if any(_is_cache(v) for v in (*others[0], *others[1].values())):
+            # A live KV / state cache, positional or under any keyword (deprecated aliases included), checked on
+            # the call as made: the recompute would update it a second time.
             self._abort("a decoder layer call with a live KV cache")
+        no_grad_forward, problem = _checkpoint_mode(layer)
+        if problem is not None:
+            self._abort(problem)
+        self.check_values[l] = self.check_values[l] or not no_grad_forward
+        kwargs = _uncached(layer, dict(kwargs))
         args2, kwargs2 = _with_hidden(args, kwargs, where, x)
-        if m == 0:
-            self.check_values[l] = not _forward_without_grad(layer)
         devices = self.layer_devices[l] | ({x.device} if x.is_cuda else set())
         self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(sorted(devices, key = str)))
         if m == 0 and self.swapper is not None:
@@ -628,7 +631,10 @@ class _Workers:
                 job = window = fn = None
                 done.set()
 
-    def run(self, window, fns):
+    def run(self, window, fns, events):
+        """Submit one job per micro-batch, appending each one's done event to `events`. The window's lock is held
+        while submitting: no worker enters the model until every job is in, and an interrupted submission aborts
+        the window, so the workers already given a job leave instead of waiting for the others."""
         import queue
         with self.lock:
             while len(self.queues) < len(fns):
@@ -637,12 +643,17 @@ class _Workers:
                                  name = f"unsloth-layer-major-{len(self.queues)}").start()
                 self.queues.append(q)
             queues = self.queues[:len(fns)]
-        events = []
-        for m, (q, fn) in enumerate(zip(queues, fns)):
-            done = threading.Event()
-            events.append(done)
-            q.put((window, m, fn, done))
-        return events
+        with window.cv:
+            try:
+                for m, (q, fn) in enumerate(zip(queues, fns)):
+                    done = threading.Event()
+                    q.put((window, m, fn, done))
+                    events.append(done)
+            except BaseException:
+                if window.abort_reason is None:
+                    window.abort_reason = "interrupted while submitting micro-batches"
+                window.cv.notify_all()
+                raise
 
 
 _WORKERS = _Workers()
@@ -687,26 +698,16 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
     if not _WINDOW_LOCK.acquire(blocking = False):
         return None, "another layer-major window is running in this process"
     try:
-        scope = getattr(swapper, "layer_major_window", None)
         reset = getattr(swapper, "reset", None)
         try:
-            with scope() if scope is not None else nullcontext():
-                results, why = _run_layer_major(layers, micro_fns, swapper, model)
+            results, why = _run_layer_major(layers, micro_fns, swapper, model)
         except BaseException:
             # The gradients and RNG are already put back; blocks a raising window left pending are released.
             if reset is not None:
                 reset()
             raise
-        if swapper is not None:
-            if results is not None and scope is not None:
-                try:
-                    swapper._end_step()   # the step's single end, once its whole backward is done
-                except torch.OutOfMemoryError:
-                    # Only the optional prefetch for the next step ran out: the step's gradients are complete.
-                    if reset is not None:
-                        reset()
-            elif results is None and reset is not None:
-                reset()       # an interrupted window leaves blocks pending: release them all
+        if results is None and reset is not None:
+            reset()       # an interrupted window leaves blocks pending: release them all
         return results, why
     finally:
         _WINDOW_LOCK.release()
@@ -744,6 +745,19 @@ def _run_layer_major(layers, micro_fns, swapper, model):
     if _saved_tensor_hooks_active():
         # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
         return None, "saved-tensor hooks are active (activation offloading)"
+    # Decoder weights get gradients only from the window's backward; one the loss parts write (a regulariser on a
+    # decoder weight) would be added before every recompute contribution instead of interleaved with them.
+    decoder, seen_dec = [], set()
+    for layer in layers:
+        for p in layer.parameters():
+            if not p.requires_grad:
+                continue
+            if id(p) in seen_dec:
+                # Standard accumulation adds its layers' contributions micro-batch by micro-batch, the window
+                # layer by layer.
+                return None, "decoder layers share a trainable weight"
+            seen_dec.add(id(p))
+            decoder.append(p)
     # A loss part can also write gradients directly (a regulariser on a decoder weight): an abort puts back all.
     params, seen = [], set()
     for owner in ([model] if model is not None else []) + list(layers):
@@ -756,14 +770,6 @@ def _run_layer_major(layers, micro_fns, swapper, model):
     except torch.OutOfMemoryError:
         return None, "out of memory while saving the gradients a window would have to restore"
     rng = _all_rng_state()
-    # Decoder weights get gradients only from the window's backward; one the loss parts write (a regulariser on a
-    # decoder weight) would be added before every recompute contribution instead of interleaved with them.
-    decoder, seen_dec = [], set()
-    for layer in layers:
-        for p in layer.parameters():
-            if p.requires_grad and id(p) not in seen_dec:
-                seen_dec.add(id(p))
-                decoder.append(p)
     watched = [(p, p.grad, None if p.grad is None else p.grad._version) for p in decoder]
 
     def restore():
@@ -777,8 +783,22 @@ def _run_layer_major(layers, micro_fns, swapper, model):
         _STATS["last_abort"] = reason
         return None, reason
 
+    scope = getattr(swapper, "layer_major_window", None)
     try:
-        return _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back)
+        with scope() if scope is not None else nullcontext():
+            results, why = _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back)
+        if results is not None:
+            if scope is not None:
+                try:
+                    swapper._end_step()   # the step's single end, once its whole backward is done
+                except torch.OutOfMemoryError:
+                    # Only the optional prefetch for the next step ran out: the step's gradients are complete.
+                    reset = getattr(swapper, "reset", None)
+                    if reset is not None:
+                        reset()
+            _STATS["windows"] += 1
+            _STATS["micro_batches"] += n
+        return results, why
     except BaseException:
         # A real error (or an interrupt) propagates, but a caller that catches it must not inherit a partial
         # accumulation or consumed RNG draws.
@@ -798,8 +818,9 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
     w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
     try:
         with _intercept(w, layers) as orig_calls:
-            events = _WORKERS.run(w, micro_fns)
+            events = []
             try:
+                _WORKERS.run(w, micro_fns, events)
                 for done in events:
                     while not done.wait(0.5):
                         pass
@@ -852,6 +873,4 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
         del error
         w.saved = w.outs = w.h0 = None
         return roll_back(reason)
-    _STATS["windows"] += 1
-    _STATS["micro_batches"] += n
     return w.results, None
