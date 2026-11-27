@@ -241,3 +241,20 @@ def test_strided_counts_match_contiguous(fmt):
     strided = storage[::2]
     assert not strided.is_contiguous()
     assert torch.equal(_call(param, x, strided, True), _call(param, x, counts, True))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_divide_global_rounds_like_the_dequantize_kernel(dtype):
+    # Every positive e4m3 block scale under a global scale where scale / g and scale * (1 / g) differ after the cast
+    # (64 of 126 x 7 bf16 weights at this g): a reciprocal multiply in the decode would not match dequantize.
+    N, K = 126, 32
+    glob = torch.tensor([1078105494], dtype = torch.int32).view(torch.float32).reshape(1, 1).cuda()
+    scales = torch.arange(1, N + 1, dtype = torch.uint8).reshape(1, N, 1).repeat(1, 1, K // 16).cuda()
+    lo = torch.arange(K // 2, dtype = torch.uint8) % 16
+    codes = (lo | (((lo + 1) % 16) << 4)).reshape(1, 1, K // 2).repeat(1, N, 1).cuda()
+    param = Nvfp4ExpertParam(codes, packed_scales = scales, packed_global = glob, packed_dtype = dtype,
+                             packed_global_mode = "divide")
+    x = torch.eye(K, dtype = dtype, device = "cuda")
+    got = _call(param, x, torch.tensor([K], dtype = torch.int32, device = "cuda"), True)
+    want = param.dequantize(dtype, transpose = False)[0].t()
+    assert torch.equal(got, want)
