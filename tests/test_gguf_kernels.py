@@ -40,6 +40,11 @@ QUANT_TYPES = [t for t in ALL_TYPES if t not in (T.F32, T.F16, T.BF16)]
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 
 
+def _half():
+    # what Unsloth computes in: bf16 on sm80+, fp16 on T4 (is_bf16_supported() is True there through emulation)
+    return torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+
 def _id(t):
     return GGML_TYPE_NAMES[t]
 
@@ -126,7 +131,7 @@ def test_triton_dequant_bitwise(ggml_type, dtype):
 @pytest.mark.parametrize("ggml_type", QUANT_TYPES, ids = _id)
 @pytest.mark.parametrize("M", [1, 5, 16, 40])
 def test_fused_linear_vs_fp64(ggml_type, M):
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _half()
     N, K = 72, _row_length(ggml_type, 4 if GGML_BLOCK[ggml_type][0] < 256 else 2)
     packed = random_packed(ggml_type, N, K, seed = M, special = False).cuda()
     w32 = dequantize_reference(packed, ggml_type, (N, K))
@@ -150,7 +155,7 @@ def test_fused_linear_vs_fp64(ggml_type, M):
 
 @cuda
 def test_linear_autograd_and_3d_input():
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _half()
     packed = random_packed(T.Q4_K, 48, 512, special = False).cuda()
     w = dequantize_reference(packed, T.Q4_K, (48, 512)).cuda()
     x = torch.randn(2, 3, 512, device = "cuda", dtype = dtype, requires_grad = True)
@@ -166,7 +171,7 @@ def test_linear_autograd_and_3d_input():
 @cuda
 @pytest.mark.parametrize("ggml_type", [T.Q4_K, T.Q6_K, T.Q8_0, T.IQ2_XXS, T.IQ3_S, T.MXFP4, T.NVFP4, T.Q2_0, T.IQ4_NL], ids = _id)
 def test_grouped_vs_fp64(ggml_type):
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _half()
     E, N = 5, 40
     K = _row_length(ggml_type, 2 if GGML_BLOCK[ggml_type][0] == 256 else 4)
     packed = random_packed(ggml_type, E * N, K, seed = 7, special = False).reshape(E, N, -1).cuda()
@@ -188,7 +193,7 @@ def test_grouped_vs_fp64(ggml_type):
 
 @cuda
 def test_compile_fullgraph_no_breaks():
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
+    dtype = _half()
     packed = random_packed(T.Q5_K, 64, 512, special = False).cuda()
     stack = random_packed(T.IQ4_XS, 3 * 32, 256, special = False).reshape(3, 32, -1).cuda()
     counts = torch.tensor([2, 0, 4], dtype = torch.int32, device = "cuda")
@@ -291,7 +296,7 @@ def test_group_split_both_layouts(ggml_type, split, monkeypatch):
     # the per-format layout choice is a speed knob: both layouts must decode the same weights
     monkeypatch.setattr(gguf_ops, "_SPLIT_MM", frozenset(QUANT_TYPES) if split else frozenset())
     monkeypatch.setattr(gguf_ops, "_NO_SPLIT_GEMV", frozenset() if split else frozenset(QUANT_TYPES))
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _half()
     N, K = 40, _row_length(ggml_type, 2 if GGML_BLOCK[ggml_type][0] >= 256 else 4)
     packed = random_packed(ggml_type, N, K, seed = 11, special = False).cuda()
     w32 = dequantize_reference(packed, ggml_type, (N, K))
@@ -310,7 +315,7 @@ def test_group_split_both_layouts(ggml_type, split, monkeypatch):
 def test_grouped_schedules(ggml_type, host_sched, monkeypatch):
     # the expert schedule (tile / row prefix sums) is computed in the kernel, or on device by torch on Triton < 3.3
     monkeypatch.setattr(gguf_ops, "_OLD_TRITON", host_sched)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _half()
     E, N = 7, 32
     K = _row_length(ggml_type, 1 if GGML_BLOCK[ggml_type][0] == 256 else 8)
     packed = random_packed(ggml_type, E * N, K, seed = 3, special = False).reshape(E, N, -1).cuda()
@@ -333,7 +338,7 @@ def test_grouped_schedules(ggml_type, host_sched, monkeypatch):
 def test_fused_large_tiles(ggml_type, M, monkeypatch):
     # the per-GPU row cap may route these through dequantize + cuBLAS; force the 64 / 128-row tile configs
     monkeypatch.setattr(gguf_ops, "_FUSED_MAX_ROWS", 1 << 30)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    dtype = _half()
     N, K = 96, _row_length(ggml_type, 2 if GGML_BLOCK[ggml_type][0] >= 128 else 8)
     packed = random_packed(ggml_type, N, K, seed = M, special = False).cuda()
     w32 = dequantize_reference(packed, ggml_type, (N, K))
