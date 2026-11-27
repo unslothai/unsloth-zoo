@@ -959,6 +959,7 @@ def train_on_responses_only(
     tokenization equals the standalone one.
     """
     # All Unsloth Zoo code licensed under LGPLv3
+    _auto_parts = False
     if trainer is not None:
         try:
             from unsloth_zoo.mlx.trainer import (
@@ -995,6 +996,7 @@ def train_on_responses_only(
         if instruction_part is None and response_part is None:
             # Neither given: auto-detect both from the chat template
             instruction_part, response_part = get_chat_template_parts(processor)
+            _auto_parts = True
             print(f"Unsloth: Auto-detected instruction_part = {repr(instruction_part)} and response_part = {repr(response_part)}")
         elif instruction_part is None or response_part is None:
             raise ValueError("Unsloth: Give both instruction_part and response_part, or neither to auto-detect!")
@@ -1092,11 +1094,25 @@ def train_on_responses_only(
     if eos_token_id is not None: boundary_first.add(eos_token_id)
     if message_start: boundary_first.add(message_start[0])
     if sample_start:  boundary_first.add(sample_start[0])
+    token_ids = {getattr(t, "content", None): i for i, t in added_tokens.items()}
+    # GLM-4.x opens a tool result with its own role token, which ends the assistant span like <|user|>.
+    role_stop_ids = {token_ids[t] for t in ("<|observation|>",) if t in token_ids} - boundary_first
+    boundary_first |= role_stop_ids
     inner_stop_ids = tuple(boundary_first | {Q_first})
+
+    # Mistral: the answer after a tool result follows [/TOOL_RESULTS] with no [/INST]; it runs to eos.
+    resume_id = token_ids.get("[/TOOL_RESULTS]")
+    resume_stop_ids = frozenset(inner_stop_ids) | {token_ids.get("[TOOL_RESULTS]")}
+    # Harmony (gpt-oss): the auto-detected marker is the final channel, but a tool call
+    # "<|start|>assistant to=functions.x ... <|call|>" is the model's output too.
+    harmony_call = None
+    if _auto_parts and "<|call|>" in token_ids and "<|start|>" in token_ids:
+        _assistant = tokenizer("<|start|>assistant", add_special_tokens = False).input_ids
+        if _assistant and _assistant[0] == token_ids["<|start|>"] and A_must[:len(_assistant)] == _assistant:
+            harmony_call = (token_ids["<|call|>"], token_ids["<|start|>"], _assistant)
 
     # Gemma 4 and FunctionGemma render a tool result inside the model's own turn. Generation stops at the
     # opening marker and the tool writes the rest, so a response span must not train past it.
-    token_ids = {getattr(t, "content", None): i for i, t in added_tokens.items()}
     tool_result_ids = [
         (token_ids[opener], token_ids[closer], token_ids.get(turn))
         for opener, closer, turn in (
@@ -1250,7 +1266,7 @@ def train_on_responses_only(
                             if token == eos_token_id:
                                 spans.append((assistant_k, j + 1))
                                 break
-                            if token == bos_token_id or \
+                            if token == bos_token_id or token in role_stop_ids or \
                                 (message_start and token == message_start[0] and \
                                  input_ids[j : j + len(message_start)] == message_start) or \
                                 (sample_start and token == sample_start[0] and \
@@ -1294,6 +1310,23 @@ def train_on_responses_only(
                 pass
                 j += 1
             pass
+
+            if resume_id is not None and resume_id in input_ids:
+                for c in [i for i, t in enumerate(input_ids) if t == resume_id]:
+                    j = c + 1
+                    while j < n and input_ids[j] not in resume_stop_ids: j += 1
+                    if j < n and input_ids[j] == eos_token_id: j += 1
+                    if j > c + 1: spans.append((c + 1, j))
+                spans.sort()
+            if harmony_call is not None and harmony_call[0] in input_ids:
+                call_id, start_id, assistant_ids = harmony_call
+                for c in [i for i, t in enumerate(input_ids) if t == call_id]:
+                    s = c - 1
+                    while s >= 0 and input_ids[s] != start_id: s -= 1
+                    k = s + len(assistant_ids)
+                    if s >= 0 and k < c and list(input_ids[s : k]) == assistant_ids:
+                        spans.append((k, c + 1))
+                spans.sort()
 
             # Apply labels (last assistant turn only when last_response_only).
             # spans[-1:] is [] when no assistant turn was found, so such samples
@@ -2590,10 +2623,26 @@ def train_on_responses_only(
         # DataCollatorForTokenClassification carrying `padding = "max_length"` is
         # a separate class, not a subclass, so an isinstance check on that one
         # class dropped its settings and silently turned the run into a
-        # dynamically padded one. Ask whether the fields are there.
-        _padding_class = _processor_backed and not _same_class and any(
+        # dynamically padded one. Ask whether the fields are there. Not only on
+        # the processor repair: the plain swap of one built on a real tokenizer
+        # replaces it too.
+        _padding_class = not _same_class and isinstance(
+            _collator, _PAD_DELEGATING_COLLATORS
+        ) and any(
             hasattr(_collator, _n)
             for _n in ("padding", "max_length", "pad_to_multiple_of")
+        )
+        # TRL's text and vision collators do not pad through `tokenizer.pad`,
+        # but their `pad_to_multiple_of` is the same rounding of the batch width
+        # (what `SFTConfig.pad_to_multiple_of` sets). Only that field: their
+        # other same-named ones, such as the vision collator's truncating
+        # `max_length`, do not mean what DataCollatorForSeq2Seq reads.
+        _trl_rounding = not _same_class and not _padding_class and any(
+            _cls.__module__.startswith("trl.") and _cls.__name__ in (
+                "DataCollatorForLanguageModeling",
+                "DataCollatorForVisionLanguageModeling",
+            )
+            for _cls in type(_collator).__mro__
         )
         # `label_pad_token_id` means the same thing to DataCollatorForSeq2Seq as
         # it does to a DataCollatorForTokenClassification, so a caller who chose
@@ -2603,11 +2652,24 @@ def train_on_responses_only(
                   "label_pad_token_id", "return_tensors") if _same_class else \
                  ("padding", "max_length", "pad_to_multiple_of",
                   "label_pad_token_id", "return_tensors")
+        if _trl_rounding: _names = ("pad_to_multiple_of",)
         _kept = {
             name: getattr(_collator, name)
             for name in _names
-            if (_same_class or _padding_class) and hasattr(_collator, name)
+            if (_same_class or _padding_class or _trl_rounding)
+            and hasattr(_collator, name)
         }
+        # `padding = "max_length"` with no `max_length` makes `tokenizer.pad`
+        # pad the inputs to `model_max_length`, but DataCollatorForSeq2Seq pads
+        # the labels to the longest row, so the two widths differ. Pin the
+        # tokenizer's real maximum; with no real one (the int(1e30) sentinel)
+        # `tokenizer.pad` would not pad at all, so pad dynamically instead.
+        if _kept.get("padding") == "max_length" and _kept.get("max_length") is None:
+            _model_max = getattr(tokenizer, "model_max_length", None)
+            if isinstance(_model_max, int) and 0 < _model_max < int(1e20):
+                _kept["max_length"] = _model_max
+            else:
+                _kept["padding"] = True
         _text_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
         # Only when a media-capable collator was displaced. Everywhere else the
         # replacement is the whole point and there is nothing to fall back to.
