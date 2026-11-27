@@ -154,10 +154,71 @@ def test_packing_bins_are_whole_rows_within_the_cap():
 
 def test_packing_stays_within_the_mini_batch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
-    # 6 splits: at most L tokens per forward, so each row packs on its own.
+    # 6 splits: one row per forward. Single-row bins cannot test cross-row isolation, so unverified packing does
+    # not run them: the padded loop does.
     calls = _run(mini_batch = ROWS)
-    assert [n for kind, n in calls if kind == "packed"] == _REAL, calls
+    assert all(kind == "padded" for kind, _ in calls), calls
     assert max(n for _, n in calls) <= L, calls
+
+
+def test_single_row_bins_never_widen_the_trusted_envelope(monkeypatch):
+    # Already trusted packing (verified before): single-row bins run packed, but they verify nothing about
+    # cross-row isolation, so a later multi-row bin of the same length is verified again, not trusted.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    model = _Model()
+    model._unsloth_seq_packing_grad_ok = True
+    calls = _run(mini_batch = ROWS, model = model)
+    assert [n for kind, n in calls if kind == "packed"] == _REAL, calls
+    assert int(getattr(model, "_unsloth_seq_packing_grad_verified_T", 0)) == 0
+    model.calls = []
+    calls = _run(mini_batch = 2, model = model)
+    packed = [n for kind, n in calls if kind == "packed"]
+    assert packed[:2] == [sum(_REAL[:4]), sum(_REAL[4:])], calls
+    assert any(kind == "padded" for kind, _ in calls), calls  # the per-row verify forwards ran
+
+
+def test_a_failing_bin_releases_the_finished_bins(monkeypatch):
+    # An OOM in the second packed bin: the first bin's graph must not stay alive through the padded fallback.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    import gc
+    import weakref
+
+    class _Sentinel:
+        pass
+
+    class _Keep(torch.autograd.Function):
+        # Identity whose backward context holds a sentinel: it lives exactly as long as the bin's graph.
+        @staticmethod
+        def forward(ctx, x, sentinel):
+            ctx.sentinel = sentinel
+            return x.view_as(x)
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad, None
+
+    model = _Model()
+    model._unsloth_seq_packing_grad_ok = True
+    seen, forward = [], model.forward
+
+    def flaky(input_ids = None, packed_seq_lengths = None, **kwargs):
+        out = forward(input_ids = input_ids, packed_seq_lengths = packed_seq_lengths, **kwargs)
+        if packed_seq_lengths is not None:
+            sentinel = _Sentinel()
+            seen.append(weakref.ref(sentinel))
+            out.logits = _Keep.apply(out.logits, sentinel)
+            del sentinel
+            if len(seen) == 2:
+                raise torch.cuda.OutOfMemoryError("injected")
+        elif seen:
+            gc.collect()
+            assert all(ref() is None for ref in seen), "a finished packed bin is still alive in the padded loop"
+        return out
+
+    model.forward = flaky
+    calls = _run(mini_batch = 2, model = model)
+    assert [kind for kind, _ in calls].count("packed") == 2, calls
+    assert any(kind == "padded" for kind, _ in calls), calls
 
 
 def test_batch_over_the_mini_batch_packs_in_bins(monkeypatch):

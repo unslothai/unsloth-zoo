@@ -5246,6 +5246,12 @@ def grpo_accumulated_loss(
                     _pack_T = max(sum(_pack_lengths_cpu[_b_lo:_b_hi]) for _b_lo, _b_hi in _pack_bins)
                 if not _pack_capped:
                     _pack_active = _pack_active_cpu
+                    if len(_pack_bins) > 1:
+                        # Rows only share a packed forward inside a bin, so only a bin with >= 2 scored rows tests
+                        # (and may verify) cross-row isolation: count the fullest bin's.
+                        _pack_active = max(
+                            sum(1 for _c in _pack_ccount_cpu[_b_lo:_b_hi] if _c > 0) for _b_lo, _b_hi in _pack_bins
+                        )
                 if (not _pack_capped) and _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok \
                         and (_pack_ok is True or _pack_active >= 2):
                     _pack_defer = (
@@ -5430,9 +5436,11 @@ def grpo_accumulated_loss(
                             if UNSLOTH_ENABLE_LOGGING:
                                 print(f"[Unsloth] GRPO seq-packing (grad) fell back at T={_pack_T} (diff={_pack_diff:.3f})", flush = True)
             except Exception as _pack_err:
-                # any failure -> drop intermediates, use the padded loop, do not retry
-                _pack_hidden = None
-                _pack_sel = None
+                # any failure -> drop intermediates (every finished bin's graph too), use the padded loop, do not retry
+                _pack_hidden = _pack_h = None
+                _pack_sel = _pack_ent = None
+                _pack_tgts = _pack_sels = _pack_ents = None
+                _fused_pack = None
                 _pack_result = None
                 _pack_use = False
                 if isinstance(_pack_err, torch.cuda.OutOfMemoryError):
