@@ -2062,7 +2062,10 @@ class _PromptProgress:
                 self.callback(processed, total, cached)
             except Exception as exc:
                 self.callback = None
-                warnings.warn(f"A prompt_progress callback raised {exc!r}; its row reports no more progress.")
+                try:  # a warnings-as-errors filter must not turn one observer into a failed batch
+                    warnings.warn(f"A prompt_progress callback raised {exc!r}; its row reports no more progress.")
+                except Exception:
+                    pass
         return self.callback is not None
 
 

@@ -647,6 +647,10 @@ def test_a_text_row_hears_each_prompt_chunk_past_what_it_did_not_hear_prefilled(
     _report_row_prefill(rows, [batch, batch])
     _report_row_prefill(rows, [batch])
     assert heard[5] == heard[7] == [(4, 9, 2)] and 3 not in heard
+    failing = _PromptProgress(lambda *_: 1 / 0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert failing(1, 2, 0) is False and failing.callback is None
     # A row's callback holds its stream weakly, so dropping the stream releases it (and its lock) at once.
     dropped = _open_stream(monkeypatch, max_tokens=2)
     dropped.add(GenerationRequest(prompt_token_ids=[9], prompt_progress=print))
