@@ -18933,9 +18933,116 @@ def _copy_source_sidecars(src_path, path):
         copied += 1
     return copied
 
-def _fuse_mlx_module(module, dequantize):
+# Same switch, spellings and default as the torch merge (saving_utils._merge_rounding_mode), re-read here since MLX
+# installs ship without torch: round to nearest drops low-lr LoRA deltas below half a 16-bit step of W.
+_MLX_MERGE_ROUNDING_MODES = ("nearest", "stochastic")
+_MLX_SR_SEED = 0x2B7E1516
+
+
+def _mlx_merge_rounding_mode():
+    mode = os.environ.get("UNSLOTH_MERGE_ROUNDING", "stochastic").strip().lower()
+    if mode in ("sr", "stochastic_rounding"): mode = "stochastic"
+    if mode in ("rtn", "round_to_nearest", ""): mode = "nearest"
+    if mode not in _MLX_MERGE_ROUNDING_MODES:
+        warnings.warn(
+            f"Unsloth: UNSLOTH_MERGE_ROUNDING={mode!r} is not one of {_MLX_MERGE_ROUNDING_MODES}; "
+            "using round to nearest.", stacklevel = 2,
+        )
+        return "nearest"
+    return mode
+
+
+def _mlx_stochastic_round(w, dtype, key):
+    """Unbiased (E[out] == w) float32 -> bf16/fp16 rounding, seeded by `key` so a merge is reproducible."""
+    import zlib
+    rng = mx.random.key(zlib.crc32(str(key).encode("utf-8")) ^ _MLX_SR_SEED)
+    if dtype == mx.bfloat16:
+        noise = mx.random.randint(0, 1 << 16, w.shape, dtype = mx.uint32, key = rng)
+        y = mx.view((mx.view(w, mx.uint32) + noise) & 0xFFFF0000, mx.float32)
+        return mx.where(mx.isfinite(w), y, w).astype(dtype)
+    r = w.astype(dtype)
+    err = w - r.astype(mx.float32)
+    bits = mx.view(r, mx.uint16).astype(mx.int32)
+    sign, mag = bits & 0x8000, bits & 0x7FFF
+    neighbour = mx.where((err > 0) != (sign != 0), mag + 1, mag - 1) | sign
+    neighbour = mx.where(mag == 0, mx.where(err < 0, 0x8001, 0x0001), neighbour)
+    neighbour = mx.view(neighbour.astype(mx.uint16), dtype)
+    p = mx.abs(err) / mx.abs(neighbour.astype(mx.float32) - r.astype(mx.float32))
+    return mx.where(mx.random.uniform(shape = w.shape, key = rng) < p, neighbour, r)
+
+
+def _mlx_round_merged_weight(w, dtype, key):
+    if dtype in (mx.bfloat16, mx.float16) and _mlx_merge_rounding_mode() == "stochastic":
+        return _mlx_stochastic_round(w, dtype, key)
+    return w.astype(dtype)
+
+
+def _fuse_mlx_lora_float32(module, dequantize, key):
+    """Fuse an mlx-lm LoRA / DoRA layer in float32 and round the merged weight once to the base dtype, or return None
+    to leave the module to its own fuse. mlx-lm's fuse casts the delta to the 16-bit base dtype before adding it
+    (two roundings) and dequantizes a QLoRA base in 16-bit (three); on NAX GPUs its float32 GEMM also runs as TF32,
+    so the delta is taken on the CPU there. A quantized base kept quantized (merged_4bit) still uses mlx-lm."""
+    try:
+        from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear
+        from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    except Exception:
+        return None
+    kind = type(module)
+    if kind not in (LoRALinear, LoRASwitchLinear, LoRAEmbedding, DoRALinear, DoRAEmbedding):
+        return None
+    base = module.embedding if kind in (LoRAEmbedding, DoRAEmbedding) else module.linear
+    dense_types = {LoRALinear: nn.Linear, DoRALinear: nn.Linear, LoRASwitchLinear: SwitchLinear,
+                   LoRAEmbedding: nn.Embedding, DoRAEmbedding: nn.Embedding}
+    quant_types = {LoRALinear: nn.QuantizedLinear, DoRALinear: nn.QuantizedLinear,
+                   LoRASwitchLinear: QuantizedSwitchLinear, LoRAEmbedding: nn.QuantizedEmbedding}
+    if type(base) is dense_types[kind]:
+        weight = base.weight
+        if not mx.issubdtype(weight.dtype, mx.floating):
+            return None
+        out_dtype, weight = weight.dtype, weight.astype(mx.float32)
+    elif dequantize and type(base) is quant_types.get(kind):
+        args = dict(group_size = base.group_size, bits = base.bits, mode = getattr(base, "mode", "affine"))
+        try:
+            # The dtype mlx-lm's fuse writes (the scales dtype, else bf16), taken lazily, and the same weights in float32.
+            out_dtype = mx.dequantize(base.weight, base.scales, base.get("biases"), **args).dtype
+            weight = mx.dequantize(base.weight, base.scales, base.get("biases"), dtype = mx.float32, **args)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    from .attention import _stock_runs_nax, _tf32_enabled
+    stream = mx.cpu if mx.default_device() == mx.gpu and _tf32_enabled() and _stock_runs_nax() else None
+    lora_a = module.lora_a.astype(mx.float32)
+    lora_b = module.lora_b.astype(mx.float32)
+    scale = float(module.scale)
+    if kind is LoRASwitchLinear:
+        num_experts, output_dims, input_dims = weight.shape
+        delta = mx.matmul(scale * lora_b, lora_a.reshape(num_experts, -1, input_dims), stream = stream)
+        fused = SwitchLinear(input_dims, output_dims, num_experts, bias = "bias" in base)
+    elif kind in (LoRAEmbedding, DoRAEmbedding):
+        delta = mx.matmul(scale * lora_a, lora_b, stream = stream)
+        fused = nn.Embedding(*weight.shape)
+    else:
+        delta = mx.matmul(scale * lora_b.T, lora_a.T, stream = stream)
+        output_dims, input_dims = weight.shape
+        fused = nn.Linear(input_dims, output_dims, bias = "bias" in base)
+    weight = weight + delta
+    if kind in (DoRALinear, DoRAEmbedding):
+        weight = (module.m.astype(mx.float32) / mx.linalg.norm(weight, axis = 1))[:, None] * weight
+    fused.weight = _mlx_round_merged_weight(weight, out_dtype, key) if out_dtype != mx.float32 else weight
+    if "bias" in base and not isinstance(fused, nn.Embedding):
+        fused.bias = base.bias
+    return fused
+
+
+def _fuse_mlx_module(module, dequantize, key=None):
     """Call module.fuse(dequantize=); a flagless fuse (ExtendedLmHead) is called as is, and save_merged_model
-    dequantizes afterwards."""
+    dequantizes afterwards. Plain mlx-lm LoRA / DoRA layers fuse in float32 with one rounding (key seeds it)."""
+    fused = _fuse_mlx_lora_float32(module, dequantize, key)
+    if fused is not None:
+        return fused
     fuse = module.fuse
     try:
         parameters = inspect.signature(fuse).parameters
@@ -19131,7 +19238,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
     # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
     fused_linears = [
-        (n, _fuse_mlx_module(m, dequantize))
+        (n, _fuse_mlx_module(m, dequantize, key=n))
         for n, m in model.named_modules()
         if hasattr(m, "fuse")
     ]
