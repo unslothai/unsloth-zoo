@@ -5481,7 +5481,7 @@ def grpo_accumulated_loss(
                 _pack_hidden = _pack_h = None
                 _pack_sel = _pack_ent = None
                 _pack_tgts = _pack_sels = _pack_ents = None
-                _sc_pack_parts = _sc_pack_head = None
+                _sc_pack_parts = _sc_pack_head = _sc_ph = _sc_pack_cov = None
                 _fused_pack = None
                 _pack_result = None
                 _pack_use = False
@@ -5641,7 +5641,7 @@ def grpo_accumulated_loss(
             # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
             # neither co-resides with it; same for a declined PrefixGrouper layout
             _pack_hidden = _pack_sel = _pack_result = None
-            _sc_pack_head = None
+            _sc_pack_head = _sc_pack_cov = None
             _pg_layout = None
             _pack_ent = _pack_entropies = None
             _fused_pack = None

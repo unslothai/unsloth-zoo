@@ -139,3 +139,22 @@ def test_score_centering_keeps_sequence_packing(monkeypatch, bins):
     assert (packed["sc"][mask] - padded["sc"][mask]).abs().max().item() < 1e-6
     for a, b in zip(packed_grads, padded_grads):
         assert (a - b).abs().max().item() < 1e-6
+
+
+def test_a_packed_centering_oom_falls_back_to_the_padded_term(monkeypatch):
+    padded, padded_grads, _ = _run(monkeypatch, packing = False)
+    real, calls = _sc.grpo_topk_head_logprobs, []
+
+    def second_bin_oom(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_sc, "grpo_topk_head_logprobs", second_bin_oom)
+    fallback, fallback_grads, packed_calls = _run(monkeypatch, packing = True, bins = [(0, 2), (2, 4)])
+    assert packed_calls == 2 and len(calls) > 2  # both bins ran, then the padded loop scored the heads
+    mask = padded["mask"].bool()
+    assert (fallback["sc"][mask] - padded["sc"][mask]).abs().max().item() < 1e-6
+    for a, b in zip(fallback_grads, padded_grads):
+        assert (a - b).abs().max().item() < 1e-6
