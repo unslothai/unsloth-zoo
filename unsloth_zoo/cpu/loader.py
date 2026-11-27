@@ -1286,6 +1286,10 @@ class FastCPUModel:
         if func is not None and generate.__self__ is model and not getattr(func, "_unsloth_cpu", False):
             # Bound per instance (MethodType), so deepcopy rebinds it to the copy.
             model.generate = types.MethodType(_unpack_encoding_generate(func), model)
+        # CPU / MPS greedy and sampling decode: generate's default DynamicCache appends with in-place writes into a
+        # chunked buffer instead of a torch.cat of every layer's whole KV per token (GRPO / online DPO rollouts).
+        from .kv_cache import install as _install_growable_kv
+        _install_growable_kv(model)
         model.for_training = types.MethodType(lambda self, *a, **k: FastCPUModel.for_training(self, *a, **k), model)
         model.for_inference = types.MethodType(lambda self: FastCPUModel.for_inference(self), model)
         model.save_pretrained_merged = types.MethodType(save_pretrained_merged, model)

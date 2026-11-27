@@ -438,6 +438,7 @@ jobs:
         # test_triton_constexpr_comments: every owned tl.constexpr has a comment and no per-call size is a constexpr.
         # test_triton_specialize_moe: MoE per-call counts keep no % 16 Triton class; routing scratch slices stay 16-byte aligned.
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
+        # test_cpu_growable_kv: CPU generate appends KV in place (no per-token torch.cat of the whole cache), same greedy / sampled tokens; sliding, hybrid and beam keep the stock cache.
         # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
         # One pytest process per group: MLX export shims replace sys.modules globally,
         # and the security network blocker would break the advisory PyPI test.
@@ -508,6 +509,7 @@ jobs:
               tests/test_grpo_autotune_units.py \
               tests/test_grpo_policy_token_caps.py \
               tests/test_grpo_zero3_collective_forwards_gloo.py \
+              tests/test_cpu_growable_kv.py \
               tests/test_deepseek_v41_compile_entries.py \
               tests/test_moe_weight_preprocessor_registry_shared.py \
               tests/test_moe_triton_down_lora_roworder.py \
