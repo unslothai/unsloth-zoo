@@ -356,7 +356,8 @@ def gemv_kernel(
         x = tl.load(X + cols, mask = cols < K, other = 0.0).to(tl.float32)
         w = _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab, TYPE, QK, BS, NB, SPLIT)
         acc += w * x
-    out = tl.sum(tl.sum(tl.sum(acc, axis = 3), axis = 2), axis = 1)
+    # one reduction over a 2-D view: Triton 3.2 maps nested 4-D reductions back to the wrong rows (duplicated pairs)
+    out = tl.sum(tl.reshape(acc, (BLOCK_N, NB * QK)), axis = 1)
     if HAS_BIAS:
         out += tl.load(BIAS + rows, mask = rmask, other = 0.0).to(tl.float32)
     tl.store(OUT + rows, out.to(OUT.dtype.element_ty), mask = rmask)
