@@ -1,6 +1,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 
 import contextlib
+import importlib
 import itertools
 import json
 from types import SimpleNamespace
@@ -867,6 +868,88 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
     assert type(verifier) is native
     assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
     assert not any(type(m).__name__.startswith("_Lane") for _, m in model.named_modules())
+
+
+def test_lane_projections_serve_a_family_with_no_exact_verifier(qwen_4bit, monkeypatch):
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import language, speculative_verifier
+    from unsloth_zoo.mlx import inference, matmul
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids, cache), rows, kernel = qwen_4bit, [], matmul.lane_qmm
+    verifier, native = language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
+    monkeypatch.setattr(inference, "SPECULATIVE_FAMILIES", {})
+    monkeypatch.setattr(inference, "LANE_FAMILIES", {"qwen3_5": language.__name__})
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append(args[1].shape[0]) or kernel(*args, **kwargs))
+    head = model.language_model.model.layers[0].mlp.down_proj
+    x = mx.ones((1, 2, head.weight.shape[1] * 32 // head.bits), mx.bfloat16)
+    expected = head(x)
+    assert inference.fast_verify_covers(model) and inference.fast_verify_available(model)
+    with inference.row_invariant_lane_projections(model):
+        assert type(verifier) is native and "_unsloth_lane_bindings" not in vars(verifier)
+        assert head.__dict__.get("_unsloth_lane_qmm") and type(head).__name__.startswith("_Lane")
+        y = head(x)
+    assert rows == [head.weight.shape[0]] and mx.allclose(y, expected, atol = 1e-2).item()
+    assert type(head) is nn.QuantizedLinear and type(verifier) is native
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
+    monkeypatch.setattr(inference, "LANE_FAMILIES", {})
+    assert not inference.fast_verify_covers(model)
+
+
+@pytest.fixture(scope = "module")
+def inkling2():
+    """Random quantized looped Inkling 2: only a loop passes speculative_verify to its expert layers."""
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+    language = pytest.importorskip("mlx_vlm.models.inkling2.language", reason = "mlx-vlm < 0.8.1 has no Inkling 2")
+    from mlx_vlm.models.inkling2.config import TextConfig
+    lm = language.LanguageModel(TextConfig.from_dict(dict(
+        hidden_size = 256, num_hidden_layers = 6, vocab_size = 512, unpadded_vocab_size = 512, num_attention_heads = 4,
+        num_key_value_heads = 2, head_dim = 64, swa_num_attention_heads = 4, swa_num_key_value_heads = 2, swa_head_dim = 64,
+        sliding_window_size = 16, intermediate_size = 128, n_routed_experts = 8, num_experts_per_tok = 2,
+        n_layers_per_attn_res_block = 2, d_rel = 16, rel_extent = 64, log_scaling_n_floor = None,
+        loop_config = dict(core_start = 2, core_end = 4, num_passes = 2, gate_rank = 8))))
+    lm.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
+                       if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, lm.parameters()))
+    lm.set_dtype(mx.bfloat16)
+    # As Inkling-2-Mini-oQ4e quantizes: NVFP4 experts (the grouped kernel takes no other 4-bit mode), 8-bit affine elsewhere.
+    nn.quantize(lm, class_predicate = lambda path, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0 and (
+        dict(group_size = 16, bits = 4, mode = "nvfp4") if "switch_mlp" in path else dict(group_size = 64, bits = 8, mode = "affine")))
+    lm.eval()
+    mx.eval(lm.parameters())
+    return SimpleNamespace(language_model = lm), [[(7 * i + 3) % 40 + 2 for i in range(48)]]
+
+
+def test_inkling2_verifies_on_its_grouped_expert_kernel_and_commits_like_verify_forward(inkling2, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.models.inkling2 import grouped_experts
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+    (model, ids), lm, hits = inkling2, inkling2[0].language_model, []
+    grouped = grouped_experts.grouped_expert_projections
+    monkeypatch.setattr(grouped_experts, "grouped_expert_projections", lambda *a: hits.append(grouped(*a) is not None) or grouped(*a))
+    prompt = mx.array([ids[0]])
+    for length, accepted in [(2, 1), (5, 2), (8, 0), (8, 7), (9, 4)]:
+        engines, offsets = [], []
+        for marked in (True, False):
+            engine = SpeculativeEngine(model, _rounds_only())
+            assert engine._marked_rows == 8
+            engine._marked_rows *= marked
+            engine.cache = make_prompt_cache(lm)
+            mx.eval(lm(prompt, cache = engine.cache).logits)
+            engines.append(engine)
+        hits.clear()
+        block = mx.array([[(13 * i + 1) % 500 + 2 for i in range(length)]])
+        (marked, _, opened), (chunked, _, transaction) = (engine._verify(block) for engine in engines)
+        assert any(hits) == (length <= 8), (length, hits)
+        assert mx.abs(marked - chunked).max().item() < 0.25, (length, mx.abs(marked - chunked).max().item())
+        nexts = []
+        for engine, state in zip(engines, (opened, transaction)):
+            lm.rollback_speculative_cache(engine.cache, state, accepted, length)
+            offsets.append(engine.cache[0][0].offset)
+            nexts.append(lm(mx.array([[9]]), cache = engine.cache).logits)
+        assert offsets == [prompt.shape[1] + accepted + 1] * 2
+        assert mx.abs(nexts[0] - nexts[1]).max().item() < 0.25
 
 
 @pytest.mark.parametrize("low", [0, 4])
@@ -3877,6 +3960,9 @@ def test_fast_verify_available_reports_what_the_lane_kernel_takes(qwen_4bit, mon
     tensors = {**row(136, 16), **row(132, 16), **row(8, 16)}   # 132 outputs are no multiple of 8
     assert checkpoint(dict(model_type = "qwen3_5_moe", quantization = quantization), tensors) == (True, "", 2)
     assert checkpoint(dict(model_type = "gemma4", quantization = quantization), tensors) == (False, "no_eligible_projections", 0)
+    assert checkpoint(dict(model_type = "inkling2_loop", quantization = quantization), tensors) == (True, "", 2)
+    if importlib.util.find_spec("mlx_vlm.models.inkling2") is not None:
+        assert all(hasattr(importlib.import_module(name), "LanguageModel") for name in set(inference.LANE_FAMILIES.values()))
     with monkeypatch.context() as patch:
         patch.setattr(nax, "kernel_probe_passed", lambda *args: False)
         assert inference.fast_verify_available(model) == (False, "probe_failed", status.projections)

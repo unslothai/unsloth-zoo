@@ -1544,6 +1544,12 @@ class SpeculativeEngine:
         self._invariant = (call is _language_call("qwen4_exp") and callable(supports) and supports()
                            and callable(getattr(self.lm, "speculative_verify_logits", None))
                            and getattr(drafter, "features", None) is None)
+        # Inkling 2's grouped expert verify kernels need speculative_verify=True; past DECODE_BLOCK_SIZE that call switches kernels.
+        self._marked_rows = 0
+        if call is _language_call("inkling2"):
+            from mlx_vlm.models.linear import DECODE_BLOCK_SIZE
+
+            self._marked_rows = DECODE_BLOCK_SIZE
         # Families whose verify forward was measured to commit ragged acceptance correctly.
         self._batch_rounds = self._exact or self._invariant or call is _language_call("gemma4")
         if getattr(drafter, "confidences", False):
@@ -1744,6 +1750,9 @@ class SpeculativeEngine:
             return logits, self._hidden(SimpleNamespace(hidden_states = [hidden])), _rows_trimmed(transaction)
         from .inference import verify_block_attention
         with verify_block_attention():
+            if self._marked_rows and inputs.shape[1] <= self._marked_rows:
+                out = self.lm(inputs, cache = self.cache, speculative_verify = True, **self._kwargs())
+                return out.logits, self._hidden(out), out.gdn_states
             out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
         return out.logits, self._hidden(out), transaction
 
