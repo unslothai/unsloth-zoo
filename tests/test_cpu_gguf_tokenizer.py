@@ -159,7 +159,33 @@ def test_gguf_only_folder_gets_the_gguf_tokenizer(tmp_path, capsys, arch):
     _forward(model, tokenizer)
 
 
-def test_gguf_only_repo_id_gets_the_gguf_tokenizer(tmp_path, monkeypatch):
+@pytest.fixture
+def hub_offline(monkeypatch):
+    """Offline whatever ran earlier in the worker: transformers 4.x looks up adapter_config.json with only the token,
+    reads the flag once at import, and huggingface_hub < 1.0 enforces it only in sessions built after it is set. The
+    online session made first is the order that sent this made-up repo id to the Hub (401 / 404)."""
+    import huggingface_hub.constants
+
+    try:
+        from huggingface_hub.utils import get_session, reset_sessions
+    except ImportError:  # huggingface_hub >= 1.0 reads the flag per request
+        get_session = reset_sessions = None
+    if get_session is not None:
+        get_session()
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    import transformers.utils.hub as transformers_hub
+
+    if hasattr(transformers_hub, "_is_offline_mode"):
+        monkeypatch.setattr(transformers_hub, "_is_offline_mode", True)
+    if reset_sessions is not None:
+        reset_sessions()
+    yield
+    if reset_sessions is not None:
+        reset_sessions()  # the next session is built once the flag is back
+
+
+def test_gguf_only_repo_id_gets_the_gguf_tokenizer(tmp_path, monkeypatch, hub_offline):
     import huggingface_hub.constants
 
     vocab = write_tiny_gguf_repo(tmp_path / "src", "qwen3")
@@ -167,8 +193,6 @@ def test_gguf_only_repo_id_gets_the_gguf_tokenizer(tmp_path, monkeypatch):
     repo_id = _as_hub_cache(tmp_path / "src", cache)
     # transformers reads the GGUF tokenizer from the default cache, whatever cache_dir says.
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(cache))
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
     model, tokenizer = _load(repo_id, cache_dir = str(cache), local_files_only = True)
     assert len(tokenizer) >= vocab - 1
     _forward(model, tokenizer)
