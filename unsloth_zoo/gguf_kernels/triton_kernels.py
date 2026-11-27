@@ -120,40 +120,42 @@ def _signed(v, s):
 
 
 @triton.jit
-def _decode(b, j, m, tab, TYPE: tl.constexpr):
-    """Values of element ``j`` (int32, 0 <= j < block size) of the blocks starting at byte pointer ``b``."""
+def _decode(b, j, jh, m, tab, TYPE: tl.constexpr):
+    """Values of element ``j`` (int32, 0 <= j < block size) of the blocks starting at byte pointer ``b``.
+    ``jh`` is ``j`` rounded down to a multiple of 8 (same shape or broadcastable): every field that depends on
+    ``j // 8`` or coarser is indexed by it, so it loads once per 8 values."""
     if TYPE == _Q8_0:
         v = _i8(b + 2 + j, m).to(tl.float32) * _f16(b, m)
     elif TYPE == _Q4_0:
-        q = (_u8(b + 2 + j % 16, m) >> (4 * (j // 16))) & 0xF
+        q = (_u8(b + 2 + j % 16, m) >> (4 * (jh // 16))) & 0xF
         v = _f16(b, m) * (q - 8).to(tl.float32)
     elif TYPE == _Q4_1:
-        q = (_u8(b + 4 + j % 16, m) >> (4 * (j // 16))) & 0xF
+        q = (_u8(b + 4 + j % 16, m) >> (4 * (jh // 16))) & 0xF
         v = _f16(b, m) * q.to(tl.float32) + _f16(b + 2, m)
     elif TYPE == _Q5_0:
-        ql = (_u8(b + 6 + j % 16, m) >> (4 * (j // 16))) & 0xF
-        qh = ((_u8(b + 2 + j // 8, m) >> (j % 8)) & 1)
+        ql = (_u8(b + 6 + j % 16, m) >> (4 * (jh // 16))) & 0xF
+        qh = ((_u8(b + 2 + jh // 8, m) >> (j % 8)) & 1)
         v = _f16(b, m) * ((ql | (qh << 4)) - 16).to(tl.float32)
     elif TYPE == _Q5_1:
-        ql = (_u8(b + 8 + j % 16, m) >> (4 * (j // 16))) & 0xF
-        qh = ((_u8(b + 4 + j // 8, m) >> (j % 8)) & 1)
+        ql = (_u8(b + 8 + j % 16, m) >> (4 * (jh // 16))) & 0xF
+        qh = ((_u8(b + 4 + jh // 8, m) >> (j % 8)) & 1)
         v = _f16(b, m) * (ql | (qh << 4)).to(tl.float32) + _f16(b + 2, m)
     elif TYPE == _Q2_K:
-        sc = _u8(b + j // 16, m)
-        q = (_u8(b + 16 + (j // 128) * 32 + j % 32, m) >> (2 * ((j % 128) // 32))) & 3
+        sc = _u8(b + jh // 16, m)
+        q = (_u8(b + 16 + (jh // 128) * 32 + j % 32, m) >> (2 * ((jh % 128) // 32))) & 3
         dl = _f16(b + 80, m) * (sc & 0xF).to(tl.float32)
         ml = _f16(b + 82, m) * (sc >> 4).to(tl.float32)
         v = dl * q.to(tl.float32) - ml
     elif TYPE == _Q3_K:
-        s = j // 16
+        s = jh // 16
         lo = (_u8(b + 96 + s % 8, m) >> (4 * (s // 8))) & 0xF
         hi = (_u8(b + 104 + s % 4, m) >> (2 * (s // 4))) & 3
         dl = _f16(b + 108, m) * ((lo | (hi << 4)) - 32).to(tl.float32)
-        ql = (_u8(b + 32 + (j // 128) * 32 + j % 32, m) >> (2 * ((j % 128) // 32))) & 3
-        h = (_u8(b + j % 32, m) >> (j // 32)) & 1
+        ql = (_u8(b + 32 + (jh // 128) * 32 + j % 32, m) >> (2 * ((jh % 128) // 32))) & 3
+        h = (_u8(b + j % 32, m) >> (jh // 32)) & 1
         v = dl * (ql - ((h ^ 1) << 2)).to(tl.float32)
     elif (TYPE == _Q4_K) or (TYPE == _Q5_K):
-        s = j // 32
+        s = jh // 32
         s4 = s % 4
         a = _u8(b + 4 + s4, m)
         mm = _u8(b + 8 + s4, m)
@@ -162,16 +164,16 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         sc = tl.where(low, a & 0x3F, (md & 0xF) | ((a >> 2) & 0x30))
         mn = tl.where(low, mm & 0x3F, (md >> 4) | ((mm >> 2) & 0x30))
         if TYPE == _Q4_K:
-            q = (_u8(b + 16 + (j // 64) * 32 + j % 32, m) >> (4 * ((j % 64) // 32))) & 0xF
+            q = (_u8(b + 16 + (jh // 64) * 32 + j % 32, m) >> (4 * ((jh % 64) // 32))) & 0xF
         else:
-            ql = (_u8(b + 48 + (j // 64) * 32 + j % 32, m) >> (4 * ((j % 64) // 32))) & 0xF
-            q = ql | (((_u8(b + 16 + j % 32, m) >> (j // 32)) & 1) << 4)
+            ql = (_u8(b + 48 + (jh // 64) * 32 + j % 32, m) >> (4 * ((jh % 64) // 32))) & 0xF
+            q = ql | (((_u8(b + 16 + j % 32, m) >> (jh // 32)) & 1) << 4)
         v = (_f16(b, m) * sc.to(tl.float32)) * q.to(tl.float32) - (_f16(b + 2, m) * mn.to(tl.float32))
     elif TYPE == _Q6_K:
-        lq = (_u8(b + (j // 128) * 64 + j % 64, m) >> (4 * ((j % 128) // 64))) & 0xF
-        hq = (_u8(b + 128 + (j // 128) * 32 + j % 32, m) >> (2 * ((j % 128) // 32))) & 3
+        lq = (_u8(b + (jh // 128) * 64 + j % 64, m) >> (4 * ((jh % 128) // 64))) & 0xF
+        hq = (_u8(b + 128 + (jh // 128) * 32 + j % 32, m) >> (2 * ((jh % 128) // 32))) & 3
         q = (lq | (hq << 4)) - 32
-        v = (_f16(b + 208, m) * _i8(b + 192 + j // 16, m).to(tl.float32)) * q.to(tl.float32)
+        v = (_f16(b + 208, m) * _i8(b + 192 + jh // 16, m).to(tl.float32)) * q.to(tl.float32)
     elif TYPE == _TQ1_0:
         r1 = tl.maximum(j - 160, 0)
         r2 = tl.maximum(j - 240, 0)
@@ -181,10 +183,10 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         q = (_u8(b + off, m) * mul) & 0xFF
         v = _f16(b + 52, m) * (((q * 3) >> 8) - 1).to(tl.float32)
     elif TYPE == _TQ2_0:
-        q = (_u8(b + (j // 128) * 32 + j % 32, m) >> (2 * ((j % 128) // 32))) & 3
+        q = (_u8(b + (jh // 128) * 32 + j % 32, m) >> (2 * ((jh % 128) // 32))) & 3
         v = _f16(b + 64, m) * (q - 1).to(tl.float32)
     elif TYPE == _Q1_0:
-        bit = (_u8(b + 2 + j // 8, m) >> (j % 8)) & 1
+        bit = (_u8(b + 2 + jh // 8, m) >> (j % 8)) & 1
         d = _f16(b, m)
         v = tl.where(bit != 0, d, _neg(d))
     elif TYPE == _Q2_0:
@@ -193,32 +195,32 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
     elif TYPE == _MXFP4:
         e = _u8(b, m)
         d = _bits2f(tl.where(e < 2, 0x00200000 << e, (e - 1) << 23))
-        q = (_u8(b + 1 + j % 16, m) >> (4 * (j // 16))) & 0xF
+        q = (_u8(b + 1 + j % 16, m) >> (4 * (jh // 16))) & 0xF
         v = d * _lut(tab + _FP4_T, q, m).to(tl.float32)
     elif TYPE == _NVFP4:
-        s = j // 16
+        s = jh // 16
         r = j % 16
         x = _u8(b + s, m)
         e = (x >> 3) & 0xF
         man = x & 7
         d = tl.where(e == 0, man.to(tl.float32) * 0.0009765625, _bits2f(((e + 119) << 23) | (man << 20)))
         d = tl.where((x == 0) | (x == 0x7F), 0.0, d)
-        q = (_u8(b + 4 + s * 8 + r % 8, m) >> (4 * (r // 8))) & 0xF
+        q = (_u8(b + 4 + s * 8 + r % 8, m) >> (4 * ((jh % 16) // 8))) & 0xF
         v = d * _lut(tab + _FP4_T, q, m).to(tl.float32)
     elif TYPE == _IQ4_NL:
-        q = (_u8(b + 2 + j % 16, m) >> (4 * (j // 16))) & 0xF
+        q = (_u8(b + 2 + j % 16, m) >> (4 * (jh // 16))) & 0xF
         v = _f16(b, m) * _lut(tab + _IQ4NL_T, q, m).to(tl.float32)
     elif TYPE == _IQ4_XS:
-        ib = j // 32
+        ib = jh // 32
         w = j % 32
         ls = (_u8(b + 4 + ib // 2, m) >> (4 * (ib % 2))) & 0xF
         hs = (_u16(b + 2, m) >> (2 * ib)) & 3
         dl = _f16(b, m) * ((ls | (hs << 4)) - 32).to(tl.float32)
-        q = (_u8(b + 8 + ib * 16 + w % 16, m) >> (4 * (w // 16))) & 0xF
+        q = (_u8(b + 8 + ib * 16 + w % 16, m) >> (4 * ((jh % 32) // 16))) & 0xF
         v = dl * _lut(tab + _IQ4NL_T, q, m).to(tl.float32)
     elif TYPE == _IQ2_XXS:
-        ib = j // 32
-        l = (j % 32) // 8
+        ib = jh // 32
+        l = (jh % 32) // 8
         k = j % 8
         aux = _u32(b + 6 + 8 * ib, m)
         db = (_f16(b, m) * (0.5 + (aux >> 28).to(tl.float32))) * 0.25
@@ -226,9 +228,9 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         sign = (_lut(tab + _KSIGNS, ((aux >> (7 * l).to(tl.uint32)) & 0x7F).to(tl.int32), m) >> k) & 1
         v = _signed(db * grid, sign)
     elif (TYPE == _IQ2_XS) or (TYPE == _IQ2_S):
-        e = j // 8
+        e = jh // 8
         k = j % 8
-        s = j // 16
+        s = jh // 16
         if TYPE == _IQ2_XS:
             q16 = _u16(b + 2 + 2 * e, m)
             grid = _lut(tab + _IQ2XS_T, (q16 & 511) * 8 + k, m)
@@ -242,8 +244,8 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         db = (_f16(b, m) * (0.5 + ls.to(tl.float32))) * 0.25
         v = _signed(db * grid.to(tl.float32), sign)
     elif TYPE == _IQ3_XXS:
-        ib = j // 32
-        l = (j % 32) // 8
+        ib = jh // 32
+        l = (jh % 32) // 8
         k = j % 8
         aux = _u32(b + 66 + 4 * ib, m)
         db = (_f16(b, m) * (0.5 + (aux >> 28).to(tl.float32))) * 0.5
@@ -251,17 +253,17 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         sign = (_lut(tab + _KSIGNS, ((aux >> (7 * l).to(tl.uint32)) & 0x7F).to(tl.int32), m) >> k) & 1
         v = _signed(db * grid, sign)
     elif TYPE == _IQ3_S:
-        s = j // 32
+        s = jh // 32
         e = j // 4
         sc = (_u8(b + 106 + s // 2, m) >> (4 * (s % 2))) & 0xF
         db = _f16(b, m) * (1 + 2 * sc).to(tl.float32)
         gidx = _u8(b + 2 + e, m) | (((_u8(b + 66 + e // 8, m) >> (e % 8)) & 1) << 8)
         grid = _lut(tab + _IQ3S_T, gidx * 4 + j % 4, m).to(tl.float32)
-        sign = (_u8(b + 74 + j // 8, m) >> (j % 8)) & 1
+        sign = (_u8(b + 74 + jh // 8, m) >> (j % 8)) & 1
         v = _signed(db * grid, sign)
     elif TYPE == _IQ1_S:
-        e = j // 8
-        qh = _u16(b + 34 + 2 * (j // 32), m)
+        e = jh // 8
+        qh = _u16(b + 34 + 2 * (jh // 32), m)
         dl = _f16(b, m) * (2 * ((qh >> 12) & 7) + 1).to(tl.float32)
         delta = tl.where((qh & 0x8000) != 0, -0.125, 0.125)
         gidx = _u8(b + 2 + e, m) | (((qh >> (3 * (e % 4))) & 7) << 8)
@@ -272,8 +274,8 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         s2 = _u16(b + 52, m)
         s3 = _u16(b + 54, m)
         d = _h2f(((s0 & 0xF000) >> 12) | ((s1 & 0xF000) >> 8) | ((s2 & 0xF000) >> 4) | (s3 & 0xF000))
-        si = j // 16
-        e = j // 8
+        si = jh // 16
+        e = jh // 8
         sc = (_u16(b + 48 + 2 * (si // 4), m) >> (3 * (si % 4))) & 7
         dl = d * (2 * sc + 1).to(tl.float32)
         hb = _u8(b + 32 + e // 2, m) >> (4 * (e % 2))
@@ -300,13 +302,24 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
 @triton.jit
 def _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab,
            TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr, NB: tl.constexpr):
-    """Decoded float32 tile (rows, NB blocks, QK values) of a packed matrix starting at block ``blk0``. Block-level
-    fields (scales) load once per (row, block); index math runs on the (1, 1, QK) in-block index only."""
+    """Decoded float32 tile (rows, NB blocks, QK // G8, G8) of a packed matrix starting at block ``blk0``, G8 = 8
+    values per group (1 for one-value blocks). Block fields load once per (row, block), group fields once per 8
+    values, and index math runs on the in-block index only."""
+    G8: tl.constexpr = 8 if QK >= 8 else 1
     blk = blk0 + tl.arange(0, NB)
-    b = P + rows.to(tl.int64)[:, None, None] * row_bytes + (blk * BS)[None, :, None]
-    m = rmask[:, None, None] & (blk < nblk)[None, :, None]
-    j = tl.arange(0, QK)[None, None, :]
-    return _decode(b, j, m, tab, TYPE)
+    b = P + rows.to(tl.int64)[:, None, None, None] * row_bytes + (blk * BS)[None, :, None, None]
+    m = rmask[:, None, None, None] & (blk < nblk)[None, :, None, None]
+    jh = (tl.arange(0, QK // G8) * G8)[None, None, :, None]
+    j = jh + tl.arange(0, G8)[None, None, None, :]
+    return _decode(b, j, jh, m, tab, TYPE)
+
+
+@triton.jit
+def _cols(blk0, QK: tl.constexpr, NB: tl.constexpr):
+    """Column index of every value of a ``_tile3`` tile, shape (1, NB, QK // G8, G8)."""
+    G8: tl.constexpr = 8 if QK >= 8 else 1
+    jh = (tl.arange(0, QK // G8) * G8)[None, None, :, None]
+    return (blk0 + tl.arange(0, NB))[None, :, None, None] * QK + jh + tl.arange(0, G8)[None, None, None, :]
 
 
 @triton.jit
@@ -320,9 +333,9 @@ def dequantize_kernel(
     nblk = K // QK
     rmask = rows < ROWS
     w = _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab, TYPE, QK, BS, NB)
-    cols = (blk0 + tl.arange(0, NB))[None, :, None] * QK + tl.arange(0, QK)[None, None, :]
-    out = OUT + rows[:, None, None] * K + cols
-    tl.store(out, w.to(OUT.dtype.element_ty), mask = rmask[:, None, None] & (cols < K))
+    cols = _cols(blk0, QK, NB)
+    out = OUT + rows[:, None, None, None] * K + cols
+    tl.store(out, w.to(OUT.dtype.element_ty), mask = rmask[:, None, None, None] & (cols < K))
 
 
 @triton.jit
@@ -335,14 +348,14 @@ def gemv_kernel(
     rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     rmask = rows < N
     nblk = K // QK
-    acc = tl.zeros((BLOCK_N, NB, QK), dtype = tl.float32)
-    j = tl.arange(0, QK)[None, None, :]
+    G8: tl.constexpr = 8 if QK >= 8 else 1
+    acc = tl.zeros((BLOCK_N, NB, QK // G8, G8), dtype = tl.float32)
     for blk0 in range(0, nblk, NB):
-        cols = (blk0 + tl.arange(0, NB))[None, :, None] * QK + j
+        cols = _cols(blk0, QK, NB)
         x = tl.load(X + cols, mask = cols < K, other = 0.0).to(tl.float32)
         w = _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab, TYPE, QK, BS, NB)
         acc += w * x
-    out = tl.sum(tl.sum(acc, axis = 2), axis = 1)
+    out = tl.sum(tl.sum(tl.sum(acc, axis = 3), axis = 2), axis = 1)
     if HAS_BIAS:
         out += tl.load(BIAS + rows, mask = rmask, other = 0.0).to(tl.float32)
     tl.store(OUT + rows, out.to(OUT.dtype.element_ty), mask = rmask)
