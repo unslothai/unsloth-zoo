@@ -432,6 +432,8 @@ def test_load_time_spill_keeps_small_1d_weights_in_ram_for_a_later_cast(monkeypa
     spilled = store.size
     sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
     assert sw.stats()["disk_layers"] >= len(state.disk)
+    # RAM and disk blocks of identical layers share one slot signature (one pool).
+    assert len({b.sig for b in sw.blocks}) == 1
     # The norms went into the tail their spill reserved: no layer was written to the file a second time.
     assert store.size == spilled
     # dataset_num_proc keeps map in-process while a controller is live.

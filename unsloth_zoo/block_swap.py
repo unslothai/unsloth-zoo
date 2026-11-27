@@ -597,12 +597,10 @@ class _Block:
             self.devices.append(device if p.data.device.type in ("cpu", "meta") else p.data.device)
         self.index = index
         refs = [_disk().disk_ref(p) if getattr(p, "_unsloth_disk", None) is not None else None for p in self.params]
-        # A layer spilled at load kept its small 1-D weights in RAM (refs None): they go last, in the tail the spill
-        # reserved for them, so the spilled weights keep their offsets and the region is completed in place.
-        kept = set()
-        if any(r is not None for r in refs):
-            kept = {k for k, r in enumerate(refs) if r is None and _stays_in_ram(self.params[k])}
-        self.layout, self.sizes = _slot_layout(self.params, self.devices, kept)
+        # Small 1-D weights (norms, biases) go last, in every block alike so identical layers share one slot
+        # signature: a layer spilled at load kept them in RAM (refs None), and they fill the tail its spill reserved.
+        tail = {k for k, p in enumerate(self.params) if _stays_in_ram(p)}
+        self.layout, self.sizes = _slot_layout(self.params, self.devices, tail)
         for d in self.devices:
             if d not in streams:
                 streams[d] = torch.cuda.Stream(device = d)
