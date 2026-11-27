@@ -428,8 +428,12 @@ def test_load_time_spill_keeps_small_1d_weights_in_ram_for_a_later_cast(monkeypa
         layer.norm.data = layer.norm.data.float()
     for name, p in layers.named_parameters():
         p.requires_grad_("lora_" in name)
+    store = _disk.live_spill()
+    spilled = store.size
     sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
     assert sw.stats()["disk_layers"] >= len(state.disk)
+    # The norms went into the tail their spill reserved: no layer was written to the file a second time.
+    assert store.size == spilled
     # dataset_num_proc keeps map in-process while a controller is live.
     assert _mod.offload_active()
     _equal(ref, _train(layers))
