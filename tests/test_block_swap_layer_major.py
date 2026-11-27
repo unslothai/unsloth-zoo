@@ -541,6 +541,182 @@ def test_distributed_is_refused(monkeypatch):
     assert _grads(model) == {}
 
 
+class _Votes:
+    """Fake MIN all-reduce: records votes; other ranks vote True unless `others` overrides a stage."""
+    def __init__(self, events = None, **others):
+        self.calls, self.others = [], others
+        self.events = events if events is not None else []
+
+    def __call__(self, ok, stage):
+        self.calls.append((ok, stage))
+        self.events.append(("vote", stage))
+        return ok and self.others.get(stage, True)
+
+
+def _voting_fns(model, batches, items, events, fail = None):
+    def fn(m, b):
+        out = model(**b, num_items_in_batch = items)
+        events.append(("loss", m))   # the loss part: where a trainer's metric gathers run
+        if fail is not None:
+            fail(m)
+        out.loss.backward()
+        return out.loss.detach()
+    return [functools.partial(fn, m, b) for m, b in enumerate(batches)]
+
+
+def test_ranks_vote_before_the_loss_parts_and_after_the_backward():
+    """Forward vote before any loss part, commit vote after the decoder backward; gradients bitwise as standard."""
+    model = _model()
+    batches, items = _batches(3)
+    _, base = _standard(model, batches, items)
+    model.zero_grad(set_to_none = True)
+    events = []
+    votes = _Votes(events)
+    losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, events), model = model,
+                                     agree = votes)
+    assert why is None and losses is not None
+    assert votes.calls == [(True, "forward"), (True, "commit")]
+    assert events[0] == ("vote", "forward") and events[-1] == ("vote", "commit")
+    assert [e for e in events if e[0] == "loss"] == [("loss", 0), ("loss", 1), ("loss", 2)]
+    _assert_same(base, _grads(model))
+
+
+def test_distributed_runs_with_a_rank_vote(monkeypatch):
+    model = _model()
+    batches, items = _batches(2)
+    _, base = _standard(model, batches, items)
+    model.zero_grad(set_to_none = True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 2)
+    votes = _Votes()
+    losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, []), model = model,
+                                     agree = votes)
+    assert why is None and votes.calls == [(True, "forward"), (True, "commit")]
+    _assert_same(base, _grads(model))
+
+
+def test_another_rank_voting_no_before_the_loss_parts_rolls_back():
+    """No loss part runs on this rank (its collectives would wait for a rank that is already rolling back)."""
+    model = _model(train_head = True)
+    batches, items = _batches(2)
+    events = []
+    votes = _Votes(events, forward = False)
+    model.zero_grad(set_to_none = True)
+    lm.layer_major_stats(reset = True)
+    losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, events), model = model,
+                                     agree = votes)
+    assert losses is None and "another rank" in why
+    assert votes.calls == [(True, "forward")]
+    assert not any(e[0] == "loss" for e in events)
+    assert _grads(model) == {} and lm.layer_major_stats()["aborts"] == 1
+
+
+def test_another_rank_voting_no_at_commit_restores_gradients_and_rng():
+    model = _model(train_head = True)
+    batches, items = _batches(2)
+    model.zero_grad(set_to_none = True)
+    _step(model, batches[0], items)          # gradients the step already holds
+    before = _grads(model)
+    torch.manual_seed(5)
+    expect = torch.rand(3)
+    torch.manual_seed(5)
+    votes = _Votes(commit = False)
+
+    def draw(m):
+        torch.rand(1)
+
+    losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, [], fail = draw),
+                                     model = model, agree = votes)
+    assert losses is None and "another rank" in why
+    assert votes.calls == [(True, "forward"), (True, "commit")]
+    _assert_same(before, _grads(model))
+    assert torch.equal(torch.rand(3), expect)
+
+
+def test_a_local_abort_votes_no_once():
+    model = _model()
+    batches, items = _batches(2)
+    votes = _Votes()
+
+    def fn(b):
+        loss = _manual_forward(model, b, between = lambda x: x * 1.0)
+        loss.backward()
+        return loss.detach()
+
+    model.zero_grad(set_to_none = True)
+    losses, why = lm.run_layer_major(_layers(model), [lambda b = b: fn(b) for b in batches], model = model,
+                                     agree = votes)
+    assert losses is None and "changed between" in why
+    assert votes.calls == [(False, "forward")]
+
+
+@pytest.mark.parametrize("why", ["no model", "concurrent", "tied"])
+def test_a_refused_window_still_votes(why, monkeypatch):
+    """Every rank votes, also one that refuses before its window starts: the others must not wait for it."""
+    model = _model()
+    batches, items = _batches(2)
+    votes = _Votes()
+    fns = _voting_fns(model, batches, items, [])
+    if why == "no model":
+        losses, reason = lm.run_layer_major(_layers(model), fns, agree = votes)
+    elif why == "concurrent":
+        assert lm._WINDOW_LOCK.acquire(blocking = False)
+        try:
+            losses, reason = lm.run_layer_major(_layers(model), fns, model = model, agree = votes)
+        finally:
+            lm._WINDOW_LOCK.release()
+    else:
+        monkeypatch.setattr(lm, "_tied_trainable_io", lambda model: True)
+        losses, reason = lm.run_layer_major(_layers(model), fns, model = model, agree = votes)
+    assert losses is None and reason
+    assert votes.calls == [(False, "forward")]
+
+
+def test_a_backward_abort_votes_no_at_commit():
+    model = _model()
+    batches, items = _batches(2)
+    mlp = _layers(model)[1].mlp
+    real = mlp.forward
+
+    def oom(*args, **kwargs):
+        if torch.is_grad_enabled():
+            raise torch.OutOfMemoryError("simulated")
+        return real(*args, **kwargs)
+
+    votes = _Votes()
+    mlp.forward = oom
+    try:
+        model.zero_grad(set_to_none = True)
+        losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, []), model = model,
+                                         agree = votes)
+    finally:
+        del mlp.forward
+    assert losses is None and "out of memory" in why
+    assert votes.calls == [(True, "forward"), (False, "commit")]
+    assert _grads(model) == {}
+
+
+def test_an_out_of_memory_error_in_a_loss_part_after_the_vote_is_raised():
+    """An error after the forward vote propagates (a rollback could pair with another rank's collective)."""
+    model = _model(train_head = True)
+    batches, items = _batches(2)
+
+    def fail(m):
+        if m == 1:
+            raise torch.OutOfMemoryError("simulated")
+
+    votes = _Votes()
+    model.zero_grad(set_to_none = True)
+    with pytest.raises(torch.OutOfMemoryError):
+        lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, [], fail = fail), model = model,
+                           agree = votes)
+    assert votes.calls == [(True, "forward")]
+    assert _grads(model) == {}
+    losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, [], fail = fail),
+                                     model = model)
+    assert losses is None and "OutOfMemoryError" in why
+
+
 def test_caller_autocast_reaches_the_micro_batches():
     # Non-reentrant: older torch's reentrant checkpoint under CPU autocast leaves the LoRA weights without
     # gradients even in standard accumulation.
