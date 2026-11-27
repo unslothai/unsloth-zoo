@@ -59,10 +59,11 @@ class _Model(torch.nn.Module):
     def get_output_embeddings(self):
         return self.head
 
-    def forward(self, input_ids = None, packed_seq_lengths = None, **kwargs):
+    def forward(self, input_ids = None, packed_seq_lengths = None, logits_to_keep = None, **kwargs):
         if packed_seq_lengths is not None:
             self.packed_calls += 1
-        return types.SimpleNamespace(logits = torch.tanh(self.emb[input_ids] @ self.mix))
+        hidden = torch.tanh(self.emb[input_ids] @ self.mix)
+        return types.SimpleNamespace(logits = hidden[:, -logits_to_keep:] if logits_to_keep else hidden)
 
 
 def _heads():
@@ -77,7 +78,7 @@ def _heads():
     return ids, logps
 
 
-def _run(monkeypatch, packing, bins = None):
+def _run(monkeypatch, packing, bins = None, vision = False):
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "1" if packing else "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "0")
@@ -118,6 +119,7 @@ def _run(monkeypatch, packing, bins = None):
         trainer, INPUT_IDS, (INPUT_IDS != PAD).long(), LOGITS_TO_KEEP, COMPLETION_MASK,
         torch.linspace(-1, 1, INPUT_IDS.shape[0]), None, None,
         loss_type = "reinforce", num_items_in_batch = int(COMPLETION_MASK.sum()),
+        **({"pixel_values": torch.zeros(INPUT_IDS.shape[0], 1, dtype = D64)} if vision else {}),
     )
     assert seen.get("sc") is not None, "the centering term did not reach the loss"
     mask = seen["mask"].to(D64)
@@ -158,3 +160,9 @@ def test_a_packed_centering_oom_falls_back_to_the_padded_term(monkeypatch):
     assert (fallback["sc"][mask] - padded["sc"][mask]).abs().max().item() < 1e-6
     for a, b in zip(fallback_grads, padded_grads):
         assert (a - b).abs().max().item() < 1e-6
+
+
+def test_a_vision_batch_keeps_the_padded_centering_term(monkeypatch):
+    # Vision batches never pack, and their loss window has no left-pad width to compare against.
+    seen, _, packed_calls = _run(monkeypatch, packing = True, vision = True)
+    assert packed_calls == 0 and seen["sc"] is not None

@@ -5189,7 +5189,7 @@ def grpo_accumulated_loss(
         # verified against the per-row forward (shape/RoPE-aware, re-checked as T grows); falls back if a
         # backend ignores packed_seq_lengths. lm_head runs on completion positions only.
         _sc_pack_head = None
-        if _sc_ids is not None and _sc_ids.shape[1] != logits_to_keep + max_left_pad:
+        if _sc_ids is not None and pixel_values is None and _sc_ids.shape[1] != logits_to_keep + max_left_pad:
             _pg_skip_pack = True  # heads not in the [rows, W] loss window: the padded loop gathers them
         new_logprobs = None
         _pack_result = None
