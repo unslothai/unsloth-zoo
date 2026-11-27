@@ -61,18 +61,31 @@ def _softmax_without_collapse(z, y, keep_logits = False):
 def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor,
                         chunk_rows: int, ignore_index: int, need_hidden_grad: bool,
                         need_weight_grad: bool, exact: bool, amp: bool,
-                        amp_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        amp_dtype: torch.dtype, softcap: float = 0.0,
+                        logit_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Opaque to Dynamo/AOT: the runtime loop keeps logits bounded without specialising symbolic rows.
     # Compiled graphs run with autocast off, so the caller's CPU autocast is passed in and restored here.
     with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
-        return _chunked_ce_forward_loop(
-            hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
-            amp_dtype if amp else None,
+        valid = labels != ignore_index
+        if bool(valid.all()):
+            return _chunked_ce_forward_loop(
+                hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+                amp_dtype if amp else None, softcap, logit_scale,
+            )
+        # Ignored rows skip the LM head GEMMs (compiled calls too: this op is opaque); their hidden grads are zero.
+        keep = valid.nonzero().squeeze(-1)
+        total, grad_hidden, grad_weight = _chunked_ce_forward_loop(
+            hidden.index_select(0, keep), weight, labels.index_select(0, keep), chunk_rows, ignore_index,
+            need_hidden_grad, need_weight_grad, exact, amp_dtype if amp else None, softcap, logit_scale,
         )
+        if need_hidden_grad:
+            grad_hidden = grad_hidden.new_zeros(hidden.shape).index_copy_(0, keep, grad_hidden)
+        return total, grad_hidden, grad_weight
 
 
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
-                             need_weight_grad, exact, amp_dtype = None):
+                             need_weight_grad, exact, amp_dtype = None, softcap = 0.0, logit_scale = 1.0):
+    """CE over softcap * tanh(hidden @ W.T * logit_scale / softcap) (no tanh if softcap is 0)."""
     rows = hidden.shape[0]
     # A detached head misses autocast's cast cache, so cast it once instead of per chunk.
     mm_weight = weight
@@ -89,6 +102,14 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
         h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
         logits = (h @ mm_weight.t()).float()
+        if logit_scale != 1.0:
+            logits.mul_(logit_scale)
+        slope = None
+        if softcap > 0:
+            logits.div_(softcap).tanh_()
+            if need_hidden_grad or need_weight_grad:
+                slope = logits.square().neg_().add_(1)
+            logits.mul_(softcap)
         safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
         logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
         total -= (log_p_target.squeeze(-1) * valid).sum()
@@ -96,6 +117,11 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
             # softmax - onehot on valid rows; p_t - 1 = expm1(log p_t).
             logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
             logits.mul_(valid.unsqueeze(-1))
+            if slope is not None:
+                logits.mul_(slope)
+                del slope
+            if logit_scale != 1.0:
+                logits.mul_(logit_scale)
             if need_hidden_grad:
                 if exact:
                     with torch.autocast("cpu", enabled = False):
@@ -116,7 +142,8 @@ _chunked_ce_forward = torch.library.custom_op(
 
 @_chunked_ce_forward.register_fake
 def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
-                             need_hidden_grad, need_weight_grad, exact, amp, amp_dtype):
+                             need_hidden_grad, need_weight_grad, exact, amp, amp_dtype, softcap = 0.0,
+                             logit_scale = 1.0):
     grad_dtype = torch.float32 if exact else hidden.dtype
     return (
         torch.empty((), dtype = torch.float32),
@@ -130,7 +157,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     is one (chunk, vocab) fp32 block in both eager and compiled calls."""
 
     @staticmethod
-    def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index):
+    def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index, softcap = 0.0, logit_scale = 1.0):
         need_hidden_grad = hidden.requires_grad
         need_weight_grad = weight.requires_grad
         # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
@@ -140,7 +167,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         amp, amp_dtype = _cpu_autocast_state()
         total, grad_hidden, grad_weight = compute(
             hidden.detach(), weight.detach(), labels, chunk_rows, ignore_index,
-            need_hidden_grad, need_weight_grad, exact, amp, amp_dtype,
+            need_hidden_grad, need_weight_grad, exact, amp, amp_dtype, float(softcap), float(logit_scale),
         )
         saved = (grad_hidden, grad_weight)
         # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
@@ -174,7 +201,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
         dh = (grad_hidden * scale.to(grad_hidden.dtype)).to(ctx.hidden_dtype) if ctx.has_hidden else None
         dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
-        return dh, dw, None, None, None, None
+        return dh, dw, None, None, None, None, None, None
 
 
 _LOGPROB_OUTPUTS = ("entropy", "log_sum_sq_probs", "mean_logits", "is_top1")
@@ -669,7 +696,8 @@ def patch_causal_conv1d_fallback(model):
 
 
 def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = None,
-                                 ignore_index = -100, shift_labels = None, chunk_rows = None):
+                                 ignore_index = -100, shift_labels = None, chunk_rows = None,
+                                 softcap = None, logit_scale = 1.0):
     """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss."""
     if shift_labels is None:
         labels = F.pad(labels, (0, 1), value = ignore_index)
@@ -687,7 +715,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         divisor = torch.full((), num_items_in_batch, dtype = torch.float32, device = hidden.device)
     else:
         divisor = float(num_items_in_batch)
-    # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.
+    # Skip ignored rows' LM head work here in eager; compiled calls drop them inside the opaque forward op.
     if not torch.compiler.is_compiling():
         valid = shift_labels != ignore_index
         if bool(valid.any()) and not bool(valid.all()):
@@ -696,7 +724,9 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
     if chunk_rows is None:
         # ~64 MB of fp32 logits per chunk.
         chunk_rows = max(16, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // weight.shape[0])
-    return _ChunkedLinearCrossEntropy.apply(hidden, weight, shift_labels, divisor, chunk_rows, ignore_index)
+    return _ChunkedLinearCrossEntropy.apply(
+        hidden, weight, shift_labels, divisor, chunk_rows, ignore_index, float(softcap or 0.0), float(logit_scale),
+    )
 
 
 # Model types whose causal-LM loss is plain CE over lm_head(hidden); others (soft caps, logit scales, z-loss, router losses) keep their own forward.
@@ -717,11 +747,68 @@ def _plain_lm_head(model):
     if getattr(text_config, "output_router_logits", False) or getattr(text_config, "num_experts", None) \
             or getattr(text_config, "num_local_experts", None) or getattr(text_config, "n_routed_experts", None):
         return False
+    return _plain_head_and_inner(model)
+
+
+def _plain_head_and_inner(model):
     lm_head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
     if not isinstance(lm_head, torch.nn.Linear) or lm_head.bias is not None:
         return False
-    inner = getattr(model, getattr(model, "base_model_prefix", "model"), None)
-    return isinstance(inner, torch.nn.Module)
+    return _inner_model_name(model) is not None
+
+
+def _inner_model_name(model):
+    """base_model_prefix, else `model` (transformers 4.x Gemma 3 text declares `language_model`)."""
+    for name in (getattr(model, "base_model_prefix", "model"), "model"):
+        if isinstance(getattr(model, name, None), torch.nn.Module):
+            return name
+    return None
+
+
+# Causal LMs whose forward transforms lm_head(hidden) before the same CE: class -> (model_type, knob, how).
+_CHUNKED_CE_TRANSFORMED = {
+    "Gemma2ForCausalLM": ("gemma2", "final_logit_softcapping", "softcap"),
+    "Gemma3ForCausalLM": ("gemma3_text", "final_logit_softcapping", "softcap"),
+    "CohereForCausalLM": ("cohere", "logit_scale", "multiply"),
+    "Cohere2ForCausalLM": ("cohere2", "logit_scale", "multiply"),
+    "GraniteForCausalLM": ("granite", "logits_scaling", "divide"),
+}
+_LOGIT_KNOBS = ("final_logit_softcapping", "logits_soft_cap", "logit_scale", "logits_scaling", "output_multiplier_scale")
+
+
+def _lm_head_transform(model):
+    """(softcap, logit_scale) of the logits the model's forward feeds its CE, or None when chunked CE cannot match."""
+    if _plain_lm_head(model):
+        return None, 1.0
+    if type(model).__name__ not in _CHUNKED_CE_TRANSFORMED or not _plain_head_and_inner(model):
+        return None
+    return _config_transform(model)
+
+
+def _config_transform(model):
+    """The transform read from the config as the forward reads it on every call; None if chunked CE cannot match."""
+    config = getattr(model, "config", None)
+    model_type, knob, how = _CHUNKED_CE_TRANSFORMED[type(model).__name__]
+    # Top-level config only: a composite (vision) config keeps its own forward.
+    if getattr(config, "model_type", None) != model_type:
+        return None
+    for name in _LOGIT_KNOBS:
+        if name != knob and getattr(config, name, None) not in (None, 1, 1.0):
+            return None
+    if getattr(config, "output_router_logits", False) or getattr(config, "num_experts", None) \
+            or getattr(config, "num_local_experts", None) or getattr(config, "n_routed_experts", None):
+        return None
+    value = getattr(config, knob, None)
+    if how == "multiply":
+        value = getattr(model, "logit_scale", value)  # Cohere's forward reads self.logit_scale
+    if value is None and how == "softcap":
+        return None, 1.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        return None
+    value = float(value)
+    if how == "softcap":
+        return value, 1.0
+    return None, (value if how == "multiply" else 1.0 / value)
 
 
 def _plain_head_weight(head):
@@ -779,17 +866,20 @@ def _logits_to_keep_as_index(model, input_ids, inputs_embeds, logits_to_keep):
 def patch_chunked_causal_lm_loss(model):
     """Routes training forwards with labels through chunked_linear_cross_entropy, per instance; logits come back None,
     so unsloth_zoo.cpu.trainer makes TRL skip logits-only metrics. Returns True when installed."""
-    if os.environ.get("UNSLOTH_CPU_CHUNKED_CE", "1") == "0" or not _plain_lm_head(model):
+    if os.environ.get("UNSLOTH_CPU_CHUNKED_CE", "1") == "0":
+        return False
+    if _lm_head_transform(model) is None:
         return False
     if getattr(model, "_unsloth_cpu_chunked_ce", False):
         return True
+    transformed = not _plain_lm_head(model)
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     original_forward = model.forward
     # Call the class forward on self, not the bound method: deepcopy (TRL reference models, merged copies) rebinds the
     # outer method, and a bound original would run the source model's weights.
     original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
-    inner_name = getattr(model, "base_model_prefix", "model")
+    inner_name = _inner_model_name(model)
     try:
         params = inspect.signature(original_forward).parameters
     except (TypeError, ValueError):
@@ -806,6 +896,11 @@ def patch_chunked_causal_lm_loss(model):
             past_key_values = cache
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
+        # Re-read per call: a cap or scale changed after patching must not train on the old one.
+        transform = _config_transform(self) if transformed else (None, 1.0)
+        if transform is None:
+            head_weight = None  # the stock forward
+        softcap, logit_scale = transform or (None, 1.0)
         logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
         if logps_targets is not None and head_weight is not None and labels is None and shift_labels is None:
             # A preference trainer's next-token log-probs from the last hidden state in row chunks (trainer.py). The
@@ -822,7 +917,7 @@ def patch_chunked_causal_lm_loss(model):
             wanted = ("mean_logits", "log_sum_sq_probs") if vars(self).get("_unsloth_cpu_logps_sq", False) else ("mean_logits",)
             log_probs, _, sq, mean_logits, _ = cpu_chunked_log_probs(
                 hidden.reshape(batch_size * length, hidden.shape[-1]), head_weight, None, logps_targets.reshape(-1), 1.0, None,
-                outputs = wanted,
+                final_logit_softcapping = softcap, logit_scale = logit_scale, outputs = wanted,
             )
             result = {"log_probs": log_probs.view(batch_size, length), "mean_logits": mean_logits.view(batch_size, length)}
             if sq is not None:
@@ -851,6 +946,7 @@ def patch_chunked_causal_lm_loss(model):
         loss = chunked_linear_cross_entropy(
             hidden, head_weight, labels,
             num_items_in_batch = num_items_in_batch, shift_labels = shift_labels, ignore_index = ignore_index,
+            softcap = softcap, logit_scale = logit_scale,
         )
         return CausalLMOutputWithPast(
             loss = loss, logits = None,
