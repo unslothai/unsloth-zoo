@@ -291,3 +291,35 @@ def test_cpu_loader_out_of_memory_retry_replays_eagerly_with_retain_graph_and_ke
     out.square().sum().backward()
     assert len(calls) == 3  # compiled again: the forward and its recompute
     assert "training eagerly" not in capsys.readouterr().out
+
+
+class _DictBlock(_KeywordBlock):
+    def forward(self, inputs):
+        return super().forward(inputs["input"])
+
+
+def test_cpu_loader_out_of_memory_retry_with_nested_inputs_and_many_checkpoints(capsys):
+    # A tensor inside a dict argument, and more outstanding checkpoints than the compiled queue keeps (64): each must
+    # still recompute eagerly after the out-of-memory retry.
+    import torch.utils.checkpoint as checkpoint
+    from unsloth_zoo.cpu import loader
+
+    torch.manual_seed(0)
+    block = _DictBlock()
+    scale = torch.ones(())
+    calls = []
+
+    def compiled(inputs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise MemoryError()
+        return block._call_impl({"input": inputs["input"] * scale})
+
+    block._compiled_call_impl = compiled
+    loader._fall_back_to_eager_on_compile_error([block])
+    xs = [torch.randn(4, 8, requires_grad = True) for _ in range(70)]
+    outs = [checkpoint.checkpoint(block, {"input": x}, use_reentrant = False) for x in xs]
+    torch.stack(outs).square().sum().backward()
+    assert all(x.grad is not None for x in xs)
+    assert len(calls) == 1
+    assert "training eagerly" not in capsys.readouterr().out

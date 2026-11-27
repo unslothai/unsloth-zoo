@@ -606,8 +606,13 @@ def _fall_back_to_eager_on_compile_error(layers):
     eager_window = {}
 
     def first_tensor(args, kwargs = None):
-        # Positional first, then keyword inputs (checkpoint(layer, hidden_states = x)).
-        for value in itertools.chain(args, (kwargs or {}).values()):
+        # Positional first, then keyword inputs (checkpoint(layer, hidden_states = x)), also inside lists / dicts.
+        try:
+            from torch.utils._pytree import tree_leaves
+            values = tree_leaves((args, kwargs or {}))
+        except Exception:
+            values = itertools.chain(args, (kwargs or {}).values())
+        for value in values:
             if isinstance(value, torch.Tensor):
                 return value
         return None
@@ -617,7 +622,10 @@ def _fall_back_to_eager_on_compile_error(layers):
         entry = (None, None, None) if x is None else (weakref.ref(x), x.data_ptr(), tuple(x.shape))
         entries = pending.setdefault(key, [])
         entries.append(entry)
-        del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
+        if pending is eager_window:
+            entries[:] = [e for e in entries if e[0] is not None and e[0]() is not None]  # live checkpoints all stay
+        else:
+            del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
 
     def window_open(key):
         entries = eager_window.get(key)
@@ -625,7 +633,7 @@ def _fall_back_to_eager_on_compile_error(layers):
             entries[:] = [entry for entry in entries if entry[0]() is not None]
         return bool(entries)
 
-    def take(key, args, pending = pending, kwargs = None, consume = True):
+    def take(key, args, pending = pending, kwargs = None):
         entries = pending.get(key)
         if not entries:
             return False
@@ -640,8 +648,7 @@ def _fall_back_to_eager_on_compile_error(layers):
                 # reentrant checkpointing recomputes on detached copies: same storage and shape
                 or (alive is None and ptr == x.data_ptr() and shape == tuple(x.shape))
             ):
-                if consume:
-                    del entries[index]
+                del entries[index]
                 return True
         return False
 
@@ -683,8 +690,9 @@ def _fall_back_to_eager_on_compile_error(layers):
                 if state["eager"]:
                     drop(_layer)
                 return _compiled(*args, **kwargs)
-            if backward and window_open(key) and take(key, args, eager_window, kwargs, consume = False):
-                # One of the eager out-of-memory retries recomputing: eagerly, as it ran.
+            if backward and window_open(key):
+                # Not a queued compiled forward while eager retries are outstanding: every forward since ran eagerly,
+                # so this recomputation does too.
                 return _layer._call_impl(*args, **kwargs)
             if _layer.__dict__.pop("_unsloth_eager_once", False) or (not backward and window_open(key)):
                 return eager_once(key, _layer, args, kwargs)  # the restart after an out-of-memory compiled call
