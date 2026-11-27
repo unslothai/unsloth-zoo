@@ -334,7 +334,12 @@ def test_spliced_image_rows_report_the_columns_their_prompt_filled(monkeypatch, 
     model._is_vlm_model = True
     prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
     request = GenerationRequest(prompt=prompt, image=Image.new("RGB", (64, 64), "red"), max_tokens=1)
-    widths = _record_widths(monkeypatch, model.language_model)
+    widths, embed = [], type(model).get_input_embeddings
+    def recording(self, *args, **kwargs):
+        out = embed(self, *args, **kwargs)
+        widths.append(out.inputs_embeds.shape[1])
+        return out
+    monkeypatch.setattr(type(model), "get_input_embeddings", recording)
     defaults = GenerationDefaults(max_tokens=1)
     if stream:
         with BatchStream(model, processor, defaults=defaults) as batch:
@@ -345,9 +350,7 @@ def test_spliced_image_rows_report_the_columns_their_prompt_filled(monkeypatch, 
                     result = event.result or result
     else:
         (result,) = generate_batch(model, processor, [request], defaults=defaults)
-    # Prefill chunks feed all but the last prompt column, which decodes the first token.
-    fed = sum(width for width in widths if width > 1) + 1
-    assert fed > 200 and result.prompt_token_count == fed, widths
+    assert widths and max(widths) > 200 and result.prompt_token_count == max(widths), widths
 
 
 @metal_only
