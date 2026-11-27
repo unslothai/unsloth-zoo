@@ -369,3 +369,37 @@ def test_cpu_loader_retained_checkpoint_replays_eagerly_after_a_later_forward(ca
     checkpoint.checkpoint(block, h, use_reentrant = False).square().sum().backward()
     assert len(calls) == 3  # freed: compiled again, forward and recompute
     assert "training eagerly" not in capsys.readouterr().out
+
+
+class _TwoOutputBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a, self.b = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+
+    def forward(self, x):
+        return self.a(x), self.b(torch.relu(x))
+
+
+def test_cpu_loader_eager_retry_window_covers_every_output():
+    # Two outputs on independent branches: dropping the first must not reopen compile while the second can still be
+    # backpropagated through the eagerly recorded checkpoint.
+    import torch.utils.checkpoint as checkpoint
+    from unsloth_zoo.cpu import loader
+
+    torch.manual_seed(0)
+    block = _TwoOutputBlock()
+    scale = torch.ones(())
+    calls = []
+
+    def compiled(x):
+        calls.append(1)
+        if len(calls) == 1:
+            raise MemoryError()
+        return block._call_impl(x * scale)
+
+    block._compiled_call_impl = compiled
+    loader._fall_back_to_eager_on_compile_error([block])
+    h = torch.randn(4, 8, requires_grad = True)
+    second = checkpoint.checkpoint(block, h, use_reentrant = False)[1]
+    second.square().sum().backward()
+    assert len(calls) == 1

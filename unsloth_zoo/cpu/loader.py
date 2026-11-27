@@ -610,17 +610,19 @@ def _fall_back_to_eager_on_compile_error(layers):
     # never mix modes; once every such graph is freed the layer compiles again.
     eager_window = {}
 
-    def first_tensor(args, kwargs = None):
-        # Positional first, then keyword inputs (checkpoint(layer, hidden_states = x)), also inside lists / dicts.
+    def tensor_leaves(value):
+        # Tensors inside lists / tuples / dicts (and model outputs pytree knows), in order.
         try:
             from torch.utils._pytree import tree_leaves
-            values = tree_leaves((args, kwargs or {}))
+            values = tree_leaves(value)
         except Exception:
-            values = itertools.chain(args, (kwargs or {}).values())
-        for value in values:
-            if isinstance(value, torch.Tensor):
-                return value
-        return None
+            values = value if isinstance(value, (list, tuple)) else [value]
+        return [v for v in values if isinstance(v, torch.Tensor)]
+
+    def first_tensor(args, kwargs = None):
+        # Positional first, then keyword inputs (checkpoint(layer, hidden_states = x)).
+        values = tensor_leaves((args, kwargs or {}))
+        return values[0] if values else None
 
     def remember(key, args, kwargs = None):
         x = first_tensor(args, kwargs)
@@ -668,14 +670,17 @@ def _fall_back_to_eager_on_compile_error(layers):
 
     def eager_once(key, layer, args, kwargs):
         out = layer._call_impl(*args, **kwargs)
-        y = first_tensor((out,))
-        node = getattr(y, "grad_fn", None)
-        metadata = getattr(node, "metadata", None)
-        if not _in_backward() and checkpointed(layer) and isinstance(metadata, dict):
-            token = _GraphToken()
-            metadata.setdefault("_unsloth_eager_retry", []).append(token)
-            window_open(key)  # prune freed graphs
-            eager_window.setdefault(key, []).append(weakref.ref(token))
+        if not _in_backward() and checkpointed(layer):
+            # One token on every output's graph: it lives while any output can still be backpropagated.
+            token, pinned = _GraphToken(), False
+            for value in tensor_leaves(out):
+                metadata = getattr(getattr(value, "grad_fn", None), "metadata", None)
+                if isinstance(metadata, dict):
+                    metadata.setdefault("_unsloth_eager_retry", []).append(token)
+                    pinned = True
+            if pinned:
+                window_open(key)  # prune freed graphs
+                eager_window.setdefault(key, []).append(weakref.ref(token))
         return out
 
     def checkpointed(layer):
