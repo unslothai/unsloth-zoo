@@ -897,6 +897,59 @@ def test_lane_projections_serve_a_family_with_no_exact_verifier(qwen_4bit, monke
     assert not inference.fast_verify_covers(model)
 
 
+@pytest.fixture(scope = "module")
+def inkling2():
+    """Random 4-bit looped Inkling 2 (Inkling 2 Mini's shape): only a loop passes speculative_verify to the expert layers."""
+    import mlx.nn as nn
+    from mlx.utils import tree_map
+    language = pytest.importorskip("mlx_vlm.models.inkling2.language", reason = "mlx-vlm < 0.8.1 has no Inkling 2")
+    from mlx_vlm.models.inkling2.config import TextConfig
+    lm = language.LanguageModel(TextConfig.from_dict(dict(
+        hidden_size = 256, num_hidden_layers = 6, vocab_size = 512, unpadded_vocab_size = 512, num_attention_heads = 4,
+        num_key_value_heads = 2, head_dim = 64, swa_num_attention_heads = 4, swa_num_key_value_heads = 2, swa_head_dim = 64,
+        sliding_window_size = 16, intermediate_size = 128, n_routed_experts = 8, num_experts_per_tok = 2,
+        n_layers_per_attn_res_block = 2, d_rel = 16, rel_extent = 64, log_scaling_n_floor = None,
+        loop_config = dict(core_start = 2, core_end = 4, num_passes = 2, gate_rank = 8))))
+    lm.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
+                       if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, lm.parameters()))
+    lm.set_dtype(mx.bfloat16)
+    nn.quantize(lm, group_size = 32, bits = 4, class_predicate = lambda path, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0)
+    lm.eval()
+    mx.eval(lm.parameters())
+    return SimpleNamespace(language_model = lm), [[(7 * i + 3) % 40 + 2 for i in range(48)]]
+
+
+def test_inkling2_verifies_on_its_grouped_expert_kernel_and_commits_like_verify_forward(inkling2, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.models.inkling2 import grouped_experts
+    from unsloth_zoo.mlx.speculative import SpeculativeEngine
+    (model, ids), lm, hits = inkling2, inkling2[0].language_model, []
+    grouped = grouped_experts.grouped_expert_projections
+    monkeypatch.setattr(grouped_experts, "grouped_expert_projections", lambda *a: hits.append(grouped(*a) is not None) or grouped(*a))
+    prompt = mx.array([ids[0]])
+    for length, accepted in [(2, 1), (5, 2), (8, 0), (8, 7), (9, 4)]:
+        engines, offsets = [], []
+        for marked in (True, False):
+            engine = SpeculativeEngine(model, _rounds_only())
+            assert engine._marked_rows == 8
+            engine._marked_rows *= marked
+            engine.cache = make_prompt_cache(lm)
+            mx.eval(lm(prompt, cache = engine.cache).logits)
+            engines.append(engine)
+        hits.clear()
+        block = mx.array([[(13 * i + 1) % 500 + 2 for i in range(length)]])
+        (marked, _, opened), (chunked, _, transaction) = (engine._verify(block) for engine in engines)
+        assert any(hits) == (length <= 8), (length, hits)
+        assert mx.abs(marked - chunked).max().item() < 0.25, (length, mx.abs(marked - chunked).max().item())
+        nexts = []
+        for engine, state in zip(engines, (opened, transaction)):
+            lm.rollback_speculative_cache(engine.cache, state, accepted, length)
+            offsets.append(engine.cache[0][0].offset)
+            nexts.append(lm(mx.array([[9]]), cache = engine.cache).logits)
+        assert offsets == [prompt.shape[1] + accepted + 1] * 2
+        assert mx.abs(nexts[0] - nexts[1]).max().item() < 0.25
+
+
 @pytest.mark.parametrize("low", [0, 4])
 def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwen_4bit, monkeypatch, low):
     from unsloth_zoo.mlx import inference, matmul
