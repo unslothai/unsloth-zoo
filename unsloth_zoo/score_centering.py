@@ -195,9 +195,7 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
     n_rows = flat_x.shape[0]
     if n_rows == 0:
         return hidden_states.new_zeros((R, T, k), dtype = torch.float32)
-    # Only positions with a recorded head reach the vocabulary projection: padding after a completion's end
-    # and unmatched rows have every slot < 0, which the caller masks out (grpo_score_centering_term).
-    # Rows per chunk stay as before, so the peak does not grow.
+    # Skip headless positions (all slots < 0, masked by the caller); keep rows per chunk so the peak does not grow.
     keep = (flat_ids >= 0).any(dim = -1)
     rows = None
     n_keep = int(keep.sum())

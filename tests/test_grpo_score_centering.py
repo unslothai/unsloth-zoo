@@ -318,8 +318,6 @@ def test_topk_head_logprobs_matches_full_softmax(softcap, mult, div, temp):
 
 @pytest.mark.parametrize("chunks", [1, 4, 9])
 def test_topk_head_logprobs_skips_positions_without_a_head(chunks, monkeypatch):
-    # Padding after a completion's end (and unmatched rows) has every head slot < 0: those positions
-    # must not reach the vocabulary projection, and the kept ones match the full computation (fp64).
     gen = torch.Generator().manual_seed(11)
     R, T, H, V, k = 4, 9, 16, 97, 5
     h = torch.randn(R, T, H, generator = gen, dtype = D64, requires_grad = True)
@@ -350,7 +348,6 @@ def test_topk_head_logprobs_skips_positions_without_a_head(chunks, monkeypatch):
     g2 = torch.autograd.grad(torch.where(mask, ref * gw, 0.0).sum(), [h, W])
     for a, b in zip(g1, g2):
         assert (a - b).abs().max().item() < 1e-12
-    # No head anywhere: zeros, still connected to the graph.
     none = sc.grpo_topk_head_logprobs(h, W, torch.full_like(ids, -1), chunks)
     assert none.shape == (R, T, k) and (none == 0).all() and none.requires_grad
 
