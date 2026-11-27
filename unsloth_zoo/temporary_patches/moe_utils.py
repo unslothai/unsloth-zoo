@@ -6375,6 +6375,17 @@ def forward_triton_grouped_gemm(
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    # The unsloth_triton backend is chosen once per process; this call's tensors can still live off the GPU (a CPU
+    # reference model, a CPU-offloaded expert stack). The Triton kernels need CUDA / HIP tensors: anything else runs the
+    # eager loop. Inline, not a helper: this function is also copied into the compiled cache.
+    _gate_up_w, _down_w = getattr(self, "gate_up_proj", None), getattr(self, "down_proj", None)
+    if (
+        hidden_states.device.type != "cuda"
+        or (isinstance(_gate_up_w, torch.Tensor) and _gate_up_w.device.type != "cuda")
+        or (isinstance(_down_w, torch.Tensor) and _down_w.device.type != "cuda")
+    ):
+        return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
+
     packed = any(is_mxfp4_expert_param(getattr(self, name, None)) for name in ("gate_up_proj", "down_proj"))
     if packed or not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
         # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
