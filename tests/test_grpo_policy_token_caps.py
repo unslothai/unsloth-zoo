@@ -14,8 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO policy pass must keep packing and PrefixGrouper within one padded mini-batch's tokens, and keep
-PrefixGrouper off when forwards are collective (sharded FSDP2), so every rank runs the same forwards."""
+"""The GRPO policy pass must keep packing and PrefixGrouper within one padded mini-batch's tokens (a batch over it
+packs in several bins of whole rows), and keep both off when forwards are collective (sharded FSDP2), so every rank
+runs the same forwards."""
 
 import collections
 import importlib.util
@@ -123,25 +124,141 @@ def _prefix_grouper(monkeypatch):
     monkeypatch.setattr(rr.grpo_accumulated_loss, "_pg_funcs", funcs, raising = False)
 
 
-def _run(mini_batch, model = None):
+def _run(mini_batch, model = None, result = None):
     model = model or _Model()
     model.train(True)
     mask = (_IDS[:, -_COMPLETION:] != 0).long()
+    advantages = torch.linspace(-1.0, 1.0, ROWS)
     out = rr.grpo_accumulated_loss(
-        _trainer(model, mini_batch), _IDS, (_IDS != 0).long(), _COMPLETION, mask, torch.ones(ROWS), None, None,
+        _trainer(model, mini_batch), _IDS, (_IDS != 0).long(), _COMPLETION, mask, advantages, None, None,
         loss_type = "dapo", max_completion_length = 8, num_items_in_batch = mask.sum().float(),
         current_gradient_accumulation_steps = 1, epsilon_low = 0.2, epsilon_high = 0.28,
     )
     out[0].backward()
+    if result is not None:
+        result["loss"] = out[0].detach()
+        result["grads"] = {k: p.grad.detach().clone() for k, p in model.named_parameters() if p.grad is not None}
     return model.calls
+
+
+_REAL = [int(n) for n in (_IDS != 0).sum(dim = 1)]
+
+
+def test_packing_bins_are_whole_rows_within_the_cap():
+    assert rr.grpo_packing_bins(_REAL, 3 * L) == [(0, 4), (4, 6)]
+    assert rr.grpo_packing_bins(_REAL, sum(_REAL)) == [(0, ROWS)]
+    assert rr.grpo_packing_bins(_REAL, L) == [(i, i + 1) for i in range(ROWS)]
+    assert rr.grpo_packing_bins(_REAL, max(_REAL) - 1) is None
+    assert rr.grpo_packing_bins([], L) == []
+
+
+def test_reverify_rows_come_from_multi_row_bins():
+    # lengths [14, 14, 6, 6, 14] under a 14-token cap: only rows 2 and 3 share a forward.
+    lengths, counts = [14, 14, 6, 6, 14], [4, 4, 4, 4, 4]
+    bins = rr.grpo_packing_bins(lengths, 14)
+    assert bins == [(0, 1), (1, 2), (2, 4), (4, 5)]
+    masked = rr.grpo_packing_multirow_counts(counts, bins)
+    assert masked == [0, 0, 4, 4, 0]
+    picked = rr.grpo_packing_verify_rows(lengths, masked, True)
+    assert 2 in picked or 3 in picked
+    assert rr.grpo_packing_multirow_counts(counts, [(0, 5)]) is counts
+
+
+def test_unsafe_length_applies_to_the_longest_bin(monkeypatch):
+    # An unsafe mark above every bin's tokens (but below the whole batch's) keeps packing on.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    model = _Model()
+    model._unsloth_seq_packing_grad_ok = True
+    model._unsloth_seq_packing_grad_unsafe_T = sum(_REAL[:4]) + 1
+    assert sum(_REAL) >= model._unsloth_seq_packing_grad_unsafe_T
+    calls = _run(mini_batch = 2, model = model)
+    assert [n for kind, n in calls if kind == "packed"][:2] == [sum(_REAL[:4]), sum(_REAL[4:])], calls
 
 
 def test_packing_stays_within_the_mini_batch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
-    # 6 splits: one row of L tokens per forward.
+    # 6 splits: one row per forward. Single-row bins cannot test cross-row isolation, so unverified packing does
+    # not run them: the padded loop does.
     calls = _run(mini_batch = ROWS)
     assert all(kind == "padded" for kind, _ in calls), calls
     assert max(n for _, n in calls) <= L, calls
+
+
+def test_single_row_bins_never_widen_the_trusted_envelope(monkeypatch):
+    # Already trusted packing (verified before): single-row bins run packed, but they verify nothing about
+    # cross-row isolation, so a later multi-row bin of the same length is verified again, not trusted.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    model = _Model()
+    model._unsloth_seq_packing_grad_ok = True
+    calls = _run(mini_batch = ROWS, model = model)
+    assert [n for kind, n in calls if kind == "packed"] == _REAL, calls
+    assert int(getattr(model, "_unsloth_seq_packing_grad_verified_T", 0)) == 0
+    model.calls = []
+    calls = _run(mini_batch = 2, model = model)
+    packed = [n for kind, n in calls if kind == "packed"]
+    assert packed[:2] == [sum(_REAL[:4]), sum(_REAL[4:])], calls
+    assert any(kind == "padded" for kind, _ in calls), calls  # the per-row verify forwards ran
+
+
+def test_a_failing_bin_releases_the_finished_bins(monkeypatch):
+    # An OOM in the second packed bin: the first bin's graph must not stay alive through the padded fallback.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    import gc
+    import weakref
+
+    class _Sentinel:
+        pass
+
+    class _Keep(torch.autograd.Function):
+        # Identity whose backward context holds a sentinel: it lives exactly as long as the bin's graph.
+        @staticmethod
+        def forward(ctx, x, sentinel):
+            ctx.sentinel = sentinel
+            return x.view_as(x)
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad, None
+
+    model = _Model()
+    model._unsloth_seq_packing_grad_ok = True
+    seen, forward = [], model.forward
+
+    def flaky(input_ids = None, packed_seq_lengths = None, **kwargs):
+        out = forward(input_ids = input_ids, packed_seq_lengths = packed_seq_lengths, **kwargs)
+        if packed_seq_lengths is not None:
+            sentinel = _Sentinel()
+            seen.append(weakref.ref(sentinel))
+            out.logits = _Keep.apply(out.logits, sentinel)
+            del sentinel
+            if len(seen) == 2:
+                raise torch.cuda.OutOfMemoryError("injected")
+        elif seen:
+            gc.collect()
+            assert all(ref() is None for ref in seen), "a finished packed bin is still alive in the padded loop"
+        return out
+
+    model.forward = flaky
+    calls = _run(mini_batch = 2, model = model)
+    assert [kind for kind, _ in calls].count("packed") == 2, calls
+    assert any(kind == "padded" for kind, _ in calls), calls
+
+
+def test_batch_over_the_mini_batch_packs_in_bins(monkeypatch):
+    # 2 splits of 3 rows: 36 real tokens over a 24-token mini-batch. Two packed forwards of whole rows
+    # replace the padded loop, with the loss and gradients of one packed forward over the whole batch.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    assert sum(_REAL) > 3 * L
+    binned, whole = {}, {}
+    calls = _run(mini_batch = 2, result = binned)
+    packed = [n for kind, n in calls if kind == "packed"]
+    assert packed == [sum(_REAL[:4]), sum(_REAL[4:])], calls
+    assert max(n for _, n in calls) <= 3 * L, calls
+    assert [n for _, n in _run(mini_batch = 1, result = whole) if _ == "packed"] == [sum(_REAL)]
+    torch.testing.assert_close(binned["loss"], whole["loss"], rtol = 1e-6, atol = 1e-7)
+    assert binned["grads"].keys() == whole["grads"].keys() and binned["grads"]
+    for name, grad in binned["grads"].items():
+        torch.testing.assert_close(grad, whole["grads"][name], rtol = 1e-5, atol = 1e-7)
 
 
 def test_packing_still_runs_when_it_fits(monkeypatch):
@@ -150,9 +267,10 @@ def test_packing_still_runs_when_it_fits(monkeypatch):
 
 
 def test_prefix_grouper_stays_within_the_mini_batch(monkeypatch):
+    # The grouped layout is over the cap, so it is declined; packing then runs one row per forward.
     _prefix_grouper(monkeypatch)
     calls = _run(mini_batch = ROWS)
-    assert all(kind == "padded" for kind, _ in calls), calls
+    assert "grouped" not in [kind for kind, _ in calls], calls
     assert max(n for _, n in calls) <= L, calls
 
 
