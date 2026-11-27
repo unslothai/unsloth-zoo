@@ -547,7 +547,7 @@ def eagle3_chunked_loss(drafter, step_hidden, final_hidden, lm_head_weight, loss
     """eagle3_loss on supervised rows in checkpointed chunks so per-step [B, T, Vd] fp32 logits never exist for the
     whole batch (OOM on 24 GB cards); normalizer (supervised tokens in the accumulated batch) replaces the
     per-microbatch count so grad accumulation weights every token equally."""
-    from ..gradient_checkpointing import _torch_checkpoint
+    from unsloth_zoo.gradient_checkpointing import _torch_checkpoint
     checkpoint = _torch_checkpoint()
 
     weight = lm_head_weight[drafter.t2d.to(lm_head_weight.device)] if drafter.uses_draft_vocab else lm_head_weight

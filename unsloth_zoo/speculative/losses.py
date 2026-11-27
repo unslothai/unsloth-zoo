@@ -75,7 +75,7 @@ def _checkpoint():
     """torch's own checkpoint (gradient_checkpointing._torch_checkpoint); this module is also loaded on its own,
     without the package, by tests/test_speculative_losses.py when unsloth is not installed."""
     try:
-        from ..gradient_checkpointing import _torch_checkpoint
+        from unsloth_zoo.gradient_checkpointing import _torch_checkpoint
     except ImportError:
         import torch.utils.checkpoint as ck
         return getattr(ck, "_unsloth_pristine_checkpoint", None) or ck.checkpoint
