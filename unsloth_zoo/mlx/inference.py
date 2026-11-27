@@ -9497,11 +9497,16 @@ _TAKEN_TREE_ROWS = 10  # a gated delta layer keeps eight forked states, and the 
 def draft_tree(selector, hidden, anchor, candidates, unary, rows, taken = False, calibration = None):
     """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row: best by the
     selector's own probabilities, or by those `calibration`'s float32 [2, depths] rows of alpha and beta map them to."""
+    return _lattice_tree(selector.predecessor_codebook.weight, selector.hidden_projection(hidden), selector.successor_codebook.weight,
+                         anchor, candidates, unary, rows, taken, calibration)
+
+
+def _lattice_tree(pred, projected, succ, anchor, candidates, unary, rows, taken = False, calibration = None):
+    """`draft_tree` over edges `sum_r pred[parent][r] * projected[position][r] * succ[token][r]`, tables indexed by `candidates`' ids."""
     if taken and rows > _TAKEN_TREE_ROWS:
         raise RuntimeError(f"a draft tree in taking order holds at most {_TAKEN_TREE_ROWS} rows")
-    projected = selector.hidden_projection(hidden)
-    pred, succ, top = selector.predecessor_codebook.weight, selector.successor_codebook.weight, candidates.shape[-1]
-    length, depth = hidden.shape[1], min(rows - 1, candidates.shape[1])
+    top = candidates.shape[-1]
+    length, depth = projected.shape[1], min(rows - 1, candidates.shape[1])
     if calibration is None:
         calibration = mx.array([[0.0], [1.0]])
     outputs = _draft_tree_kernels()[0](
@@ -10381,6 +10386,67 @@ def sparse_drafter(model, target, original):
             matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
         return original
     return _SparseDrafter(model, target, original, bindings)
+
+
+_DSPARK = "mlx_vlm.speculative.drafters.dspark.dspark"
+_MARKOV_TREE_CONTRACT = {_DSPARK: {"DSparkDraftModel.draft_block": "ff3e98d8725850f5",
+                                   "VanillaMarkov.sample_block": "201eaf9e1605bdc9",
+                                   "VanillaMarkov.apply_step_logits": "2d752529859cf498",
+                                   "VanillaMarkov.get_prev_embeddings": "741dd8523946500e"},
+                         "mlx_vlm.speculative.drafters.qwen3_dflash.dflash": {"DFlashDraftModel._logits": "17df2a902489e60a"}}
+_MARKOV_TREE_TOP = 8   # candidates per position, from the block's own logits
+
+
+def _table_rows(module, ids):
+    if "scales" in module:
+        return mx.dequantize(module["weight"][ids], module["scales"][ids], module["biases"][ids] if "biases" in module else None,
+                             module.group_size, module.bits, mode = module.mode)
+    return module["weight"][ids]
+
+
+class _MarkovTreeDrafter:
+    """DSpark's blocks, and best-first trees over a block's logits plus its Markov transition `w1[parent] . w2[token]`."""
+
+    def __init__(self, model, original, bindings):
+        self.model, self.original, self.bindings = model, original, bindings
+
+    def __call__(self, *args, **kwargs):
+        return self.original(*args, **kwargs)
+
+    def tree(self, last_bonus, hidden, cache, block_size, rows, scan = None, taken = False, calibration = None):
+        model = self.model
+        markov, length, own = model.markov_head, int(block_size) - 1, bool(model.config.sample_from_anchor)
+        if model.draft_block != self.original or model.training or not _bindings_intact(self.bindings):
+            raise RuntimeError("a DSpark draft tree needs the block drafting it was built for")
+        anchor = mx.array([last_bonus], mx.int32) if isinstance(last_bonus, int) else last_bonus.reshape(-1).astype(mx.int32)
+        masks = mx.full((1, length - own), int(model.config.mask_token_id), dtype = mx.int32)
+        proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)
+        block = model._logits(proposed if own else proposed[:, 1:])
+        # The block's own chain at every depth, so the tree's first children are the chain its budget prices.
+        chain = markov.sample_block(block, first_prev_tokens = anchor, sampler = lambda x: mx.argmax(x, axis = -1))[0]
+        logits = block[0].astype(mx.float32)
+        candidates = mx.argpartition(logits, -_MARKOV_TREE_TOP, axis = -1)[:, -_MARKOV_TREE_TOP:]
+        chain = chain.astype(candidates.dtype)[:, None]
+        held = (candidates == chain).any(axis = -1, keepdims = True)
+        candidates = mx.where(held, candidates, mx.concatenate([chain, candidates[:, 1:]], axis = -1)).astype(mx.int32)
+        # The kernel reads its tables by token: here by candidate slot, the anchor last, and maps the slots back.
+        tokens = mx.concatenate([candidates.reshape(-1), anchor])
+        pred, succ = (_table_rows(table, tokens).astype(mx.float32) for table in (markov.markov_w1, markov.markov_w2))
+        slots = mx.arange(length * _MARKOV_TREE_TOP, dtype = mx.int32).reshape(1, length, _MARKOV_TREE_TOP)
+        tree = _lattice_tree(pred, mx.ones((1, length, pred.shape[-1]), mx.float32), succ, mx.array([length * _MARKOV_TREE_TOP], mx.int32),
+                             slots, mx.take_along_axis(logits, candidates, axis = -1)[None], rows, taken, calibration)
+        return tree._replace(tokens = tokens[tree.tokens])
+
+
+def markov_tree_drafter(model, original):
+    """`original` able to draft trees too, for a DSpark drafter with the pairwise Markov head in the target's vocabulary."""
+    module = sys.modules.get(_DSPARK)
+    if (module is None or not mx.metal.is_available() or type(model) is not module.DSparkDraftModel
+            or type(model.markov_head) is not module.VanillaMarkov or model.d2t is not None or original != model.draft_block
+            or model.config.vocab_size < _MARKOV_TREE_TOP):
+        return original
+    bindings = _resolved_bindings(_MARKOV_TREE_CONTRACT)
+    return original if bindings is None else _MarkovTreeDrafter(model, original, bindings)
 
 _DFLASH = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
 _PREDRAFT_CONTRACT = {_DFLASH: {"DFlashAttention.__call__": "38d25e361a41e018"}, "mlx_vlm.models.cache": {

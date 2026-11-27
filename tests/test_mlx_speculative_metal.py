@@ -1278,6 +1278,52 @@ def test_a_lone_greedy_row_verifies_draft_trees_and_keeps_its_tokens_and_scores(
     assert not commits
 
 
+def test_dspark_drafts_trees_over_its_markov_lattice_and_keeps_its_replies(qwen_4bit, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, speculative as S
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        drafter = S._built(S.ContextDrafter, _tiny_companion(model, "RadixArk/Qwen3.8-27B-DSpark"), model.language_model)
+        dspark, block = drafter.model, drafter.trained_depth + 1
+        assert isinstance(drafter._draft, inference._MarkovTreeDrafter) and drafter.tree_widths == (block,)
+        context = drafter.features(model.language_model(mx.array([ids[0][:24]]), **drafter.capture))
+        anchor, stash, logits = ids[0][24], [], dspark._logits
+        monkeypatch.setattr(dspark, "_logits", lambda h: stash.append(logits(h)) or stash[-1])
+        for quantized in (False, True):
+            # A head of a real rank, strong enough to lift the chain past the block's own top candidates.
+            mx.random.seed(0)
+            markov = type(dspark.markov_head)(dspark.config.vocab_size, 64)
+            markov.markov_w1.weight = markov.markov_w1.weight * 64
+            if quantized:
+                markov.markov_w1, markov.markov_w2 = nn.QuantizedEmbedding.from_embedding(markov.markov_w1, 64, 4), nn.QuantizedLinear.from_linear(markov.markov_w2, 64, 4)
+            dspark.markov_head, dspark.confidence_head = markov, None
+            stash.clear()
+            chain = dspark.draft_block(anchor, context, dspark.make_cache(), block, lambda x: mx.argmax(x, axis = -1))
+            tree = drafter._draft.tree(anchor, context, dspark.make_cache(), block, 16)
+            tokens, parents, depths, logq = (a.tolist() for a in (tree.tokens, tree.parent, tree.block.depth, tree.logq))
+            # The first children are the block's own chain, which the Markov steps may lift past the top candidates.
+            first = next((i for i in range(1, 16) if parents[i] != i - 1), 16)
+            assert tokens[0] == anchor and first > 2 and tokens[1:first] == chain[0, : first - 1].tolist()
+            # Siblings' log q differ by their Markov step logits from their parent, whatever the candidates around them.
+            pairs = [(a, b) for a in range(1, 16) for b in range(a + 1, 16) if parents[a] == parents[b]]
+            assert any(depths[a] > 1 for a, _ in pairs)
+            for a, b in pairs:
+                step = markov.apply_step_logits(stash[0][:, depths[a] - 1], mx.array([tokens[parents[a]]]))[0].astype(mx.float32)
+                assert abs((logq[a] - logq[b]) - (step[tokens[a]] - step[tokens[b]]).item()) < 0.05
+        # Tree rounds of the real lattice keep a greedy reply decoding's.
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        drafter.predraft_rows, rounds = 0, []
+        engine = S.SpeculativeEngine(model, _script(("draft", 4), ("plain", 2)), drafter)
+        engine.controller.max_depth = drafter.trained_depth
+        drafter.tree_budget = SimpleNamespace(choose = lambda: block, observe = lambda *args: None)
+        tree_round = engine._tree_round
+        monkeypatch.setattr(engine, "_tree_round", lambda *args: rounds.append(1) or tree_round(*args))
+        assert _scored_reply(model, ids, engine, 48)[0] == _solo(model, ids[0], 48, SamplingParams()) and rounds
+    sparse = S._built(S.ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2"), model.language_model)
+    assert not isinstance(sparse._draft, inference._MarkovTreeDrafter)
+
+
 def test_tree_and_chain_rounds_commit_on_the_engines_stream(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams
