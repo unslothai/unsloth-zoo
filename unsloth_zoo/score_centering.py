@@ -498,11 +498,12 @@ def _prompt_index(rollout, pad_token_id):
     return index
 
 
-def _segment_start(row, kept, m, full, n_gen, pad_token_id):
+def _segment_start(row, kept, m, full, n_gen, pad_token_id, prompt_width):
     """Row column where a record's generated tokens start (its prompt being the row's first m kept tokens), or None
     when the row does not hold that generation there."""
     if m == 0:
-        return None
+        # A prompt of pad ids only (BOS == EOS == pad): no kept token to anchor on, so use the row's prompt boundary.
+        return prompt_width
     prompt = full[:len(full) - n_gen]
     trailing = 0
     if pad_token_id is not None:
@@ -563,7 +564,7 @@ def lookup_rollout_topk(input_ids, logits_to_keep, k, pad_token_id = None):
                         continue
                     head_ids, head_logps = rollout["raw"][full]
                     n_gen = head_ids.shape[0]
-                    start = _segment_start(row, kept, m, full, n_gen, pad_token_id)
+                    start = _segment_start(row, kept, m, full, n_gen, pad_token_id, prompt_width)
                     if start is None or start < prompt_width or start >= width:
                         continue
                     generated = full[len(full) - n_gen:]

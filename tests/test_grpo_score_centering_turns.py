@@ -198,6 +198,19 @@ def test_whole_match_wins_over_a_sibling_sharing_its_first_tokens():
     assert torch.equal(ids, ref_ids) and torch.equal(logps, ref_logps)
 
 
+def test_prompt_of_pad_ids_only_anchors_at_the_prompt_boundary():
+    sc.reset_score_centering()
+    gen = torch.Generator().manual_seed(8)
+    V, k = 30, 4
+    out, tr = _output([PAD], [2, 3], V, k, gen)  # BOS == EOS == pad: the prompt strips to nothing
+    sc.record_rollout_topk([out], k)
+    L = 3
+    ids, _, matched = sc.lookup_rollout_topk(_batch([([PAD], [2, 3])], 2, L), L, k, PAD)
+    ref_ids, _ = _reference_heads(1, L, k, [(0, 0, tr)])
+    assert matched.tolist() == [True]
+    assert torch.equal(ids, ref_ids)
+
+
 def test_store_is_bounded_without_a_lookup():
     sc.reset_score_centering()
     gen = torch.Generator().manual_seed(4)
