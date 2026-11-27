@@ -855,6 +855,51 @@ def test_dense_families_bitwise(arch):
     _assert_same(base_grads, grads)
 
 
+def _skip_aware_flag(cls, monkeypatch):
+    """Unsloth's gradient_checkpointing class property (every-N-layer checkpointing): a getter / setter pair with no
+    deleter, the value kept under another instance key, a marked layer reads False."""
+    def _get(self):
+        if self.__dict__.get("_unsloth_every_n_skip", False):
+            return False
+        return self.__dict__.get("_unsloth_gc_flag", self.__dict__.get("gradient_checkpointing", False))
+
+    def _set(self, value):
+        self.__dict__["_unsloth_gc_flag"] = value
+
+    monkeypatch.setattr(cls, "gradient_checkpointing", property(_get, _set), raising = False)
+
+
+@pytest.mark.parametrize("installed", ["before_model", "after_model", "every_2_layers"])
+def test_gradient_checkpointing_class_property(monkeypatch, installed):
+    """Unsloth installs the flag as a class property; the window turns it off and back on without deleting it."""
+    if installed == "before_model":
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        _skip_aware_flag(LlamaDecoderLayer, monkeypatch)
+    model = _model(False)
+    layers = _layers(model)
+    if installed != "before_model":
+        _skip_aware_flag(type(layers[0]), monkeypatch)
+    if installed == "every_2_layers":
+        for i, layer in enumerate(layers):
+            if "gradient_checkpointing" in layer.__dict__:
+                layer.__dict__["_unsloth_gc_flag"] = layer.__dict__.pop("gradient_checkpointing")
+            if i % 2:
+                layer.__dict__["_unsloth_every_n_skip"] = True
+    keys = ("gradient_checkpointing", "_unsloth_gc_flag", "_unsloth_every_n_skip")
+    state = [{k: l.__dict__[k] for k in keys if k in l.__dict__} for l in layers]
+    flags = [l.gradient_checkpointing for l in layers]
+    assert any(flags)
+    batches, items = _batches()
+    base_losses, base_grads = _standard(model, batches, items)
+    lm.layer_major_stats(reset = True)
+    losses, grads = _layer_major(model, batches, items)
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, grads)
+    assert lm.layer_major_stats()["recomputes"] == 3 * len(layers)
+    assert [l.gradient_checkpointing for l in layers] == flags
+    assert [{k: l.__dict__[k] for k in keys if k in l.__dict__} for l in layers] == state
+
+
 def test_kv_shared_layers_are_refused():
     """Gemma 4 style: a consumer layer reads the key / value states a producer wrote (no-grad in the window)."""
     layers = _toy_stack()
