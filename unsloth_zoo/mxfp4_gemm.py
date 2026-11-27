@@ -828,7 +828,7 @@ def mxfp4_grouped_mm_available(device = None) -> bool:
     device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":
         return False
-    if torch.version.hip is None and not _triton_lowers_dot(
+    if not is_rocm_torch(torch) and not _triton_lowers_dot(
         torch.cuda.get_device_capability(device), triton.__version__,
     ):
         return False
@@ -1156,7 +1156,7 @@ def packed_grouped_mm_available(device, fmt, dtype = torch.bfloat16) -> bool:
     """CUDA sm_80+ (not ROCm), bf16 / fp16 inputs, and a per (device, format, dtype) self-check against dequantize."""
     if fmt not in _PACKED_FORMATS or dtype not in (torch.bfloat16, torch.float16):
         return False
-    if not _HAS_TRITON or _triton_too_old() or torch.version.hip is not None or not torch.cuda.is_available():
+    if not _HAS_TRITON or _triton_too_old() or is_rocm_torch(torch) or not torch.cuda.is_available():
         return False
     device = torch.device(device)
     if device.type != "cuda":
