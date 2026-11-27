@@ -1083,11 +1083,23 @@ def packed_grouped_mm_mode():
 _PACKED_MAX_ROWS = {}
 
 
+def _packed_default_max_rows(capability):
+    """Default auto cutoff (rows per expert) from LoRA training steps, Qwen3-30B-A3B expert shapes, NVFP4 experts,
+    fused vs dequantize + grouped GEMM, whole step (fwd, checkpoint replay, dX):
+    RTX PRO 6000 (sm_120) +14-18% at 32 rows, +1-9% at 64, +4-9% at 128 -> 192 on sm_12x;
+    L4 (sm_89) +26-32% at 32 rows, -0.3 to +7% at 64, -5 to +3% at 128 -> 64 on sm_86 / sm_89;
+    A100 (sm_80) the layer alone gains only below 32 rows -> 32 elsewhere."""
+    capability = tuple(capability)
+    if capability[0] == 12:
+        return 192
+    if capability in ((8, 6), (8, 7), (8, 9)):
+        return 64
+    return 32
+
+
 def packed_grouped_mm_max_rows(device = None):
-    """Routed rows per expert below which the fused kernel runs under auto (UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS).
-    The dense chunk costs bandwidth, so the cutoff follows it. Qwen3-30B-A3B experts, fwd + dX vs dequantize:
-    L4 (sm_89) 2.0-5.1x at 16-64 rows, 1.4-2.1x at 128, 0.84-0.96x at 256 -> 192 on sm_86 / sm_89 / sm_12x;
-    A100 (sm_80) 1.2-1.6x at 16 rows, 0.85-1.18x at 64, 0.8-1.0x at 128 -> 32 elsewhere."""
+    """Routed rows per expert below which the fused kernel runs under auto (UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS);
+    the per-architecture default is _packed_default_max_rows."""
     import os
     value = os.environ.get("UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS")
     if value is not None:
@@ -1102,8 +1114,7 @@ def packed_grouped_mm_max_rows(device = None):
         index = torch.cuda.current_device()
     rows = _PACKED_MAX_ROWS.get(index)
     if rows is None:
-        cap = torch.cuda.get_device_capability(index)
-        rows = _PACKED_MAX_ROWS[index] = 192 if cap in ((8, 6), (8, 7), (8, 9)) or cap[0] == 12 else 32
+        rows = _PACKED_MAX_ROWS[index] = _packed_default_max_rows(torch.cuda.get_device_capability(index))
     return rows
 
 
