@@ -155,7 +155,8 @@ def test_patched_forward_matches_stock_loss_and_grads(name, softcap, monkeypatch
         assert applied[0][0] == softcap
     assert torch.allclose(out.loss, ref.loss, rtol = 1e-5, atol = 1e-6), (out.loss, ref.loss)
     for (n, p), (_, q) in zip(model.named_parameters(), stock.named_parameters()):
-        assert torch.allclose(p.grad, q.grad, rtol = 1e-4, atol = 1e-6), n
+        # Relative to the whole tensor: fp32 summation order differs by BLAS build (Windows vs Linux).
+        assert float((p.grad - q.grad).norm()) <= 2e-5 * float(q.grad.norm()) + 1e-7, n
 
 
 def test_kill_switch_keeps_stock_forward(monkeypatch):
