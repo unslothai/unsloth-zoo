@@ -2710,6 +2710,9 @@ def _select_moe_backend():
             return "sonic_moe"
         _log_info(f"Unsloth: '{requested}' backend requested but is not available. Falling back to next available.")
 
+    if _rocm_arch_prefers_unsloth_triton() and _check_grouped_gemm_available():
+        _log_info("Unsloth: Using MoE backend 'unsloth_triton' (ROCm gfx1151: torch._grouped_mm is a synced per-expert loop)")
+        return "unsloth_triton"
     if _check_torch_grouped_mm_supported():
         _log_info("Unsloth: Using MoE backend 'grouped_mm'")
         return "grouped_mm"
@@ -2722,6 +2725,26 @@ def _select_moe_backend():
     if _GROUPED_MM_TRAINING_PROBE_FAILURE is not None:
         _log_grouped_mm_fallback(_GROUPED_MM_TRAINING_PROBE_FAILURE, f"MoE backend '{backend}'")
     return backend
+
+
+# ROCm archs whose auto MoE backend is unsloth_triton even when torch._grouped_mm passes the training probe. There
+# torch._grouped_mm is its per-expert mm loop with a host sync per expert (CK grouped GEMM only on opt-in gfx942 /
+# gfx950 / gfx90a). gfx1151 (Strix Halo), Qwen3-30B-A3B layer shape (E 128, top-8), LoRA r16, bf16, exclusive GPU:
+# 0.4960 s/step on grouped_mm vs 0.4246 on unsloth_triton (1.17x; 5637 vs 5 aten::item per step), same distance to
+# an fp64 oracle. UNSLOTH_MOE_BACKEND=grouped_mm still selects grouped_mm.
+_ROCM_UNSLOTH_TRITON_ARCHS = ("gfx1151",)
+
+
+def _rocm_arch_prefers_unsloth_triton():
+    if not is_rocm_torch(torch):
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        arch = str(getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "gcnArchName", "") or "")
+    except Exception:
+        return False
+    return arch.split(":", 1)[0] in _ROCM_UNSLOTH_TRITON_ARCHS
 
 
 def _unsloth_triton_beats_loop():
