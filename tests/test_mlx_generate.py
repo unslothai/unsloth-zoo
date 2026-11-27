@@ -2158,7 +2158,7 @@ def test_a_vision_row_hears_each_prefill_chunk_once_it_has_run(monkeypatch):
     finished = []
     with pytest.warns(UserWarning, match="its row reports no more progress"):
         while session.rows_in_flight:
-            for event in list(session.step()):  # as BatchStream.step collects them
+            for event in list(session.step()):
                 order.append(("token", event.index))
                 finished += [event.index] if event.result else []
     assert finished == [quiet, loud]

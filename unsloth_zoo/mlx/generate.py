@@ -296,12 +296,10 @@ class GenerationRequest:
     ``drafts=False`` keeps a row of a speculative batch off the draft: its tokens are the
     target's own, as a reply decoded without speculation draws them. Other batches ignore it.
 
-    ``prompt_progress`` is called with ``(processed, total, cached)`` as the row's prompt is
-    prefilled: ``processed`` and ``total`` over the columns past the ``cached`` prefix the row
-    resumed from. Chunks run as a row joins (a speculative row, an image text row) are reported
-    from ``add``. A vision model prefilling unchunked reports nothing, as do vision batches where
-    something other than unsloth-zoo overrides mlx-vlm's ``PromptProcessingBatch``. The callback
-    cannot change the ``BatchStream`` reporting to it.
+    ``prompt_progress(processed, total, cached)`` is called per prefill chunk, counting columns past
+    the ``cached`` prefix; chunks run on join (speculative or image text rows) report from ``add``.
+    Unchunked vision prefills, and vision batches whose ``PromptProcessingBatch`` another library
+    overrides, report nothing. The callback cannot change the ``BatchStream`` reporting to it.
     """
 
     prompt: str | None = None
@@ -2469,7 +2467,7 @@ def _open_prefill_scope(prune = False):
     while scope is not None and scope[0] is None:
         scope = scope[1]
     node = scope if prune else None
-    while node is not None:  # splice closed scopes out of the chain, so it holds only open ones
+    while node is not None:  # drop closed scopes from the chain
         link = node[1]  # read once: contexts copied from one another share these cells
         while link is not None and link[0] is None:
             link = link[1]
@@ -4113,7 +4111,6 @@ class _VLMBatchSession:
             try:
                 _install_row_prefill_batch(adapter.batch_module)
             except BatchRowRefused:
-                # Something else builds the prompt batches, so none counts its chunks.
                 progress = None
         insert_kwargs = {"prompt_kwargs": row_kwargs}
         if row_processors is not None:
@@ -4317,8 +4314,7 @@ class _VLMBatchSession:
             self._report_prefill(*self._prefilling)
             prompting = getattr(self.generator, "_prompt_batch", None) if self._progress else None
             _, events = self._cache_materializer.next()
-            # The step may also have built and started a batch from a queued row.
-            # Held only to report: a finished prompt batch still owns its pre-merge cache.
+            # Held only to report (a finished prompt batch still owns its pre-merge cache).
             self._prefilling = (prompting, getattr(self.generator, "_prompt_batch", None)) if self._progress else ()
             prompting = None
             if not events:
