@@ -89,10 +89,7 @@ def env(monkeypatch):
         monkeypatch.setattr(vu.torch.cuda, "memory_stats", mem.stats)
         monkeypatch.setattr(vu.torch.cuda, "mem_get_info", mem.info)
         monkeypatch.delenv("UNSLOTH_VLLM_STANDBY_KEEP_AWAKE", raising = False)
-        monkeypatch.setattr(vu, "_STANDBY_KEEP_AWAKE", {
-            "kept_awake": 0, "slept": 0, "measured": [], "pending": None, "rollout_tokens": 0, "last": None,
-            "announced": False,
-        })
+        monkeypatch.setattr(vu, "_STANDBY_KEEP_AWAKE", {"kept_awake": 0, "slept": 0, "last": None, "announced": False})
         vu.patch_vllm_standby_keep_awake()
         return LLM(), mem, calls
     return setup
@@ -185,6 +182,18 @@ def test_chat_rollouts_count_too(env):
     llm.chat([{"role": "user", "content": "x"}])
     llm.sleep(level = 1)
     assert calls == [("generate",)]
+
+
+def test_measurements_belong_to_their_engine(env):
+    # a second engine (a reload, another trainer) has measured nothing yet: its first rollout-ending sleep runs
+    llm, mem, calls = env()
+    trl_step(llm, mem, calls, 1 * GB)
+    assert trl_step(llm, mem, calls, 0) == ["wake_up", "wake_up"]
+    other = type(llm)()
+    del calls[:]
+    other.generate(["p"])
+    other.sleep(level = 2)
+    assert calls == [("generate",), ("sleep", 2)]
 
 
 def test_level_zero_pause_is_always_honoured(env):

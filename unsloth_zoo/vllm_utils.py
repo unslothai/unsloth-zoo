@@ -1366,9 +1366,7 @@ pass
 # fits in the memory left beside the mapped KV, keep vLLM awake instead. The first step always sleeps (it measures the
 # training step), every step re-checks the fit against its own rollout size, and a step that does not fit sleeps as
 # before. Numerics are unchanged: sleep only unmaps memory. UNSLOTH_VLLM_STANDBY_KEEP_AWAKE=0 always sleeps.
-_STANDBY_KEEP_AWAKE = {
-    "kept_awake": 0, "slept": 0, "measured": [], "pending": None, "rollout_tokens": 0, "last": None, "announced": False,
-}
+_STANDBY_KEEP_AWAKE = {"kept_awake": 0, "slept": 0, "last": None, "announced": False}
 _STANDBY_KEEP_AWAKE_SAFETY = 1.2
 _STANDBY_KEEP_AWAKE_HISTORY = 16
 
@@ -1397,13 +1395,23 @@ def _standby_memory_point():
 pass
 
 
-def _standby_close_measurement():
+def _standby_state(llm):
+    """Per-engine measurements: one engine's training steps say nothing about another's memory."""
+    state = getattr(llm, "_unsloth_standby_keep_awake_state", None)
+    if state is None:
+        state = {"measured": [], "pending": None, "rollout_tokens": 0}
+        try: llm._unsloth_standby_keep_awake_state = state
+        except Exception: pass
+    return state
+pass
+
+
+def _standby_close_measurement(s):
     """At the first wake_up after a sleep or a kept-awake step: the training step's working set, from what was
     allocated when it started to torch's reserved high water during it. reserved only grows between the two points
     unless something empties the cache, so the high water is the later of now and the all-time peak when the step set
     a new peak; otherwise the step stayed under the old peak, which bounds it from above. Counting from allocated (not
     reserved) keeps the cached blocks a kept-awake step reuses in its working set, so the estimate never decays."""
-    s = _STANDBY_KEEP_AWAKE
     pend = s["pending"]
     if pend is None: return
     s["pending"] = None
@@ -1415,10 +1423,9 @@ def _standby_close_measurement():
 pass
 
 
-def _standby_fits(tokens):
+def _standby_fits(s, tokens):
     """True when the coming training step, scaled to this rollout's padded size, fits in the device's free memory
-    with the safety factor and a margin, judged from the training steps measured so far."""
-    s = _STANDBY_KEEP_AWAKE
+    with the safety factor and a margin, judged from this engine's training steps measured so far."""
     if not s["measured"]: return False, None
     _, _, _, free, total = _standby_memory_point()
     need = _STANDBY_KEEP_AWAKE_SAFETY * max(g * max(1.0, tokens / t) for g, t in s["measured"])
@@ -1446,14 +1453,14 @@ def patch_vllm_standby_keep_awake():
     LLM = getattr(vllm, "LLM", None)
     if LLM is None or getattr(LLM, "_unsloth_standby_keep_awake", False): return
     import functools
-    s = _STANDBY_KEEP_AWAKE
+    stats = _STANDBY_KEEP_AWAKE
     _orig_sleep, _orig_wake_up = LLM.sleep, LLM.wake_up
 
     def _counting(original):
         @functools.wraps(original)
         def call(self, *args, **kwargs):
             outputs = original(self, *args, **kwargs)
-            try: s["rollout_tokens"] += _standby_rollout_tokens(outputs)
+            try: _standby_state(self)["rollout_tokens"] += _standby_rollout_tokens(outputs)
             except Exception: pass
             return outputs
         return call
@@ -1469,29 +1476,30 @@ def patch_vllm_standby_keep_awake():
             return _orig_sleep(self, *args, **kwargs)
         # Only the sleep that ends a rollout may be skipped. With no rollout since the last wake (the trainer's first
         # sleep, a resume, a user freeing the GPU) vLLM always sleeps.
+        s = _standby_state(self)
         tokens, s["rollout_tokens"] = s["rollout_tokens"], 0
         enabled = tokens > 0 and _standby_keep_awake_enabled()
         fits = False
         s["pending"] = None
         if enabled:
             try:
-                _standby_close_measurement()
-                fits, info = _standby_fits(tokens)
+                _standby_close_measurement(s)
+                fits, info = _standby_fits(s, tokens)
                 _, peak, allocated, _, _ = _standby_memory_point()
                 s["pending"] = {"allocated": allocated, "peak": peak, "tokens": tokens}
             except Exception as e:
                 fits, info = False, {"error": repr(e)}
-            s["last"] = dict(info or {}, kept_awake = bool(fits))
+            stats["last"] = dict(info or {}, kept_awake = bool(fits))
         if fits:
-            s["kept_awake"] += 1
+            stats["kept_awake"] += 1
             self._unsloth_standby_awake = True
-            if not s["announced"]:
-                s["announced"] = True
+            if not stats["announced"]:
+                stats["announced"] = True
                 print(f"Unsloth: Standby keeps vLLM awake between steps: training fits beside it "
                       f"(needs about {info['need_gb']:.1f} GB, {info['free_gb']:.1f} GB free). "
                       f"Set UNSLOTH_VLLM_STANDBY_KEEP_AWAKE=0 to always sleep.")
             return None
-        if enabled: s["slept"] += 1
+        if enabled: stats["slept"] += 1
         self._unsloth_standby_awake = False
         result = _orig_sleep(self, *args, **kwargs)
         if s["pending"] is not None:
@@ -1505,7 +1513,8 @@ def patch_vllm_standby_keep_awake():
 
     @functools.wraps(_orig_wake_up)
     def wake_up(self, *args, **kwargs):
-        try: _standby_close_measurement()
+        s = _standby_state(self)
+        try: _standby_close_measurement(s)
         except Exception: s["pending"] = None
         if getattr(self, "_unsloth_standby_awake", False):
             # Never slept: nothing to map back, and vLLM would only warn that the executor is not sleeping.
