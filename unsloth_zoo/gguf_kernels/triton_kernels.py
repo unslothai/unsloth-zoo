@@ -109,8 +109,14 @@ def _lut(tab, idx, m):
 
 
 @triton.jit
+def _neg(v):
+    # sign-bit flip: exact IEEE negation, -0.0 for +0.0 (Triton 3.2 lowers -v to 0 - v, which keeps +0.0)
+    return (v.to(tl.uint32, bitcast = True) ^ 0x80000000).to(tl.float32, bitcast = True)
+
+
+@triton.jit
 def _signed(v, s):
-    return tl.where(s != 0, -v, v)
+    return tl.where(s != 0, _neg(v), v)
 
 
 @triton.jit
@@ -180,7 +186,7 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
     elif TYPE == _Q1_0:
         bit = (_u8(b + 2 + j // 8, m) >> (j % 8)) & 1
         d = _f16(b, m)
-        v = tl.where(bit != 0, d, -d)
+        v = tl.where(bit != 0, d, _neg(d))
     elif TYPE == _Q2_0:
         q = (_u8(b + 2 + j // 4, m) >> (2 * (j % 4))) & 3
         v = _f16(b, m) * (q - 1).to(tl.float32)
@@ -280,7 +286,7 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
         e = mag >> 3
         man = mag & 7
         v = tl.where(e == 0, man.to(tl.float32) * 0.001953125, _bits2f(((e + 120) << 23) | (man << 20)))
-        v = tl.where((x & 0x80) != 0, -v, v)
+        v = tl.where((x & 0x80) != 0, _neg(v), v)
         v = tl.where(mag == 0x7F, float("nan"), v)
     elif TYPE == _F16:
         v = _f16(b, m)

@@ -197,13 +197,15 @@ def test_compile_fullgraph_no_breaks():
         y = gguf_linear(x, packed, T.Q5_K, (64, 512)) * 2
         z = gguf_grouped_mm(xs, stack, T.IQ4_XS, (3, 32, 256), counts)
         w = dequantize_gguf(packed, T.Q5_K, (64, 512), x.dtype)
-        return y.float().sum() + z.float().sum() + w.float().sum()
+        return y.float().sum() + z.float().sum() + w.float().mean()
 
     torch._dynamo.reset()
     compiled = torch.compile(fn, fullgraph = True)
-    x = torch.randn(4, 512, device = "cuda", dtype = dtype, requires_grad = True)
-    xs = torch.randn(6, 256, device = "cuda", dtype = dtype, requires_grad = True)
+    # small inputs: float16 outputs of random K-quant weights (|w| up to ~60) must not overflow
+    x = (torch.randn(4, 512, device = "cuda") * 1e-2).to(dtype).requires_grad_()
+    xs = (torch.randn(6, 256, device = "cuda") * 1e-2).to(dtype).requires_grad_()
     out = compiled(x, xs)
+    assert torch.isfinite(out)
     out.backward()
     want = fn(x.detach().requires_grad_(), xs.detach().requires_grad_())
     assert torch.allclose(out, want, rtol = 1e-3, atol = 1e-2)

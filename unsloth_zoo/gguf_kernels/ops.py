@@ -111,9 +111,11 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
     qk, bs = GGML_BLOCK[ggml_type]
     K = shape[-1]
     rows = packed.numel() // ggml_row_bytes(ggml_type, K)
-    out = torch.empty(shape, dtype = dtype, device = packed.device)
+    # sm < 80 has no bf16 conversion instruction (Triton 3.2 cannot emit one): decode to float32, round in torch.
+    native = dtype != torch.bfloat16 or torch.version.hip is not None or torch.cuda.get_device_capability(packed.device)[0] >= 8
+    out = torch.empty(shape, dtype = dtype if native else torch.float32, device = packed.device)
     if out.numel() == 0:
-        return out
+        return out.to(dtype)
     NB = max(1, 256 // qk)
     BLOCK_R = 16
     grid = (-(-rows // BLOCK_R), -(-(K // qk) // NB))
@@ -123,7 +125,7 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
             TYPE = ggml_type, QK = qk, BS = bs, BLOCK_R = BLOCK_R, NB = NB,
             num_warps = 4, enable_fp_fusion = False,
         )
-    return out
+    return out if native else out.to(dtype)
 
 
 def _dequantize_impl(packed, ggml_type, shape, dtype):
