@@ -538,6 +538,7 @@ def _init_unset(head, std):
 def load_nextn_state_dict(source, config, revision = None):
     """Read only MTP tensors of a NextN family checkpoint; returns (state_dict with canonical names, per-expert layout as in checkpoint, info)."""
     from safetensors import safe_open
+    from ..safetensors_pread import pread_backend_kwargs
     from .mtp import _weight_map
 
     family = mtp_family_for_config(config)
@@ -568,7 +569,8 @@ def load_nextn_state_dict(source, config, revision = None):
             from huggingface_hub import hf_hub_download
             shard_path = hf_hub_download(str(source), shard, revision = revision)
         files.append(shard_path)
-        with safe_open(shard_path, framework = "pt", device = "cpu") as f:
+        # the head is built on the GPU and loads this dict once: pread where mmap -> GPU is slow
+        with safe_open(shard_path, framework = "pt", device = "cpu", **pread_backend_kwargs()) as f:
             for name in shard_names:
                 prefix, canon = family.from_ckpt(name, n)
                 prefixes.add(prefix)

@@ -393,6 +393,7 @@ from huggingface_hub import (
 )
 from safetensors import safe_open
 from safetensors.torch import save_file
+from .safetensors_pread import pread_backend_kwargs
 from collections import OrderedDict
 from tqdm import tqdm as ProgressBar
 import os, shutil, re, functools
@@ -1217,7 +1218,11 @@ def _merge_and_overwrite_lora(
             header_metadata = json.loads(mm.read(length_of_header))
             mm.seek(0)
 
-        with safe_open(filename_original if source_path is None else source_path, framework = "pt", device = "cpu") as file:
+        # only LoRA / bias / vocab targets are read, one at a time, and merged on the GPU: pread where mmap -> GPU is slow
+        with safe_open(
+            filename_original if source_path is None else source_path, framework = "pt", device = "cpu",
+            **pread_backend_kwargs(),
+        ) as file:
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
             bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
@@ -2174,6 +2179,10 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
 
         for _fused_key, _experts in _perexpert.items():
             if _fused_key in processed_mxfp4_keys:
+                continue
+            # header only: a pread handle would read a skipped stack in full
+            _fused_meta = header_metadata.get(_fused_key, {})
+            if len(_fused_meta.get("shape", (0, 0, 0))) != 3 or _fused_meta.get("dtype") in ("F8_E4M3", "F8_E5M2"):
                 continue
             _fused_W = file.get_tensor(_fused_key)
             if _fused_W.dim() != 3 or _fused_W.dtype in _FP8_WEIGHT_DTYPES:

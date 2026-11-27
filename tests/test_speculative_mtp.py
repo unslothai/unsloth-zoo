@@ -350,3 +350,29 @@ def test_gradients_reach_head_only(setup):
     loss.backward()
     assert setup.embed.weight.grad is None
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters())
+
+
+@pytest.mark.parametrize("pread", ["1", "0"])
+def test_load_reads_with_pread_where_wanted(setup, monkeypatch, pread):
+    """UNSLOTH_SAFETENSORS_PREAD=1 (a unified-memory GPU's default) reads the head with pread, 0 keeps mmap;
+    the tensors are bit-identical either way."""
+    import safetensors
+    from unsloth_zoo import safetensors_pread as sp
+
+    if not sp.safetensors_supports_backend():
+        pytest.skip("safetensors < 0.8 has no backend keyword")
+    monkeypatch.setenv(sp.PREAD_ENV, pread)
+    backends = []
+    real = safetensors.safe_open
+
+    def spy(*args, **kwargs):
+        backends.append(kwargs.get("backend"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(safetensors, "safe_open", spy)
+    sd, _ = load_mtp_state_dict(setup.ckpt)
+    # the weight-map scan reads keys only; the tensor read is the last open
+    assert backends and backends[-1] == ("pread" if pread == "1" else None)
+    assert set(sd) == set(setup.sd)
+    for name, tensor in sd.items():
+        assert torch.equal(tensor.view(torch.uint8), setup.sd[name].contiguous().view(torch.uint8)), name

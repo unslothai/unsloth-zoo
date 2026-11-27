@@ -123,6 +123,7 @@ def load_mtp_state_dict(source, revision = None, config = None):
     head-relative (fc.weight), others keep full names (info["prefix"] is empty); only shards holding the head are
     opened."""
     from safetensors import safe_open
+    from ..safetensors_pread import pread_backend_kwargs
     text = _text_config(config) if config is not None else _source_text_config(source, revision)
     family = _nextn_family(text)
     if family is not None:
@@ -162,7 +163,8 @@ def load_mtp_state_dict(source, revision = None, config = None):
             from huggingface_hub import hf_hub_download
             shard_path = hf_hub_download(str(source), shard, revision = revision)
         files.append(shard_path)
-        with safe_open(shard_path, framework = "pt", device = "cpu") as f:
+        # the head is built on the GPU and loads this dict once: pread where mmap -> GPU is slow
+        with safe_open(shard_path, framework = "pt", device = "cpu", **pread_backend_kwargs()) as f:
             for name in shard_names:
                 state_dict[name[len(prefix):]] = f.get_tensor(name)
 
