@@ -1234,7 +1234,12 @@ pass
 
 # A fresh interpreter, not a fork: forking a process that holds a model is slow and pins its pages.
 _CATCH_ALL_HELPER = """
-import importlib.util, sys
+import sys
+# `-c` puts the working directory first on sys.path (Python < 3.11 has no -P); the helper needs only the stdlib, numpy
+# and this file, so drop it before any import: a pickle.py in a shared cwd such as /tmp must not run here.
+if not getattr(sys.flags, "safe_path", False) and sys.path and sys.path[0] in ("", "."):
+    del sys.path[0]
+import importlib.util
 from multiprocessing.connection import Connection
 spec = importlib.util.spec_from_file_location("_unsloth_rl_sandbox", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
