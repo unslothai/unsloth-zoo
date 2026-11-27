@@ -37,6 +37,7 @@
 import importlib.util
 import logging
 import os
+from contextlib import nullcontext
 from functools import partial
 
 import torch
@@ -82,7 +83,7 @@ def _native_modeling():
 
 
 # Checkpointed layer runs (first forward + recompute), for tests and engagement checks.
-REPLAY_STATS = {"runs": 0, "compressor_lora": 0}
+REPLAY_STATS = {"runs": 0, "compressor_lora": 0, "indexer": 0}
 
 
 def prepare_compiled_checkpoint():
@@ -184,6 +185,10 @@ def patch_deepseek_v41_gradient_checkpointing():
                 if kwargs.get(key) is not None:
                     kwargs[key] = None
 
+        # The first run is the forward, later ones the recompute: the indexer's top-k is replayed, not re-scored.
+        frame, scope = _selection_frame()
+        passes = [0]
+
         def run(*inner_args, **inner_kwargs):
             REPLAY_STATS["runs"] += 1
             replay.clear()
@@ -191,8 +196,10 @@ def patch_deepseek_v41_gradient_checkpointing():
             # transformers 5.23+ checkpoints `forward` itself: leaving the flag on would double-checkpoint and lose the group state.
             previous = self.gradient_checkpointing
             self.gradient_checkpointing = False
+            replaying = passes[0] > 0
+            passes[0] += 1
             try:
-                with _compressor_lora(self):
+                with _compressor_lora(self), scope(frame, replaying):
                     return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
             finally:
                 self.gradient_checkpointing = previous
@@ -205,6 +212,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         shared.update(replay)
         return out
 
+    _replay_indexer_selection(getattr(modeling, "DeepseekV41Indexer", None))
     # The port's own compressor, before a compiled cache replaces the class in the modeling module.
     _pooled_reads_weight(getattr(modeling, "DeepseekV41Compressor", None))
     _ORIGINAL_COMPRESSOR.append(getattr(modeling, "DeepseekV41Compressor", None))
@@ -218,6 +226,83 @@ def patch_deepseek_v41_gradient_checkpointing():
 pass
 
 TEMPORARY_PATCHES.append(patch_deepseek_v41_gradient_checkpointing)
+
+
+def _no_selection_scope(frame, replay):
+    return nullcontext()
+
+
+def _gc_module():
+    """unsloth_zoo.gradient_checkpointing when it has the selection replay, else None (imported once)."""
+    if not _GC_MODULE:
+        try:
+            from unsloth_zoo import gradient_checkpointing as gc_module
+            if not hasattr(gc_module, "checkpoint_replayed_selection"):
+                gc_module = None
+        except Exception:
+            gc_module = None
+        _GC_MODULE.append(gc_module)
+    return _GC_MODULE[0]
+
+
+_GC_MODULE = []
+
+
+def _selection_frame():
+    """(frame, scope) for one checkpointed layer call: gradient_checkpointing's routing frame and scope, so a no-grad
+    selection op inside the layer (the indexer) runs once and its recompute reads the first pass. (None, no-op) when
+    no backward follows, UNSLOTH_GC_REPLAY_SELECTION=0, or that module is unavailable."""
+    if not torch.is_grad_enabled() or os.environ.get("UNSLOTH_GC_REPLAY_SELECTION", "1") == "0":
+        return None, _no_selection_scope
+    gc_module = _gc_module()
+    if gc_module is None:
+        return None, _no_selection_scope
+    return gc_module.CheckpointRoutingFrame(), gc_module._checkpoint_routing_scope
+
+
+def _replay_indexer_selection(indexer_cls):
+    """The indexer is a no-grad top-k of the layer input (an fp32 score GEMM per query chunk): under a checkpoint the
+    recompute returns the first pass's indices and replays its writes to `shared` (indexer keys, candidate blocks)."""
+    import inspect
+
+    if indexer_cls is None or getattr(indexer_cls.forward, "_unsloth_selection_replay", False):
+        return
+    original = indexer_cls.forward
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        return
+    if "shared" not in signature.parameters:
+        return
+
+    def forward(self, *args, **kwargs):
+        gc_module = None if torch.compiler.is_compiling() else _gc_module()
+        if gc_module is None or getattr(gc_module._GC_ROUTING_TLS, "frame", None) is None:
+            return original(self, *args, **kwargs)
+        try:
+            shared = signature.bind(self, *args, **kwargs).arguments.get("shared")
+        except TypeError:
+            shared = None
+        if not (callable(getattr(shared, "items", None)) and callable(getattr(shared, "update", None))):
+            return original(self, *args, **kwargs)
+
+        def select():
+            before = dict(shared.items())
+            out = original(self, *args, **kwargs)
+            REPLAY_STATS["indexer"] += 1
+            return out, {k: v for k, v in shared.items() if before.get(k, _MISSING) is not v}
+
+        out, written = gc_module.checkpoint_replayed_selection(("deepseek_v41_indexer", id(self)), select)
+        shared.update(written)
+        return out
+
+    forward._unsloth_selection_replay = True
+    forward._unsloth_original = original
+    forward.__doc__ = original.__doc__
+    indexer_cls.forward = forward
+
+
+_MISSING = object()
 
 
 def _non_reentrant_checkpoint(layer = None):

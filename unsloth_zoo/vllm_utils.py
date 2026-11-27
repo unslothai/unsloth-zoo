@@ -7315,9 +7315,10 @@ pass
 
 
 def _strip_lora_adapter_name(state_dict, name):
-    """vLLM reads lora_A.weight, PEFT names it lora_A.<adapter>.weight; other adapters' tensors stay out."""
+    """vLLM reads lora_A.weight, PEFT names it lora_A.<adapter>.weight; other adapters' tensors stay out.
+    Same anchored rule for "default": a blind replace kept e.g. DPO's "ref" adapter and renamed module names
+    such as "default_mlp"."""
     # All Unsloth Zoo code licensed under LGPLv3
-    if name == "default": return {k.replace(".default", ""):v for k, v in state_dict.items()}
     segment = re.compile(r"\.lora_([AB])\." + re.escape(name) + r"(?=\.|$)")
     return {segment.sub(r".lora_\1", k):v for k, v in state_dict.items() if segment.search(k)}
 pass
