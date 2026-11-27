@@ -332,6 +332,16 @@ _COMPILE_SWITCH_MODULES = (
 
 
 @_pytest.fixture
+def triton_moe_on_cpu(monkeypatch):
+    """Let forward_triton_grouped_gemm take its Triton branch with CPU tensors. Tests that fake the grouped-GEMM kernels
+    (or stop at the autotune step) check that branch's own logic on CPU CI; without this the device gate (#2864) sends
+    CPU tensors to the eager loop and they test something else, or nothing."""
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    monkeypatch.setattr(moe_utils, "_triton_moe_tensors_on_gpu", lambda module, hidden_states: True)
+
+
+@_pytest.fixture
 def compile_enabled(monkeypatch):
     _enable_compile(monkeypatch)
 

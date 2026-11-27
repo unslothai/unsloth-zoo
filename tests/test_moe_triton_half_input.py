@@ -12,6 +12,8 @@ import torch
 
 from unsloth_zoo.temporary_patches import moe_utils as M
 
+pytestmark = pytest.mark.usefixtures("triton_moe_on_cpu")
+
 
 def _run(monkeypatch, x_dtype, w_dtype):
     tuned, gemm_inputs = [], []
