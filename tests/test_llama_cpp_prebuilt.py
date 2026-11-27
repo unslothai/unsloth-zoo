@@ -694,6 +694,8 @@ def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest 
 def test_attempt_order_cpu_only_linux(monkeypatch, tmp_path):
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
+    # No GPU: a CUDA host would try the CUDA bundle first (test_llama_cpp_cuda_bundle_for_export.py).
+    monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
     calls = _wire_attempt_recorder(monkeypatch, fork_release = ("b9585", FORK_ASSETS), ggml_release = ggml)
     assert llama_cpp._install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp"), gpu_support = False) is None
