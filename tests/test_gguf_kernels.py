@@ -314,6 +314,8 @@ def test_group_split_both_layouts(ggml_type, split, monkeypatch):
 @pytest.mark.parametrize("ggml_type", [T.IQ4_XS, T.Q4_0, T.NVFP4], ids = _id)
 def test_grouped_schedules(ggml_type, host_sched, monkeypatch):
     # the expert schedule (tile / row prefix sums) is computed in the kernel, or on device by torch on Triton < 3.3
+    if not host_sched and gguf_ops._old_triton():
+        pytest.skip("Triton < 3.3 scans a replicated layout wrongly: the in-kernel schedule is never used there")
     monkeypatch.setattr(gguf_ops, "_OLD_TRITON", host_sched)
     dtype = _half()
     E, N = 7, 32
