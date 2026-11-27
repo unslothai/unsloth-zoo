@@ -93,7 +93,9 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         mm_weight = weight.to(amp_dtype)
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
-    grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0)
+    # The head gradient is [V, H] fp32 (622 MB for a 151k vocab): the first chunk's product becomes the buffer, so
+    # it is never zero filled first; later chunks add into it in place.
+    grad_weight = None
     total = torch.zeros((), dtype = torch.float32)
     for start in range(0, rows, chunk_rows):
         end = min(start + chunk_rows, rows)
@@ -129,9 +131,18 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                 else:
                     grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
             if need_weight_grad:
-                grad_weight.addmm_(logits.t(), h.float())
+                if grad_weight is None:
+                    grad_weight = torch.empty(weight.shape, dtype = torch.float32)
+                    with torch.autocast("cpu", enabled = False):
+                        torch.mm(logits.t(), h.float(), out = grad_weight)
+                else:
+                    grad_weight.addmm_(logits.t(), h.float())
         # Free logits before the next projection, else two chunks' logits coexist beside the head copy.
         del logits
+    if not need_weight_grad:
+        grad_weight = torch.empty(0)
+    elif grad_weight is None:  # no rows
+        grad_weight = torch.zeros(weight.shape, dtype = torch.float32)
     return total, grad_hidden, grad_weight
 
 
@@ -150,6 +161,39 @@ def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
         torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0),
         torch.empty(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0),
     )
+
+
+# torch 2.8+: whether this backward pass keeps the graph (retain_graph); older torch scales out of place.
+_KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
+_TOP_SAVED_HOOKS = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+
+
+def _owned_ptr(buffer):
+    """The forward's head-gradient address, or None under compile / a saved-tensor hook (which may hand back a
+    shared or substituted buffer that must not be scaled in place)."""
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        if _TOP_SAVED_HOOKS is not None and _TOP_SAVED_HOOKS(True) is not None:
+            return None
+        return buffer.data_ptr()
+    except (RuntimeError, TypeError):  # fake / functional tensors have no storage
+        return None
+
+
+def _scale_in_place_ok(owned, buffer):
+    """In place only in an eager backward that frees the graph (a retained graph runs backward again on the same
+    buffer), without create_graph, on the exact buffer forward made."""
+    if owned is None or _KEEP_GRAPH is None or torch.compiler.is_compiling() or torch.is_grad_enabled():
+        return False
+    if type(buffer) is not torch.Tensor or buffer.requires_grad or not buffer.is_contiguous():
+        return False
+    try:
+        if buffer.data_ptr() != owned or _KEEP_GRAPH():
+            return False
+    except RuntimeError:  # not inside a backward pass
+        return False
+    return True
 
 
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
@@ -180,6 +224,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             loss = total / (1.0 if divisor == 0 else divisor)
             ctx.divisor = divisor
         ctx.save_for_backward(*saved)
+        ctx.owned_weight_grad = _owned_ptr(grad_weight) if need_weight_grad else None
         ctx.has_hidden = need_hidden_grad
         ctx.has_weight = need_weight_grad
         ctx.weight_dtype = weight.dtype
@@ -200,7 +245,16 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             empty = math.isnan(ctx.divisor) or ctx.divisor == 0
             scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
         dh = (grad_hidden * scale.to(grad_hidden.dtype)).to(ctx.hidden_dtype) if ctx.has_hidden else None
-        dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
+        dw = None
+        if ctx.has_weight:
+            if _scale_in_place_ok(ctx.owned_weight_grad, grad_weight):
+                # Scale the op's own [V, H] buffer in place (bitwise equal to the product) and hand it on, so it is
+                # adopted as .grad instead of a fresh 622 MB copy; a unit scale (plain backward()) skips the pass.
+                if not bool(scale == 1):
+                    grad_weight.mul_(scale)
+                dw = grad_weight.to(ctx.weight_dtype)
+            else:
+                dw = (grad_weight * scale).to(ctx.weight_dtype)
         return dh, dw, None, None, None, None, None, None
 
 
