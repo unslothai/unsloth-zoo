@@ -119,23 +119,34 @@ def _is_force_float32_arch(model_type: str) -> bool:
     return False
 
 
-def _convert_mlx_dtype(model, target_dtype, model_type: str = "") -> None:
+def _convert_mlx_dtype(model, target_dtype, model_type: str = "", default_dtype: bool = False) -> None:
     """Casts float params to target_dtype, keeping quantized ints and honoring the optional path-based cast_predicate;
     warns on bf16 to fp16 for FORCE_FLOAT32 archs (Gemma3, gpt_oss, Qwen3.5), as fp16's narrower range gives NaN/Infs
-    in training."""
+    in training. default_dtype marks a target picked for dtype=None, so float32 weights cast down are reported."""
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_map_with_path
     cast_pred = getattr(model, "cast_predicate", lambda _: True)
 
     needs_cast = False
     has_bf16 = False
+    float32_cast_down = 0
     for k, v in tree_flatten(model.parameters()):
         if cast_pred(k) and mx.issubdtype(v.dtype, mx.floating) and v.dtype != target_dtype:
             needs_cast = True
             if v.dtype == mx.bfloat16:
                 has_bf16 = True
+            elif v.dtype == mx.float32 and target_dtype != mx.float32:
+                float32_cast_down += 1
     if not needs_cast:
         return
+
+    if default_dtype and float32_cast_down:
+        target_name = "bfloat16" if target_dtype == mx.bfloat16 else "float16"
+        print(
+            f"Unsloth: dtype=None loads MLX models in {target_name}, so "
+            f"{float32_cast_down} float32 tensors of this checkpoint were cast "
+            f"to {target_name}. Pass dtype='float32' to keep them in float32."
+        )
 
     if has_bf16 and target_dtype == mx.float16 and _is_force_float32_arch(model_type):
         warnings.warn(
@@ -9285,9 +9296,12 @@ class FastMLXModel:
         Args:
             model_name: Any HuggingFace repo name.
             max_seq_length: Maximum sequence length for training.
-            dtype: Target floating-point dtype. ``None`` (default) keeps the
-                model's native dtype. Accepts ``"float16"``, ``"bfloat16"``,
-                ``"float32"`` or the corresponding ``mx.*`` constants.
+            dtype: Target floating-point dtype. ``None`` (default) loads
+                floating weights in bfloat16, or float16 on M1/M2, so a
+                float32 checkpoint is cast down (a notice is printed); pass
+                ``"float32"`` to keep it in float32. Accepts ``"float16"``,
+                ``"bfloat16"``, ``"float32"`` or the corresponding ``mx.*``
+                constants.
                 Quantized integer weights are preserved regardless. On M1/M2,
                 bf16 is emulated and ~40-70%% slower in prefill — fp16 is
                 recommended on those chips.
@@ -10415,6 +10429,7 @@ class FastMLXModel:
                     model,
                     target_dtype,
                     model_type=model_type,
+                    default_dtype=dtype is None,
                 )
             elif want_runtime_quant:
                 _run_with_vlm_config_view(
@@ -10594,7 +10609,7 @@ class FastMLXModel:
                 )
 
             if target_dtype is not None:
-                _convert_mlx_dtype(model, target_dtype, model_type=model_type)
+                _convert_mlx_dtype(model, target_dtype, model_type=model_type, default_dtype=dtype is None)
             elif want_runtime_quant:
                 import mlx.core as mx
                 mx.eval(model.parameters())
