@@ -38,6 +38,8 @@ __all__ = [
     "quantize_experts_mxfp4",
     "quantize_experts_mxfp8",
     "PACKED_EXPERT_STATS",
+    "PACKED_EXPERT_OWN_GROUPED_LINEAR",
+    "PACKED_EXPERT_OWN_GROUPED_MM",
 ]
 
 try:
@@ -670,12 +672,55 @@ class _PackedGroupedLinear(torch.autograd.Function):
         return dx, None, None, None, None, None, None, None
 
 
+# Packed stacks of any other format (a ``_PackedExpertParam`` subclass with its own ``_decode``, e.g. Unsloth's GGUF
+# expert stacks) run their own ``packed_grouped_mm`` if they bring one, else the chunked dequantize + grouped GEMM
+# below; callers check these flags before relying on them.
+PACKED_EXPERT_OWN_GROUPED_LINEAR = True
+PACKED_EXPERT_OWN_GROUPED_MM = True
+_BUILTIN_FORMATS = ("nvfp4", "mxfp8")
+
+
+def _own_grouped_impl(inputs, param, counts, transpose_b):
+    # A stack class may bring a grouped GEMM over its own blocks (`packed_grouped_mm(param, x, counts,
+    # transpose_b)`, frozen weight, returns None to decline); else the chunked dequantize + grouped GEMM.
+    own = getattr(type(param), "packed_grouped_mm", None)
+    if own is not None:
+        out = own(param, inputs.contiguous(), counts, transpose_b)
+        if out is not None:
+            return out.contiguous()
+    from unsloth_zoo.mxfp4_stacked_experts import _chunked_grouped_mm
+    return _chunked_grouped_mm(inputs.contiguous(), param, counts, None, inputs.dtype, transpose_b).contiguous()
+
+
+class _OwnPackedGroupedLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inputs, param, counts, transpose_b):
+        ctx.save_for_backward(counts)
+        ctx.param, ctx.transpose_b = param, transpose_b
+        with torch.no_grad():
+            return _own_grouped_impl(inputs, param, counts, transpose_b)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (counts,) = ctx.saved_tensors
+        dx = None
+        if ctx.needs_input_grad[0]:
+            with torch.no_grad():
+                dx = _own_grouped_impl(grad.contiguous(), ctx.param, counts, not ctx.transpose_b)
+        return dx, None, None, None
+
+
 def packed_expert_grouped_linear(inputs, param, counts, transpose_b):
     """``inputs`` (expert-sorted rows) @ W_e for a frozen NVFP4 / MXFP8 / block-FP8 stack; ``transpose_b``: the grouped
     GEMM's (E, K, N) operand is the transpose of the packed (E, N, K) rows. Forward and dX only (frozen base)."""
     if param.packed_format == "fp8_block":
         from unsloth_zoo.temporary_patches.moe_fp8_grouped import fp8_block_grouped_linear
         return fp8_block_grouped_linear(inputs, param, counts, transpose_b)
+    if param.packed_format not in _BUILTIN_FORMATS:
+        if not torch.compiler.is_compiling():
+            PACKED_EXPERT_STATS["calls"] += 1
+        counts = counts.to(device = inputs.device)
+        return torch.compiler.disable(_OwnPackedGroupedLinear.apply)(inputs, param, counts, bool(transpose_b))
     if not torch.compiler.is_compiling():
         PACKED_EXPERT_STATS["calls"] += 1
     scales, glob = param._companions()
