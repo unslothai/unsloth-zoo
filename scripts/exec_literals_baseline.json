@@ -413,6 +413,20 @@
       "reason": "Source is inspect.getsource of the installed transformers GraniteMoeHybridDecoderLayer.forward with three fixed regex substitutions; nothing user supplied reaches it."
     },
     {
+      "file": "unsloth_zoo/temporary_patches/inductor_nonowning_inplace.py",
+      "sink": "compile",
+      "digest": "3a0f3fd28c61c818",
+      "count": 1,
+      "reason": "Source is inspect.getsource of the installed torch._inductor BaseSchedulerNode.decide_inplace_update with one fixed literal inserted after a fixed anchor; nothing user supplied reaches it."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/inductor_nonowning_inplace.py",
+      "sink": "exec",
+      "digest": "eaf031d87c7faf9f",
+      "count": 1,
+      "reason": "Source is inspect.getsource of the installed torch._inductor BaseSchedulerNode.decide_inplace_update with one fixed literal inserted after a fixed anchor; nothing user supplied reaches it."
+    },
+    {
       "file": "unsloth_zoo/temporary_patches/misc.py",
       "sink": "exec",
       "digest": "4fa12b50b62060cd",
