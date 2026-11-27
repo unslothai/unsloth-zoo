@@ -15,8 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Affine `x @ W^T` on stock packed weights: small-row 4/8-bit qmm for Apple GPUs without stock NAX kernels,
-multi-row qmv whose rows match one-row stock calls bit for bit, row-invariant lane qmm, and the dense (or, on NAX,
-staged) training route for frozen projections."""
+multi-row qmv whose rows match one-row stock calls bit for bit, row-invariant lane qmm, and the dense training route
+for frozen projections."""
 
 import functools
 import hashlib
@@ -240,14 +240,19 @@ def simd_qmm(x, w, scales, biases, group_size, bits):
     return _simd_qmm_launch(M, w.shape[0], K, group_size, bits, x.dtype)(inputs = [x, w, scales, biases])[0]
 
 
-# `nax._QMM_ROWS_BY_GPU` format; measured on an M3 Max, used for every generation.
-_SIMD_QMM_ROWS = ((4, None, 1 << 23, 7168, 3, 24), (4, None, 1 << 24, 65536, 3, 24), (4, None, 1 << 24, None, 3, 16),
-                  (8, None, 1 << 23, None, 3, 16))
+# (bits, group size|None, min weights, max N|None, min rows, max rows), first match wins; measured on an M3 Max.
+_SIMD_QMM_ROWS = ((4, None, 1 << 21, 65536, 3, 24), (8, None, 1 << 21, 4096, 3, 24), (4, None, 1 << 24, None, 3, 4))
+# Rows within those ranges that stay native: measured slower than stock end to end.
+SIMD_QMM_STOCK_ROWS = (5, 16)
 
 
 def simd_qmm_row_range(N, K, group_size, bits):
     """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
-    return nax._measured_row_range(_SIMD_QMM_ROWS, _SIMD_QMM_MAX_ROWS, N, K, group_size, bits)
+    for entry_bits, entry_group_size, fewest, widest, low, high in _SIMD_QMM_ROWS:
+        if (bits == entry_bits and entry_group_size in (None, group_size) and N * K >= fewest
+                and (widest is None or N <= widest)):
+            return max(low, 2), min(high, _SIMD_QMM_MAX_ROWS)  # one row stays on stock qmv, at the bandwidth roofline
+    return 0, -1
 
 
 def probe_simd_qmm():
@@ -1648,367 +1653,6 @@ def probe_lane_qmm():
             assert mx.array_equal(mx.view(part, mx.uint16), mx.view(got[start:start + M], mx.uint16)).item(), (bits, start, M)
 
 
-# MIT License
-#
-# Copyright © 2023 Apple Inc.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
-# Exact full-K staged prefill, adapted from MLX bff10220c.
-_STAGED_QMM_HEADER = r"""
-template <typename U, int N, int bits, typename BytePtr, typename OutPtr>
-inline void dequantize_staged(BytePtr w, U scale, U bias, OutPtr out) {
-  static_assert(bits == 4 || bits == 8, "4/8-bit affine weights");
-  const float s = float(scale), b = float(bias);
-  if (bits == 4) {
-    for (int i = 0; i < N / 2; i++) {
-      out[2*i] = static_cast<U>(s * (w[i] & 0x0f) + b);
-      out[2*i+1] = static_cast<U>((s / 16.0f) * (w[i] & 0xf0) + b);
-    }
-  } else {
-    for (int i = 0; i < N; i++) out[i] = static_cast<U>(s * w[i] + b);
-  }
-}
-template <
-    typename T,
-    short BROWS,
-    short BCOLS,
-    short dst_ld,
-    short tgp_size,
-    short group_size,
-    short bits>
-struct QuantizedBlockLoaderStaged {
-  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
-  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
-  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
-  MLX_MTL_CONST short n_reads = (BCOLS_PACKED * BROWS) / tgp_size;
-  MLX_MTL_CONST short n_words = n_reads * bytes_per_pack / 4;
-
-  static_assert(
-      BCOLS_PACKED * BROWS >= tgp_size &&
-          n_words * 4 == n_reads * bytes_per_pack,
-      "Every thread loads whole words");
-  static_assert(
-      n_reads * pack_factor <= group_size && n_reads * pack_factor <= BCOLS,
-      "A thread's values must lie in one row and quantization group");
-
-  const short thread_idx;
-  const short bi;
-  const short bj;
-  const device uint8_t* src;
-  const device T* scales;
-  const device T* biases;
-  uint32_t raw[n_words];
-  T scale;
-  T bias;
-
-  QuantizedBlockLoaderStaged(
-      const device uint8_t* src_,
-      const device T* scales_,
-      const device T* biases_,
-      const int src_ld,
-      ushort simd_group_id,
-      ushort simd_lane_id) thread
-      : thread_idx(simd_group_id * 32 + simd_lane_id),
-        bi(n_reads* thread_idx / BCOLS_PACKED),
-        bj((n_reads * thread_idx) % BCOLS_PACKED),
-        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
-            bj * bytes_per_pack),
-        scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
-
-  void fetch(const int k) thread {
-    auto p = (const device uint32_t*)(src + k * bytes_per_pack / pack_factor);
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < n_words; i++) {
-      raw[i] = p[i];
-    }
-    const int g = (k + bj * pack_factor) / group_size;
-    scale = scales[g];
-    bias = biases[g];
-  }
-
-  void store(threadgroup T* dst) const thread {
-    constexpr short n_vals = n_reads * pack_factor;
-    static_assert(n_vals % 8 == 0, "8-value stores");
-    T v[n_vals];
-    uint8_t b[n_words * 4];
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < n_words * 4; i++) {
-      b[i] = uint8_t(raw[i / 4] >> (8 * (i % 4)));
-    }
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < n_reads; i++) {
-      dequantize_staged<T, pack_factor, bits>(
-          b + i * bytes_per_pack, scale, bias, v + i * pack_factor);
-    }
-    dst += bi * dst_ld + bj * pack_factor;
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < n_vals; i += 8) {
-      *(threadgroup vec<T, 8>*)(dst + i) = *(thread vec<T, 8>*)(v + i);
-    }
-  }
-};
-
-template <
-    typename T,
-    int group_size,
-    int bits,
-    typename U = T,
-    int BM = 64,
-    int BK = 64,
-    int BN = 64,
-    int SM = 16>
-METAL_FUNC void qmm_t_nax_staged_impl(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    device U* y,
-    threadgroup T* Ws,
-    const constant int& K,
-    const constant int& N,
-    const constant int& M,
-    const int k_end,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  static_assert(BK == 64 && BN == 64, "64-column tiles");
-  static_assert(SM > 0 && SM % 16 == 0 && BM % SM == 0, "Whole row fragments");
-  static_assert(
-      sizeof(T) == 2, "Two tiles fit threadgroup memory for 16-bit T");
-
-  constexpr int pack_factor = get_pack_factor<bits, 8>();
-  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  constexpr int tile_size = BN * BK_padded;
-
-  using loader_w_t = QuantizedBlockLoaderStaged<
-      T,
-      BN,
-      BK,
-      BK_padded,
-      (BM / SM) * SIMD_SIZE,
-      group_size,
-      bits>;
-  using frag_t = typename BaseNAXFrag::template dtype_frag_t<T>;
-
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / group_size;
-  const int y_row = tid.y * BM;
-  const int y_col = tid.x * BN;
-
-  loader_w_t loader_w(
-      (const device uint8_t*)w + y_col * K_w,
-      scales + y_col * K_g,
-      biases + y_col * K_g,
-      K,
-      simd_gid,
-      simd_lid);
-
-  const int tile_rows = min(BM, M - y_row);
-  constexpr int TM = SM / 16;
-  const int sm = SM * int(simd_gid);
-  const int rows = min(SM, tile_rows - sm);
-  const short2 sc = BaseNAXFrag::get_coord();
-  const device T* x0[TM];
-  const device T* x1[TM];
-  STEEL_PRAGMA_UNROLL
-  for (short m = 0; m < TM; m++) {
-    const int r0 = min(sm + m * 16 + int(sc.y), tile_rows - 1);
-    const int r1 = min(sm + m * 16 + int(sc.y) + 8, tile_rows - 1);
-    x0[m] = x + (y_row + r0) * static_cast<int64_t>(K) + sc.x;
-    x1[m] = x + (y_row + r1) * static_cast<int64_t>(K) + sc.x;
-  }
-
-  NAXTile<float, TM, BN / 16> Dtile;
-  Dtile.clear();
-  vec<T, 4> a_cur[BK / 16][TM][2];
-  vec<T, 4> a_next[BK / 16][TM][2];
-
-  loader_w.fetch(0);
-  loader_w.store(Ws);
-  if (rows > 0) {
-    STEEL_PRAGMA_UNROLL
-    for (short s = 0; s < BK / 16; s++) {
-      STEEL_PRAGMA_UNROLL
-      for (short m = 0; m < TM; m++) {
-        a_cur[s][m][0] = *(const device vec<T, 4>*)(x0[m] + s * 16);
-        a_cur[s][m][1] = *(const device vec<T, 4>*)(x1[m] + s * 16);
-      }
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  for (int k = 0, it = 0; k < k_end; k += BK, it++) {
-    const bool more = k + BK < k_end;
-    if (more) {
-      loader_w.fetch(k + BK);
-    }
-    if (rows > 0) {
-      const int kn = more ? k + BK : k;
-      STEEL_PRAGMA_UNROLL
-      for (short s = 0; s < BK / 16; s++) {
-        STEEL_PRAGMA_UNROLL
-        for (short m = 0; m < TM; m++) {
-          a_next[s][m][0] = *(const device vec<T, 4>*)(x0[m] + kn + s * 16);
-          a_next[s][m][1] = *(const device vec<T, 4>*)(x1[m] + kn + s * 16);
-        }
-      }
-      const threadgroup T* ws =
-          Ws + (it & 1) * tile_size + sc.y * BK_padded + sc.x;
-      STEEL_PRAGMA_UNROLL
-      for (short s = 0; s < BK / 16; s++) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < BN / 16; j += 2) {
-          const threadgroup T* p0 = ws + (j * 16) * BK_padded + s * 16;
-          const threadgroup T* p1 = p0 + 16 * BK_padded;
-          frag_t b0;
-          frag_t b1;
-          STEEL_PRAGMA_UNROLL
-          for (short h = 0; h < 2; h++) {
-            const vec<T, 4> u0 =
-                *(const threadgroup vec<T, 4>*)(p0 + h * 8 * BK_padded);
-            const vec<T, 4> u1 =
-                *(const threadgroup vec<T, 4>*)(p1 + h * 8 * BK_padded);
-            STEEL_PRAGMA_UNROLL
-            for (short c = 0; c < 4; c++) {
-              b0[h * 4 + c] = u0[c];
-              b1[h * 4 + c] = u1[c];
-            }
-          }
-          STEEL_PRAGMA_UNROLL
-          for (short m = 0; m < TM; m++) {
-            frag_t a;
-            STEEL_PRAGMA_UNROLL
-            for (short c = 0; c < 4; c++) {
-              a[c] = a_cur[s][m][0][c];
-              a[4 + c] = a_cur[s][m][1][c];
-            }
-            BaseNAXFrag::mma(
-                Dtile.frag_at(m, j),
-                Dtile.frag_at(m, j + 1),
-                a,
-                metal::bool_constant<false>{},
-                b0,
-                b1,
-                metal::bool_constant<true>{});
-          }
-        }
-      }
-      STEEL_PRAGMA_UNROLL
-      for (short s = 0; s < BK / 16; s++) {
-        STEEL_PRAGMA_UNROLL
-        for (short m = 0; m < TM; m++) {
-          a_cur[s][m][0] = a_next[s][m][0];
-          a_cur[s][m][1] = a_next[s][m][1];
-        }
-      }
-    }
-    if (more) {
-      loader_w.store(Ws + ((it + 1) & 1) * tile_size);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-
-  if (rows <= 0) {
-    return;
-  }
-  y += (y_row + sm) * static_cast<int64_t>(N) + y_col;
-  if (rows == SM) {
-    Dtile.store(y, N);
-  } else {
-    Dtile.store_safe(y, N, short2(BN, rows));
-  }
-}
-
-"""
-_STAGED_QMM_SOURCE = """
-threadgroup T Ws[2 * 64 * (64 + 16 / sizeof(T))];
-qmm_t_nax_staged_impl<T, GS, BITS, T, 64, 64, 64, 16>(
-    w, scales, biases, x, y, Ws, K, N, M, K, threadgroup_position_in_grid,
-    simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-"""
-_STAGED_QMM_HEADERS = ("steel/utils.h", "steel/gemm/nax.h", "quantized_utils.h", "quantized_nax.h")
-STAGED_QMM_PROBE_KEY = "staged_qmm:" + hashlib.sha256((repr(_STAGED_QMM_HEADERS) + _STAGED_QMM_HEADER + _STAGED_QMM_SOURCE).encode()).hexdigest()[:12]
-
-
-@functools.cache
-def _staged_qmm_kernel():
-    try:
-        headers = [nax._mlx_kernel_header(p) for p in _STAGED_QMM_HEADERS]
-        if not all(headers):
-            return None
-        return mx.fast.metal_kernel(name = "unsloth_staged_qmm", input_names = ["w", "scales", "biases", "x", "K", "N", "M"],
-                                    output_names = ["y"], header = "".join(headers) + _STAGED_QMM_HEADER, source = _STAGED_QMM_SOURCE)
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-        return None
-
-
-def staged_qmm_supported(M, N, K, group_size, bits, mode):
-    return (mode == "affine" and bits in (4, 8) and group_size in (32, 64, 128)
-            and 1024 <= M <= 4096 and 2048 <= N <= 32768 and 2048 <= K <= 32768
-            and N * K <= 1 << 28 and N % 64 == K % 64 == K % group_size == 0)
-
-
-def staged_qmm_available():
-    return (mx.__version__ == "0.32.4" and mx.default_device() == mx.gpu and nax.nax_available()
-            and os.environ.get("UNSLOTH_MLX_STAGED_PREFILL", "1") != "0" and _staged_qmm_kernel() is not None
-            and nax.kernel_probe_passed(STAGED_QMM_PROBE_KEY, __name__, "probe_staged_qmm", nax.nax_available))
-
-
-def staged_qmm(x, w, scales, biases, group_size, bits):
-    (M, K), N = x.shape, w.shape[0]
-    return _staged_qmm_kernel()(inputs = [w, scales, biases, x, mx.array(K, mx.int32), mx.array(N, mx.int32), mx.array(M, mx.int32)],
-                     template = [("T", x.dtype), ("GS", group_size), ("BITS", bits)],
-                     grid = (128 * (N // 64), -(-M // 64), 1), threadgroup = (128, 1, 1),
-                     output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
-
-
-@functools.cache
-def differentiable_staged_qmm(group_size, bits):
-    @mx.custom_function
-    def routed(x, w, scales, biases):
-        return staged_qmm(x, w, scales, biases, group_size, bits)
-
-    @routed.vjp
-    def vjp(primals, cotangent, output):
-        x, w, scales, biases = primals
-        with mx.stream(mx.gpu):
-            _, (dx, ds, db) = mx.vjp(lambda x, s, b: mx.quantized_matmul(
-                x, w, s, b, transpose = True, group_size = group_size, bits = bits), (x, scales, biases), (cotangent,))
-        return dx, mx.zeros_like(w), ds, db
-
-    return routed
-
-
-def probe_staged_qmm():
-    for dtype, bits, group in itertools.product((mx.bfloat16, mx.float16), (4, 8), (32, 64, 128)):
-        w, s, b = mx.quantize(mx.random.normal((2048, 2048), key = mx.random.key(group)).astype(dtype) * 0.02,
-                             group_size = group, bits = bits)
-        for M in (1024, 1057):
-            x = mx.random.normal((M, 2048), key = mx.random.key(M)).astype(dtype)
-            got = staged_qmm(x, w, s, b, group, bits)
-            native = mx.quantized_matmul(x, w, s, b, transpose = True, group_size = group, bits = bits)
-            assert mx.array_equal(got.view(mx.uint16), native.view(mx.uint16)).item(), (dtype, bits, group, M)
-
-
 # Dense training route: the kernel writes stock qmm's fp32-rounded `s * q + b` tile; the vjp re-dequantizes for dx.
 _TRAIN_QMM_BITS = (4, 8)
 _TRAIN_QMM_GROUP_SIZES = (32, 64, 128)
@@ -2077,44 +1721,12 @@ def probe_dense_train_qmm():
         assert mx.array_equal(got.view(mx.uint16), tile.view(mx.uint16)).item(), (dtype, bits, group_size)
 
 
-def staged_train_qmm_supported(M, N, K, group_size):
-    """For an affine 4/8-bit projection the caller has checked; `probe_staged_qmm` covers group sizes 32, 64 and 128."""
-    return (M >= 1024 and 2048 <= N <= 32768 and 2048 <= K <= 32768
-            and N * K <= 1 << 28 and N % 64 == K % 64 == K % group_size == 0)
-
-
-def staged_train_qmm_available():
-    return (nax.nax_available() and nax.gap_open("staged_train_qmm") and _staged_qmm_kernel() is not None
-            and nax.kernel_probe_passed(STAGED_QMM_PROBE_KEY, __name__, "probe_staged_qmm", nax.nax_available))
-
-
-@functools.cache
-def differentiable_staged_train_qmm(group_size, bits):
-    """The staged forward with stock's dx for a frozen packed weight, whose quantization parameters get zero
-    gradients."""
-    @mx.custom_function
-    def routed(x, w, scales, biases):
-        return staged_qmm(x, w, scales, biases, group_size, bits)
-
-    @routed.vjp
-    def vjp(primals, cotangent, output):
-        x, w, scales, biases = primals
-        with mx.stream(mx.gpu):
-            dx = mx.quantized_matmul(cotangent, w, scales, biases, transpose = False, group_size = group_size,
-                                     bits = bits)
-        return dx, mx.zeros_like(w), mx.zeros_like(scales), mx.zeros_like(biases)
-
-    return routed
-
-
-def available_train_qmm_routes():
-    """UNSLOTH_MLX_DENSE_TRAIN_QMM=0 and UNSLOTH_MLX_STAGED_TRAIN_QMM=0 each disable one route."""
-    dense = (os.environ.get("UNSLOTH_MLX_DENSE_TRAIN_QMM", "1") != "0" and nax.gap_open("dense_train_qmm")
-             and simd_qmm_available() and _train_dequantize_kernel() is not None
-             and nax.kernel_probe_passed(DENSE_TRAIN_QMM_PROBE_KEY, __name__, "probe_dense_train_qmm",
-                                         simd_qmm_available))
-    staged = os.environ.get("UNSLOTH_MLX_STAGED_TRAIN_QMM", "1") != "0" and staged_train_qmm_available()
-    return ("dense",) * dense + ("staged",) * staged
+def dense_train_qmm_available():
+    """UNSLOTH_MLX_DENSE_TRAIN_QMM=0 disables the route."""
+    return bool(os.environ.get("UNSLOTH_MLX_DENSE_TRAIN_QMM", "1") != "0" and nax.gap_open("dense_train_qmm")
+                and simd_qmm_available() and _train_dequantize_kernel() is not None
+                and nax.kernel_probe_passed(DENSE_TRAIN_QMM_PROBE_KEY, __name__, "probe_dense_train_qmm",
+                                            simd_qmm_available))
 
 
 def _train_qmm_rows(module, x):
@@ -2135,26 +1747,14 @@ def _train_qmm_rows(module, x):
     return x.size // K
 
 
-def choose_train_qmm_route(module, x, routes):
-    """The training route ("dense" or "staged") this call of `module` takes, or None for the native call."""
-    rows = _train_qmm_rows(module, x) if routes else None
+def call_dense_train_qmm(module, x):
+    """`module(x)` without its bias on the dense training route, or None where the native call serves."""
+    rows = _train_qmm_rows(module, x)
     if rows is None:
         return None
-    N = module["weight"].shape[0]
-    if ("dense" in routes and rows >= _DENSE_TRAIN_QMM_MIN_ROWS and N >= _DENSE_TRAIN_QMM_MIN_OUTPUTS
-            and N * x.shape[-1] <= _DENSE_TRAIN_QMM_MAX_WEIGHTS):
-        return "dense"
-    if "staged" in routes and staged_train_qmm_supported(rows, N, x.shape[-1], module.group_size):
-        return "staged"
-    return None
-
-
-def call_train_qmm_route(module, x, routes):
-    """`module(x)` without its bias on the training route this call takes, or None where the native call serves."""
-    route = choose_train_qmm_route(module, x, routes)
-    if route is None:
+    N, K = module["weight"].shape[0], x.shape[-1]
+    if rows < _DENSE_TRAIN_QMM_MIN_ROWS or N < _DENSE_TRAIN_QMM_MIN_OUTPUTS or N * K > _DENSE_TRAIN_QMM_MAX_WEIGHTS:
         return None
-    K = x.shape[-1]
-    y = (_dense_train_qmm if route == "dense" else differentiable_staged_train_qmm)(module.group_size, module.bits)(
+    y = _dense_train_qmm(module.group_size, module.bits)(
         x.reshape(-1, K), module["weight"], module["scales"], module["biases"])
     return y.reshape(*x.shape[:-1], y.shape[-1])

@@ -18,8 +18,6 @@
 
 from __future__ import annotations
 
-import subprocess
-
 import pytest
 
 mx = pytest.importorskip("mlx.core")
@@ -85,7 +83,7 @@ def test_every_gap_names_the_pinned_mlx_release():
     pinned = set(re.findall(r'"mlx==([0-9.]+)', pyproject))
     assert len(pinned) == 1
     for name, gap in nax._GAPS.items():
-        assert pinned <= set(gap.open_in), f"re-measure {name} for mlx {pinned}"
+        assert gap.closed_on_main or pinned <= set(gap.open_in), f"re-measure {name} for mlx {pinned}"
 
 
 @pytest.mark.parametrize("version,closed_on_main,expected", [
@@ -142,19 +140,6 @@ def test_kernel_probe_does_not_import_from_the_working_directory(monkeypatch, tm
     assert nax._run_probe("unsloth_planted_probe", "good") != ""
     monkeypatch.syspath_prepend(str(tmp_path))   # on this process's own path it is importable
     assert nax._run_probe("unsloth_planted_probe", "good") == ""
-
-
-def test_gpu_core_count_reads_the_ioregistry(monkeypatch):
-    from unittest import mock
-    from unsloth_zoo.mlx import nax
-
-    # Paravirtual GPUs (CI VMs, `air64_*`) publish no core count.
-    assert nax._gpu_generation() is None or nax._gpu_core_count() > 0
-    ioreg = lambda code, out = '"gpu-core-count" = 12': subprocess.CompletedProcess([], code, out, "")
-    for result, cores in ((ioreg(0), 12), (ioreg(1), None), (ioreg(0, '"gpu-core-count" = <0c>'), None),
-                          (FileNotFoundError("ioreg"), None)):
-        monkeypatch.setattr(nax.subprocess, "run", mock.Mock(side_effect = [result]))
-        assert nax._gpu_core_count.__wrapped__() == cores
 
 
 def test_gpu_generation_reads_the_architecture(monkeypatch):

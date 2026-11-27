@@ -37,6 +37,7 @@ from transformers import Trainer, TrainingArguments
 
 from . import losses
 from .capture import effective_lm_head_weight, resolve_text_parts, run_frozen_target
+from .trainer import token_average_scale
 
 _CONFIG_EXTRAS = (
     "block_size", "target_layer_ids", "mask_token_id", "num_anchors", "enable_confidence_head",
@@ -155,6 +156,22 @@ def sample_anchor_positions(loss_mask, num_anchors, generator = None):
     anchors = picked[:, :num_anchors].sort(dim = 1).values
     keep = torch.arange(num_anchors, device = device)[None] < valid.sum(1, keepdim = True).clamp(max = num_anchors)
     return torch.where(keep, anchors, torch.zeros_like(anchors)), keep
+
+
+def _eval_slots(anchors, keep, loss_mask, block_size):
+    """(label_index, eval_mask) per block slot: slot j of anchor a scores x[a+j+1] while loss_mask holds."""
+    S = loss_mask.shape[1]
+    label_index = anchors[..., None] + torch.arange(block_size, device = anchors.device) + 1
+    safe = torch.where(keep[..., None], label_index.clamp(max = S - 1), torch.zeros_like(label_index))
+    lm = torch.gather(loss_mask[:, None].expand(-1, anchors.shape[1], -1), 2, safe) > 0
+    eval_mask = ((label_index < S) & lm & keep[..., None]).int().cumprod(-1).bool()
+    return safe, eval_mask
+
+
+def _slot_weights(slot, decay_gamma):
+    if decay_gamma and decay_gamma > 0:
+        return torch.exp(-slot.float() / float(decay_gamma))
+    return torch.ones_like(slot, dtype = torch.float32)
 
 
 class Qwen3DSparkDrafter(nn.Module):
@@ -333,12 +350,8 @@ class Qwen3DSparkDrafter(nn.Module):
             hidden = layer(hidden, ctx, cos, sin, mask)
         hidden = self.norm(hidden).view(B, N, bs, -1)
 
-        label_index = anchors[..., None] + offsets + 1
-        in_range = label_index < S
-        safe = torch.where(keep[..., None], label_index.clamp(max = S - 1), torch.zeros_like(label_index))
+        safe, eval_mask = _eval_slots(anchors, keep, loss_mask, bs)
         target_ids = torch.gather(input_ids[:, None].expand(-1, N, -1), 2, safe)
-        lm = torch.gather(loss_mask[:, None].expand(-1, N, -1), 2, safe) > 0
-        eval_mask = (in_range & lm & keep[..., None]).int().cumprod(-1).bool()
         prev_ids = torch.cat([anchor_tok[..., None], target_ids[..., :-1]], dim = -1)
         return {
             "hidden": hidden, "target_ids": target_ids, "prev_ids": prev_ids, "eval_mask": eval_mask,
@@ -377,16 +390,18 @@ def _row_terms(hidden, prev_emb, lm_w, mk_w2, teacher_hidden, teacher_w, labels)
 
 
 def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 0.9,
-                confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None):
+                confidence_alpha = 1.0, decay_gamma = 4.0, chunk_size = 1024, teacher_lm_head_weight = None,
+                normalizer = None):
     """Chunked DSpark loss over supervised rows; teacher_hidden [B, S, H] is post-norm target states projected by
-    teacher_lm_head_weight (defaults to the drafter's copy); returns (loss, stats)."""
+    teacher_lm_head_weight (defaults to the drafter's copy); normalizer = slot-weight sum of the whole accumulation
+    window (else this batch's); returns (loss, stats)."""
     eval_mask = out["eval_mask"]
     rows = eval_mask.nonzero(as_tuple = True)
     hidden = out["hidden"][rows]
     labels = out["target_ids"][rows]
     prev = out["prev_ids"][rows]
     slot = rows[2]
-    weight = torch.exp(-slot.float() / float(decay_gamma)) if decay_gamma and decay_gamma > 0 else torch.ones_like(slot, dtype = torch.float32)
+    weight = _slot_weights(slot, decay_gamma)
     lm_w = drafter.lm_head.weight
     teacher_w = lm_w if teacher_lm_head_weight is None else teacher_lm_head_weight.to(device = lm_w.device, dtype = hidden.dtype)
     # A chunk holds ~6 fp32 [rows, V] tensors (logits, log-softmax, probs, teacher, l1 terms).
@@ -433,12 +448,24 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
             conf_loss = (F.binary_cross_entropy_with_logits(conf, accept, reduction = "none") * weight).sum() / den
             loss = loss + confidence_alpha * conf_loss
             stats["confidence_loss"] = float(conf_loss.detach())
+    if normalizer is not None:
+        # Logged terms stay this batch's means; the loss becomes its share of the window's weighted mean.
+        loss = loss * (den / normalizer.to(den).clamp_min(1e-6))
     bs = out["hidden"].shape[2]
     per_slot = torch.zeros(bs, device = slot.device).index_add_(0, slot, correct)
     count = torch.zeros(bs, device = slot.device).index_add_(0, slot, torch.ones_like(correct))
     stats["top1_per_slot"] = (per_slot / count.clamp_min(1)).tolist()
     stats["count_per_slot"] = count.tolist()
     return loss, stats
+
+
+def _loss_mask(inputs):
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask")
+    loss_mask = inputs.get("labels", input_ids) != -100
+    if attention_mask is not None:
+        loss_mask = loss_mask & attention_mask.bool()
+    return loss_mask
 
 
 @dataclass
@@ -477,17 +504,43 @@ class UnslothDSparkTrainer(Trainer):
                 pad = getattr(tokenizer, "eos_token_id", 0) or 0
             kwargs["data_collator"] = MTPDataCollator(pad)
         super().__init__(model = model, args = args, **kwargs)
+        # compute_loss divides by the window's slot weight (get_batch_samples), so the Trainer must not also divide by GA.
+        self.model_accepts_loss_kwargs = True
         self._dspark_log = []
+
+    def get_batch_samples(self, epoch_iterator, num_batches, *args, **kwargs):
+        # Anchors are drawn here, not in the forward, so the loss divides by the slot weight of every micro-batch in
+        # the window: a token count is not that denominator.
+        batch_samples, _ = super().get_batch_samples(epoch_iterator, num_batches, *args, **kwargs)
+        drafter = self.accelerator.unwrap_model(self.model)
+        total = None
+        for i, x in enumerate(batch_samples):
+            loss_mask = _loss_mask(x)
+            # Seeded by step, not the global RNG: Trainer restores a checkpoint's RNG state only after this call.
+            gen = torch.Generator(device = loss_mask.device)
+            gen.manual_seed(hash((self.args.seed, self.state.global_step, self.args.process_index, i)) & (2**63 - 1))
+            anchors, keep = sample_anchor_positions(loss_mask, int(self.args.dspark_num_anchors), gen)
+            _, eval_mask = _eval_slots(anchors, keep, loss_mask, drafter.block_size)
+            slot = torch.arange(drafter.block_size, device = eval_mask.device).expand_as(eval_mask)
+            weight = (_slot_weights(slot, self.args.dspark_decay_gamma) * eval_mask).sum()
+            x["dspark_anchors"], x["dspark_anchor_keep"] = anchors, keep
+            total = weight if total is None else total + weight
+        if total is not None and self.args.average_tokens_across_devices and self.args.world_size > 1:
+            total = self.accelerator.gather(total.reshape(1)).sum()
+        return batch_samples, total
 
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
-        labels = inputs.get("labels", input_ids)
         if attention_mask is not None and bool((attention_mask[:, 0] == 0).any()):
             raise ValueError("Unsloth: UnslothDSparkTrainer needs right-padded batches (left padding misaligns positions).")
-        loss_mask = labels != -100
-        if attention_mask is not None:
-            loss_mask = loss_mask & attention_mask.bool()
+        loss_mask = _loss_mask(inputs)
+        anchors = None
+        if inputs.get("dspark_anchors") is not None:
+            anchors = (inputs["dspark_anchors"], inputs["dspark_anchor_keep"])
+        normalizer = None
+        if num_items_in_batch is not None and anchors is not None:
+            normalizer = torch.as_tensor(num_items_in_batch, dtype = torch.float32).reshape(-1)[0]
         drafter = self.accelerator.unwrap_model(model)
         # DeepSpec's -1 is the embedding output, not the last layer (a Python index to the capture).
         ids = drafter.target_layer_ids
@@ -502,13 +555,18 @@ class UnslothDSparkTrainer(Trainer):
             l1_alpha = self.args.dspark_l1_alpha, confidence_alpha = self.args.dspark_confidence_alpha,
             decay_gamma = self.args.dspark_decay_gamma, chunk_size = self.args.dspark_chunk_size,
             teacher_lm_head_weight = effective_lm_head_weight(resolve_text_parts(self.target_model)["lm_head"]),
+            normalizer = normalizer,
         )
         if isinstance(model, nn.DataParallel):
             # DataParallel scatters forward kwargs along dim 0 and cannot gather Python stats: score after the gather.
-            out = model(context, input_ids, loss_mask, self.args.dspark_num_anchors)
+            out = model(context, input_ids, loss_mask, self.args.dspark_num_anchors, anchors = anchors)
             loss, stats = dspark_loss(drafter, out, **loss_kwargs)
         else:
-            loss, stats = model(context, input_ids, loss_mask, self.args.dspark_num_anchors, loss_kwargs = loss_kwargs)
+            loss, stats = model(context, input_ids, loss_mask, self.args.dspark_num_anchors, anchors = anchors,
+                                loss_kwargs = loss_kwargs)
+            # DDP ranks each divide by the global slot weight; DataParallel above already scores the gathered batch.
+            if normalizer is not None:
+                loss = loss * token_average_scale(self, num_items_in_batch)
         if model.training:
             self._dspark_log.append(stats)
         return (loss, None) if return_outputs else loss

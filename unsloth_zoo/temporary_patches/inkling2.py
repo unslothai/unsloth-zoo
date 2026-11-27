@@ -13,10 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Inkling 2 (inkling2 / inkling2_loop, transformers >= 5.24) MoE experts: softcapped SwiGLU over
-gate and up, tanh(g / c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u, with fp32 routed outputs;
-both expert classes and fp32 reference must declare _apply_gate, else generic backends use
-act_fn(gate) * up."""
+"""Inkling 2 (inkling2 / inkling2_loop, transformers >= 5.24) MoE experts: softcapped SwiGLU tanh(g
+/ c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u with fp32 routed outputs; both expert classes and
+fp32 reference must declare _apply_gate, else generic backends use act_fn(gate) * up."""
 
 import contextlib
 import functools
@@ -69,21 +68,18 @@ def patch_inkling2_moe_experts():
 TEMPORARY_PATCHES.append(patch_inkling2_moe_experts)
 
 
-# Block attention residuals. Compiled with Inductor (dynamic = True, CUDA), the one-query form over 3+ stacked blocks
-# returns correct values but wrong input grads, so the compiler keeps them eager. A torch.compiler.disable boundary
-# does that outside any graph, but inside an enclosing compiled graph it is a graph break, and under fullgraph = True
-# a hard Unsupported. The opaque custom ops below keep the same eager forward and backward inside the graph instead.
+# Inductor (dynamic = True, CUDA) gives correct values but wrong input grads for the one-query form
+# over 3+ stacked blocks; torch.compiler.disable works outside graphs but graph-breaks inside them
+# (Unsupported under fullgraph = True), so opaque custom ops keep eager fwd and bwd.
 def inkling2_block_residual_reference(block_states, partial_block_states, query, eps, sdpa = False):
-    """transformers' Inkling2{,Loop}BlockAttentionResidual.forward (sdpa, else eager attention), stacked as
-    [..., num_queries, hidden] instead of unbound."""
+    """transformers' BlockAttentionResidual; stacks [..., num_queries, hidden], not unbound."""
     stacked = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim = -2).float()
     stacked = stacked * torch.rsqrt(stacked.square().mean(-1, keepdim = True) + eps)
     hidden = stacked.shape[-1]
     q = query.float().view(-1, hidden)
     if sdpa:
-        # The module's own call, on the operands autocast would give it (each cast on its own, after the expand, so
-        # the grads accumulate in fp32 as there). Cast by hand: torch.func.vjp through the math backend under an
-        # active autocast fails ("expected scalar type Float but found Half", torch 2.10).
+        # Cast by hand as the module's autocast would, each after the expand so grads accumulate in
+        # fp32; torch.func.vjp via the math backend fails under active autocast on torch 2.10.
         q, k, v = q.expand(*stacked.shape[:-2], -1, -1), stacked, stacked
         device_type = stacked.device.type
         autocast, autocast_dtype = _autocast_state(device_type)
@@ -91,15 +87,13 @@ def inkling2_block_residual_reference(block_states, partial_block_states, query,
             q, k, v = q.to(autocast_dtype), k.to(autocast_dtype), v.to(autocast_dtype)
         with torch.autocast(device_type, enabled = False):
             return torch.nn.functional.scaled_dot_product_attention(q, k, v, scale = hidden ** -0.5)
-    # Eager: the scale goes on the fp32 query before the matmul (the module scales after it), so under fp16 autocast
-    # the score (up to hidden * |q| unscaled) cannot overflow to inf.
+    # Scale the fp32 query first, since unscaled fp16 autocast scores could overflow to inf.
     scores = torch.matmul(q * hidden ** -0.5, stacked.transpose(-1, -2))  # [..., num_queries, blocks]
     return torch.matmul(torch.softmax(scores, dim = -1, dtype = torch.float32), stacked)
 
 
 def _autocast_state(device_type):
-    # The caller's autocast for this device. The op body runs below the dispatcher's autocast handling and, compiled,
-    # outside the enclosing autocast region, so the state is passed in and re-entered explicitly.
+    # Autocast state is passed in: compiled op body runs outside the caller's autocast region.
     try:
         return torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type)
     except Exception:  # older torch: per-device getters
@@ -156,9 +150,8 @@ try:
     def _residual_backward_op(grad: torch.Tensor, block_states: torch.Tensor, partial_block_states: torch.Tensor,
                               query: torch.Tensor, eps: float, device_type: str, autocast: bool,
                               autocast_dtype: torch.dtype, sdpa: bool) -> List[torch.Tensor]:
-        # The op body runs below autograd: torch.func.vjp carries its own grad transform. The recompute re-enters the
-        # forward's autocast, whatever the backward pass runs under, and sets aside the caller's saved tensor hooks
-        # (save_on_cpu offloading), which torch.func refuses and this local recompute has no use for.
+        # Runs below autograd (torch.func.vjp has its own grad transform); re-enters the forward's
+        # autocast, not the backward's, and sets aside saved tensor hooks torch.func refuses.
         with _without_saved_tensors_hooks():
             _, vjp = torch.func.vjp(
                 lambda b, p, q: _residual_under(device_type, autocast, autocast_dtype, sdpa, b, p, q, eps),
@@ -230,8 +223,7 @@ def _has_hooks(module):
 
 
 def _residual_op_eps(module, args):
-    # Only the layout the reference reproduces: two tensor inputs, an unweighted RMSNorm, eager or sdpa attention
-    # (transformers 5.23 calls sdpa directly and keeps no config on the module).
+    # Only two tensors, unweighted RMSNorm, eager/sdpa; transformers 5.23 has no module config.
     if _RESIDUAL_OP is None or args is None:
         return None
     query, norm = getattr(module, "query", None), getattr(module, "norm", None)

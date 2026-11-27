@@ -743,8 +743,7 @@ def _kept_set_sparse_max_density():
 
 
 def _kept_set_is_compiling():
-    # The CSR size decision and the route counters are data-dependent / side effects: packed + no counters
-    # while an outer torch.compile traces the scorer.
+    # Data-dependent CSR size, side-effect counters: packed, no counters under torch.compile.
     try:
         return torch.compiler.is_compiling()
     except AttributeError:
@@ -2826,9 +2825,8 @@ def grpo_forwards_are_collective(model):
     from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
     if zero3_partitioned_training():
         return True
-    # A partitioned model keeps ds_id after the global config is cleared or names another stage
-    # (Accelerate multi-plugin). ZeRO-3 converts every parameter, so the first one answers (O(1));
-    # read only once DeepSpeed is loaded, and a positive never reverts.
+    # ds_id survives a cleared config or another stage (Accelerate multi-plugin); ZeRO-3 converts
+    # every param, so the first answers; read once DeepSpeed loads; a positive never reverts.
     if model.__dict__.get("_unsloth_grpo_zero3_partitioned", False):
         return True
     if "deepspeed.runtime.zero.partition_parameters" in sys.modules and hasattr(
@@ -2889,8 +2887,7 @@ pass
 RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
 
 
-# Multimodal keys TRL's GRPO trainer puts in the inputs dict; both Unsloth logprob paths must forward these same keys or
-# the importance ratio compares two policies (unslothai/unsloth issue 6960).
+# Logprob paths must forward these keys or ratios mix policies (unslothai/unsloth issue 6960).
 GRPO_VISION_KEYS = (
     "pixel_values",
     "image_grid_thw",
@@ -2941,8 +2938,7 @@ RL_REPLACEMENTS["grpo_video_bank_rows"] = grpo_video_bank_rows
 
 
 class _GrpoBankRows:
-    # A chunk's video rows out of the bank, built only when the chunk is read: a noncontiguous range (repeated
-    # prompts) is a copy, and holding every chunk's copy at once would bring back the per-generation copies.
+    # Built lazily: noncontiguous (repeated prompt) ranges copy; holding all costs memory.
     __slots__ = ("bank", "rows", "start", "end")
 
     def __init__(self, bank, rows, start, end):
@@ -2989,9 +2985,8 @@ pass
 RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
 
-# The vision keys every released unsloth up to 2026.9.4 forwards on the no-grad side (hard coded in its
-# _get_per_token_logps_and_entropies replacement); an unreadable companion is assumed one of these, since forwarding
-# more on the gradient side alone makes the policies differ.
+# Released unsloth up to 2026.9.4 forwards these keys on the no-grad side (hardcoded); an unreadable
+# companion is assumed one of them, since more gradient-side keys alone make policies differ.
 GRPO_RELEASED_VISION_KEYS = (
     "pixel_values",
     "image_grid_thw",
@@ -3002,9 +2997,8 @@ GRPO_RELEASED_VISION_KEYS = (
     "mm_token_type_ids",
 )
 
-# Markers whose presence in the installed unsloth's no-grad replacement means it reads this module's key tuple; either
-# one suffices (unslothai/unsloth issue 11031 collects keys in a helper, naming only the chunker); one constant keeps
-# the test and gate in step.
+# Markers in installed unsloth's no-grad replacement mean it reads this tuple; either suffices
+# (unslothai/unsloth issue 11031 names only the chunker); one constant keeps test and gate in step.
 GRPO_SHARED_HELPER_MARKERS = ("grpo_get_vision_inputs", "grpo_vision_chunks")
 
 # Memo for grpo_companion_vision_keys. Set once per process; tests reset it to None.
@@ -4011,9 +4005,8 @@ pass
 RL_REPLACEMENTS["grpo_rollout_as_old_ratio_metrics"] = grpo_rollout_as_old_ratio_metrics
 
 
-# Forward-gradient GRPO routing (fused_linear_grpo_loss). Counts per grpo_accumulated_loss call: "fused" took the
-# forward-gradient op, "head_budget" deferred but scored with the log-prob op (an opted-in trainable head over its
-# memory budget), "oom" ran out of memory in the fused op and fell back to the log-prob op.
+# Forward-gradient GRPO routing per grpo_accumulated_loss call: fused (forward-gradient op),
+# head_budget (opted-in trainable head over budget, log-prob op), oom (fell back to log-prob op).
 GRPO_FUSED_ROUTE_STATS = {"fused": 0, "head_budget": 0, "oom": 0}
 # A trainable lm_head takes the log-prob op unless opted in: the forward-gradient op's float32 head accumulator costs
 # 4 V H bytes and measured 0.86x / 0.95x of the log-prob op on an L4 (bf16, V 151936, H 4096, 2k / 8k tokens), while
@@ -4721,6 +4714,7 @@ def grpo_accumulated_loss(
         # of every completion token, looked up by content in TRL's [prompt | completion] layout.
         _sc_ids = _sc_logps = None
         _sc_head_list = []
+        _sc_k = 0
         if kwargs.get("loss_type", "grpo") == "reinforce" and getattr(trainer, "use_vllm", False):
             from unsloth_zoo.rl_replacements import grpo_score_centering_k as _sc_enabled_k
             _sc_k = _sc_enabled_k(trainer, kwargs, _rollout_logps_as_old, bool(_support_kwargs))
@@ -4729,6 +4723,10 @@ def grpo_accumulated_loss(
                 _sc_ids, _sc_logps, _sc_matched = _sc_lookup(
                     input_ids, logits_to_keep, _sc_k, trainer.processing_class.pad_token_id,
                 )
+        if not _sc_k and os.environ.get("UNSLOTH_GRPO_SCORE_CENTERING", "0").strip().lower() not in ("", "0", "false", "off", "no"):
+            # Centering is off for this loss: stop the generate wrapper recording heads nobody reads.
+            from unsloth_zoo.score_centering import pause_score_centering_record as _sc_pause
+            _sc_pause()
 
         # The text path rebuilds completion_mask from token ids, which would undo TRL's
         # mask_truncated_completions row zeroing; keep TRL's rows and reapply them before the loss.
@@ -6286,8 +6284,7 @@ def _distillation_jsd_chunk(
     student_log_probs = torch.nn.functional.log_softmax(student_logits, dim = -1)
     teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim = -1)
 
-    # Reduce on the STUDENT head's device (the gradient accumulates there); an accelerate split can put the two heads on
-    # different devices; both moves are no-ops when co-located.
+    # Reduce on STUDENT head's device (grads accumulate there); accelerate may split heads.
     if teacher_log_probs.device != student_log_probs.device:
         teacher_log_probs = teacher_log_probs.to(student_log_probs.device)
     if valid.device != student_log_probs.device:

@@ -70,7 +70,6 @@ def _generate_safe_configs(FlexBwDConfig, shmem_limit, head_dim, dtype, worst_bl
         for stages in [2, 1]:
             for warps in [4, 8]:
                 configs.append(FlexBwDConfig(block, block, block, block, stages, warps))
-    # Always include the smallest safe fallback
     fallback = FlexBwDConfig(16, 16, 16, 16, 1, 4)
     if fallback not in configs:
         configs.append(fallback)
@@ -119,7 +118,6 @@ def patch_flex_attention_bwd_configs():
                 if not shmem_limit:
                     return configs
 
-                # Patch only if some original config exceeds shared memory.
                 needs_patch = False
                 worst_block = 0
                 for c in configs:
@@ -132,7 +130,6 @@ def patch_flex_attention_bwd_configs():
                 if not needs_patch and configs:
                     return configs
 
-                # Add safe fallback configs for this GPU / head_dim / dtype
                 safe = _generate_safe_configs(
                     FlexBwDConfig, shmem_limit, head_dim, dtype, worst_block,
                 )

@@ -77,7 +77,6 @@ except (ImportError, NotImplementedError):
         return _IS_APPLE_SILICON
 
 logger = logging.getLogger(__name__)
-# Configure basic logging if not already configured elsewhere
 if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s: %(message)s')
 
@@ -458,8 +457,7 @@ def _resolve_monolith_bundle_convert_script(require_gguf_py = True):
 pass
 
 
-# `sys.path` and `sys.modules` are process-global, so concurrent swaps of different gguf trees would interleave; the
-# lock is reentrant because a swap can reach another swap of the same tree.
+# sys.path/sys.modules are process-global, so swaps must lock; RLock since swaps can nest.
 _GGUF_MODULE_SWAP_LOCK = threading.RLock()
 
 
@@ -479,7 +477,6 @@ def use_local_gguf(gguf_py_path = None):
 
 def _use_local_gguf(gguf_py_path):
     """The swap itself, run under `_GGUF_MODULE_SWAP_LOCK`."""
-    # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
     if gguf_py_path is None:
@@ -490,8 +487,7 @@ def _use_local_gguf(gguf_py_path):
     try:
         if os.path.exists(gguf_py_path):
             logger.debug(f"Adding {gguf_py_path} to sys.path")
-            # Insert at index 0, ahead of the script directory Python puts there, since a process started inside another
-            # gguf-py checkout has that at sys.path[0].
+            # Insert at index 0 so this gguf-py beats the script dir at sys.path[0].
             sys.path.insert(0, gguf_py_path)
 
             # Drop system gguf modules to force a reimport from gguf-py
@@ -506,7 +502,6 @@ def _use_local_gguf(gguf_py_path):
     finally:
         sys.path[:] = original_sys_path
 
-        # Remove any newly imported gguf modules
         new_modules = set(sys.modules.keys()) - original_modules
         gguf_modules_to_remove = [m for m in new_modules if m.startswith('gguf')]
         for module in gguf_modules_to_remove:
@@ -709,7 +704,6 @@ def do_we_need_sudo(system_type="debian"):
     sudo = False
     print("Unsloth: Updating system package directories")
 
-    # Choose update command based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         update_cmd = f"{pkg_manager} check-update"
@@ -741,7 +735,6 @@ def do_we_need_sudo(system_type="debian"):
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
             elif time.time() - start_time >= 180:
-                # Failure if longer than 3 minutes
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
         pass
@@ -845,19 +838,16 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
         stderr = stderr or ""
         all_output = stdout + stderr
 
-        # Check exit code
         if sp.returncode != 0:
             error_msg = f"[FAIL] Command `{command}` failed with exit code {sp.returncode}\n"
             if stdout: error_msg += f"stdout: {stdout}\n"
             if stderr: error_msg += f"stderr: {stderr}\n"
             raise RuntimeError(error_msg)
 
-        # Process output
         for line in all_output.splitlines(keepends=True):
             if line.rstrip().endswith(SHELL_COMMAND_NOT_FOUND):
                 raise RuntimeError(f"Command not found: {command}")
 
-            # Check for other bad outcomes
             for key, value in BAD_OUTCOMES.items():
                 if key in line:
                     error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
@@ -883,7 +873,6 @@ def try_execute_with_auto_install(command, sudo=False, print_output=False, print
             package_name = command.split(" ", 1)[0]
             print(f"Trying to install missing package: {package_name}")
             install_package(package_name, sudo, print_output, print_outputs, system_type)
-            # Retry once
             try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
         else:
             raise
@@ -2746,10 +2735,8 @@ _UNSLOTH_BRANDING_MARKER = b"# UNSLOTH_BRANDING_APPLIED"
 # Idempotency marker for the monolith branding patch, which edits the in-memory entrypoint and so cannot add a marker comment of its own.
 _UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
 
-# Same for the gguf attribute guard patch.
 _GGUF_GUARD_LINE = b"except AttributeError: gguf."
-# Reads back names already guarded, anchored on the except half: `try: gguf.X` is also what the reference scan matches,
-# so one pattern for both could not tell them apart.
+# Anchored on the except half, since `try: gguf.X` also matches the reference scan.
 _GGUF_GUARD_PATTERN = re.compile(rb"except AttributeError: gguf\.([\.A-Z_0-9]{3,}) = None")
 # Matches the whole guard so the reference scan can run with previous guards stripped; otherwise it finds gguf.X inside its own guards and re-guards every name.
 _GGUF_GUARD_BLOCK_PATTERN = re.compile(
@@ -2777,8 +2764,7 @@ pass
 # export and, under UNSLOTH_CONVERTER_SCAN_STRICT, refused the export itself.
 # A cap below the thing it is meant to read is not a safety margin.
 MAX_CONVERSION_PACKAGE_FILES = 256
-# Bounds the traversal, not just files read: empty directories never reach the file cap, so a huge tree was walked on
-# every export through the cache key; generous next to real packages of dozens of entries.
+# Caps traversal: empty dirs skip the file cap, and a huge tree was walked on every export.
 MAX_CONVERSION_PACKAGE_ENTRIES = 4096
 # And a bound on how many places get that allowance. Every root directory became
 # a location of its own, with no limit on how many there could be, so a tree with
@@ -2793,8 +2779,7 @@ MAX_SCAN_LOCATIONS = 64
 # could then import and run it.
 GENERATED_CONVERTER_NAME = "unsloth_convert_hf_to_gguf.py"
 
-# No module is read whole: past MAX_MODULE_BYTES (the scanner's 8 MiB cap) a module cannot be judged anyway, and reading
-# one enormous or sparse module exhausted memory before any finding.
+# Not read whole: past MAX_MODULE_BYTES a module can't be judged; a huge one exhausted memory.
 MAX_MODULE_BYTES = 8 * 1024 * 1024
 MODULE_READ_CHUNK = 1024 * 1024
 
@@ -2865,7 +2850,6 @@ def _purge_regenerable_bytecode(
                             if recursive:
                                 pending.append(entry.path)
                             elif entry.name == "__pycache__" and root == package_dir:
-                                # As above: the cache belonging to this directory.
                                 pending.append(entry.path)
                             continue
                     except OSError:
@@ -3232,7 +3216,6 @@ def _stays_within(root, path):
 def _source_beside(root, name):
     """The .py this cache would be rebuilt from, or None when there is none."""
     if os.path.basename(root) == "__pycache__":
-        # base.cpython-313.pyc -> ../base.py
         candidate = os.path.join(os.path.dirname(root), name.split(".")[0] + ".py")
     else:
         suffix = os.path.splitext(name)[1]
@@ -3929,8 +3912,7 @@ def _conversion_package_modules(
                 continue
             seen_directories.add(identity)
         try:
-            # Uses scandir, not walk: walk lists a whole directory's names at once, so a huge directory was listed
-            # before either budget was checked; this iterator checks per entry.
+            # scandir, not walk: walk lists all names at once; budgets are checked per entry.
             with os.scandir(root) as scanner:
                 for entry in scanner:
                     entries += 1
@@ -3945,8 +3927,7 @@ def _conversion_package_modules(
                         if recursive:
                             pending.append(entry.path)
                         elif entry.name == "__pycache__" and root == conversion_dir:
-                            # The cache of this directory's own modules, not a subtree; skipping it let a planted
-                            # __pycache__/gguf.<tag>.pyc run in place of the scanned source.
+                            # Own cache only; skipping it lets a planted .pyc shadow source.
                             pending.append(entry.path)
                         continue
                     name = entry.name
@@ -3967,9 +3948,8 @@ def _conversion_package_modules(
                             sorted(found)[:file_limit], False, tuple(unreadable),
                         )
         except OSError:
-            # An unreadable subdirectory is recorded and the walk goes on, since aborting would silence a readable
-            # malicious module beside it, even in strict mode; an unreadable conversion/ root still fails the whole
-            # package.
+            # Unreadable subdirectories are recorded and skipped, since aborting would hide a
+            # malicious module nearby, even in strict mode; an unreadable conversion/ root fails.
             if root == conversion_dir:
                 return PackageWalk(None, False, (".",))
             unreadable.append(
@@ -4647,10 +4627,8 @@ def _download_convert_hf_to_gguf_cached(
 pass
 
 
-# Preserve the pre-split lru_cache surface (cache_clear, cache_info,
-# cache_parameters) so external callers keep working. __wrapped__ is not
-# forwarded because the inner function takes a private (name, _local_script_info)
-# pair while the public wrapper is a single-arg callable.
+# Keeps cache_clear/cache_info/cache_parameters for external callers; __wrapped__ is not forwarded:
+# the inner takes a private (name, _local_script_info) pair, the wrapper is single-arg.
 _download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
 _download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
 _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
@@ -4981,8 +4959,7 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
     parts = sorted(input_folder.glob("model*.safetensors"))
     if parts:
         index_path = input_folder / "model.safetensors.index.json"
-        # llama.cpp gives the canonical index precedence whenever any
-        # safetensors part exists, including alongside model.safetensors.
+        # llama.cpp prefers the index over model.safetensors when any safetensors part exists.
         if index_path.is_file():
             return any(_is_mtp(name) for name in _names_from_index(index_path))
         from safetensors import safe_open
@@ -5534,8 +5511,7 @@ def _converter_gguf_requirements(script_path, architecture = None, is_vlm = None
         module_certain, module_advisory = _gguf_requirements_from_source(source)
         certain |= module_certain
         advisory |= module_advisory
-    # Another architecture's module: imported only by load_all_models, which
-    # swallows the failure.
+    # Another architecture's module, imported only by load_all_models, which swallows errors.
     for path in advisory_sources:
         try:
             with open(path, "rb") as f:
@@ -6804,21 +6780,17 @@ pass
 
 GGUF_ARCHITECTURE_KEY = "general.architecture"
 
-# Read by llama_model_base::load_hparams with no required = false, so a missing one throws before any tensor;
-# {arch}.attention.head_count and {arch}.feed_forward_length are deliberately NOT here, as get_key_or_arr(..., false)
-# reads them optionally.
+# Read by llama_model_base::load_hparams without required = false, so a missing one throws;
+# {arch}.attention.head_count and {arch}.feed_forward_length are read optionally, so not listed.
 GGUF_UNIVERSAL_REQUIRED_KEYS = (
     "{arch}.context_length",    # ml.get_key(LLM_KV_CONTEXT_LENGTH,   hparams.n_ctx_train)
     "{arch}.embedding_length",  # ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd)
     "{arch}.block_count",       # ml.get_key(LLM_KV_BLOCK_COUNT,      hparams.n_layer_all)
 )
 
-# A tensor namespace implies the metadata namespace describing it:
-# (tensor marker, required keys, exempt architectures, why).
-# A key qualifies only if every architecture carrying the namespace reads it with
-# no trailing `false` in `src/models/*.cpp`; optional readers go in the exempt set,
-# anything weaker in GGUF_CONDITIONAL_ADVISORY_KEYS. A hit here refuses to publish.
-# Verified against llama.cpp b49650adb31f2e49a0d76113aeb1792134fd8413.
+# A tensor namespace implies metadata keys: required only if every architecture with it reads them
+# with no trailing `false` in `src/models/*.cpp`; optional readers are exempt, weaker ones advisory;
+# a hit refuses to publish; verified on llama.cpp b49650adb31f2e49a0d76113aeb1792134fd8413.
 GGUF_CONDITIONAL_REQUIRED_KEYS = (
     (
         ".indexer",
@@ -6849,8 +6821,7 @@ GGUF_CONDITIONAL_REQUIRED_KEYS = (
     ),
 )
 
-# Same shape as the required keys but warnings only: llama.cpp loads these files, so refusing would fail a working
-# export even though the result is likely wrong.
+# Warn only: llama.cpp loads these, so refusing would break a working but likely wrong export.
 GGUF_CONDITIONAL_ADVISORY_KEYS = (
     (
         "_exps",
@@ -6970,7 +6941,6 @@ def _gguf_field_int(reader, key):
         return None
 
 
-# A block index in a parameter name: `model.layers.31.mlp...`, `transformer.h.5...`.
 _HF_BLOCK_INDEX_RE = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 
 
@@ -7174,8 +7144,7 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
             continue
         tensor_names.extend(tensor.name for tensor in shard_reader.tensors)
 
-    # Runs BEFORE the architecture exemption: that exemption covers which metadata keys a loader reads, and a corrupt
-    # shard is unloadable whatever the architecture.
+    # Before the architecture exemption (metadata keys only); a corrupt shard is unloadable.
     if unreadable_shards and report_structural:
         listed = ", ".join(f"`{name}`" for name in unreadable_shards)
         return [
@@ -7266,8 +7235,7 @@ GGUF_VERIFY_WINDOW_DEFAULT = 4096
 # 262k vocabulary, and the first and last tensors are always sampled).
 GGUF_VERIFY_DEEP_MAX_ELEMENTS = 64 * 1024 * 1024
 
-# The only in-block weights a published method deliberately zeroes: LLaMA Pro block expansion (arXiv 2401.02415)
-# zero-inits o_proj and down_proj so the copy is identity; llama.cpp loads it.
+# LLaMA Pro (arXiv 2401.02415) zero-inits o_proj, down_proj for identity; llama.cpp loads it.
 GGUF_IDENTITY_INIT_SUFFIXES = (".attn_output.weight", ".ffn_down.weight")
 
 
@@ -7769,7 +7737,6 @@ def check_build_requirements():
         if cmake_generator is None:
             missing.append('build-essential')
 
-        # Check OpenSSL dev
         is_installed, package_name = check_libcurl_dev()
         if not is_installed:
             missing.append(package_name)
@@ -7900,15 +7867,12 @@ def check_linux_type():
     if system != "linux":
         return "unknown"
 
-    # Check if it's Debian/Ubuntu-based:
     if os.path.exists('/etc/debian_version'):
         return 'debian'
 
-    # Check if it's RPM-based (CentOS/RHEL/Fedora):
     elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
         return 'rpm'
 
-    # Check if it's Arch-based (Arch/Manjaro):
     elif os.path.exists('/etc/arch-release'):
         return 'arch'
 

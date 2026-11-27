@@ -107,9 +107,7 @@ def _rocm_probe_dtype(device):
 
 
 def _select_rocm_sdpa(device):
-    # Backend selection only, never a launch: the SDPA kernels themselves are validated in isolated
-    # processes by Unsloth's rocm_sdpa_check. Read under the caller's live backend policy (sdpa_kernel,
-    # torch.backends.cuda flags), so nothing is cached.
+    # No launch: rocm_sdpa_check validates kernels in isolated processes; flags read live.
     with torch.cuda.device(device), torch.inference_mode(False), torch.enable_grad():
         q = torch.empty((1, 2, 16, 64), device = device, dtype = _rocm_probe_dtype(device), requires_grad = True)
         choice = int(_ROCM_SDPA_SELECT(q))
@@ -247,8 +245,7 @@ def _device_peak(device):
     try:
         return torch.cuda.memory_stats_as_nested_dict(device)["allocated_bytes"]["all"]["peak"]
     except Exception:
-        # No allocator statistics (a global CUDAPluggableAllocator raises from getDeviceStats):
-        # nothing is kept, the call recomputes as with saved attention off.
+        # No allocator stats (global CUDAPluggableAllocator): keep none, recompute as if off.
         return None
 
 
@@ -355,8 +352,7 @@ def _auto_keep(frame, entry):
 
 
 def _auto_release(frame, measured):
-    # Without a reading first, a later peak reading is charged with fewer kept bytes than it held,
-    # which only overstates the run's own peak: safe, but the replay reads first to stay exact.
+    # Reading first keeps the peak exact; without it, the peak is only overstated (safe).
     for device, kept in frame.kept:
         budget = _BUDGETS[device]
         if measured:
@@ -851,8 +847,7 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
             for i, leaf in enumerate(leaves):
                 if _same_view_of(t, leaf):
                     return ("leaf", i, t.shape, t.stride(), t.storage_offset() - leaf.storage_offset())
-            # Detached: a rejected graph (random / too big) is never backpropagated, and an op saving its
-            # own output would hold itself through its grad_fn.
+            # Rejected graphs never backprop; self-saved output would hold itself via grad_fn.
             t = t.detach()
             kept.append(t)
             return t
@@ -897,8 +892,7 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
             if leaf is x:
                 leaves[i] = None
             else:
-                # The kept graph holds the leaf (AccumulateGrad), which shares Q / K / V storage: swap in
-                # a stand-in so it keeps its autograd identity but not the storage.
+                # Leaf shares Q/K/V storage: a stand-in keeps autograd identity, not storage.
                 leaf.data = torch.empty((), dtype = leaf.dtype, device = leaf.device).expand(leaf.shape)
         kept.clear()
         entry.leaves = leaves
@@ -929,15 +923,13 @@ _PATCHED_MARK = "_unsloth_saved_attention"
 
 
 def _in_unsloth_compiled_block():
-    # Unsloth's own per-layer compile (fullgraph=False, a graph break is legal). Not set when the block
-    # is inlined into a user's torch.compile, which may be fullgraph=True.
+    # Set in Unsloth's fullgraph=False compile; not in a user's compile (maybe fullgraph=True).
     flag = getattr(sys.modules.get("unsloth.models._block_compile"), "_IN_COMPILED_REGION", None)
     return bool(flag) and bool(flag[0])
 
 
 def _strict_trace():
-    # Trace time only: is the frame being compiled one that may not graph break (fullgraph=True, or
-    # torch._dynamo.error_on_graph_break(True))? Unknown torch internals answer yes, the in-graph route.
+    # At trace time: strict (fullgraph=True, error_on_graph_break)? Unknown answers yes.
     try:
         from torch._dynamo.symbolic_convert import InstructionTranslator
         tx = InstructionTranslator.current_tx()
@@ -954,9 +946,7 @@ except Exception:
 
 
 def _strict_slot_impl(token, grad):
-    # Runs every time the strict in-graph route runs, compiled or not: it does to the frame what the
-    # helpers do for a call that keeps nothing (one empty entry in the first pass, one entry taken in the
-    # replay), so entries stay matched by call order whichever route each pass took.
+    # Adds an entry in the first pass and takes one in replay; entries match by call order.
     frame = getattr(_TLS, "frame", None)
     if frame is None:
         return
@@ -969,8 +959,7 @@ def _strict_slot_impl(token, grad):
 
 _SLOT_TOKEN = torch.zeros(())
 try:
-    # An opaque op stays in a fullgraph compile; the declared mutation keeps it from being dropped as dead
-    # code and orders the slots of one graph. Grad mode is read at trace time, as the helpers read it.
+    # Opaque op kept by a declared mutation; orders one graph's slots; grad mode read at trace.
     @torch.library.custom_op("unsloth_zoo::saved_attention_strict_slot", mutates_args = ("token",))
     def _strict_slot(token: torch.Tensor, grad: bool) -> None:
         _strict_slot_impl(token, grad)
@@ -986,15 +975,9 @@ def saved_attention_skip_slot():
 
 
 def _stay_in_caller_graph():
-    # A call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays in the
-    # caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True training
-    # compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, only a call traced by
-    # a compile that may not graph break stays in the graph: it keeps nothing, and its slot op fills or
-    # takes that call's entry, so a pass that falls back to eager (a fullgraph=False compile under
-    # error_on_graph_break at its recompile limit) still lines up with the other. Any other compile
-    # (Unsloth's blocks, a user's fullgraph=False) breaks into the helpers as eager code does: a
-    # fullgraph=False frame can fall back to eager on one pass only (recompile limit), and the frame's
-    # entries are matched by call order, so both passes must take the same route whatever the compile does.
+    # Outside any frame stays in caller's graph (helpers are compiler-disabled); inside a frame only
+    # a compile that may not graph break stays; other compiles break; both passes must take the same
+    # route.
     if getattr(_TLS, "frame", None) is None:
         return True
     if not torch.compiler.is_compiling() or _in_unsloth_compiled_block():

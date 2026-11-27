@@ -70,10 +70,8 @@ def _patch_deepseek_v3_naive_moe():
     if hasattr(DeepseekV3NaiveMoe, "_unsloth_already_patched"):
         return
 
-    # Patch PEFT ParamWrapper for separated LoRA weights
     patch_param_wrapper_for_moe()
 
-    # LoRA extraction function for DeepSeekV3 (standard format)
     def _deepseek_v3_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
         return extract_moe_lora_weights_for_grouped_mm(
             wrapper,
@@ -86,12 +84,10 @@ def _patch_deepseek_v3_naive_moe():
             logger_obj=logger,
         )
 
-    # Register extractor on the class (staticmethod, not bound) + mark model type
     DeepseekV3NaiveMoe._unsloth_lora_extractor_fn = staticmethod(_deepseek_v3_lora_extractor)
     DeepseekV3NaiveMoe._unsloth_model_type = "deepseek_v3"
     DeepseekV3NaiveMoe._unsloth_already_patched = True
 
-    # DeepseekV3NaiveMoe.forward -> backend dispatch in moe_utils
     patch_function(DeepseekV3NaiveMoe, "forward", get_forward_moe_backend())
 
     def patched_moe_forward(self, hidden_states):
@@ -102,7 +98,6 @@ def _patch_deepseek_v3_naive_moe():
         topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        # Mark the experts module for proper LoRA extraction
         self.experts._unsloth_model_type = "deepseek_v3"
 
         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(

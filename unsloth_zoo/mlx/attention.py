@@ -52,11 +52,15 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     return scores > copy + padding
 
 
-# Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.3);
+# Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.5);
 # elsewhere mlx builds the scores anyway, so a copy would add cost rather than replace it.
 _FUSED_FULL_HEAD_DIMS = frozenset((64, 72, 80, 96, 128))
 _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
+# mlx's sdpa_split serves 33 to 128 stacked query rows at these head dims (the vector kernels hold 32).
+_SPLIT_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 192, 256))
 _SPLIT_MIN_QUERIES = 1024
+# On NAX, half-precision head_dim 256 also fuses from this many queries once batch x heads fills the machine.
+_HALF_D256_MIN_QUERIES, _HALF_D256_MIN_HEADS = 512, 8
 _D512_MIN_QUERY_BLOCKS = 1024
 # mlx also fuses square causal head_dim 256 prefill this long; on NAX the split covers it.
 _SQUARE_D256_MIN_QUERIES = 2048
@@ -67,10 +71,15 @@ def _atoi(value):
     return int(match.group()) if match else 0
 
 
-@functools.cache
+def mlx_setting(name, default):
+    # mlx 0.32.5 reads its settings through mx.config, which caches `default` on first read: pass mlx's own.
+    if hasattr(mx, "config"):
+        return mx.config.get(name, default)
+    return _atoi(os.environ.get(name, str(default)))
+
+
 def _tf32_enabled():
-    # mlx reads MLX_ENABLE_TF32 once, through atoi.
-    return _atoi(os.environ.get("MLX_ENABLE_TF32", "1")) != 0
+    return mlx_setting("MLX_ENABLE_TF32", 1) != 0
 
 
 def _stock_runs_nax():
@@ -87,34 +96,47 @@ def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
     causal = isinstance(mask, str) and mask == "causal"
     if causal and L > S:
         return False
-    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
+    nax = (causal or isinstance(mask, mx.array)) and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
     if head_dim == value_dim == 256:
-        if split and (causal or isinstance(mask, mx.array)):
+        if nax and (L >= _SPLIT_MIN_QUERIES or dtype in (mx.bfloat16, mx.float16) and L >= _HALF_D256_MIN_QUERIES
+                    and B * HQ >= _HALF_D256_MIN_HEADS):
             return True
         return dtype != mx.float32 and causal and L >= _SQUARE_D256_MIN_QUERIES and L == S
     if head_dim == value_dim == 512:
-        return split and causal and B * HQ * -(-L // 32) >= _D512_MIN_QUERY_BLOCKS
+        return nax and L >= _SPLIT_MIN_QUERIES and B * HQ * -(-L // 32) >= _D512_MIN_QUERY_BLOCKS
     return ((head_dim == value_dim and head_dim in _FUSED_FULL_HEAD_DIMS)
             or (head_dim, value_dim) == (96, 64))
 
 
-def _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask):
-    L, S = queries.shape[-2], q_keys[0].shape[-2]
-    gqa = queries.shape[-3] // q_keys[0].shape[-3]
-    if L > S or L * gqa > 32:
+def _vector_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
+    L, S, HKV = queries.shape[-2], q_keys[0].shape[-2], q_keys[0].shape[-3]
+    gqa = queries.shape[-3] // HKV
+    if L > S:
         return False
+    if L * gqa > 32:
+        return (L * gqa <= 128 and head_dim == value_dim and head_dim in _SPLIT_VECTOR_HEAD_DIMS and S >= 128
+                and not isinstance(mask, mx.array)
+                and (HKV > 1 or _stock_runs_nax() and (_tf32_enabled() or dtype != mx.float32)))
     if head_dim == value_dim == 512:
-        # mlx reads MLX_SDPA_D512_MIN_KL on every call; 0 also lifts the other defaults.
-        min_keys = _atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
+        # 0 also lifts the other defaults.
+        min_keys = mlx_setting("MLX_SDPA_D512_MIN_KL", 1024)
         return S >= min_keys and (min_keys == 0
                                   or (L == 1 and gqa == 8 and not isinstance(mask, mx.array)))
     return ((head_dim == value_dim and head_dim in _FUSED_VECTOR_HEAD_DIMS)
             or (head_dim, value_dim) in ((192, 128), (96, 64)))
 
 
+def _mask_reaches_fused_heads(mask, shape):
+    # mlx right-aligns masks to [B, HQ, L, S], runtimes read a 3-D mask's axis 0 as batch: fuse unambiguous ones only.
+    lead = mask.shape[:-2]
+    return (len(lead) == 1 and lead[0] == 1) or (len(lead) == 2 and lead[0] in (1, shape[0]) and lead[1] in (1, shape[1]))
+
+
 def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     """Whether mlx will really fuse this call."""
     dtype = _result_dtype(queries, q_keys, q_values)
+    if isinstance(mask, mx.array) and mask.ndim > 2 and not _mask_reaches_fused_heads(mask, queries.shape):
+        return False
     if isinstance(mask, mx.array) and mx.issubdtype(mask.dtype, mx.floating):
         # The fused kernel rejects such a mask; the runtime widens the scores instead.
         if mx.result_type(mask.dtype, dtype) != dtype:
@@ -123,7 +145,7 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     value_dim = q_values[1].shape[-1] * group_size
     if queries.shape[-2] > 8:
         return _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask)
-    return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
+    return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask)
 
 
 # mlx builds full `[B, HQ, L, S]` scores for these causal calls; below the floors that is small and faster.
@@ -175,47 +197,6 @@ def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
             or _forces_fused(*route) or _blocks_d512_scores(*route))
 
 
-@functools.cache
-def _thread_limited_gpu():
-    # M1/M2, and paravirtual GPUs (`air64_v*`), which hit the same limits on GitHub's M1 runners.
-    from . import nax
-
-    return nax._gpu_generation() in (13, 14) or nax._gpu_architecture().startswith("air64")
-
-
-def _over_vector_thread_limit(q, k, v, mask):
-    # mlx 0.32.4's non-causal fp16 d256 two-pass kernel allows 28 of its 32 simdgroups on M1/M2 (ml-explore/mlx#4719).
-    if not (q.dtype == mx.float16 and q.ndim == 4 and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
-            and 1 < q.shape[-2] <= min(8, k.shape[-2]) and k.shape[-3] > 0 and not isinstance(mask, str)):
-        return False
-    if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] not in (1, q.shape[-2]):
-        return False
-    return 28 < q.shape[-3] // k.shape[-3] * q.shape[-2] <= 32
-
-
-def _one_pass_d512_over_thread_limit(q, k, v, mask):
-    # mlx 0.32.4's one-pass fp16/fp32 d512 kernel, used below 4096 keys, cannot launch 1024 threads on M1/M2 (ml-explore/mlx#4708).
-    if not (q.dtype in (mx.float16, mx.float32) and q.ndim == 4 and q.shape[-1] == k.shape[-1] == v.shape[-1] == 512
-            and q.shape[-2] == 1 and k.shape[-3] > 0 and (mask is None or isinstance(mask, str))):
-        return False
-    S, min_keys = k.shape[-2], _atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
-    # At 0 mlx fuses array-masked calls too, so the all-true mask the caller adds would not avoid the kernel.
-    if q.shape[-3] // k.shape[-3] != 8 or not 0 < min_keys <= S < 4096:
-        return False
-    from . import nax
-
-    return nax._gpu_architecture()[-1:] not in ("d", "s") or S < 1024
-
-
-def _split_query_rows(stock, q, k, v, scale, mask, sinks):
-    # Both halves keep the full call's key-partition plan, so every row equals the unsplit result.
-    half = (q.shape[-2] + 1) // 2
-    per_row = isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] > 1
-    return mx.concatenate([
-        stock(q[..., rows, :], k, v, scale=scale, mask=mask[..., rows, :] if per_row else mask, sinks=sinks)
-        for rows in (slice(None, half), slice(half, None))], axis=-2)
-
-
 def fused_sdpa_over(stock):
     """Wrap `mx.fast.scaled_dot_product_attention`; training keeps mlx's own dispatch."""
     @functools.wraps(stock)
@@ -234,12 +215,6 @@ def fused_sdpa_over(stock):
             mask = original
             if isinstance(mask, mx.array) and mask.shape[-2] != q.shape[-2]:
                 mask = mask[..., -q.shape[-2]:, :]
-        if not kwargs and _thread_limited_gpu():
-            if _over_vector_thread_limit(q, k, v, mask):
-                return _split_query_rows(stock, q, k, v, scale, mask, sinks)
-            if _one_pass_d512_over_thread_limit(q, k, v, mask):
-                # mlx has no fused head-dim-512 kernel for an array mask, so an all-true one takes its unfused attention.
-                mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
         if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
                 and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
                 and not mlx_training_patches_active()):

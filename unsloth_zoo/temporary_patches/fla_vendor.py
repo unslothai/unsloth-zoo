@@ -300,7 +300,6 @@ def _tensor_on_hopper(x):
         return True
 
 
-# Why fla was disabled, for unsloth's loader message.
 _FLA_DISABLED_REASON = None
 
 
@@ -960,7 +959,6 @@ def _resolved_implementation(wrapper):
         except ValueError:
             continue
         if callable(value):
-            # glm5_next's safe_gate partial: report the fla kernel it wraps.
             return getattr(value, _KDA_SAFE_GATE_INNER, value)
     return None
 
@@ -1458,8 +1456,7 @@ def _make_rocm_fp32_chunk_gated_delta_rule(original):
 
 
 def _make_rocm_fp32_guard(original, what):
-    """Refuse float32 on ROCm gfx11 before any kernel launches: a direct caller of fla's internals
-    (unsloth's opaque gated-delta op self-checks through them) gets an exception, not a dead GPU."""
+    """Raise on float32 ROCm gfx11 pre-launch so direct fla callers error, not a dead GPU."""
 
     @functools.wraps(original)
     def guarded(*args, **kwargs):
@@ -1475,9 +1472,7 @@ def _make_rocm_fp32_guard(original, what):
     return guarded
 
 
-# Every spelling a gated-delta entry point is exported under (fla's package, its parent fla.ops, the kernel
-# submodule, the decode alias added above); a wrapper installed on the canonical name is rebound onto each
-# of them that still names the callable it wraps, so no shorthand keeps the unwrapped kernel.
+# Rebind each gated-delta export still naming the wrapped kernel, so no alias keeps it unwrapped.
 _GATED_DELTA_EXPORTS = {
     "chunk_gated_delta_rule": ("chunk_gdn",),
     "fused_recurrent_gated_delta_rule": ("fused_recurrent_gdn",),
@@ -1496,8 +1491,7 @@ def _gated_delta_export_names(name):
 
 
 def _rebind_gated_delta_exports(name, original, wrapped, modules = ()):
-    """Point every export of ``name`` that is still ``original`` at ``wrapped`` (identity only, so a
-    separately implemented export is never replaced), in fla's namespaces and in ``modules``."""
+    """Rebind exports still identical to ``original`` onto ``wrapped``; separate ones are kept."""
     rebound = 0
     for modname in _GATED_DELTA_NAMESPACES + tuple(modules):
         module = sys.modules.get(modname)
@@ -1568,9 +1562,8 @@ def _on_cpu(args, kwargs):
 
 
 def _make_cpu_gated_delta_rule(original, recurrent):
-    """CPU tensors take transformers torch reference, others the original; plain Python so
-    torch.compile traces it; updated=() keeps fla disable marker from being copied onto this
-    wrapper"""
+    """CPU tensors use transformers torch reference, others the original; plain Python so
+    torch.compile traces it; updated=() keeps fla disable marker from being copied onto wrapper."""
     names = [
         n for n, p in inspect.signature(original).parameters.items()
         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
@@ -1617,10 +1610,8 @@ def _install_cpu_torch_path():
         if original is None:
             continue
         try:
-            # Resolved here rather than in the first (possibly traced) call, where an import breaks the graph. A GPU
-            # host takes it only from a modeling module already imported: importing transformers' Qwen3-Next
-            # modeling costs every `import unsloth` about a second, for a CPU gated-delta call a GPU host seldom
-            # makes; its first CPU call resolves it then. A host with no GPU, where every call is a CPU one, imports.
+            # Resolved here, not in the first (possibly traced) call where an import breaks the
+            # graph; GPU hosts skip the costly import unless already loaded; no-GPU hosts import.
             _torch_reference_gated_delta_rule(recurrent, import_missing = not _has_gpu())
         except Exception:
             pass
@@ -1630,8 +1621,7 @@ def _install_cpu_torch_path():
         else:
             wrapped = _make_cpu_gated_delta_rule(original, recurrent)
         if original is not None:
-            # Every export (package, fla.ops, kernel submodule, chunk_gdn / fused_recurrent_gdn, the decode
-            # alias) and the modeling modules that bound the kernel at import.
+            # Rebind every export and the modeling modules that bound the kernel at import.
             _rebind_gated_delta_exports(name, original, wrapped, _l2norm_modules(_GATED_DELTA_MODELING))
         installed = True
     return installed
@@ -1718,10 +1708,9 @@ def _sm75_torch_chunk_gated_delta_rule(
     return o, final_state
 
 
-# The torch path keeps every chunk's intermediates for backward: measured peak per (token x value head) of one
-# fwd + bwd, K = V = 128: float16 12 KB compiled / 16 KB eager, bfloat16 13 / 17 KB (fla recomputes in backward and
-# keeps far less). Calls whose estimate (eager bound, float32 matmuls above it) exceeds a fraction of the GPU memory
-# free at the first sm75 call keep fla, so a config that fits with fla still fits.
+# Torch path keeps chunk intermediates for backward: peak per token x value head, K=V=128, fwd+bwd:
+# float16 12 KB compiled / 16 KB eager, bfloat16 13 / 17 KB (fla recomputes); sm75 calls estimated
+# above a GPU memory fraction keep fla.
 _SM75_BYTES_PER_TOKEN_HEAD = {"float16": 16 * 1024, "other": 24 * 1024}
 _SM75_MEM_FRACTION = 0.5
 
@@ -1734,9 +1723,7 @@ def _sm75_mem_fraction():
 
 
 def _sm75_budget_impl(index):
-    """Bytes the torch path may use on GPU ``index``: a fraction of the memory free (driver free + the caching
-    allocator's unused reserve) at the first sm75 call, read once per device so every call (forward, checkpoint
-    recompute, every compiled graph) decides alike for a given shape."""
+    """Bytes on GPU ``index``: fraction of memory free at first sm75 call, read once per device."""
     budgets = _sm75_state["budget"]
     if index not in budgets:
         try:
@@ -1831,8 +1818,7 @@ def _make_sm75_chunk_gated_delta_rule(original):
         return _sm75_torch_chunk_gated_delta_rule(**a, **extra)
 
     setattr(chunk_gated_delta_rule, _SM75_TORCH_MARK, "torch")
-    # The CPU wrapper underneath stays visible to its installer, so a later patch pass does not wrap this wrapper
-    # again (each pass stacked another CPU / sm75 pair, and the kernel-hub closure bound a middle one).
+    # Copy _CPU_TORCH_MARK onto this wrapper so a re-run does not stack another CPU/sm75 pair.
     cpu_mark = getattr(original, _CPU_TORCH_MARK, None)
     if cpu_mark is not None:
         setattr(chunk_gated_delta_rule, _CPU_TORCH_MARK, cpu_mark)

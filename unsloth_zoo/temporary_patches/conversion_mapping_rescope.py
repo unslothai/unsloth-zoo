@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Re-scopes the leaked submodule renamings that transformers 5.4.0 (PR 44300) merges into a composite model, dropping
-bnb quant_state sidecars; applies to 5.4.0 and 5.5.0 through 5.5.4 (upstream fixed it in 5.6.0, PR 45567); neither
-gate is a version check."""
+"""Re-scopes leaked submodule renamings (transformers 5.4.0, PR 44300) that drop bnb quant_state
+sidecars; covers 5.4.0 and 5.5.0-5.5.4 by structure, not version; fixed in 5.6.0 (PR 45567)."""
 
 __all__ = [
     "patch_transformers_composite_prefix_renaming",
@@ -156,9 +155,7 @@ def _rescoped_renaming(conversion, prefix, sample_keys, model_keys):
 
 
 def _leaked_submodule_prefix_renamings(model):
-    """Renamings the submodule recursion merged into the model's mapping where they do not belong; walks submodules in
-    the same order with first model type winning; ignores renamings the parent registers for itself; empty if nothing
-    leaked."""
+    """Leaked submodule renamings; first model type wins, parent's own skipped; empty if none."""
     from transformers.conversion_mapping import extract_weight_conversions_for_model
     from transformers.core_model_loading import WeightRenaming
     from transformers.modeling_utils import PreTrainedModel
@@ -241,8 +238,7 @@ def _rescope_conversions(model, conversions):
         fixed += 1
 
     if not fixed and not dropped:
-        # Nothing replaced: return the caller's own list, not a copy, so 'this patch changed nothing' stays checkable by
-        # identity if the install gate is ever bypassed.
+        # Caller's own list, so identity shows no change even if the install gate is bypassed.
         return conversions
 
     if UNSLOTH_ENABLE_LOGGING:

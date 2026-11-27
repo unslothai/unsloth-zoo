@@ -215,6 +215,38 @@ def test_auto_swap_indices_names_the_disk_tier():
         del os.environ["UNSLOTH_OFFLOAD_DISK_PLACEMENT"]
 
 
+@pytest.mark.parametrize("world, want", [(1, []), (2, [0, 1, 3, 5, 7, 8, 9])])
+def test_disk_tier_indices_plan_for_this_ranks_share_of_host_ram(monkeypatch, world, want):
+    """Local ranks read the same free RAM: each plans its disk tier for free // LOCAL_WORLD_SIZE."""
+    # Meta layers: none of their bytes are in host RAM yet.
+    layers = nn.ModuleList([nn.Linear(64, 64, bias = False, device = "meta").requires_grad_(False) for _ in range(10)])
+    per = 64 * 64 * 4
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 * per, 12 * per))
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_HOST_LIMIT", raising = False)
+    monkeypatch.delenv("UNSLOTH_OFFLOAD_DISK_PLACEMENT", raising = False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(world))
+    assert _mod._disk_tier_indices(layers, list(range(10))) == want
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_plan_disk_budgets_this_ranks_share_of_host_ram(monkeypatch, world):
+    """BlockSwap's disk fallback keeps in host RAM only what this local rank's share of free RAM holds."""
+    from types import SimpleNamespace
+    per = 1 << 20
+    blocks = [SimpleNamespace(disk = None, sizes = [per], params = [object()], nbytes = lambda: per) for _ in range(10)]
+    stub = SimpleNamespace(blocks = blocks, _host_credit = [], depth = 1)
+    monkeypatch.setattr(_mod, "_host_free", lambda: (64 * per, 12 * per))
+    monkeypatch.setattr(_disk, "disk_tier_reason", lambda: None)
+    monkeypatch.setattr(_disk, "host_limit_bytes", lambda: None)
+    monkeypatch.setattr(_disk, "_shared_spill", lambda nbytes: None)
+    monkeypatch.setattr(_disk, "_round_up", lambda n: n)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(world))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_PLACEMENT", "tail")
+    assert BlockSwap._plan_disk(stub, "refused") is True
+    # 12 blocks of free RAM (world 1) or 6 (world 2), less the staging ring (2) and a block of lag (1).
+    assert len(stub._to_spill) == 10 - (12 // world - 3)
+
+
 # GPU -------------------------------------------------------------------------------------------------------------
 
 class _Layer(nn.Module):
@@ -401,6 +433,46 @@ def test_load_time_spill_then_install(monkeypatch):
     assert sw.stats()["disk_layers"] >= len(state.disk)
     _equal(ref, _train(layers))
     sw.remove()
+
+
+@_cuda
+def test_load_time_spill_keeps_small_1d_weights_in_ram_for_a_later_cast(monkeypatch):
+    """A norm upcast to float32 after the load-time spill (a model's post-load dtype fixups) trains like the same
+    cast on an all-RAM copy: small 1-D weights are never spilled, so the cast is an ordinary in-memory one."""
+    base = _stack()
+    want = copy.deepcopy(base)
+    for layer in want:
+        layer.norm.data = layer.norm.data.float()
+    ref = _train(want)
+    layers = copy.deepcopy(base)
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    state = _mod._HostLoad(9, "tail")
+    state.layers, state.indices = layers, _mod.swap_indices(len(layers), 9, "tail")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    for i in state.indices:
+        state.evict(i)
+    assert state.disk
+    for i in state.disk:
+        assert layers[i].norm.device.type == "cpu" and getattr(layers[i].norm, "_unsloth_disk", None) is None
+        assert getattr(layers[i].base.weight, "_unsloth_disk", None) is not None
+    for layer in layers:
+        layer.norm.data = layer.norm.data.float()
+    for name, p in layers.named_parameters():
+        p.requires_grad_("lora_" in name)
+    store = _disk.live_spill()
+    spilled = store.size
+    sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    assert sw.stats()["disk_layers"] >= len(state.disk)
+    # RAM and disk blocks of identical layers share one slot signature (one pool).
+    assert len({b.sig for b in sw.blocks}) == 1
+    # The norms went into the tail their spill reserved: no layer was written to the file a second time.
+    assert store.size == spilled
+    # dataset_num_proc keeps map in-process while a controller is live.
+    assert _mod.offload_active()
+    _equal(ref, _train(layers))
+    sw.remove()
+    assert not _mod.offload_active()
 
 
 @_cuda

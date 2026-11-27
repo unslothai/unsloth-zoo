@@ -120,8 +120,7 @@ def _cuda_context_exists():
 
 
 def _any_device_integrated():
-    # Any integrated device makes double buffering pure overhead, and mixed boxes are rare; torch is imported inside so
-    # this module imports before torch is available.
+    # Any integrated device makes double buffering pure overhead; torch is imported lazily.
     try:
         import torch
         return any(
@@ -132,9 +131,7 @@ def _any_device_integrated():
         return False
 
 
-# AMD APU graphics: the GPU has no memory of its own, only a carve-out of system RAM (Raven / Picasso, Renoir / Cezanne,
-# Van Gogh, Rembrandt, Raphael, Mendocino, Phoenix / Hawk Point, Strix Point, Strix Halo, Krackan). Read from
-# gcnArchName, which every ROCm reports correctly, unlike hipDeviceProp_t::integrated before ROCm 6.2.
+# APUs share RAM; use gcnArchName: hipDeviceProp_t::integrated is unreliable before ROCm 6.2
 _HIP_APU_ARCHS = frozenset((
     "gfx902", "gfx909", "gfx90c", "gfx1033", "gfx1035", "gfx1036", "gfx1037",
     "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153",
@@ -187,9 +184,8 @@ def device_is_integrated_part(index):
     return any(marker in name for marker in _NVIDIA_UNIFIED_NAME_MARKERS)
 
 
-# An integrated AMD part's BIOS carve-out (UMA frame buffer, 512 MiB to 96 GiB on Strix Halo) is
-# hidden from the OS; allocations use host RAM (GTT) only beyond it, a separate budget host offload
-# relieves; shared only if the carve-out is at most CARVEOUT_MAX_SHARE of what torch can allocate.
+# AMD APU BIOS carve-out is hidden from the OS; past it, allocations use GTT host RAM; shared only
+# if carve-out is at most CARVEOUT_MAX_SHARE of allocatable memory.
 CARVEOUT_MAX_SHARE = 0.25
 
 

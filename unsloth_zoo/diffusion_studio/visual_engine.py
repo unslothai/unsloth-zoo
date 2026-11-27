@@ -64,9 +64,8 @@ def _resolve_bin(server_bin=None):
 
 
 def _torch_cuda_lib_dir():
-    """Windows: torch/lib if it ships cudart64_*.dll, else None; LD_LIBRARY_PATH is ignored there, so without torch/lib
-    on PATH the child errors 126 and falls back to CPU (unsloth#6273; mirrors llama-server fix unsloth#5491); glob is
-    CUDA-major-agnostic."""
+    """Windows: torch/lib if it has cudart64_*.dll, else None; PATH needed as LD_LIBRARY_PATH is
+    ignored, or the child falls to CPU (unsloth#6273, unsloth#5491); CUDA-major-agnostic glob."""
     try:
         import torch
         torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
@@ -85,9 +84,8 @@ def _torch_cuda_lib_dir():
 
 
 def _bundled_cuda_lib_dirs():
-    """Linux/WSL nvidia-* wheel lib dirs, prepended ahead of any system path so the bundled CUDA is used, not a missing
-    or WSL-crashing system one (unsloth#6303); torch/lib excluded as its libgomp/libstdc++ could shadow system libs;
-    [] if none."""
+    """Linux/WSL nvidia-* wheel lib dirs, prepended ahead of system paths so bundled CUDA wins
+    (unsloth#6303); torch/lib excluded: libgomp/libstdc++ can shadow system libs; [] if none."""
     import sysconfig
 
     roots, dirs = [], []
@@ -112,8 +110,7 @@ DEFAULT_NGL = 99
 
 
 def _resolve_ngl(ngl = None, base_env = None):
-    """GPU layers (llama.cpp n_gpu_layers): explicit ngl wins, then the NGL env var, else all layers, so partial offload
-    works for GGUFs larger than VRAM (unsloth#7574)."""
+    """ngl, else NGL env, else all layers; partial offload for GGUFs above VRAM (unsloth#7574)."""
     if ngl is not None:
         return max(0, int(ngl))
     raw = (os.environ if base_env is None else base_env).get("NGL")
@@ -169,8 +166,7 @@ def _canvas_maxtok(maxtok):
 
 
 def _replace_request_file(req_path, req):
-    """Writes via mkstemp then os.replace so a link planted at req_path is replaced, not written through; kept local
-    since importing unsloth_zoo.compiler would pull in torch."""
+    """mkstemp + os.replace so a link planted at req_path is replaced; local to avoid torch."""
     directory = os.path.dirname(req_path) or "."
     descriptor, temporary_path = tempfile.mkstemp(
         prefix = f".{os.path.basename(req_path)}.", suffix = ".tmp", dir = directory,
@@ -197,8 +193,7 @@ class VisualServer:
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        # /dev/shm and /tmp are 1777 with enumerable PIDs, so a PID-derived name is world readable and can be
-        # pre-empted; each server gets its own 0700 dir with an unpredictable name.
+        # PID-derived names in /dev/shm or /tmp can be pre-empted; use a random 0700 dir.
         self._req_dir = None
         if req_path:
             self.req = req_path
@@ -227,8 +222,7 @@ class VisualServer:
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
             raise RuntimeError(f"visual server failed to start: {line!r}")
-        # Server prints "READY <n_vocab> <maxtok>": maxtok is the resolved per-turn context budget, possibly auto-sized
-        # to fit VRAM when MAXTOK=0; older servers print only "READY <n_vocab>".
+        # READY <n_vocab> <maxtok>: maxtok auto-fit to VRAM when MAXTOK=0; old servers omit it.
         parts = line.split()
         self.n_vocab = int(parts[1]) if len(parts) > 1 else 0
         self.maxtok = int(parts[2]) if len(parts) > 2 else self.maxtok_req
@@ -251,9 +245,8 @@ class VisualServer:
         # Forward tools so the server renders them into the chat template (inputs.tools) for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        # The request body carries the whole conversation: no link, not world
-        # readable, and no FIFO. O_NONBLOCK refuses one with no reader; one whose read
-        # end is already held open opens fine, so the fstat is what refuses that.
+        # Request body holds the whole conversation: no symlink, not world readable, no FIFO;
+        # O_NONBLOCK misses a FIFO with an open reader, so fstat also checks.
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         if not no_follow:
             # No atomic no-follow open here, and an lstat first is only a time of check.
@@ -310,8 +303,7 @@ def _parse_stats(line):
 
 
 def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None, tools=None):
-    """Streams a turn via on_frame(block, step, total, text), on_commit(cumulative_text) and on_stats(dict), returns the
-    committed reply, raises ContextOverflow past the budget; a crash before any frame is retried once."""
+    """Returns the reply; crash before any frame is retried once; ContextOverflow past budget."""
     progressed = {"emitted": False}
 
     def _frame(b, s, t, x):
@@ -374,7 +366,6 @@ def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commi
 
 
 if __name__ == "__main__":
-    # standalone smoke: one prompt end to end, printing a couple of frames per block
     import sys, time
     gguf = sys.argv[1] if len(sys.argv) > 1 else "diffusion-gemma-Q8_0.gguf"
     prompt = sys.argv[2] if len(sys.argv) > 2 else "In one sentence, what is a transformer in ML?"

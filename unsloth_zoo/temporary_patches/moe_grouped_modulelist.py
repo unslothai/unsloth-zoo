@@ -58,8 +58,7 @@ __all__ = [
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    # The zoo injects a bitsandbytes stub where the package is absent (e.g. macOS arm64); its attributes are placeholder
-    # objects, so isinstance raises TypeError; a non-class Params4bit therefore counts as no bitsandbytes.
+    # isinstance on zoo's bnb stub placeholders raises TypeError, so non-class means no bnb.
     HAS_BNB = isinstance(Params4bit, type)
     if not HAS_BNB:
         Params4bit = None
@@ -187,8 +186,7 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
             raise
         if not w.is_contiguous():   # an unaligned view (e.g. storage offset): the copy may pass
             return _grouped_mm_fix(x, w.contiguous(), offs)
-        # Shared with moe_utils, not a Python loop: a loop tapes each per-group slice, whose router-decided shape makes
-        # non-reentrant checkpointing abort the backward; two callers tape it, so the hazard is reachable.
+        # Python loop tapes router-decided slices; non-reentrant checkpoint aborts backward.
         try:
             from .moe_utils import _manual_grouped_mm
         except Exception:
@@ -399,8 +397,7 @@ def _bnb_build_down_stack(experts, spec, dtype, projs = None):
     return torch.stack([_expert_weight(d, dtype) for d in projs.down], 0).transpose(1, 2)
 
 
-# Gate / up / down projection of every expert, plus the [g0, u0, g1, u1, ...] list the gate_up pointer table reads;
-# built once per readiness verdict (_block_projs), not per call.
+# Per-expert gate/up/down, interleaved gate_up; built once per readiness verdict, not per call.
 _ExpertProjs = collections.namedtuple("_ExpertProjs", ("gate", "up", "down", "gate_up"))
 
 
@@ -552,9 +549,8 @@ def _lora_delta(x, offsets, projs, lora, dtype):
     return gmm(h, B, offsets) * scaling
 
 
-# Stacked expert LoRA, since PEFT's per-expert tensors make optimizer, clip and autograd pay per tensor (36,864 on
-# Qwen3-30B-A3B): one [E, r, in] / [E, out, r] Parameter per projection as weight_stack on expert 0; each expert's
-# weight is a view of it, and per-expert weight keys save and load.
+# Per-expert LoRA tensors cost optimizer, clip and autograd per tensor (36,864 on Qwen3-30B-A3B);
+# one [E, r, in] / [E, out, r] weight_stack on expert 0 as views; per-expert keys save and load.
 _STACK_NAME = "weight_stack"
 
 
@@ -666,8 +662,7 @@ def _stackable_lora(projs):
                 return None
         if getattr(p, "lora_variant", None) or getattr(p, "lora_bias", {}).get(name, False):
             return None
-        # Dropout > 0 runs the per-expert loop in train mode: a stack would turn an unrouted expert's None grad into
-        # zeros, which weight decay and momentum still move.
+        # Dropout > 0: stacking would zero unrouted grads, which decay and momentum still move.
         drop = p.lora_dropout[name] if name in p.lora_dropout else None
         if drop is not None and not isinstance(drop, torch.nn.Identity) and getattr(drop, "p", 0) > 0:
             return None
@@ -931,8 +926,7 @@ def _grouped_state(block, experts, spec, device, dtype):
 def grouped_moe_forward(self, hidden_states: torch.Tensor):
     spec = self._unsloth_moe_spec
     experts = self.experts
-    # Grouped path only on the frozen-base CUDA path in bf16 / fp16 with every expert grouped-ready; CPU/offload,
-    # unsupported LoRA, fp32 and dtype/device mismatch fall back.
+    # Frozen CUDA bf16/fp16 with all experts ready; CPU, offload, unsupported LoRA fall back.
     if hidden_states.device.type not in ("cuda", "xpu") \
             or hidden_states.dtype not in (torch.bfloat16, torch.float16):
         if not torch.compiler.is_compiling():
@@ -991,13 +985,11 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         cu = getattr(self, "_cached_gate_up", None)
         if cu is None or cu.device != dev or cu.dtype != dtype:
             with torch.no_grad():
-                # Resident stacks: one contiguous copy at build time.
                 self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype, projs).contiguous()
                 self._cached_down = _build_down_stack(experts, spec, dtype, projs).contiguous()
         gate_up = _grouped_mm_fix(permuted, self._cached_gate_up, offsets)
     else:
         gate_up = _grouped_expert_gemm(permuted, offsets, lambda: _build_gate_up_stack(experts, spec, dtype, projs), recompute)
-    # Expert LoRA: each wrapped projection adds its grouped delta to its base output, as the loop does.
     gate, up = gate_up.chunk(2, dim=-1)
     if lora["gate"] is not None:
         gate = gate + _lora_delta(permuted, offsets, projs.gate, lora["gate"], dtype)

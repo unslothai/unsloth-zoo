@@ -227,19 +227,9 @@ def _snapshot_current(experts, snap):
     return list(map(_get_version, snap["versioned"])) == snap["versions"]
 
 
-# Decode epochs. _snapshot_current rechecks every expert (identity, addresses, versions: a few hundred attribute
-# reads per layer, about 10% of an NF4 decode step on a slow host). A one-token decode step on the cache of the
-# previous decode step belongs to the same epoch: a layer's tables are fully checked on its first call of an
-# epoch, then only _sentinel_current (the first gate_up / down expert) runs until the epoch changes. A new epoch
-# starts with a new cache object, on every generate() call and on a cache reset (a reused static cache). The
-# shortcut also needs moe_ready_epoch's stamp, read at the call, unchanged since the full check: the experts subtree
-# is tracked there, so a module / parameter / buffer registered in it (setattr, as PEFT merges and unloads do), a
-# move (.to / .cuda / .half, which also pops these tables), requires_grad_, a PEFT state method or an optimizer
-# step ends it, even inside a decode step; without that machinery (or under accelerate / FSDP2 hooks) every call is
-# fully checked. A check without an epoch (the experts' eval forward, as in prefill) clears the stamp. Not rechecked
-# inside one generation: a non-first expert's weight swapped by .data assignment, a parameter set to None, or
-# quant_state / tensor surgery in place between two one-token steps. UNSLOTH_GPTOSS_ROUTED_EPOCH=0 checks every
-# call fully.
+# Full check (~10% of NF4 decode step, slow host) per epoch; then sentinel expert only until new
+# generate, cache reset or experts-subtree change; accelerate/FSDP2 hooks force full checks; .data
+# swaps, None params, quant_state surgery unchecked; UNSLOTH_GPTOSS_ROUTED_EPOCH=0 disables epochs.
 _EPOCH_ENABLED = os.environ.get("UNSLOTH_GPTOSS_ROUTED_EPOCH", "1") != "0"
 # Counts per prepare_routed_experts call on built tables: "full" ran _snapshot_current, "sentinel" only the O(1) check.
 ROUTED_EPOCH_STATS = {"full": 0, "sentinel": 0}

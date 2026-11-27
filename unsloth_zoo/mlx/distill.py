@@ -40,8 +40,7 @@ __all__ = [
 
 DEFAULT_CHUNK_SIZE = 128
 
-# Peak per batch*seq*vocab fp32 buffer, fitted on Qwen2.5-0.5B <- 3B and rounded up; an oversized step aborts with
-# "[METAL] Command buffer execution failed" and wedges the GPU.
+# Peak fp32 batch*seq*vocab buffer fitted on Qwen2.5-0.5B <- 3B; oversized steps wedge the GPU.
 NAIVE_ACTIVATION_MULTIPLIER = 16.0
 CHUNKED_ACTIVATION_MULTIPLIER = 13.0
 MEMORY_SAFETY_FRACTION = 0.85

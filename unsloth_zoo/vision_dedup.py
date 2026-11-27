@@ -77,8 +77,7 @@ class _BlockExpand(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         grad_src = grad.new_zeros(ctx.src_shape)
-        # Half-precision copies are summed in fp32 and rounded once: a running fp16 sum overflows on partial
-        # sums (40000 + 40000 - 40000 - 40000 gave inf) that the unwrapped tower accumulates without.
+        # Half copies sum in fp32: partial fp16 sums overflow (40000+40000-40000-40000 is inf)
         wide = torch.float32 if grad.dtype in (torch.float16, torch.bfloat16) else grad.dtype
         for s0, length, copies in ctx.blocks:
             acc = grad[copies[0] : copies[0] + length]
@@ -301,8 +300,7 @@ def _zero3(module):
 
 
 def _collective(module):
-    # FSDP2 (Unsloth's resharding layout or any DTensor-sharded tower) and ZeRO-3 towers all-gather per
-    # forward; a rank-local self-check or fallback forward would hang the other ranks.
+    # FSDP2/ZeRO-3 towers all-gather per forward; rank-local self-checks/fallbacks hang peers.
     if _zero3(module):
         return True
     try:
@@ -431,7 +429,6 @@ def _make_wrapper(module, original):
             _fallback(module, f"unmappable output: {e}")
             return original(*args, **kwargs)
         if not module.__dict__.get(_VERIFIED, False) and os.environ.get("UNSLOTH_GRPO_IMAGE_DEDUP_VERIFY", "1") != "0":
-            # First use per module: self-check the mapping against a full encode.
             with torch.no_grad():
                 full = original(*args, **kwargs)
             reason = _outputs_mismatch(mapped, full, inverse)

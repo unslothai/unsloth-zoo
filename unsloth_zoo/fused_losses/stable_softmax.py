@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Target log-probs without softmax collapse (arXiv 2610.31642, Section 2): z_t - logsumexp(z) rounds to 0 past a ~16.6
-nat float32 margin, so log p_t = -softplus(logsumexp_{j != t}(z_j) - z_t)."""
+"""Softplus target log-probs avoid float32 collapse past ~16.6 nats (arXiv 2610.31642)."""
 
 import torch
 
@@ -41,9 +40,8 @@ def _softplus(x):
 
 
 def _centred(z, target):
-    """Returns (log p_t, logsumexp(z) - m, m, z - m) with m the detached row max; centred so a shared offset cannot
-    round the normaliser away; normaliser is logaddexp(lse_others, z_t), not z_t - logp; masked-sum target, not
-    gather; finfo.min, not -inf, keeps target-only support NaN free."""
+    """Returns (log p_t, logsumexp(z) - m, m, z - m), m the detached row max; centred against
+    rounding, logaddexp not z_t - logp, masked-sum not gather, finfo.min not -inf for NaN-free."""
     m = z.detach().amax(-1, keepdim = True)
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     z = z - m
@@ -111,8 +109,7 @@ def _acc(dtype):
 
 
 def _rows_forward(chunk, target):
-    # Saves row max and lse relative to it: an absolute lse rounds the normaliser away at a large shared logit offset,
-    # and exp(z - lse) would disagree with the forward.
+    # Lse is saved relative to the row max; an absolute lse rounds the normaliser away.
     logp, lse_c, m, _ = _centred(chunk.to(_acc(chunk.dtype)), target)
     return logp, lse_c, m
 
@@ -144,8 +141,7 @@ _COMPILED_ROWS = {}
 
 
 def _rows_impl(logits):
-    """Returns (forward, backward) per chunk: one fused Inductor kernel each on cuda / xpu (eager reads the chunk ~6
-    times); in-place eager pair elsewhere or if compiling fails."""
+    """Fused Inductor kernels on cuda / xpu; the eager pair otherwise or if compiling fails."""
     if logits.device.type not in ("cuda", "xpu") or _COMPILED_ROWS.get("failed") or _compile_disabled():
         return _rows_forward_eager, _rows_backward_eager
     if not _COMPILED_ROWS:
@@ -180,8 +176,7 @@ class _CrossEntropyRows(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, target):
         if torch.compiler.is_compiling():
-            # No Python row loop when traced: range() over a symbolic row count specialises it (recompile per length,
-            # ConstraintViolationError under mark_dynamic); Inductor fuses the upcast.
+            # No row loop when traced: range() over symbolic rows specialises per length.
             logp, lse_c, m = _rows_forward(logits, target)
             ctx.save_for_backward(logits, target, logp, lse_c, m)
             return -logp

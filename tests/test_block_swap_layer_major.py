@@ -58,7 +58,7 @@ FAMILIES = {
 
 
 def _model(reentrant = True, layers = 4, dtype = torch.float32, device = "cpu", train_embed = False,
-           train_head = False, seed = 0, arch = "llama"):
+           train_head = False, seed = 0, arch = "llama", attn = "eager"):
     torch.manual_seed(seed)
     cfg_name, model_name, extra = FAMILIES[arch]
     if not hasattr(transformers, model_name):
@@ -66,7 +66,7 @@ def _model(reentrant = True, layers = 4, dtype = torch.float32, device = "cpu", 
     cfg = getattr(transformers, cfg_name)(hidden_size = 64, intermediate_size = 128, num_hidden_layers = layers,
                                           num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 256,
                                           max_position_embeddings = 256, **extra)
-    cfg._attn_implementation = "eager"
+    cfg._attn_implementation = attn
     model = getattr(transformers, model_name)(cfg).to(dtype = dtype, device = device)
     model.config.use_cache = False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": reentrant})
@@ -1076,6 +1076,153 @@ def test_gradient_checkpointing_class_property(monkeypatch, installed):
     assert [{k: l.__dict__[k] for k in keys if k in l.__dict__} for l in layers] == state
 
 
+def _smart_gradient_checkpointing(monkeypatch):
+    """Unsloth's smart gradient checkpointing (what use_gradient_checkpointing = "unsloth" patches in at
+    max_seq_length >= 512; its device buffers are CUDA ones), undone after the test."""
+    gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
+    import transformers.modeling_utils as mu
+    for owner, name in ((torch.utils.checkpoint, "CheckpointFunction"), (torch.utils.checkpoint, "checkpoint"),
+                        (mu, "checkpoint")):
+        monkeypatch.setattr(owner, name, getattr(owner, name))
+    for name in ("_old_CheckpointFunction", "_old_checkpoint"):
+        monkeypatch.delattr(torch.utils.checkpoint, name, raising = False)
+    gc.patch_unsloth_smart_gradient_checkpointing(dtype = torch.bfloat16)
+    assert torch.utils.checkpoint.CheckpointFunction is gc.UnslothCheckpointFunction
+    return gc
+
+
+def _unsloth_ckpt_case(model, gc, ckpt):
+    layers = _layers(model)
+    if ckpt == "unsloth_gradient_checkpoint":
+        for layer in layers:
+            layer._gradient_checkpointing_func = gc.unsloth_gradient_checkpoint
+    elif ckpt == "torch":
+        # torch's own reentrant checkpoint, which runs UnslothCheckpointFunction once it is patched in.
+        for layer in layers:
+            layer._gradient_checkpointing_func = functools.partial(torch.utils.checkpoint._old_checkpoint,
+                                                                   use_reentrant = True)
+    else:
+        assert layers[0]._gradient_checkpointing_func.func is gc.unsloth_checkpoint
+    device = next(model.parameters()).device
+    batches, items = _batches(device = device)
+    base_losses, base_grads = _standard(model, batches, items)
+    for step in range(2):
+        lm.layer_major_stats(reset = True)
+        losses, grads = _layer_major(model, batches, items)
+        s = lm.layer_major_stats()
+        assert (s["windows"], s["recomputes"], s["aborts"]) == (1, 3 * len(layers), 0), s
+        assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+        _assert_same(base_grads, grads)
+
+
+def test_moe_routing_under_unsloth_checkpoint_aborts():
+    """Unsloth's checkpoint replays the forward's MoE routing in its recompute; the window does not, so a layer that
+    routes under it aborts before any decoder gradient exists."""
+    gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
+
+    class Routed(_CkptToy):
+        def _inner(self, x, past_key_value = None):
+            index = torch.zeros(x.shape[:-1] + (1,), dtype = torch.long)
+            weights = torch.ones(x.shape[:-1] + (1,))
+            index, weights = gc.moe_checkpoint_routing(self, index, weights)
+            return torch.tanh(self.lin(x)) * weights
+
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([Routed(gc.unsloth_gradient_checkpoint) for _ in range(3)])
+    losses, why = _toy_run(layers, _ckpt_fns(layers))
+    assert losses is None and "routes MoE" in why, why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_float32_inputs_stored_in_bfloat16_are_refused(monkeypatch):
+    """UnslothCheckpointFunction may keep a float32 layer input in bfloat16 for its recompute (autocast); the window
+    keeps it exact, which would not be standard accumulation."""
+    gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
+
+    class UnslothCheckpointFunction(torch.autograd.Function):
+        pass
+    monkeypatch.setattr(torch.utils.checkpoint, "CheckpointFunction", UnslothCheckpointFunction)
+    layer = _CkptToy()
+    x = torch.zeros(2, 4)
+    monkeypatch.setattr(gc, "_offload_store_dtype", lambda t: torch.bfloat16)
+    with lm._unsloth_frames(layer, x) as frames:
+        assert "bfloat16" in frames[0]
+    monkeypatch.setattr(gc, "_offload_store_dtype", lambda t: t.dtype)
+    with lm._unsloth_frames(layer, x) as frames:
+        assert frames[0] is None
+    # Unpatched: unsloth_offloaded_gradient_checkpoint still runs UnslothCheckpointFunction,
+    # unsloth_gradient_checkpoint keeps its input as is.
+    monkeypatch.undo()
+    monkeypatch.setattr(gc, "_offload_store_dtype", lambda t: torch.bfloat16)
+    for name, refused in (("unsloth_offloaded_gradient_checkpoint", True), ("unsloth_gradient_checkpoint", False)):
+        layer = _CkptToy(getattr(gc, name))
+        with lm._unsloth_frames(layer, x) as frames:
+            assert (frames[0] is not None) is refused, name
+
+
+def test_block_swap_wrapped_unsloth_checkpoint_gets_a_routing_frame():
+    """Block swap's residency wrapper around Unsloth's checkpoint (as BlockSwap._wrap_checkpoint installs it) is
+    resolved to the shim, so the window forward still runs in a routing frame."""
+    gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
+    swapper = object()
+    inner = gc.unsloth_gradient_checkpoint
+
+    def run_in_checkpoint(function, *args, **kw):
+        return inner(function, *args, **kw)
+    run_in_checkpoint._unsloth_block_swap = swapper
+    run_in_checkpoint._unsloth_block_swap_wrapper = run_in_checkpoint
+    run_in_checkpoint.__wrapped__ = inner
+    layer = _CkptToy(run_in_checkpoint)
+    x = torch.zeros(2, 4, requires_grad = True)
+    with lm._unsloth_frames(layer, x, swapper) as frames:
+        assert frames[0] is None and frames[1] is not None
+    with lm._unsloth_frames(layer, x, object()) as frames:
+        assert frames == [None, None, None]
+
+
+def test_unsloth_gradient_checkpoint_engages_bitwise():
+    """A decoder layer checkpointed by Unsloth's unsloth_gradient_checkpoint: windows run, bitwise to standard."""
+    gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
+    _unsloth_ckpt_case(_model(True), gc, "unsloth_gradient_checkpoint")
+
+
+@_cuda
+@pytest.mark.parametrize("ckpt", ["unsloth_checkpoint", "unsloth_gradient_checkpoint", "torch"])
+def test_gpu_unsloth_smart_gradient_checkpointing_engages_bitwise(monkeypatch, ckpt):
+    """use_gradient_checkpointing = "unsloth" at max_seq_length >= 512 patches in unsloth_checkpoint and
+    UnslothCheckpointFunction: every window runs (no abort, 3 x layers recomputes), bitwise equal to standard."""
+    gc = _smart_gradient_checkpointing(monkeypatch)
+    model = _model(True, dtype = torch.bfloat16, device = "cuda")
+    for p in model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+    _unsloth_ckpt_case(model, gc, ckpt)
+
+
+@_cuda
+@pytest.mark.parametrize("ckpt", ["unsloth_checkpoint", "torch"])
+def test_gpu_saved_attention_frames_are_replayed(monkeypatch, ckpt):
+    """UNSLOTH_GC_SAVE_ATTENTION: UnslothCheckpointFunction keeps each forward's attention outputs for its recompute;
+    the window keeps and replays them the same way (every recompute reuses them), bitwise equal to standard."""
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    for name in ("sdpa", "flash_attention_2", "flash_attention_3"):
+        if ALL_ATTENTION_FUNCTIONS.get(name) is not None:
+            monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS, name, ALL_ATTENTION_FUNCTIONS[name])
+    gc = _smart_gradient_checkpointing(monkeypatch)
+    sa = sys.modules["unsloth_zoo.saved_attention"]
+    model = _model(True, dtype = torch.bfloat16, device = "cuda", attn = "sdpa")
+    for p in model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+    layers = len(_layers(model))
+    sa.SAVED_ATTENTION_STATS.clear()
+    _unsloth_ckpt_case(model, gc, ckpt)
+    # Standard accumulation (3 micro-batches) and both windows: every recompute reused its forward's attention.
+    assert sa.SAVED_ATTENTION_STATS["reused"] == 3 * 3 * layers, dict(sa.SAVED_ATTENTION_STATS)
+    assert sa.SAVED_ATTENTION_STATS["unmatched"] == 0, dict(sa.SAVED_ATTENTION_STATS)
+
+
 def test_kv_shared_layers_are_refused():
     """Gemma 4 style: a consumer layer reads the key / value states a producer wrote (no-grad in the window)."""
     layers = _toy_stack()
@@ -1349,8 +1496,9 @@ def test_checkpoint_wrappers_the_window_cannot_reproduce_are_refused(how):
     assert all(p.grad is None for p in layers.parameters())
 
 
-def test_unsloth_checkpoint_shims_are_refused(monkeypatch):
-    """They replay MoE routing / saved-attention frames around the recompute; the window would bypass them."""
+def test_unsloth_checkpoint_shims(monkeypatch):
+    """Unsloth's shims are reentrant whatever use_reentrant says, saved-attention frames armed or not (the window
+    keeps and replays those frames itself)."""
     import types
 
     def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
@@ -1360,10 +1508,14 @@ def test_unsloth_checkpoint_shims_are_refused(monkeypatch):
         shims = types.ModuleType("unsloth_zoo.gradient_checkpointing")
         monkeypatch.setitem(sys.modules, "unsloth_zoo.gradient_checkpointing", shims)
     monkeypatch.setattr(shims, "unsloth_gradient_checkpoint", unsloth_gradient_checkpoint, raising = False)
+    saved = types.ModuleType("unsloth_zoo.saved_attention")
+    armed = [False]
+    saved.save_attention_requested = lambda: armed[0]
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.saved_attention", saved)
     for func in (unsloth_gradient_checkpoint, functools.partial(unsloth_gradient_checkpoint, use_reentrant = False)):
         layer = _CkptToy(func)
-        no_grad_forward, problem = lm._checkpoint_mode(layer)
-        assert no_grad_forward is False and "routing" in problem
+        for armed[0] in (False, True):
+            assert lm._checkpoint_mode(layer) == (True, None)
     layer.gradient_checkpointing = False
     assert lm._checkpoint_mode(layer) == (False, None)
 

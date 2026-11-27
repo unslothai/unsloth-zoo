@@ -62,8 +62,7 @@ def _layer_norm_eager(
             bias=bias,
             eps=eps,
         ).to(input.dtype)
-    # SigLIP norms keep float32 weights under bfloat16 activations; the eager body (no Dynamo compile) must normalise in
-    # the wider dtype, as CUDA rejects mixed dtypes.
+    # SigLIP fp32 norm weights, bf16 input: eager uses wider dtype (CUDA rejects mixed dtypes).
     if (
         weight is not None and input.is_floating_point() and weight.is_floating_point()
         and (bias is None or bias.is_floating_point())
@@ -173,7 +172,6 @@ def patch_torch_functions():
 pass
 
 
-# Patch TorchAO functions
 try:
     import torchao.quantization.qat.fake_quantizer
     if not hasattr(torchao.quantization.qat.fake_quantizer, "__UNSLOTH_PATCHED__"):
@@ -182,7 +180,6 @@ try:
             if qat_class.startswith("_"): continue
             qat_class = getattr(torchao.quantization.qat.fake_quantizer, qat_class)
             if hasattr(qat_class, "forward"):
-                # Skip already compiled functions
                 if not hasattr(qat_class.forward, "get_compiler_config"):
                     qat_class.forward = torch_compile(qat_class.forward)
         torchao.quantization.qat.fake_quantizer.__UNSLOTH_PATCHED__ = True

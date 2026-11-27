@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Private AppleNeuralEngine runtime via ctypes, undocumented and may change per macOS; fp16 tensors
-in IOSurfaces; raises AneError rather than guessing; only full row tiles take the split; opt-in
-UNSLOTH_MLX_ANE_PREFILL=1."""
+"""Private AppleNeuralEngine runtime (undocumented, may change per macOS); fp16 IOSurface tensors;
+raises AneError, never guesses; only full row tiles split; opt-in UNSLOTH_MLX_ANE_PREFILL=1."""
 
 import collections
 import concurrent.futures
@@ -228,8 +227,7 @@ class Program:
                 raise AneError("the runtime rejected the program description")
             identifier = ctypes.string_at(rt.call(rt.call(model, "hexStringIdentifier"), "UTF8String")).decode()
             self.directory = os.path.join(os.environ.get("TMPDIR", "/tmp"), identifier)
-            # A compiled program is served from this directory, which identical programs in other processes share:
-            # each marks it, cached or not, and the last one removes it.
+            # Shared by identical programs; each marks it, and the last one removes it.
             with _directory_lock(self.directory):
                 self.cached = self._compiled(model)
                 self.marker = self._mark() if self.cached else self._compile(model, mil, weights)
@@ -615,8 +613,7 @@ def _slice(blob, index, mlp, k, tile):
 
 
 def _split_bytes(mlp, k):
-    """Memory a split adds to the checkpoint's: what the Neural Engine wires for its int8 weights, outside the process,
-    while prefill runs. The GPU remainders are views of the checkpoint's tensors."""
+    """Bytes the Neural Engine wires for int8 weights off-process; GPU remainders are views."""
     return _WIRED_FACTOR * 3 * k * _projections(mlp)[2].weight.shape[0]
 
 
@@ -667,9 +664,8 @@ class _Attached:
 
 
 def _relieve(group):
-    """Release programs from the end of `group` when memory runs short: enough to bring active memory plus what the
-    Neural Engine wires back under the working set, or all of them at critical pressure. Running any procedure wires a
-    whole program, including those of layers that have detached, so programs are what is priced and released."""
+    """Release programs from `group`'s end until active plus Neural Engine wired memory fits the
+    working set, or all at critical pressure; programs are wired whole, detached layers too."""
     level = _pressure_level()
     attached = [m for m in map(lambda ref: ref(), group.mlps)
                 if m is not None and getattr(m.__dict__.get(_STATE), "group", None) is group]
@@ -888,9 +884,8 @@ def _route(mlp, tile):
 
 
 def _rerouted(now, tuned):
-    """Whether the share no longer fits the GPU routes: a projection now takes a faster route than the one it was tuned
-    on, or Int8 Prefill is off for a share tuned against int8 remainders. A slower route otherwise (a retired dense
-    shape, or no route scope held) only lowers the GPU time the split beats."""
+    """Whether the share no longer fits the GPU routes: a projection takes a faster route than
+    tuned, or Int8 Prefill is off for an int8-tuned share; slower routes only lower GPU time."""
     rank = {"stock": 0, "tiled": 1, "dense": 1, "int8": 2}
     return (any(rank[a] > rank[b] for a, b in zip(now.split("/"), tuned.split("/")))
             or _int8(tuned) and not _int8(now))
@@ -959,9 +954,8 @@ def _candidates(model):
 
 
 def prepare_ane_prefill(model, *, tile = _TILE, share = None):
-    """Compile a Neural Engine split per dense SwiGLU MLP, attached only if at least 5% faster than
-    GPU; default share (Neural Engine channel fraction) is calibrated on the first layer of the
-    most common quantization and cached per machine, macOS build, MLX version and shape."""
+    """Split dense SwiGLU MLPs onto the ANE if 5%+ faster than GPU; default share (channel fraction)
+    calibrated on 1st layer of most common quant; cached per machine, macOS, MLX, shape."""
     started = time.perf_counter()
     try:
         status = _prepare(model, tile, share)
@@ -1133,9 +1127,8 @@ def ane_prefill_checkpoint_available(model_dir):
 
 @contextmanager
 def ane_prefill_mlp(model, ane_prefill = None, *, _modules = None):
-    """Prefill tiles take the Neural Engine split (approximate int8); UNSLOTH_MLX_ANE_PREFILL=1
-    enables it; partial tiles are padded only when calibration measured that faster; short tiles,
-    training and a failed split keep the native module."""
+    """Prefill tiles use Neural Engine split (approx. int8) when UNSLOTH_MLX_ANE_PREFILL=1; partial
+    tiles pad only if calibrated faster; short tiles, training, failed splits stay native."""
     changed, tracked = [], hasattr(model, "__dict__")
     try:
         with _LOCK:

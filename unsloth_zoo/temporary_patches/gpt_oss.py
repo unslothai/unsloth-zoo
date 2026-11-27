@@ -208,8 +208,7 @@ def _gpt_oss_dense_graph_decode(inputs_embeds):
 
 
 def _gpt_oss_graph_dense_attention(hidden_states):
-    """A one-token step of a graph-planned generate() whose mask came back dense: always in "dense" mode, and in
-    "auto" mode when the flex mask could not publish a graph contract."""
+    """One-token graph step, dense mask: dense mode, or auto when flex has no graph contract."""
     return (
         isinstance(hidden_states, torch.Tensor) and hidden_states.dim() >= 2 and hidden_states.shape[1] == 1
         and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() in ("dense", "auto")
@@ -251,8 +250,7 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
     logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
     probs = logits[..., :kv_len].to(value.dtype)
-    # Outside autocast, as the eager path's out=query matmul: the result keeps the activations' dtype and range
-    # (an fp16 autocast would recast bf16 values past 65504 to inf).
+    # Autocast off as in eager: fp16 autocast would recast bf16 values past 65504 to inf.
     with torch.autocast(device_type = value.device.type, enabled = False):
         out = torch.matmul(probs, value)
     return out.reshape(bsz, n_heads, q_len, head_dim).transpose(1, 2).contiguous(), None
@@ -296,8 +294,7 @@ def _code_digest(code):
 
 def _mask_function_identity(fn, depth = 4):
     """Flat key naming mask_function code and scalar captures; None if it captures a tensor, dict,
-    object or functools.partial (cannot rebuild or key it); published on BlockMask so a graph is
-    never replayed for another mask"""
+    object or functools.partial; set on BlockMask so no graph replays for another mask."""
     out = []
 
     def walk(f, depth):
@@ -314,8 +311,7 @@ def _mask_function_identity(fn, depth = 4):
                 values.append(None)
         values.extend(getattr(f, "__defaults__", None) or ())
         values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
-        # Globals: scalars keyed by value, functions walked, module/class attributes read; else
-        # unkeyable.
+        # Globals: scalars by value, functions walked, module/class attrs read; else unkeyable.
         module_globals = getattr(f, "__globals__", None) or {}
         for name in code.co_names:
             if name not in module_globals:
@@ -612,8 +608,7 @@ def _mxfp4_layout_arguments(layout_module, w):
         strided_argument = StridedLayout()
 
     if _force_strided_mxfp4_values(value_layout, layout_module, w):
-        # Otherwise generate() dies in matmul_ogs (only Hopper swizzling is supported for values); unswizzled values
-        # pair with the strided scales and stay MXFP4.
+        # matmul_ogs needs Hopper-swizzled values; unswizzled stay MXFP4 with strided scales.
         global _MXFP4_STRIDED_VALUES_WARNED
         value_layout, value_layout_opts = strided_argument, {}
         if not _MXFP4_STRIDED_VALUES_WARNED:
@@ -1294,8 +1289,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
 class ParameterModule(nn.Linear):
-    """Wraps a parameter as nn.Linear for PEFT: grouped_mm needs 3D weights (gate_up (E, H, 2I), down (E, I, H)) while
-    PEFT needs 2D (Out, In), reshaped via get_param()."""
+    """Wraps 3D grouped_mm weights as 2D (Out, In) nn.Linear for PEFT; get_param() gives 3D."""
 
     def __init__(
         self, in_features, out_features, shape_3d, permute_to_2d, permute_to_3d
@@ -1474,8 +1468,7 @@ pass
 
 
 class _RouterLinearParams(nn.Module):
-    """Weight/bias container like nn.Linear but not one, so BitsAndBytes will not quantize it; keys
-    linear.weight/linear.bias match BnB 4-bit checkpoints that saved the router via nn.Linear."""
+    """Not nn.Linear, so BnB skips it; linear.weight/linear.bias keys match 4-bit checkpoints."""
     def __init__(self, in_features, out_features, dtype):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
@@ -1571,15 +1564,13 @@ class GptOssExpertsBnb4bit(nn.Module):
         )
 
     def _grouped_bnb4bit_ready(self):
-        """True when every expert is a bnb Linear4bit with a populated quant_state (plain or one PEFT LoRA), so grouped
-        torch._grouped_mm applies; stores that state on self._unsloth_grouped_lora; keep it self-contained since the
-        compiler copies the source into a cache lacking this file's globals."""
+        """True if all experts are bnb Linear4bit with populated quant_state (plain or one PEFT
+        LoRA); keep self-contained: compiler copies source into a cache lacking module globals."""
         import os
         if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
             return False
-        # Not gated on UNSLOTH_COMPILE_DISABLE since grouped_qlora_forward is torch.compiler.disable'd (eager either
-        # way); reuse the readiness check while ready_signature is unchanged, and skip it while moe_ready_epoch is
-        # unchanged.
+        # Not gated on UNSLOTH_COMPILE_DISABLE: grouped_qlora_forward is torch.compiler.disable'd
+        # anyway; reuse while ready_signature unchanged, skip while moe_ready_epoch unchanged.
         from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import (
             cached_ready, ready_record, ready_signature,
         )
@@ -1868,9 +1859,7 @@ def _rebind_gpt_oss_compiled_classes():
 
 
 def restore_gpt_oss_original():
-    """
-    Restore original GPT-OSS classes (undo BnB 4bit patch).
-    """
+    """Restores the original GPT-OSS classes, undoing the BnB 4bit patch."""
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         if hasattr(transformers.models.gpt_oss.modeling_gpt_oss, '_original_GptOssExperts'):
@@ -1911,8 +1900,7 @@ _GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
 
 
 def _gpt_oss_cache_locations():
-    """Dirs that may hold the compiled gpt_oss module: the configured location and the temp fallback used when it is not
-    writable; resolved without the compiler so it never triggers distributed coordination at patch time."""
+    """Configured dir, temp fallback if unwritable; no compiler, no distributed coordination."""
     locs = []
     loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
     if loc:
@@ -1968,8 +1956,7 @@ pass
 
 
 def _gpt_oss_marker_mode(loc):
-    """Mode is 0664 in a group-shared cache where every member must rewrite the marker (its flavor is not a secret),
-    else 0600; owner-only there leaves the two flavors disagreeing."""
+    """0664 if shared (members rewrite marker; flavor not secret), else 0600."""
     try:
         if os.name != "posix":
             return 0o600
@@ -1980,8 +1967,7 @@ pass
 
 
 def _gpt_oss_replace_marker(marker_path, desired_flavor, mode = 0o600):
-    """Lands the marker by replacing the name (mkstemp then os.replace): a link at marker_path is replaced rather than
-    written through, and only directory write is needed, so a group member can update a marker it does not own."""
+    """mkstemp + os.replace: symlinks are replaced, so group members need only dir write."""
     import tempfile
     directory = os.path.dirname(marker_path) or "."
     descriptor, temporary_path = tempfile.mkstemp(
@@ -2008,15 +1994,13 @@ pass
 
 
 def _gpt_oss_write_marker(loc, desired_flavor):
-    """Writes the flavor marker without following links out of loc; same flags as compiler._write_bytes_durably:
-    O_NONBLOCK stops a planted FIFO blocking the load, S_ISREG rejects a FIFO with a reader that would swallow the
-    marker."""
+    """Writes the marker without following links out of loc (compiler._write_bytes_durably flags);
+    O_NONBLOCK so a planted FIFO cannot block; S_ISREG rejects FIFOs a reader would swallow."""
     marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
     mode = _gpt_oss_marker_mode(loc)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow or mode != 0o600:
-        # Shared cache: the marker belongs to whoever built it, so only a replacement can update it; also covers the
-        # no-atomic-no-follow-open case, where an lstat first would be a time-of-check gap.
+        # Shared caches, or no O_NOFOLLOW: replace the marker, since an lstat first is a race.
         return _gpt_oss_replace_marker(marker_path, desired_flavor, mode)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
@@ -2035,9 +2019,8 @@ pass
 
 
 def _invalidate_gpt_oss_compiled_module(locations = None):
-    """Drops the compiled gpt_oss module (sys.modules, .py, .pyc) so it is rebuilt for current classes; sweeps all
-    locations unless `locations` is given, since a stale location says nothing about the others and a planted
-    candidate must not delete a good cache."""
+    """Drops the compiled gpt_oss module (sys.modules, .py, .pyc) to force a rebuild; sweeps all
+    locations unless `locations` is given, so a planted candidate cannot delete a good cache."""
     try:
         import sys as _sys
         import importlib, importlib.util
@@ -2056,7 +2039,6 @@ def _invalidate_gpt_oss_compiled_module(locations = None):
                         os.remove(_pyc)
                 except Exception:
                     pass
-        # Forget any cached finder/directory state for these paths.
         try:
             importlib.invalidate_caches()
         except Exception:
@@ -2066,13 +2048,10 @@ def _invalidate_gpt_oss_compiled_module(locations = None):
 
 
 def _sync_gpt_oss_compiled_flavor(desired_flavor):
-    """Invalidates the on-disk gpt_oss module built for another flavor (bnb4bit vs stock): the in-process flag is unset
-    in a fresh process, so a 16bit load after 4bit would import stale BnB classes; a marker records the flavor, and a
-    mismatch or missing marker drops the module."""
+    """Missing/mismatched flavor marker drops module; 16bit after 4bit would import stale BnB."""
     try:
         locations = _gpt_oss_cache_locations()
-        # Stale is decided per location, never globally: marking all stale because one is lets anyone who can create the
-        # predictable temp candidate delete a valid primary cache on every load.
+        # Stale is per location: a planted temp candidate must not wipe a valid primary cache.
         stale = []
         for loc in locations:
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
@@ -2154,17 +2133,15 @@ if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
     # Only total capacity is needed; mem_get_info() can create a device context at import time, leaving otherwise idle processes with persistent device memory.
     device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    # Integrated NVIDIA parts may report only the carve-out, so cuda_total_memory raises it to the driver total when
-    # larger; discrete cards and HIP are unchanged.
+    # cuda_total_memory raises iGPU carve-out to driver total if larger; dGPU/HIP unchanged.
     from unsloth_zoo.integrated_device import cuda_total_memory
     device_memory = cuda_total_memory(0)
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 
-# Coordinate descent tuning is opt-in via UNSLOTH_COORDINATE_DESCENT_TUNING=1 since it costs decode compile time on
-# A100/L4 with no gain; the 40 threshold is in GiB, so A100-SXM4-40GB (39.49) falls below it and the boundary is kept
-# since combo kernels show no effect on either side.
+# Opt-in via UNSLOTH_COORDINATE_DESCENT_TUNING=1: costs decode compile time on A100/L4 with no gain.
+# 40 is GiB (A100-SXM4-40GB is 39.49); boundary kept, no combo-kernel effect either side.
 use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
 
 fused_torch_compile_options = get_torch_compile_options(
@@ -2196,7 +2173,6 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
 @_torch_compile(dynamic=None, fullgraph=True, options=fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
-    # Router
     router_out = self.router(hidden_states)
     if isinstance(router_out, tuple) and len(router_out) == 3:
         _, router_scores, router_indices = router_out
@@ -2210,7 +2186,6 @@ def moe_forward_inference(self, hidden_states):
     num_experts = routing_weights.shape[1]
     X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
 
-    # ModuleList (old style) vs 3D parameters (new style)
     if hasattr(moe, "gate_up_projs"):
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(moe.gate_up_projs)]
         gate_up = torch.stack(gate_up_list, dim=0)
@@ -2669,7 +2644,6 @@ pass
 # GPT OSS MoE LoRA Support using grouped GEMM kernels
 # ============================================================================
 
-# IMPORTS FROM MOE UTILS
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
@@ -3128,11 +3102,9 @@ def mxfp4_ogs_experts_forward(
 
 
 def _mxfp4_experts_out_dtype(module, input_dtype, routed_by_unsloth = True):
-    """float32 when training on float16, else input_dtype: an fp16 residual stream overflows to inf on gpt-oss-20b.
-
-    Only for Unsloth-routed calls (they cast the router input) with Unsloth's attention installed (it casts q/k/v
-    input); stock MLP / attention would reject a float32 stream. UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL=0 disables.
-    """
+    """Float32 for fp16 training on Unsloth-routed calls with Unsloth's attention installed (else
+    input_dtype); stock MLP/attention reject float32; UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL=0
+    disables."""
     if (
         routed_by_unsloth
         and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
@@ -3257,8 +3229,7 @@ TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
 @torch.compiler.disable
 def _try_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
                          batch_size, num_tokens, num_experts, top_k):
-    """Grouped bnb-4bit training forward, or None for the per-expert loop; one opaque call so a compiled decoder layer
-    takes a single graph break instead of tracing readiness checks."""
+    """Grouped bnb-4bit forward, or None to fall back; one opaque call, a single graph break."""
     if not self._grouped_bnb4bit_ready():
         return None
     try:
@@ -3355,15 +3326,9 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            # Three separate things keep this float32, none of them redundant. On the
-            # forced-float32 path only, a quantized down_proj computes in float32 via
-            # _pre_set_compute_dtype, set in unsloth's loader; without that rule the layer
-            # takes the run's ordinary compute dtype, bfloat16 included. The float32
-            # gated_output is what Linear4bit restores the output to, since it captures
-            # inp_dtype and casts back. And autocast off is what protects the unquantized
-            # fallback, which takes F.linear and ignores compute_dtype. It does not keep the
-            # adapter matmuls in float32 -- the forced-float32 LoRA path casts those to
-            # float16 itself.
+            # Float32 via _pre_set_compute_dtype (forced-float32 path only, else compute dtype incl.
+            # bfloat16), float32 gated_output Linear4bit restores, autocast off for unquantized
+            # F.linear; adapter matmuls are not fp32 (forced-float32 LoRA casts to float16).
             if not self.training:
                 # Eval also reaches here with unquantized 16-bit experts (llm_int8_skip_modules).
                 w = getattr(getattr(down_proj, "base_layer", down_proj), "weight", None)
@@ -3408,9 +3373,8 @@ def torch_native_forward(
         return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
 pass
 
-# torch_native_forward protects the down projection three ways in float16: fp32 swiglu and gated_output (the dtype
-# Linear4bit restores its output to), _pre_set_compute_dtype (loader rule, forced-float32 path only), and autocast off
-# for the unquantized fallback; bfloat16 registers no float32 rule.
+# fp16 down proj: fp32 swiglu and gated_output (Linear4bit output dtype), _pre_set_compute_dtype
+# (forced-float32 only), autocast off (unquantized fallback); bfloat16 has no fp32 rule.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():

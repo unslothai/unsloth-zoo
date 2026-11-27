@@ -87,9 +87,7 @@ REPLAY_STATS = {"runs": 0, "compressor_lora": 0, "indexer": 0}
 
 
 def prepare_compiled_checkpoint():
-    """Set specialize_float so checkpoint recompute saves the same tensors as forward (unspecialized
-    floats reorder LoRA saves); set once at load before anything compiles, since Dynamo guards
-    config and per-call toggling recompiles"""
+    """Set specialize_float at load, before compiling: unspecialized floats reorder LoRA saves."""
     dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
     if dynamo_config is None or not hasattr(dynamo_config, "specialize_float"):
         return False
@@ -308,9 +306,7 @@ _MISSING = object()
 
 
 def _non_reentrant_checkpoint(layer = None):
-    """The non-reentrant checkpoint for this layer: Unsloth's wrapper when the model bound one (it offloads the saved
-    inputs for use_gradient_checkpointing = "unsloth" and forces use_reentrant = False), else torch's own, also when
-    Unsloth's smart (reentrant) checkpointing replaced torch.utils.checkpoint.checkpoint."""
+    """Unsloth's layer wrapper if bound (forces use_reentrant=False), else torch's, even if patched."""
     import torch.utils.checkpoint as ckpt
     bound = getattr(layer, "_gradient_checkpointing_func", None) or ckpt.checkpoint
     bound = getattr(bound, "func", bound)  # functools.partial(checkpoint, **gradient_checkpointing_kwargs)
@@ -361,9 +357,8 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_fake_quant_ste)
 
 
-# Grouped LoRA for o_a_proj (when unsloth grouped LoRA is not registered): A [r,in_g], B
-# [G*out_g,r], delta=B@A keeps base shape; group g rows of B act on group g input; plain PEFT
-# B(A(x)) is [..,G,G*out_g], cannot add
+# Grouped LoRA for o_a_proj (if unsloth's is absent): A [r,in_g], B [G*out_g,r], delta=B@A keeps
+# base shape; group g rows of B act on group g input; PEFT B(A(x)) is [..,G,G*out_g], cannot add.
 _GROUPED_LORA_CLS = None
 
 
@@ -534,9 +529,8 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_config_aliases)
 
 
-# Pooled (ratio > 1) compressor reads .weight, so LoRA on kv_proj/gate_proj is skipped; the decoder
-# layer swaps in merged W + scaling*B@A views (fp32, no LoRA dropout), since the compiled cache
-# replaces the compressor and attention classes
+# Pooled (ratio > 1) compressor reads .weight, skipping LoRA on kv_proj/gate_proj; decoder layer
+# swaps in merged W+scaling*B@A views (fp32, no LoRA dropout) as compiled cache replaces classes.
 class _MergedLoraWeight:
     __slots__ = ("module",)
 
@@ -558,8 +552,7 @@ class _MergedLoraWeight:
         return torch.nn.functional.linear(x, self.merged_weight().to(x.dtype))
 
     def __getattr__(self, name):
-        # Not a property: an AttributeError inside a property would fall back to __getattr__ and hand out the
-        # base weight silently.
+        # Not a property: AttributeError falls to __getattr__, silently giving base weight.
         if name == "weight":
             return self.merged_weight()
         return getattr(self.module, name)
@@ -696,8 +689,7 @@ def _frozen_engram(modeling, key, emb):
 
 
 def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_size = 32, dtype = None):
-    """Parameter-free engram table for the native DeepSeek-V4.1, so sharding, meta init, optimizers and DCP never see
-    it. The frozen table load hook binds it to the checkpoint after ``from_pretrained``."""
+    """Parameter-free, so sharding, meta init, optimizers and DCP never see it; bound at load."""
     import types
     from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
     if not install_frozen_table_load_hook():

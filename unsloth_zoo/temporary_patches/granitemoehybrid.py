@@ -109,9 +109,8 @@ def patch_GraniteMoeHybridDecoderLayer_float16():
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridDecoderLayer_float16)
 
 
-# Float32 norm weights promote output, so cast back to input dtype only in that case
-# (UNSLOTH_HIGH_PRECISION_LAYERNORM); installed with source in linecache so the compiler copies the
-# patched body
+# Float32 norm weights promote the output, so cast back to input dtype only then
+# (UNSLOTH_HIGH_PRECISION_LAYERNORM); source goes in linecache so compiled code copies the patch.
 _NORM_RETURN = "return self.weight * hidden_states.to(input_dtype)"
 _NORM_RETURN_CAST = (
     "output = self.weight * hidden_states.to(input_dtype)\n"

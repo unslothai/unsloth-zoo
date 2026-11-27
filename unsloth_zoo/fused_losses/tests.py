@@ -58,7 +58,6 @@ def test_fused_ce_loss(
         if lm_head_requires_grad: lm_head_weight.requires_grad_(True)
         if lm_bias_requires_grad: lm_head_bias.requires_grad_(True)
 
-        # Mask out total ratio
         mask = torch.zeros(input_ids.numel(), dtype = torch.bool, device = device)
         mask[:int(mask.numel()*mask_ratio)] = 1
         permutation = torch.randperm(mask.numel())

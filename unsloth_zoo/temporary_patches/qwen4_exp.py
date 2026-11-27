@@ -40,8 +40,7 @@ QWEN4_EXP_INDEXER_STATS = {"vectorised": 0}
 
 
 _reference_qsa_forward = None
-# Whether the reference converts its selection back to an additive float mask for a float (eager) attention mask:
-# transformers up to 5.22 does; 5.23 always returns the boolean selection and combines it in the attention layer.
+# Reference: additive float mask up to transformers 5.22; 5.23 returns the boolean selection.
 _qsa_returns_float_mask = True
 
 
@@ -114,9 +113,7 @@ def _qwen4_exp_vectorised_indexer_mask(indexer, hidden_states, position_embeddin
 
 def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
                                           past_key_values=None):
-    """Indexer on filled cache slots only (installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0);
-    unfilled static-cache slots would index past the position table (CUDA assert in batched
-    generate)"""
+    """Filled slots only under UNSLOTH_QWEN4_EXP_FAST_QSA=0; unfilled ones overrun positions."""
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     if attention_mask is not None and attention_mask.dim() == 4:
         n_positions = position_embeddings[0].shape[-2]
@@ -264,10 +261,9 @@ def _arange(n, device):
 
 @torch.no_grad()
 def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype):
-    """Returns [b, q, budget + ratio - 1] slots, no host sync; blocks pool over each query's ordered
-    visible slots, so masks must show each query its visible slots; other masks: None before
-    cache writes on host, else counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected, so no
-    hidden key is read."""
+    """Returns [b, q, budget + ratio - 1] slots without host sync; masks must show each query its
+    visible slots (blocks pool over them); other masks: None before cache writes on host, else
+    counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected so no hidden key is read."""
     import math
     batch, q_len = hidden_states.shape[:2]
     raw_cache = layer.indexer_keys
@@ -382,10 +378,7 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
 
 
 def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
-    """QSA into a filled DynamicCache (decode, MTP), else None for the reference; caches roped fp32
-    block keys per layer, gathering only selected K / V rows; assumes each query sees its row's
-    visible keys up to itself; other masks take the reference on host, else are counted in
-    QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected, so no hidden key is read."""
+    """QSA into a filled DynamicCache (decode/MTP), else None; assumes queries see their visible keys."""
     if not _cached_decode_enabled() or past_key_values is None:
         return None
     output_attentions = kwargs.get("output_attentions")
@@ -499,8 +492,7 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
             return out
     if not torch.compiler.is_compiling():
         QWEN4_EXP_SPARSE_STATS["reference"] += 1
-    # fp32 RoPE tables with half-precision projections (4-bit) promote Q/K but not V after RoPE;
-    # compiler rewrites skip this wrapper, so cast tables to the activation dtype here
+    # fp32 RoPE tables promote Q/K, not V, on half projections; compiler skips this; cast here.
     if (
         hidden_states.dtype in (torch.float16, torch.bfloat16)
         and isinstance(position_embeddings, (tuple, list))
@@ -529,8 +521,7 @@ _reference_ple_forward = None
 def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_ple_forward
-    # Keep a half residual stream half: the float32 gate sum under autocast would make it and every later MoE input
-    # float32; a float32 residual keeps autocast, which casts it for the half short convolution.
+    # Keep residual half: fp32 gate sum under autocast would promote it and later MoE inputs
     device_type = hidden_states.device.type
     if (
         hidden_states.dtype in (torch.bfloat16, torch.float16)
@@ -584,8 +575,7 @@ def _ngram_table_wanted(num_embeddings, embedding_dim, dtype):
     nbytes = int(num_embeddings) * int(embedding_dim) * torch.empty((), dtype=dtype).element_size()
     mode = os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower()
     if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
-        # Full finetuning trains every weight: auto keeps the table a real parameter. An explicit disk / ram
-        # request still wins, but the table then stays frozen, so say so.
+        # Full finetune: auto keeps the table trainable; explicit disk/ram wins and freezes it
         if mode not in ("disk", "ram"):
             return False
         logger.warning(f"Unsloth: UNSLOTH_FROZEN_TABLE={mode} keeps the Qwen4Exp n-gram table frozen during full "

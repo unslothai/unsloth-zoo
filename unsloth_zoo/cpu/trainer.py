@@ -192,9 +192,8 @@ def _check_cpu_packing(model, training_args):
     return False
 
 
-# Compiling the decoder layers cost 7 s (warm Inductor cache) to 138 s (cold, Qwen3-0.6B on a loaded 2-core slot) and
-# saved 24% of a SmolLM2-135M step. Auto mode times eager steps first and compiles only when the steps left would repay a
-# cold compile at a conservative saving: UNSLOTH_CPU_COMPILE_COST_S / UNSLOTH_CPU_COMPILE_SAVING override the estimates.
+# Auto mode times eager steps, then compiles only if steps left repay a conservative cold compile at
+# a conservative saving; UNSLOTH_CPU_COMPILE_COST_S / UNSLOTH_CPU_COMPILE_SAVING override.
 _COMPILE_COLD_SECONDS = 150.0
 
 
@@ -261,10 +260,9 @@ def _install_compile_gate(trainer):
 
 
 def _activation_bytes_without_checkpointing(model, batch, length):
-    """Upper estimate of the activations autograd keeps for a ``batch`` x ``length`` micro-batch with no checkpointing:
-    per layer about 9 hidden + 3 kv + 4 intermediate values per token (norms, q/k/v, attention out, MLP gate / up /
-    act), doubled for fp32 norm upcasts and LoRA / autograd extras. Eager (and any non SDPA / flash) attention also
-    keeps heads x length x length scores per sequence: the fp32 softmax plus its cast, doubled the same way."""
+    """Upper estimate of activations autograd keeps per batch x length micro-batch without
+    checkpointing: 9 hidden + 3 kv + 4 intermediate per token per layer, doubled for fp32 upcasts
+    and LoRA; eager or non-SDPA/flash attention adds heads x length^2 fp32 softmax, also doubled."""
     config = getattr(model, "config", None)
     text = getattr(config, "get_text_config", lambda: config)()
     hidden = getattr(text, "hidden_size", None)
@@ -350,8 +348,7 @@ def _patch_post_init(cls):
 
     @functools.wraps(original)
     def __post_init__(self, *args, **kwargs):
-        # TRL resolves bf16=None to not-fp16 before the base class validates it, so normalize fp16/optim before the
-        # original runs and TRL's resolved bf16 after it.
+        # TRL resolves bf16=None to not-fp16 first, so normalize fp16/optim before, bf16 after.
         normalize_cpu_training_arguments(self)
         result = original(self, *args, **kwargs)
         if getattr(self, "bf16", False) and not cpu_bf16_supported():
@@ -363,9 +360,8 @@ def _patch_post_init(cls):
 
 
 def _patch_cpu_fp16_accelerator(trainer_cls):
-    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler); when
-    normalize_cpu_training_arguments kept fp16 (no native bf16), enable CPU autocast and a CPU GradScaler before the
-    model and optimizer are prepared."""
+    """accelerate turns fp16 into a silent fp32 CPU run (no autocast, no scaler); when fp16 is kept
+    (no native bf16), enable CPU autocast and CPU GradScaler before prepare()."""
     original = trainer_cls.create_accelerator_and_postprocess
     if getattr(original, "_unsloth_cpu", False):
         return
@@ -393,10 +389,9 @@ def _patch_cpu_fp16_accelerator(trainer_cls):
 
 
 def _disable_cpu_autocast_cache(accelerator):
-    """torch.autocast caches the low-precision copy of a fp32 leaf weight (PEFT keeps LoRA adapters in fp32) for the
-    whole outermost autocast region, and caches it even under no_grad. KTO's no_grad KL pass then hands the policy pass
-    a detached copy: the adapters get no gradient, and with gradient checkpointing the recompute fails on mismatched
-    metadata. The model's own bf16 weights are never cast, so turning the cache off only re-casts the small adapters."""
+    """autocast caches a low-precision copy of fp32 LoRA adapters per outermost region, even under
+    no_grad; KTO's KL pass hands the policy pass a detached copy: no adapter gradient, and
+    checkpoint recompute fails on metadata; disabling the cache only recasts the small adapters."""
     from accelerate.utils import AutocastKwargs
     handler = accelerator.autocast_handler
     accelerator.autocast_handler = AutocastKwargs(enabled = handler.enabled if handler is not None else True,
@@ -404,8 +399,7 @@ def _disable_cpu_autocast_cache(accelerator):
 
 
 def _patch_cpu_autocast_cache(trainer_cls):
-    """transformers 4.x enters its own CPU autocast around compute_loss (cache on by default); 5.x leaves autocast to
-    accelerate, whose handler _disable_cpu_autocast_cache already covers."""
+    """4.x: own CPU autocast in compute_loss (cache on); 5.x: accelerate's, covered by handler."""
     original = getattr(trainer_cls, "autocast_smart_context_manager", None)
     if original is None or getattr(original, "_unsloth_cpu", False):
         return
@@ -801,8 +795,7 @@ def _patch_sft_compute_loss(sft_trainer_cls):
     sft_trainer_cls.compute_loss = compute_loss
 
 
-# Arguments notebooks still pass to SFTTrainer itself. On GPU, unsloth's TRL rewrite accepts them;
-# stock TRL (what the CPU backend uses) moved them onto SFTConfig.
+# Notebooks still pass these to SFTTrainer; stock TRL (CPU backend) moved them to SFTConfig.
 _LEGACY_SFT_KWARGS = {
     "dataset_text_field": "dataset_text_field",
     "max_seq_length": "max_length",

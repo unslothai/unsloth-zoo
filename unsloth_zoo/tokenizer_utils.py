@@ -444,8 +444,7 @@ def _count_input_ids(train_dataset, mapping):
         train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
         return
     pass
-    # mapping flattens its batch into one array, so passing the whole dataset is an O(total tokens) transient; chunking
-    # is exactly equivalent since it accumulates into a counter and .map(batched=True) already calls it once per batch
+    # Chunking is exact (map(batched=True) already batches); avoids an O(total tokens) array.
     batch = []
     for row in train_dataset:
         if "input_ids" not in row: continue

@@ -192,8 +192,7 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextConfig_kv_shared_zero)
 # ----------------------------------------------------------------------------
 
 def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
-    """Hardened cache __init__ that transiently deletes num_kv_shared_layers==0 around the original init and restores it
-    in finally; if deletion fails, the original init runs unchanged."""
+    """Drops num_kv_shared_layers==0 in init, restored in finally; plain init if delete fails."""
 
     def __init__(self, *args, **kwargs):
         decoder_config = None
@@ -211,12 +210,10 @@ def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
             try:
                 del decoder_config.num_kv_shared_layers
             except (AttributeError, TypeError):
-                # Cannot mutate; fall through to original init.
                 return _orig_init(self, *args, **kwargs)
             try:
                 _orig_init(self, *args, **kwargs)
             finally:
-                # Always restore, even if __init__ raised.
                 try:
                     object.__setattr__(decoder_config, "num_kv_shared_layers", 0)
                 except Exception:
@@ -287,14 +284,12 @@ TEMPORARY_PATCHES.append(patch_StaticCache_kv_shared_zero)
 
 
 # ============================================================================
-# E2B/E4B (num_kv_shared_layers > 0): with use_cache=False shared layers recompute K/V from wrong hidden states; a
-# per-forward carrier plus non-reentrant checkpointing fixes 5.5.0-5.5.1 (by signature, not version); 5.5.2+ uses
-# shared_kv_states and no-ops (huggingface/transformers issue 45242).
+# num_kv_shared_layers > 0 with use_cache=False recomputes K/V from wrong hidden states; carrier +
+# non-reentrant GC fixes 5.5.0-5.5.1; 5.5.2+ no-ops (huggingface/transformers issue 45242).
 # ============================================================================
 
 def _gemma4_kv_sharing_needs_cache():
-    """True only on the buggy 5.5.0-5.5.1 path that routes KV sharing through past_key_values; 5.5.2+ passes native
-    shared_kv_states. Detected by signature, not version, to track the mid-release backport."""
+    """True on buggy 5.5.0-5.5.1 only; detected by signature (not version) to track backports."""
     try:
         import inspect
         from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
@@ -351,8 +346,7 @@ _UNSLOTH_CKPT_SHIM_NAMES = frozenset({
     "unsloth_checkpoint", "unsloth_gradient_checkpoint",
     "unsloth_offloaded_gradient_checkpoint",
 })
-# Capture pristine torch.utils.checkpoint at import, before Unsloth GC patches swap it, so forcing non-reentrant
-# survives stacked shims (_old_checkpoint may be one).
+# Pristine checkpoint taken at import, before GC patches; forced non-reentrant survives shims.
 try:
     import torch.utils.checkpoint as _ckpt_at_import
     _PRISTINE_TORCH_CHECKPOINT = (
@@ -365,12 +359,10 @@ except Exception:
 
 
 def _resolve_pristine_checkpoint(_ckpt):
-    """Returns the real torch checkpoint: import-captured ref first, then the set-once ref the GC patcher stashes before
-    shims stack, else unwraps _old_checkpoint past Unsloth shims; None if all are shims."""
+    """Import ref, else GC-stashed ref, else unwrap _old_checkpoint; None if all are shims."""
     if _PRISTINE_TORCH_CHECKPOINT is not None:
         return _PRISTINE_TORCH_CHECKPOINT
-    # patch_unsloth_*_gradient_checkpointing stash the real fn on first patch, so it survives stacked shims and a late
-    # gemma4 import where _old_checkpoint is a shim.
+    # Stashed by patch_unsloth_*_gradient_checkpointing on first patch; survives stacked shims.
     captured = getattr(_ckpt, "_unsloth_pristine_checkpoint", None)
     if captured is not None and getattr(captured, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES:
         return captured
@@ -385,8 +377,7 @@ def _resolve_pristine_checkpoint(_ckpt):
             break
         seen.add(id(nxt))
         cand = nxt
-    # Never return a shim: forcing use_reentrant=False onto it would wrap the offloaded checkpointer being bypassed and
-    # silently drop the gradient fix; return None instead.
+    # Never return a shim: forcing use_reentrant=False on it silently drops the gradient fix.
     if getattr(cand, "__name__", "") in _UNSLOTH_CKPT_SHIM_NAMES:
         return None
     return cand
@@ -408,9 +399,8 @@ def _gemma4_model_has_kv_sharing(model):
 
 
 def _gemma4_force_nonreentrant_checkpointing(model):
-    """Forces non-reentrant GC on E-series layers so shared K/V stays grad-connected: reentrant recompute reads detached
-    K/V and gives wrong producer k/v_proj grads; non-reentrant matches the use_cache=True reference (cosine 1.0 on
-    5.5.0 and 5.12.1); trades CPU offload for correctness; no-op without GC or KV sharing."""
+    """Non-reentrant GC on E-series keeps shared K/V grad-connected (reentrant: wrong k/v_proj
+    grads; cosine 1.0 on 5.5.0, 5.12.1); trades CPU offload; no-op without GC/KV sharing."""
     if not _gemma4_model_has_kv_sharing(model):
         return
     import functools
@@ -451,8 +441,7 @@ def _gemma4_force_nonreentrant_checkpointing(model):
 
 
 def _gemma4_attach_shared_kv_carrier(model):
-    """Attaches a fresh per-forward carrier to every Gemma4TextAttention so shared layers can reach it after GC nulls
-    their past_key_values kwarg; the attention list is cached, empty without sharing."""
+    """Attaches a per-forward carrier to every attention; GC nulls past_key_values kwarg."""
     attns = getattr(model, "_unsloth_gemma4_attns", None)
     if attns is None:
         attns = [m for m in model.modules() if m.__class__.__name__ == "Gemma4TextAttention"]
@@ -474,8 +463,7 @@ def _gemma4_attach_shared_kv_carrier(model):
 
 
 def _gemma4_clear_shared_kv_carrier(model):
-    """Drops the producer K/V the carrier pins; only safe when no checkpointed backward will read it (not
-    torch.is_grad_enabled()); no-op without KV sharing or a carrier."""
+    """Drops pinned producer K/V; safe only if no checkpointed backward reads it (grad off)."""
     attns = getattr(model, "_unsloth_gemma4_attns", None)
     if not attns:
         return
@@ -493,9 +481,8 @@ def _gemma4_clear_shared_kv_carrier(model):
 
 
 def _gemma4_carrier_overlap_unsafe(model):
-    """Overlapping checkpointed forwards corrupt grads via the module-scoped carrier only with KV sharing AND gradient
-    checkpointing on a Gemma-4 layer, since recompute re-reads it; without GC, two forwards before one backward are
-    safe; 31B/26B-A4B have no carrier."""
+    """Overlapping checkpointed forwards corrupt grads only with KV sharing and GC on a layer
+    (recompute re-reads the carrier); safe without GC; 31B/26B-A4B have no carrier."""
     if not _gemma4_model_has_kv_sharing(model):
         return False
     layers = getattr(model, "_unsloth_gemma4_decoder_layers", None)
@@ -509,9 +496,8 @@ def _gemma4_carrier_overlap_unsafe(model):
 
 
 def _arm_carrier_outstanding_marker(model, output):
-    """Marks the carrier outstanding until this forward's backward starts (a grad hook on the output clears it), so
-    pending DPO/contrastive graphs are told apart from grad accumulation; no-op if nothing in the output carries
-    grad."""
+    """Marks carrier outstanding until this forward's backward starts (grad hook clears it), so
+    pending DPO/contrastive graphs differ from grad accumulation; no-op if output has no grad."""
     tensor = getattr(output, "last_hidden_state", None)
     if not isinstance(tensor, torch.Tensor):
         if isinstance(output, torch.Tensor):
@@ -561,8 +547,7 @@ def _make_kv_shared_use_cache_false_safe_forward(_orig_forward, attach_carrier):
                         _gemma4_clear_shared_kv_carrier(self)
                     except Exception:
                         pass
-            # Only with KV sharing AND gradient checkpointing does a second outstanding forward clobber the carrier
-            # during recompute, so only then track and reject; 31B/26B-A4B and GC-off runs still work.
+            # KV sharing + GC: second outstanding forward clobbers carrier; 31B/26B-A4B fine.
             overlap_unsafe = _gemma4_carrier_overlap_unsafe(self)
             if overlap_unsafe and getattr(self, "_unsloth_gemma4_carrier_outstanding", False):
                 raise RuntimeError(
@@ -626,8 +611,7 @@ def _is_gemma4_attr(node, owner, attr):
 
 
 def _gemma4_receiver_is_inputs_embeds(node):
-    """Matches the receiver's base name, so inputs_embeds.to(...).masked_scatter counts but
-    scratch.to(inputs_embeds.device) does not, which would falsely read as fixed upstream."""
+    """Receiver must be inputs_embeds; a scratch cast would falsely read as fixed upstream."""
     while True:
         if isinstance(node, ast.Name):
             return node.id == "inputs_embeds"
@@ -640,9 +624,8 @@ def _gemma4_receiver_is_inputs_embeds(node):
 
 
 def _gemma4_audio_merge_casts(forward_node):
-    """Returns (buggy_casts, fixed_casts) of audio masked_scatter source args split by whether dtype is carried;
-    unmatched shapes match neither (patch no-ops); receiver must be inputs_embeds;
-    tests/test_gemma4_dtype_drift_guards.py reuses it as the drift canary."""
+    """Splits audio masked_scatter casts into (buggy, fixed) by dtype carry; unmatched shapes no-op;
+    receiver must be inputs_embeds; used by tests/test_gemma4_dtype_drift_guards.py."""
     buggy_casts = []
     fixed_casts = []
     for node in ast.walk(forward_node):
@@ -736,8 +719,7 @@ def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
         1,
     )
 
-    # Keep Hugging Face's decorators intact: re-running a method-level @auto_docstring outside its class loses class
-    # context and fails, so only the undecorated body is transplanted.
+    # Undecorated body only: re-running a method-level @auto_docstring outside its class fails.
     forward_node.decorator_list = []
     ast.fix_missing_locations(forward_node)
     namespace = {}
@@ -796,8 +778,7 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4Model_forward_kv_shared_no_cache)
 
 
-# Gemma4 AudioAttention: config attention_invalid_logits_value (-1e9) overflows fp16 max (65504); on Tesla T4 autocast
-# downcasts attn_weights to fp16 and masked_fill fails.
+# attention_invalid_logits_value (-1e9) overflows fp16 max; T4 autocast masked_fill fails.
 
 def patch_Gemma4AudioAttention():
     try:
@@ -975,8 +956,7 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
 # ============================================================================
 
 def _gemma4_vision_pooler_status(pooler_cls):
-    """Classifies Gemma4VisionPooler.forward source as buggy (dtype-preserving scale, <= 5.9.x), fixed (fp32 scale, >=
-    5.10.1) or unknown (unavailable or drifted; fails open to upstream)."""
+    """Buggy (dtype-preserving scale, <=5.9.x), fixed (fp32, >=5.10.1), unknown (fails open)."""
     import inspect
     try:
         source = inspect.getsource(pooler_cls.forward)
@@ -995,8 +975,7 @@ pass
 
 
 def _gemma4_vision_cast_dtype(vision_model, pixel_values):
-    """Fallback cast dtype when the embedder hook saw nothing: uses the input_proj weight dtype (pixels are cast to it
-    outside autocast), else the pixel dtype if the embedder drifts."""
+    """No hook: input_proj weight dtype (pixels cast to it outside autocast), else pixel dtype."""
     embedder = getattr(vision_model, "patch_embedder", None)
     weight = getattr(getattr(embedder, "input_proj", None), "weight", None)
     if torch.is_tensor(weight):

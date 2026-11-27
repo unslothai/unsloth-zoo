@@ -84,8 +84,7 @@ def _unsloth_gemma4_ple_cast_input(module, x):
     dtype = getattr(weight, "dtype", None)
     if dtype is None or not getattr(dtype, "is_floating_point", False):
         return x
-    # Skip sub-2-byte floats such as float8 (casting the fp32 carrier to fp8 destroys it; fp8 matmuls scale internally);
-    # getattr keeps older torch dtypes without itemsize a no-op.
+    # Skip sub-2-byte floats (fp8 casts destroy the fp32 carrier); missing itemsize is a no-op.
     if getattr(dtype, "itemsize", 2) < 2:
         return x
     return x if x.dtype == dtype else x.to(dtype)
@@ -568,9 +567,8 @@ def _patch_gemma4_text_attention(module, prefix):
             )
             attn_output = torch.matmul(attn_weights, v_r).transpose(1, 2)
         elif attention_interface is not None:
-            # Registered backend (flex/flash) owns mask semantics: pass the mask as upstream prepared it (2-D padding
-            # for FA, BlockMask for flex); flash kernels need fp16 inputs and accumulate in fp32 so stability holds;
-            # flex handles fp32.
+            # Registered backend owns mask semantics: pass the upstream mask (2-D padding for FA,
+            # BlockMask for flex); flash needs fp16 (fp32 accumulate), flex handles fp32.
             q, k, v = query_states, key_states, value_states
             if attn_impl != "flex_attention":
                 q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
@@ -642,8 +640,7 @@ def _patch_gemma4_text_attention(module, prefix):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass
-    # force=True: gemma4.py's shared-KV carrier already wraps forward as (self, *args, **kwargs), so a signature check
-    # would reject this; the carrier's q/k fp32 vs v fp16 SDPA mismatch is handled inline above.
+    # force=True since gemma4's carrier wrapper (*args, **kwargs) fails a signature check.
     patch_forced_float32(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
 pass
 

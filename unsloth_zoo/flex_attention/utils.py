@@ -91,8 +91,7 @@ try:
             return _flex_attention(query, key, value, *args, **kwargs)
         # ROCm: calls whose backward will run get a static compile (symbolic lengths gave NaN grads on gfx1151).
         flex_attention = rocm_static_flex(flex_attention, _rocm_static_flex_entry)
-    # Prefill/training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once q_len * GQA
-    # group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
+    # AUTO sends <128-row queries to flex_decoding, invalid if q_len*GQA>128 (CheckpointError).
     PREFILL_KERNEL_OPTIONS = {**(kernel_options or {}), "FORCE_USE_FLEX_ATTENTION": True}
 
     # torch >= 2.9: return_lse's deprecation warning is a graph break on 2.10; use AuxRequest.
@@ -124,8 +123,7 @@ try:
     _ONE_BLOCK_MISCOMPILE = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 13)
 
     def _compile_block_mask(bsz, head, M, N):
-        # torch 2.10's dynamic create_block_mask miscompiles one-block lengths: block counts come out 2 instead of 1 and
-        # read past the buffer (illegal memory access).
+        # torch 2.10 dynamic create_block_mask miscompiles 1-block lengths (reads past buffer).
         blk = FLEX_ATTENTION_BLOCK_SIZE
         if not _ONE_BLOCK_MISCOMPILE or (M > blk and N > blk):
             return True
@@ -152,9 +150,7 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         return _build_block_mask(mask_mod, bsz, head, M, N, device)
 
-    # Block masks for stateless mask_mods (causal / sliding window) only depend on the
-    # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.
-    # Never pass mask_mods closing over per batch tensors (padding, document ids).
+    # Shared across layers, keyed by mask_mod and shapes; never close over per-batch tensors.
     _BLOCK_MASK_CACHE = {}
     _BLOCK_MASK_CACHE_SIZE = 32
 
@@ -173,8 +169,7 @@ try:
         key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
         block_mask = _BLOCK_MASK_CACHE.get(key)
         if block_mask is None:
-            # Masks grow ~quadratically with length, so only the current shape's masks are kept (one per mask_mod and
-            # inference mode, shared by one forward's layers); other shapes are freed first.
+            # Masks grow ~quadratically; only current-shape masks are kept, others are freed.
             for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
                 del _BLOCK_MASK_CACHE[k]
             if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
@@ -332,13 +327,11 @@ try:
                 https://pytorch.org/blog/flexattention-for-inference/
                 https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L91
                 """
-                # Get next multiple of FLEX_ATTENTION_KV_INCREMENT
                 div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 2 # Minus two since we need the block mask to use the saved offset_tensor
                 # Minus 2, not -1, since offset is pre-incremented (see self.offset += 1), not post-incremented.
                 if self.offset <= -2:
-                    # Minimum is -1
                     self.offset = -1
                     # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = None
@@ -383,7 +376,6 @@ try:
                 n = sliding_window
                 self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
                 if self.offset <= -2:
-                    # Minimum is -1
                     self.offset = -1
                     # During decoding we do self.offset += 1, so self.offset = 0
                 self.sliding_window = sliding_window - 1 # Minus 1 since token 128 means index 127
@@ -402,8 +394,7 @@ try:
                 self.offset += 1
                 self.offset_tensor.add_(1)
             elif (self.sliding_window is not None):
-                # Quick return: the sliding window block mask is always the same; reached only once offset >=
-                # sliding_window (max sliding window already reached).
+                # Block mask is fixed once offset >= sliding_window (max window reached).
                 return self.block_mask_slice
             if self.offset >= self.max_length:
                 # Must be >= since offset=127 with max_length=128 means size 128, because indexing is zero based.
@@ -478,8 +469,7 @@ def _raises_removed_error(source):
 
 
 def _torch_template_uses_block_ptr(*candidates):
-    # First candidate group present in the installed torch decides; read the files, no import. True / False once every
-    # file of that group was read, None when the answer is unknown (no group found, a member missing or unreadable).
+    # Reads the first installed candidate group's files, no import; None when unknown.
     import importlib.util
     try:
         spec = importlib.util.find_spec("torch")
@@ -512,8 +502,7 @@ def _flex_decode_template_uses_block_ptr():
 
 
 def _flex_main_template_uses_block_ptr():
-    # The main flex kernel, forward and backward: block pointers up to torch 2.8 (non-TMA path), tensor descriptors from
-    # 2.9. Every file of the 2.9+ group must be read before it counts as free of block pointers.
+    # Block pointers to torch 2.8 (non-TMA), tensor descriptors from 2.9; read all 2.9+ files.
     return _torch_template_uses_block_ptr(
         (
             "_inductor/kernel/flex/templates/flex_attention.py.jinja",
@@ -526,7 +515,6 @@ def _flex_main_template_uses_block_ptr():
 
 
 def _kernel_options_position():
-    # flex_attention(query, key, value, score_mod, block_mask, scale, enable_gqa, return_lse, kernel_options, *, ...)
     try:
         import inspect
         from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
@@ -576,9 +564,8 @@ def _flex_decoding_unavailable(block_ptr_removed, decode_uses_block_ptr, main_us
     return bool(block_ptr_removed) and decode_uses_block_ptr is True and main_uses_block_ptr is False
 
 
-# Decided at import (no file reads inside traced code). A failed flex_decoding compile makes Dynamo skip flex_attention
-# for the whole process, so every later prefill builds the full score matrix; short queries take the main kernel instead
-# when it is known to be free of block pointers (torch 2.9+).
+# Decided at import, not in traced code; if flex_decoding fails to compile, Dynamo skips
+# flex_attention process-wide; short queries use the main kernel if block-pointer-free (torch 2.9+).
 _TRITON_BLOCK_PTR_REMOVED = bool(HAS_FLEX_ATTENTION) and _triton_block_ptr_removed()
 _DECODE_USES_BLOCK_PTR = _flex_decode_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
 _MAIN_USES_BLOCK_PTR = _flex_main_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None

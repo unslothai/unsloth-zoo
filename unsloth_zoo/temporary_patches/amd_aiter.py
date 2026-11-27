@@ -30,16 +30,14 @@ _DISABLE_ENV = "UNSLOTH_DISABLE_AITER"
 # flash_attn_func applies 1/sqrt(head_dim) itself and takes no softmax_scale, so a model with a different scale must not take this path.
 _SCALE_RTOL = 1e-6
 
-# Kwargs the interface delivers but this kernel ignores: RoPE is already applied to q/k and cache bookkeeping is outside
-# it; measured on transformers 4.57.6, 5.0.0 and 5.14.1.
+# Ignored kwargs: RoPE pre-applied to q/k, cache outside (transformers 4.57.6, 5.0.0, 5.14.1).
 _BENIGN_KWARGS = frozenset((
     "position_ids", "use_cache", "cache_position", "past_key_value",
     "past_key_values", "layer_idx", "layer_head_mask", "output_attentions",
     "head_mask", "sliding_window", "position_bias",
 ))
 
-# These change the result and flash_attn_func cannot express them: sliding_window is windowed attention, position_bias
-# becomes an additive mask on transformers >= 5.14, softcap and s_aux are soft capping and sinks.
+# Result-changing: flash_attn_func lacks windowing, position_bias (>=5.14), softcap, s_aux.
 _SEMANTIC_KWARGS = (
     "sliding_window", "position_bias", "softcap", "logit_softcapping",
     "s_aux", "attention_chunk_size", "head_mask",
@@ -69,8 +67,7 @@ def aiter_attention_forward(
     if os.environ.get(_DISABLE_ENV, "0") == "1":
         return _fallback()
 
-    # Registration is AMD gated but this is callable directly and the gate is cached at import, so re-check per call:
-    # is_hip is uncached and cheap, and ROCm tensors report device.type "cuda", so both checks are needed.
+    # Gate cached at import, so recheck: is_hip is uncached; ROCm reports device.type cuda.
     from unsloth_zoo.device_type import is_hip
     if not is_hip() or not query.is_cuda:
         return _fallback()
@@ -83,8 +80,7 @@ def aiter_attention_forward(
         if kwargs.get(name) is not None:
             return _fallback()
 
-    # An unknown kwarg means a newer transformers added an argument this backend has not seen, so fall back rather than
-    # ignore its semantics; do not name the loop variable `value`, it would shadow the tensor.
+    # New kwargs may carry unseen semantics: fall back; don't name loop var value (shadows).
     for kwarg_name, kwarg_value in kwargs.items():
         if (kwarg_name not in _BENIGN_KWARGS
                 and kwarg_value is not None and kwarg_value is not False):

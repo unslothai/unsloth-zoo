@@ -70,7 +70,6 @@ def _is_gemma4_config(config):
 pass
 
 def is_comparable(val):
-    # Only basic types, not tensors
     from enum import Enum
     return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype, Enum))
 
@@ -112,19 +111,16 @@ def compare_attributes(original_model, new_model):
         buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
 
-        # Missing: in original but not in new
         missing_in_new = orig_attrs - new_attrs
         missing_in_new = missing_in_new - {'hf_device_map', 'source_cls'}
         if missing_in_new:
             for attr in sorted(missing_in_new):
                 missing_attrs.append(f"{name}.{attr}")
 
-        # Extra: in new but not in original
         extra_in_new = new_attrs - orig_attrs
         if extra_in_new:
             print(f'Found some extra attributes like: {list(extra_in_new)[:5]}...')
 
-        # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
         common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
@@ -223,8 +219,7 @@ def copy_attributes(original_model, new_model):
                 original_val = getattr(original_module, attr)
 
                 if attr in buffer_names and attr != "layer_scalar":
-                    # gemma3 etc. keep embed_scale and position_ids as buffers, so copy such buffers from the original,
-                    # moved to the new model's device, to avoid inconsistencies.
+                    # gemma3 buffers (embed_scale, position_ids) are copied to the new device.
                     setattr(module, attr, original_val.to(new_model.device))
                 elif is_comparable(original_val):
                     setattr(module, attr, original_val)
@@ -289,9 +284,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype}
     original_meta_model = None
     error = None
-    # include_buffers=False is required: buffers (e.g. Gemma 3's embed_scale,
-    # position_ids) need real values, not empty meta tensors, or attribute
-    # access fails during inference.
+    # include_buffers=False is required: buffers (e.g. Gemma 3's embed_scale, position_ids) need
+    # real values, not empty meta tensors, or attribute access fails during inference.
     with init_empty_weights(include_buffers = False):
         if model_name is not None and not using_text_subconfig:
             try:
@@ -333,14 +327,12 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     if is_qwen4_exp_config(causal_config):
         _set_config_attrs(new_config, qwen4_exp_empty_config_attrs(new_config))
 
-    # Set attention module head_dim
     head_dim = _global_config_value(
         causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads,
     )
     new_config.update({"head_dim" : head_dim})
 
-    # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
-    # for the 43+ architectures that set it False (GptOss, Mamba, Bloom, GPT-J...).
+    # eager, not sdpa: from_config raises ValueError for 43+ archs with _supports_sdpa False.
     new_model = AutoModelForCausalLM.from_config(
         new_config,
         attn_implementation = "eager",
@@ -789,8 +781,7 @@ def _is_known_architecture(architecture):
 pass
 
 
-# Matches `blocks[0]` or `blocks[0][1]`: a name without brackets (not limited to ASCII identifiers, since PyTorch allows
-# Unicode submodule names) plus digit-only subscripts; the name goes to getattr.
+# Matches blocks[0] or blocks[0][1]: a bracket-free name (any Unicode) plus digit subscripts.
 _INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
 _INDEX = re.compile(r"\[(\d+)\]")
 
@@ -1653,7 +1644,6 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(vision_config, "num_hidden_layers", 12),
         }
     else:
-        # Standard causal LM
         return getattr(config, "num_hidden_layers", 32)
 
 

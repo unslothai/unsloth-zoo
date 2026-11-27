@@ -66,8 +66,7 @@ _PROBE_INFLIGHT: "Optional[tuple[threading.Thread, list]]" = None
 # Memo key includes the probe flag, so an unprobed optimistic default is stored but cannot satisfy a probing caller
 _CACHED: "Optional[tuple[float, XetHealth, bool]]" = None
 _MEMO_SECONDS = 60.0  # a snapshot download asks repeatedly; don't re-probe per file
-# Bumped when a recorded outcome invalidates the memo: _evaluate() runs outside the lock, so without it a verdict read
-# before a demotion could be published after it, keeping downloads on Xet for another memo window.
+# Bumped on invalidation; _evaluate() runs unlocked, so a stale verdict could land after it.
 _GENERATION = 0
 
 
@@ -137,10 +136,8 @@ def health_state_path() -> Optional[Path]:
         from .hf_cache import _is_writable
 
         hf_home, hub_cache, _ = _active_caches()
-        # HF_HOME resolves to a default even when read-only, so preferring it unconditionally sent
-        # the verdict to an unwritable path whenever only HF_HUB_CACHE was relocated. Writes then
-        # failed silently and, the streak being rebuilt from this file alone, the machine could never
-        # be demoted no matter how often Xet stalled.
+        # HF_HOME resolves even read-only, so preferring it unconditionally sent verdicts to an
+        # unwritable path when only HF_HUB_CACHE moved; the machine could never be demoted.
         candidates = [hf_home, hub_cache.parent if hub_cache is not None else None]
         for base in candidates:
             if base is not None and _is_writable(base):
@@ -240,9 +237,8 @@ def _probe_cas_reachable() -> "tuple[Optional[bool], str]":
         except Exception as e:  # noqa: BLE001 - the probe must never raise into a download
             sink.append((False, f"Xet CAS unreachable: {type(e).__name__}"))
 
-    # Single-flight: join(timeout) cannot kill a worker blocked in getaddrinfo, so one thread per preflight would
-    # accumulate for the life of a server process; only a LIVE worker is reused, so a finished-but-unread result is
-    # never served stale.
+    # Single-flight: join(timeout) cannot kill a worker blocked in getaddrinfo, so a thread per
+    # preflight would pile up; only a LIVE worker is reused, never a finished-but-unread one.
     with _PROBE_LOCK:
         inflight = _PROBE_INFLIGHT
         if inflight is None or not inflight[0].is_alive():
@@ -292,9 +288,7 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
     except urllib.error.HTTPError as e:
         # The endpoint ANSWERED, which is all this probe measures.
         if e.code in (404, 401, 429):
-            # 404 mirror/on-prem, 401 auth never attempted and 429 throttling say nothing about Xet; one NAT exhausts
-            # the anonymous /api/ quota (500 per 5min per IP, 1,000 per user); 403/407 still demote, as a blocking proxy
-            # answers.
+            # 404/401/429 say nothing (NAT quota); 403/407 demote: a blocking proxy answers.
             return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
         return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:
@@ -374,8 +368,7 @@ def record_xet_outcome(ok: bool, reason: str = "") -> None:
     """Records a Xet outcome; two consecutive failures demote to HTTP; must never raise or slow callers"""
     global _CACHED, _GENERATION
     try:
-        # Holds _STATE_MUTEX and the state file guard across the whole read-modify-write: the streak comes from disk, so
-        # a peer write landing in between would be dropped.
+        # Lock spans the RMW: streak comes from disk, so a peer write in between is dropped.
         with _STATE_MUTEX, _state_file_guard():
             _record_outcome_locked(ok, reason)
         with _LOCK:

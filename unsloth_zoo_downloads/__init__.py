@@ -14,6 +14,5 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Stdlib-only Hub download helpers for a backend and its child, importable without unsloth_zoo's init (torch,
-transformers, patches); the init's env steps (cache redirect, apply_xet_env, offline/hf_transfer flags) are skipped;
-callers set those; unsloth_zoo.<module> aliases these modules."""
+"""Stdlib-only Hub helpers, importable without unsloth_zoo's init; callers set its skipped env steps
+(cache redirect, apply_xet_env, offline/hf_transfer); unsloth_zoo.<module> aliases them."""

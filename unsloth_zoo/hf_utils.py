@@ -91,7 +91,6 @@ def _dtype_stringify(x):
             return str(x).split(".", 1)[-1]
         if isinstance(x, str) and x.startswith("torch."):
             tail = x.split(".", 1)[-1]
-            # Only strip "torch." if the tail is actually a dtype on torch
             if hasattr(torch, tail) and isinstance(getattr(torch, tail), torch.dtype):
                 return tail
     except Exception:
@@ -153,8 +152,7 @@ _MAX_INSTANCE_CONFIG_NODES = 1024
 
 
 def _instance_attribute_model_types(config) -> list:
-    # to_dict() writes the class model_type, so configs naming themselves only on the instance (Ling-2.6-flash: class
-    # '', instance 'bailing_hybrid') serialize as empty.
+    # to_dict() writes class model_type; instance-only ones (Ling-2.6-flash) come out empty.
     found, seen, stack = [], set(), [config]
     while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
@@ -350,7 +348,6 @@ pass
 
 
 def fix_lora_auto_mapping(model):
-    # Fix LoraConfig's auto_mapping_dict
     if getattr(model, "peft_config", None) is None: return
 
     peft_config = model.peft_config

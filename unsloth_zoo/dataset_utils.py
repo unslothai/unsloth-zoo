@@ -54,13 +54,11 @@ def _longest_common_sublist(lists):
         """Return (exists, sublist) for a common sublist of `length`."""
         common = set()
         first = lists[0]
-        # All sublists of `length` from the first list
         for i in range(len(first) - length + 1):
             sub = tuple(first[i:i + length])
             common.add(sub)
         pass
 
-        # Keep only sublists also present in every remaining list
         for lst in lists[1:]:
             current = set()
             for i in range(len(lst) - length + 1):
@@ -144,17 +142,14 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
-    # substring == [0] may just be the original single token.
-    # Fixes https://github.com/unslothai/unsloth/issues/1290
-    # Mistral [INST] [/INST] singular tokens break since we output [0] but need [3] [4].
+    # [0] may be a real token (Mistral); fixes https://github.com/unslothai/unsloth/issues/1290
     if substring == [0] and len(all_input_ids[0]) == 1:
         single_token = all_input_ids[0][0]
         if all(single_token in x for x in all_input_ids):
             substring = [single_token]
     pass
 
-    # If substring is original input_ids + [0], keep the original. Happens when
-    # the chat template uses no newlines/spaces (e.g. Phi-4).
+    # Keep original when substring is input_ids + [0]: no newlines/spaces in template (Phi-4).
     if (len(set(str(x) for x in all_input_ids)) == 1) and \
         (len(all_input_ids[0]) + 1 == len(substring)) and \
         (all_input_ids[0] == substring[:-1]):
@@ -162,10 +157,8 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         substring = all_input_ids[0]
     pass
 
-    # Recover optional left/right tokens around the matched core. `substring` carries
-    # an appended [0] sentinel, so it need not be a sublist of `original`; track the
-    # match index explicitly rather than letting the loop fall through (which sliced
-    # at the last index, or left `j` unbound on an empty tokenization).
+    # [0] sentinel: substring may not be a sublist, so track the match in where (loop j can be
+    # unbound).
     original = _without_dummy_prefix(tokenizer(component, add_special_tokens = False).input_ids, component, tokenizer)
     where = -1
     for j in range(len(original)):
@@ -173,20 +166,12 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
             where = j
             break
     if where == -1:
-        # The core was never located in the component's own tokenization, so it was
-        # never verified against real tokenizer output. It can be the bare [0]
-        # sentinel, or a real token with that sentinel glued on (Phi-3 gives
-        # [32010, 0] for a marker that tokenizes to [32010]). Returning it either
-        # makes A_first == 0 and matches every <unk>/<pad>/"!" in the corpus, or
-        # matches nothing and masks the whole dataset. Report no core instead, which
-        # both empty-core guards downstream already handle. Only force_match = False
-        # gets here: with force_match = True the core is the component's own
-        # tokenization, so it is always located at index 0.
+        # A core not located in its own component tokenization is unverified (bare [0] or glued,
+        # e.g. Phi-3 [32010, 0]); it matches every <unk>/<pad>, so report no core.
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
-    # Plain-text marker edges can BPE-merge with the next message (aya-vision-32b: ">" + "\\sigma" -> ">\\"),
-    # so make them optional, but only while an added token anchors the core: "Q:" -> "Q" hits user text.
+    # Edges may BPE-merge (aya-vision-32b): optional only if an added token anchors the core.
     start, end = _stable_marker_edges(component, original, tokenizer)
     new_start, new_end = max(where, start), min(where + len(substring), end)
     if new_end > new_start and (new_start, new_end) != (where, where + len(substring)):
@@ -540,8 +525,7 @@ def _labels_are_token_level(dataset, sample):
     # No usable features: an in-memory dict-of-lists, or an IterableDataset.
     value = sample.get("labels") if isinstance(sample, dict) else None
     if value is None:
-        # Scan for the first non-null row, capped so a streaming or huge split
-        # is not walked end to end for a column verdict.
+        # Scan for a non-null row, capped so a streaming or huge split is not walked whole.
         try:
             for i, row in enumerate(dataset):
                 if i >= 100: break
@@ -550,8 +534,7 @@ def _labels_are_token_level(dataset, sample):
                 if value is not None: break
         except Exception: value = None
     if value is None: return None
-    # A string/bytes `labels` is a class NAME, not tokens; it can never be
-    # supervision, so it goes with the other raw columns.
+    # A string/bytes labels value is a class name, never supervision; treat it as a raw column.
     if isinstance(value, (str, bytes)): return False
     try:
         len(value)
@@ -646,9 +629,7 @@ def _keep_media_columns(trainer, keys):
         pass
 
 
-# Every suffix a missing entry costs is a VLM row silently trained as text,
-# so cover the modern web formats too (`.avif` is what most image CDNs serve
-# now) and the older spellings of the ones already here.
+# Missing suffixes train VLM rows as text silently; include modern (.avif) and older spellings.
 _MEDIA_SUFFIXES = (
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
     ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
@@ -671,15 +652,12 @@ def _looks_like_media_value(value, _depth = 0):
     if not isinstance(value, str): return False
     text = value.strip().lower()
     if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
-    # Drop a query string/fragment: `.../cat.jpg?width=64`.
     for sep in ("?", "#"):
         text = text.split(sep, 1)[0]
     return text.endswith(_MEDIA_SUFFIXES)
 
 
-# The prose that goes WITH the media. Tokenizer outputs live in `_TEXT_COLUMNS`;
-# these are the raw columns a vision collator still has to read, and a keep-list
-# that held the image but not its prompt left that collator nothing to tokenize.
+# Raw text companions the vision collator reads; an image alone leaves nothing to tokenize.
 _RAW_TEXT_COMPANION_COLUMNS = frozenset((
     "text", "texts", "prompt", "prompts", "question", "questions",
     "caption", "captions", "instruction", "instructions", "input", "inputs",
@@ -715,24 +693,17 @@ class _MediaAwareCollator:
                  companion_keys = ()):
         self.text = text
         self.media = media
-        # Kept so the media collator can read the prompt beside its image, and
-        # stripped again on the text path, which cannot tensorize a raw string.
-        # Lowercased: `_keep` below tests `key.lower()`, and unlike the other two
-        # sets this one carries the caller's own `dataset_text_field`. A
-        # mixed-case one (`Body`) never matched, so the raw string it names
-        # survived into a text batch and `DataCollatorForSeq2Seq` died on it.
+        # Kept for the media collator, stripped on the text path; lowercased because _keep tests
+        # key.lower(), and a mixed-case dataset_text_field (Body) never matched, so
+        # DataCollatorForSeq2Seq died on its raw string.
         self.companion_keys = frozenset(
             k.lower() if isinstance(k, str) else k for k in companion_keys)
-        # Split, not merged: an ambiguous name is decided by its value below,
-        # and folding the two would match `url` on the name alone.
+        # Split: ambiguous keys are judged by value, since folding matches url by name alone.
         self.ambiguous_keys = frozenset(ambiguous_keys)
         self.media_keys = frozenset(media_keys) - self.ambiguous_keys
 
-    # Raw conversational columns. Their images sit INSIDE the value, as
-    # `{"type": "image", ...}` parts, so no top-level key names them and a batch
-    # of them went to the text collator that cannot read the conversation at all,
-    # let alone its images. Routed to the media collator on the column's
-    # presence: that collator handles this TRL format, and the text one cannot.
+    # Images sit in typed content parts, so no top-level key names them; route on the column
+    # presence to the media collator, since the text collator cannot read conversations.
     _CONVERSATION_KEYS = frozenset((
         "messages", "conversations", "conversation", "chat",
     ))
@@ -743,10 +714,8 @@ class _MediaAwareCollator:
             for k in keys:
                 if not isinstance(k, str): continue
                 lowered = k.lower()
-                # An ambiguous name is weighed by its VALUE, the same trade the
-                # initial-split guard makes: `path`/`url` is a media reference
-                # or ordinary provenance, and matching the name alone would send
-                # every row carrying a plain URL to the vision collator.
+                # Ambiguous names (path/url) are judged by value: name alone would send every plain
+                # URL to vision.
                 if lowered in self.ambiguous_keys:
                     if _looks_like_media_value(feature.get(k)): return True
                     continue
@@ -758,21 +727,9 @@ class _MediaAwareCollator:
     def __call__(self, features):
         if self._has_media(features):
             return self.media(features)
-        # Strip what only the MEDIA path wanted kept. The signature whitelist is
-        # global, so a benign `url`/`path`/`prompt`/`content` column now survives
-        # unused-column removal for every split -- and the text collator
-        # tensorizes every key it is handed, so a retained string kills the
-        # batch. Removed here, not from the keep-list: the media path still
-        # needs those columns, and this is the only point that knows which path
-        # a batch took. Copies, so the caller's rows are left alone.
-        # By VALUE for the ambiguous and companion names, not by name alone. Both
-        # sets are ordinary English words, so under `remove_unused_columns=False`
-        # a caller's tensorizable auxiliary input called `output` or `content`
-        # was dropped from every text batch and its custom `compute_loss` never
-        # saw it. What the text collator cannot stack is a raw STRING; a number
-        # or a tensor under the same name is a model input and stays.
-        # The media names go on sight: they are never model inputs, and a text
-        # batch is one `_has_media` already declined to call multimodal.
+        # Drops media-only columns from text batches (global whitelist keeps them): ambiguous or
+        # companion names by value (raw strings only), media names on sight; media path needs them;
+        # remove_unused_columns=False keeps tensor or number output.
         maybe = self.ambiguous_keys | self.companion_keys
         def _keep(key, value):
             if not isinstance(key, str): return True
@@ -787,8 +744,7 @@ class _MediaAwareCollator:
         return self.text(stripped)
 
     def __getattr__(self, attribute):
-        # Only for names this class does not define; `text` is set in __init__,
-        # so this cannot recurse through it.
+        # Only for undefined names; text is set in __init__, so this cannot recurse.
         if attribute.startswith("__"): raise AttributeError(attribute)
         return getattr(self.__dict__["text"], attribute)
 pass
@@ -959,6 +915,7 @@ def train_on_responses_only(
     tokenization equals the standalone one.
     """
     # All Unsloth Zoo code licensed under LGPLv3
+    _auto_parts = False
     if trainer is not None:
         try:
             from unsloth_zoo.mlx.trainer import (
@@ -995,6 +952,7 @@ def train_on_responses_only(
         if instruction_part is None and response_part is None:
             # Neither given: auto-detect both from the chat template
             instruction_part, response_part = get_chat_template_parts(processor)
+            _auto_parts = True
             print(f"Unsloth: Auto-detected instruction_part = {repr(instruction_part)} and response_part = {repr(response_part)}")
         elif instruction_part is None or response_part is None:
             raise ValueError("Unsloth: Give both instruction_part and response_part, or neither to auto-detect!")
@@ -1092,11 +1050,25 @@ def train_on_responses_only(
     if eos_token_id is not None: boundary_first.add(eos_token_id)
     if message_start: boundary_first.add(message_start[0])
     if sample_start:  boundary_first.add(sample_start[0])
+    token_ids = {getattr(t, "content", None): i for i, t in added_tokens.items()}
+    # GLM-4.x opens a tool result with its own role token, which ends the assistant span like <|user|>.
+    role_stop_ids = {token_ids[t] for t in ("<|observation|>",) if t in token_ids} - boundary_first
+    boundary_first |= role_stop_ids
     inner_stop_ids = tuple(boundary_first | {Q_first})
+
+    # Mistral: the answer after a tool result follows [/TOOL_RESULTS] with no [/INST]; it runs to eos.
+    resume_id = token_ids.get("[/TOOL_RESULTS]")
+    resume_stop_ids = frozenset(inner_stop_ids) | {token_ids.get("[TOOL_RESULTS]")}
+    # Harmony (gpt-oss): the auto-detected marker is the final channel, but a tool call
+    # "<|start|>assistant to=functions.x ... <|call|>" is the model's output too.
+    harmony_call = None
+    if _auto_parts and "<|call|>" in token_ids and "<|start|>" in token_ids:
+        _assistant = tokenizer("<|start|>assistant", add_special_tokens = False).input_ids
+        if _assistant and _assistant[0] == token_ids["<|start|>"] and A_must[:len(_assistant)] == _assistant:
+            harmony_call = (token_ids["<|call|>"], token_ids["<|start|>"], _assistant)
 
     # Gemma 4 and FunctionGemma render a tool result inside the model's own turn. Generation stops at the
     # opening marker and the tool writes the rest, so a response span must not train past it.
-    token_ids = {getattr(t, "content", None): i for i, t in added_tokens.items()}
     tool_result_ids = [
         (token_ids[opener], token_ids[closer], token_ids.get(turn))
         for opener, closer, turn in (
@@ -1250,7 +1222,7 @@ def train_on_responses_only(
                             if token == eos_token_id:
                                 spans.append((assistant_k, j + 1))
                                 break
-                            if token == bos_token_id or \
+                            if token == bos_token_id or token in role_stop_ids or \
                                 (message_start and token == message_start[0] and \
                                  input_ids[j : j + len(message_start)] == message_start) or \
                                 (sample_start and token == sample_start[0] and \
@@ -1294,6 +1266,23 @@ def train_on_responses_only(
                 pass
                 j += 1
             pass
+
+            if resume_id is not None and resume_id in input_ids:
+                for c in [i for i, t in enumerate(input_ids) if t == resume_id]:
+                    j = c + 1
+                    while j < n and input_ids[j] not in resume_stop_ids: j += 1
+                    if j < n and input_ids[j] == eos_token_id: j += 1
+                    if j > c + 1: spans.append((c + 1, j))
+                spans.sort()
+            if harmony_call is not None and harmony_call[0] in input_ids:
+                call_id, start_id, assistant_ids = harmony_call
+                for c in [i for i, t in enumerate(input_ids) if t == call_id]:
+                    s = c - 1
+                    while s >= 0 and input_ids[s] != start_id: s -= 1
+                    k = s + len(assistant_ids)
+                    if s >= 0 and k < c and list(input_ids[s : k]) == assistant_ids:
+                        spans.append((k, c + 1))
+                spans.sort()
 
             # Apply labels (last assistant turn only when last_response_only).
             # spans[-1:] is [] when no assistant turn was found, so such samples
@@ -2590,10 +2579,26 @@ def train_on_responses_only(
         # DataCollatorForTokenClassification carrying `padding = "max_length"` is
         # a separate class, not a subclass, so an isinstance check on that one
         # class dropped its settings and silently turned the run into a
-        # dynamically padded one. Ask whether the fields are there.
-        _padding_class = _processor_backed and not _same_class and any(
+        # dynamically padded one. Ask whether the fields are there. Not only on
+        # the processor repair: the plain swap of one built on a real tokenizer
+        # replaces it too.
+        _padding_class = not _same_class and isinstance(
+            _collator, _PAD_DELEGATING_COLLATORS
+        ) and any(
             hasattr(_collator, _n)
             for _n in ("padding", "max_length", "pad_to_multiple_of")
+        )
+        # TRL's text and vision collators do not pad through `tokenizer.pad`,
+        # but their `pad_to_multiple_of` is the same rounding of the batch width
+        # (what `SFTConfig.pad_to_multiple_of` sets). Only that field: their
+        # other same-named ones, such as the vision collator's truncating
+        # `max_length`, do not mean what DataCollatorForSeq2Seq reads.
+        _trl_rounding = not _same_class and not _padding_class and any(
+            _cls.__module__.startswith("trl.") and _cls.__name__ in (
+                "DataCollatorForLanguageModeling",
+                "DataCollatorForVisionLanguageModeling",
+            )
+            for _cls in type(_collator).__mro__
         )
         # `label_pad_token_id` means the same thing to DataCollatorForSeq2Seq as
         # it does to a DataCollatorForTokenClassification, so a caller who chose
@@ -2603,11 +2608,24 @@ def train_on_responses_only(
                   "label_pad_token_id", "return_tensors") if _same_class else \
                  ("padding", "max_length", "pad_to_multiple_of",
                   "label_pad_token_id", "return_tensors")
+        if _trl_rounding: _names = ("pad_to_multiple_of",)
         _kept = {
             name: getattr(_collator, name)
             for name in _names
-            if (_same_class or _padding_class) and hasattr(_collator, name)
+            if (_same_class or _padding_class or _trl_rounding)
+            and hasattr(_collator, name)
         }
+        # `padding = "max_length"` with no `max_length` makes `tokenizer.pad`
+        # pad the inputs to `model_max_length`, but DataCollatorForSeq2Seq pads
+        # the labels to the longest row, so the two widths differ. Pin the
+        # tokenizer's real maximum; with no real one (the int(1e30) sentinel)
+        # `tokenizer.pad` would not pad at all, so pad dynamically instead.
+        if _kept.get("padding") == "max_length" and _kept.get("max_length") is None:
+            _model_max = getattr(tokenizer, "model_max_length", None)
+            if isinstance(_model_max, int) and 0 < _model_max < int(1e20):
+                _kept["max_length"] = _model_max
+            else:
+                _kept["padding"] = True
         _text_collator = DataCollatorForSeq2Seq(tokenizer = tokenizer, **_kept)
         # Only when a media-capable collator was displaced. Everywhere else the
         # replacement is the whole point and there is nothing to fall back to.
@@ -2818,8 +2836,7 @@ def standardize_data_formats(
     import collections
     import itertools
 
-    # VLMs need list-valued content ([{"type": "text", "text": ...}]); text
-    # models use a plain string.
+    # VLMs need list-valued content parts; text models use a plain string.
     is_vlm = False
     if tokenizer is not None:
         if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
@@ -2847,15 +2864,13 @@ def standardize_data_formats(
         for alias in (aliases_for_system + aliases_for_user + aliases_for_assistant)
     )
 
-    # The cardinality heuristic below ties on small datasets, picks the content column, and
-    # the alias check then rejects the user's own text.
+    # Cardinality ties on small datasets pick content; the alias check then rejects user text.
     alias_keys = [
         key for key in keys
         if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
     ]
 
-    # Both columns alias-only is real: {"role": "user", "content": "assistant"} comes out
-    # swapped with no error anywhere. The key NAMES are the only tiebreak left.
+    # Alias-only in both columns swaps roles silently; key names are the only tiebreak left.
     named_role_keys = [key for key in keys if str(key).strip().lower() in _ROLE_KEY_NAMES]
 
     if len(alias_keys) == 1:
@@ -2885,8 +2900,7 @@ def standardize_data_formats(
         )
     pass
 
-    # Normalization can collapse two aliases the caller meant to keep apart ("Human" for
-    # user, "human" for assistant), silently relabelling every such message. Refuse instead.
+    # Normalizing can merge aliases kept apart (Human, human); refuse, don't silently relabel.
     aliases_mapping = {}
     for group, role in (
         (aliases_for_system, "system"),
@@ -2905,8 +2919,7 @@ def standardize_data_formats(
                 )
             aliases_mapping[key] = role
 
-    # Normalise only on a miss and memoise the spelling this dataset uses, capped so a
-    # pathological dataset cannot grow the dict without limit.
+    # Normalise only on a miss; memo capped at _ALIAS_MEMO_LIMIT so a dataset cannot grow it.
     _ALIAS_MEMO_LIMIT = 64
 
     def _standardize_dataset(examples):
@@ -2940,10 +2953,9 @@ def standardize_data_formats(
     }
 
     if not isinstance(dataset, IterableDataset):
-        # One policy, one place. The copy that used to live here read stdlib
-        # multiprocessing's start method while datasets uses multiprocess, and it
-        # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
-        # on datasets >= 4.1, the pool this exists to avoid.
+        # One num_proc policy, in dataset_num_proc: datasets uses multiprocess, and falling back to
+        # num_proc=1 under memory pressure is a Pool(1) on datasets >= 4.1, which this exists to
+        # avoid.
         from .dataset_num_proc import environment_override, get_dataset_num_proc
         # Per-row work is tiny, so a pool mostly pickles shards: in-memory defaults stay in process (as Studio's copy does).
         if (
@@ -3078,8 +3090,7 @@ def _row_tools(example):
 
 # Faster SFTTrainer prepare_dataset
 _MAP_TO_DISK_DIR = None
-# Windows cannot delete a file that is still memory-mapped, and the tokenized dataset is usually still
-# alive when the atexit cleanup runs, so each run would leave its dir behind; the next run removes them.
+# Windows cannot delete memory-mapped files still alive at atexit; the next run sweeps them.
 _SWEEP_STALE_MAP_DIRS = __import__("os").name == "nt"
 
 

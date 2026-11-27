@@ -16,7 +16,7 @@
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
 the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts,
-small-batch quantized projections on the neural accelerators, the pre-norm residual handoff,
+small-batch quantized projections, int8 prefill on the neural accelerators, the pre-norm residual handoff,
 Qwen exact speculative verify blocks, wide-head decode and Gemma 4 verify-block attention, Qwen sparse attention block selection,
 QSA indexer blocks kept across cache trims, dilated depthwise convolutions, and SSD-backed PLE row reads."""
 
@@ -206,7 +206,7 @@ def _staged_forward_rows(inputs):
 
 @functools.cache
 def _staged_submit_window():
-    if mx.__version__ != "0.32.4":
+    if mx.__version__ != "0.32.5":
         return 0
     if not mx.metal.is_available():
         return 0
@@ -1794,7 +1794,7 @@ def _qwen4_qmv(linear, fast):
         return False
     N, K = linear.weight.shape[0], linear.weight.shape[1] * 32 // linear.bits
     aligned = K % ((32 // linear.bits) * 64) == 0
-    # Both 0.32.3 and 0.32.4 take qmv_fast for aligned K and whole 8-row tiles; qmv_quad serves K of 64 or 128.
+    # MLX takes qmv_fast for aligned K, qmv_quad for K of 64 or 128; this route also needs whole 8-row tiles.
     return N % 8 == 0 and (aligned if fast else not aligned and K not in (64, 128))
 
 
@@ -1813,17 +1813,17 @@ def _qwen4_inject_qmv(linear, streams, width, dtype):
     call = type(linear).__call__
     if call is not nn.QuantizedLinear.__call__ and call not in _ONE_ROW_STOCK_CALLS:
         return False
-    # 0.32.4 takes qmv_fast for K in whole fast blocks whatever N is; 0.32.3 only for whole 8-row tiles.
+    # MLX 0.32.5 takes qmv_fast for K in whole fast blocks whatever N is.
     return (linear.mode == "affine" and linear.bits in (4, 8) and "bias" not in linear
             and linear.scales.dtype == dtype and linear.biases.dtype == dtype
             and linear.weight.shape == (streams, width * linear.bits // 32) and streams < 8
             and linear.group_size in (32, 64, 128) and width % (32 // linear.bits * 64) == 0
-            and mx.__version__ == "0.32.4")
+            and mx.__version__ == "0.32.5")
 
 
 @functools.cache
 def _qwen4_ordered_down_kernel():
-    if mx.__version__ != "0.32.4" or not mx.metal.is_available():
+    if mx.__version__ != "0.32.5" or not mx.metal.is_available():
         return None
     try:
         seen = set()
@@ -2011,7 +2011,7 @@ def _qwen4_stream_down_source(reuse = 1):
 
 @functools.cache
 def _qwen4_stream_kernels():
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+    if (mx.__version__ != "0.32.5" or not mx.metal.is_available()
             or mx.device_info().get("architecture") != "applegpu_g15s"):
         return None
     try:
@@ -4757,7 +4757,7 @@ METAL_FUNC void plain_qmv(const device T* x, const device uint* w, const device 
 
 @functools.cache
 def _plain_moe_kernels(rows = False):
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+    if (mx.__version__ != "0.32.5" or not mx.metal.is_available()
             or mx.device_info().get("architecture") != "applegpu_g15s"):
         return None
     try:
@@ -5882,23 +5882,25 @@ class _SmallRowRoute(NamedTuple):
     state: str = "nax_qmm"
     reader: str = None
     code_offset: bool = False   # the kernel may fold `s * (sum x (2^bits + q) - 2^bits * sum x)` out of each group
+    stock_rows: str = None   # names `module`'s (lowest, highest) rows within the kernel's range that stay native
 
     def call(self, suffix, *args):
         kernel = getattr(self.module, self.kernel + suffix)
         return kernel(*args, reader = self.reader) if self.reader and not suffix else kernel(*args)
 
 
-_NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
-                                ("QMM_PROBE_KEY", "probe_small_m_qmm"), True)
+# Stock NAX kernels serve every row count: this scope only carries int8 prefill, sorted gather and dense prefill.
+_NAX_QMM_ROUTE = _SmallRowRoute(nax, None, "Nax", "NAX", None, None, None, True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
-                                 "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
+                                 "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False,
+                                 stock_rows = "SIMD_QMM_STOCK_ROWS")
 _LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane", "UNSLOTH_MLX_LANE_QMM", None,
                                  ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm", code_offset = True)
 
 
 def _small_row_route():
-    """The small-row kernel this GPU runs, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
+    """The small-row route this GPU's scope takes, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
     if nax.nax_available():
         return _NAX_QMM_ROUTE
     return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
@@ -6183,12 +6185,13 @@ def _nax_qmm_classes(route, *cache_key):
     if bindings is None:
         return {}
 
-    # Calls no route takes (below every route, between small-row and the next, a native block) skip the checks.
+    # Calls no route takes (including a route's stock rows) skip the checks.
     def declined(self, x):
         if type(x) is not mx.array:
             return False
         n = x.size
-        if n < self._unsloth_nax_qmm_floor or self._unsloth_nax_qmm_ceiling < n < self._unsloth_nax_qmm_next:
+        if (n < self._unsloth_nax_qmm_floor or self._unsloth_nax_qmm_ceiling < n < self._unsloth_nax_qmm_next
+                or self._unsloth_nax_qmm_stock_low <= n <= self._unsloth_nax_qmm_stock_high):
             return True
         if route.takes_blocks or n > self._unsloth_nax_qmm_ceiling:
             return False
@@ -6218,6 +6221,7 @@ def _nax_qmm_classes(route, *cache_key):
         base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
                    {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
                     "_unsloth_nax_qmm_floor": 0, "_unsloth_nax_qmm_ceiling": 0, "_unsloth_nax_qmm_next": 0,
+                    "_unsloth_nax_qmm_stock_low": 0, "_unsloth_nax_qmm_stock_high": -1,
                     "_unsloth_nax_int8_prefill_rows": 0})
         for base, name, method in ((nn.QuantizedLinear, "__call__", linear),
                                    (nn.QuantizedEmbedding, "as_linear", as_linear))
@@ -6279,7 +6283,8 @@ def _nax_restore(module):
     if native is not None:
         module.__class__ = native
     for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
-                 "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
+                 "_unsloth_nax_qmm_next", "_unsloth_nax_qmm_stock_low", "_unsloth_nax_qmm_stock_high",
+                 "_unsloth_nax_int8_prefill_rows",
                  "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready",
                  "_unsloth_nax_owner"):
         module.__dict__.pop(name, None)
@@ -6418,17 +6423,13 @@ def _int8_prefill_status(projections):
 
 @contextmanager
 def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
-    """Run affine quantized projections on the M5 neural accelerators where measured faster.
+    """Run affine quantized projections on unsloth's kernels where measured faster than stock.
 
-    Quantized linears and tied quantized embedding heads called with the row counts measured
-    faster than stock for their shape on this GPU use a matmul2d kernel that reads the stock
-    packed codes and keeps stock's per-group factorization in fp32; each (shape, quantization,
-    dtype, kernel variant) is checked against stock's fp32 arithmetic at first use. Single rows,
-    training and other quantizations keep the native call. `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
-
-    Where stock MLX has no NAX kernels (the GPUs before M5), 4- and 8-bit projections take the
-    small-row kernels of `matmul` under their own row table and the same first-use check;
-    `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
+    Where stock MLX has no NAX kernels (the GPUs before M5), quantized linears and tied quantized
+    embedding heads take 4- and 8-bit small-row kernels of `matmul` at the row counts measured
+    faster than stock for their shape; each (shape, quantization, dtype, kernel variant) is checked
+    against stock's fp32 arithmetic at first use. Single rows, training and other quantizations
+    keep the native call. `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
     `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 2- to
     8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
@@ -6450,7 +6451,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
             if tracked:
                 model.__dict__["_unsloth_nax_int8_prefill_scope"] = (depth + 1, bool(int8_prefill))
             route = _small_row_route()
-            small_m = (route is not None and os.environ.get(route.switch, "1") != "0"
+            small_m = (route is not None and route.kernel is not None and os.environ.get(route.switch, "1") != "0"
                        and nax.gap_open(route.gap))
             int8_prefill = bool(int8_prefill) and route is _NAX_QMM_ROUTE
             sorted_gather = (route is _NAX_QMM_ROUTE and os.environ.get("UNSLOTH_MLX_NAX_SORTED_GATHER", "1") != "0"
@@ -6517,6 +6518,9 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                     module._unsloth_nax_qmm_floor = min(after, rows[0] if rows else after) * K
                     module._unsloth_nax_qmm_ceiling = (rows[1] if rows else -1) * K
                     module._unsloth_nax_qmm_next = after * K
+                    if rows is not None and route.stock_rows:
+                        module._unsloth_nax_qmm_stock_low, module._unsloth_nax_qmm_stock_high = (
+                            row * K for row in getattr(route.module, route.stock_rows))
                     if int8_prefill_rows:
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
@@ -6557,18 +6561,22 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
 _DENSE_QMM_LOCK = RLock()
 _DENSE_QMM_VERIFIED = {}
-_STAGED_QMM_VERIFIED = {}
 _DENSE_QMM_MIN_ROWS = 1024
 # MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
 # and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
-_DENSE_QMM_DISPATCH_MLX = ("0.32.4",)  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
+_DENSE_QMM_DISPATCH_MLX = ("0.32.5",)
+
+
+def _dense_prefill_serves():
+    # Where stock runs its NAX kernels, its staged qmm_t_nax beats dequantizing once.
+    return mx.__version__ in _DENSE_QMM_DISPATCH_MLX and not attention._stock_runs_nax()
 
 
 def _dense_qmm_rows(M, N, K):
-    """MLX 0.32.3/0.32.4's row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles,
+    """MLX 0.32.5's row-count decisions past the tile floor (dense steel_matmul_axpby split K, tiles,
     K blocks, row alignment; qmm reads rows only in bounds checks): one comparison per distinct tuple."""
     widest = max(M, N)
     return (K >= 3 * widest, M <= 2048 and N <= 2048, K >= 8192 and K > M + N, N > M, M * N >= 1 << 20,
@@ -6593,7 +6601,7 @@ _TILED_QMM_SOURCE = """
 TILED_QMM_PROBE_KEY = "tiled_qmm:" + hashlib.sha256(
     _TILED_QMM_SOURCE.format(template = "", **_TILED_QMM_TILE).encode()).hexdigest()[:12]
 # Releases whose quantized matmul dispatch `_tile_shape_loses` keeps clear of split-K and qmv.
-_TILED_QMM_DISPATCH_MLX = ("0.32.4",)
+_TILED_QMM_DISPATCH_MLX = ("0.32.5",)
 # Stock may run qmv up to 32 rows, and fewer rows pad one 64-row tile past stock's 32-row one.
 _TILED_QMM_MIN_ROWS = _TILED_QMM_TILE["BM"] // 2 + 1
 
@@ -6706,11 +6714,11 @@ def _dense_prefill_qmm(module, x, bindings):
     one-column output (matvec, kernel picked per row count) would need a check per prompt length: native.
     Calls it declines go to the tiled route when that is on, exact by construction and not compared.
     """
-    if mx.__version__ not in _DENSE_QMM_DISPATCH_MLX:
+    if not _dense_prefill_serves():
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
-    if x.size == x.shape[-1]:  # one row: the staged and dense routes need 1024, the tiled tile pads past stock's
+    if x.size == x.shape[-1]:  # one row: the dense route needs 1024, the tiled tile pads past stock's
         return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
     if not isinstance(w, mx.array) or w.ndim != 2 or not isinstance(scales, mx.array):
@@ -6718,10 +6726,6 @@ def _dense_prefill_qmm(module, x, bindings):
     N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
     if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
         return None
-    if module.__dict__.get("_unsloth_staged_qmm") and not module.training and _bindings_intact(bindings):
-        staged = _staged_prefill_qmm(module, x, w, scales, biases, M, N, K)
-        if staged is not None:
-            return staged
     if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
         if module.__dict__.get("_unsloth_tiled_qmm"):
@@ -6758,33 +6762,6 @@ def _dense_prefill_qmm(module, x, bindings):
             if module.__dict__.get("_unsloth_tiled_qmm") else None)
 
 
-def _staged_prefill_qmm(module, x, w, scales, biases, M, N, K):
-    group_size, bits, mode = module.group_size, module.bits, module.mode
-    if (mx.default_device() != mx.gpu or not matmul.staged_qmm_supported(M, N, K, group_size, bits, mode)
-            or not isinstance(biases, mx.array) or not x.dtype == scales.dtype == biases.dtype
-            or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
-            or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
-        return None
-    key = (M, N, K, group_size, bits, x.dtype)
-    verified = _STAGED_QMM_VERIFIED.get(key)
-    if verified is False:
-        return None
-    routed = matmul.differentiable_staged_qmm(group_size, bits)(x.reshape(M, K), w, scales, biases)
-    if verified is None:
-        native = mx.quantized_matmul(x.reshape(M, K), w, scales, biases, transpose = True,
-                                     group_size = group_size, bits = bits)
-        _staged_ready()
-        try:
-            verified = _settled(bool(mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()))
-        except (RuntimeError, ValueError) as error:
-            _unless_failed_buffer(error)
-            return None
-        _STAGED_QMM_VERIFIED[key] = verified
-        if not verified:
-            logger.warning("staged prefill differs from native for %s; the staged route stays disabled", key)
-    return routed.reshape(*x.shape[:-1], N) if verified else None
-
-
 def _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings):
     group_size, bits, mode = module.group_size, module.bits, module.mode
     if (mx.default_device() != mx.gpu or mode != "affine" or bits not in _TILED_QMM_BITS
@@ -6804,7 +6781,7 @@ def _dense_qmm_bindings(*cache_key):
 
 
 def _dense_prefill_in_scope(module, x):
-    """The dense result for a NAX-routed linear inside a `dense_prefill_linear` scope, else None."""
+    """The dense result for a small-row-routed linear inside a `dense_prefill_linear` scope, else None."""
     if not module.__dict__.get("_unsloth_dense_qmm_scopes"):
         return None
     bindings = _dense_qmm_bindings(nn.QuantizedLinear.__call__)
@@ -6813,7 +6790,7 @@ def _dense_prefill_in_scope(module, x):
 
 def prefill_route(module, rows):
     """The route a `rows`-row call of this quantized linear takes under the scopes it holds now: "int8", "dense",
-    "staged", "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
+    "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
     d, w, scales = module.__dict__, module["weight"], module["scales"]
     N, K, dtype = w.shape[0], scales.shape[-1] * module.group_size, scales.dtype
     low = getattr(module, "_unsloth_nax_int8_prefill_rows", 0)
@@ -6822,10 +6799,7 @@ def prefill_route(module, rows):
         return "int8"
     if not d.get("_unsloth_dense_qmm_scopes"):
         return "stock"
-    if (d.get("_unsloth_staged_qmm") and matmul.staged_qmm_supported(rows, N, K, module.group_size, module.bits, module.mode)
-            and _STAGED_QMM_VERIFIED.get((rows, N, K, module.group_size, module.bits, dtype)) is not False):
-        return "staged"
-    if (mx.__version__ in _DENSE_QMM_DISPATCH_MLX and rows >= _DENSE_QMM_MIN_ROWS and N != 1
+    if (_dense_prefill_serves() and rows >= _DENSE_QMM_MIN_ROWS and N != 1
             and -(-rows // 16) * -(-N // 16) > _DENSE_QMM_MIN_TILES and N * K <= _DENSE_QMM_MAX_WEIGHTS):
         biases = module.get("biases")
         family = (N, K, module.bits, module.group_size, module.mode, dtype, w.dtype, dtype,
@@ -6861,16 +6835,14 @@ def dense_prefill_linear(model, *, _modules = None):
     Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
     densely, bit-identical to the quantized matmul; smaller calls,
     training, and any shape that fails its first-use comparison keep the exact tiled route when eligible,
-    otherwise the native call. A linear the
-    NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
+    otherwise the native call. A linear `nax_quantized_linear` already routes keeps its small-row route and
+    takes this one for the rest. Where stock MLX runs its NAX kernels, those beat this route and it stays off.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
 
     Where stock MLX runs no NAX kernels, affine calls this route leaves to stock's plain quantized matmul
     run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
     construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
     turns that off.
-    On NAX GPUs, eligible affine prefill uses staged loads with native accumulation order, checked by a probe
-    and per shape on first use. `UNSLOTH_MLX_STAGED_PREFILL=0` turns this off; native vjps are retained.
     """
     changed = []
     try:
@@ -6880,7 +6852,6 @@ def dense_prefill_linear(model, *, _modules = None):
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
                 tiled = None   # its probe waits for a linear it could serve
-                staged = None
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -6897,14 +6868,11 @@ def dense_prefill_linear(model, *, _modules = None):
                     else:
                         if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
                             tiled = _tiled_prefill_enabled()
-                            staged = matmul.staged_qmm_available()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
                         if tiled:
                             module.__dict__["_unsloth_tiled_qmm"] = True
-                        if staged:
-                            module.__dict__["_unsloth_staged_qmm"] = True
                     changed.append((module, fused))
         yield model
     finally:
@@ -6912,18 +6880,17 @@ def dense_prefill_linear(model, *, _modules = None):
             for module, fused in reversed(changed):
                 module._unsloth_dense_qmm_scopes -= 1
                 if not module._unsloth_dense_qmm_scopes:
-                    if type(module) is fused:   # a NAX-routed linear keeps the NAX scope's class
+                    if type(module) is fused:   # a small-row-routed linear keeps that scope's class
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
-                    module.__dict__.pop("_unsloth_staged_qmm", None)
 
 
 _WINDOW_MASK_LOCK = RLock()
 _WINDOW_MASK_MODULE = "mlx_vlm.models.gemma4.language"
 _WINDOW_MASK_CONTRACT = {
     _WINDOW_MASK_MODULE: {
-        "Gemma4TextModel._make_masks": ("d02d670a2d988a1d", "bc6547b19c9add74"),
+        "Gemma4TextModel._make_masks": ("d02d670a2d988a1d", "1aa47525d32da822"),
         "Gemma4TextModel.__call__": "bad1bb823b9aa527",
         "create_attention_mask": "a5e4c86965a3c8dc",
         "RotatingKVCache.make_mask": "7868d53d8c02ff7c",
@@ -6941,7 +6908,7 @@ def _native_window_mask_source_matches(original):
     leaf = original
     seen = set()
     try:
-        while isinstance(leaf, FunctionType) and _ast_fingerprint(leaf) == "bc6547b19c9add74":
+        while isinstance(leaf, FunctionType) and _ast_fingerprint(leaf) == "1aa47525d32da822":
             if id(leaf) in seen:
                 return False
             seen.add(id(leaf))
@@ -8483,7 +8450,7 @@ def _exact_attention_kernels():
 def _sdpa_vector_blocks(gqa, keys):
     """The block count of MLX 0.32.3's 2-pass vector SDPA for one head-dim-256 query row over `keys` keys, or None off that kernel."""
     device = nax._gpu_architecture()[-1:]
-    if not ((device in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)) or os.environ.get("MLX_SDPA_BLOCKS"):
+    if not ((device in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)) or attention.mlx_setting("MLX_SDPA_BLOCKS", 0) > 0:
         return None
     return _vector_blocks(gqa, keys)
 
@@ -8511,7 +8478,7 @@ def _vector_launch(gqa, rows, keys, dim):
     """MLX's unmasked vector SDPA launch for `rows` query rows per head: passes, key interleave, one-row GQA kernel."""
     if not ((_gpu_class() in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)):
         return 1, 0, False
-    # MLX 0.32.4 gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
+    # MLX gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
     grouped = rows == 1 and keys >= 8192 and (gqa == 8 and dim in (64, 128) or gqa in (12, 16) and dim == 128)
     return 2, _vector_blocks(gqa * rows, keys), grouped
 
@@ -8573,7 +8540,7 @@ def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)
             or queries.shape[1] % keys.shape[1] or queries.shape[1] // keys.shape[1] > 16):
         return None
     length, gqa, dim = queries.shape[2], queries.shape[1] // keys.shape[1], queries.shape[-1]
-    prefix, forced = keys.shape[2] - length, os.environ.get("MLX_SDPA_BLOCKS")
+    prefix, forced = keys.shape[2] - length, attention.mlx_setting("MLX_SDPA_BLOCKS", 0)
     # The fused kernel serves at most 8 query rows and 32 across a GQA group; each chunk's keys end at its last row,
     # where the lower-right causal mask aligns. A launch other than a row's own reduces it in another order.
     chunks = _causal_chunks(gqa, dim, prefix, length, min(8, 32 // gqa), forced)
@@ -10740,7 +10707,7 @@ def _launch_simds(dtype = mx.bfloat16):
 
 def _vector_blocks(simds, keys):
     """The key-interleave count MLX 0.32.3's sdpa_vector_2pass picks for this launch."""
-    forced = int(os.environ.get("MLX_SDPA_BLOCKS", "0") or 0)
+    forced = attention.mlx_setting("MLX_SDPA_BLOCKS", 0)
     if forced > 0:
         return (forced + 31) // 32 * 32
     gpu = _gpu_class()
@@ -10819,8 +10786,8 @@ _WIDE_ATTENTION_CONTRACT = {
 
 
 def _wide_head_decode_attention(queries, keys, values, scale, mask):
-    # MLX 0.32.4 prefetches four D512 BF16 keys per thread; do not shadow a later tuned dispatch.
-    if mx.__version__ != "0.32.4":
+    # MLX 0.32.5 prefetches four D512 BF16 keys per thread; do not shadow a later tuned dispatch.
+    if mx.__version__ != "0.32.5":
         return None
     if not (mask is None or isinstance(mask, str) and mask == "causal"):
         return None
@@ -10829,7 +10796,7 @@ def _wide_head_decode_attention(queries, keys, values, scale, mask):
             and queries.shape[2:] == (1, 512) and keys.shape[3] == 512
             and queries.dtype == keys.dtype == values.dtype == mx.bfloat16
             and keys.shape[1] > 0 and queries.shape[1] == 8 * keys.shape[1]
-            and keys.shape[2] >= attention._atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
+            and keys.shape[2] >= attention.mlx_setting("MLX_SDPA_D512_MIN_KL", 1024)
             and _two_pass_keys(keys.shape[2]) and _vector_attention_kernels() is not None):
         return None
     blocks = _vector_blocks(8, keys.shape[2])
@@ -10890,12 +10857,12 @@ def _wide_attention_class(base, helper, cache_type):
 
 @contextmanager
 def fused_decode_attention(model, *, _modules = None):
-    """Route MLX 0.32.4's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
+    """Route MLX 0.32.5's wide BF16 single-token decode attention through the vector kernel after bitwise agreement;
     everything else, training and distributed models stay native."""
     changed = []
     try:
         with _WIDE_ATTENTION_LOCK:
-            if mx.__version__ == "0.32.4" and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+            if mx.__version__ == "0.32.5" and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 specs = {}
                 for path, contract in _WIDE_ATTENTION_CONTRACT.items():
                     bindings = _resolved_bindings({path: contract})
@@ -11305,7 +11272,7 @@ _QSA_DECODE_SOURCE = "15388c560af7468e7c3c9641bdb454ec4991167b94496fec24a7d0685e
 
 @functools.cache
 def _qsa_decode_kernel(source):
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+    if (mx.__version__ != "0.32.5" or not mx.metal.is_available()
             or hashlib.sha256(source.encode()).hexdigest() != _QSA_DECODE_SOURCE):
         return None
     # Keep native arithmetic and geometry; only K/V integer addresses change. Feature views read their strides too.
