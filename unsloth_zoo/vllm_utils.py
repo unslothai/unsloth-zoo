@@ -1387,29 +1387,30 @@ pass
 
 
 def _standby_memory_point():
-    """(reserved bytes, all-time reserved peak, free bytes, device total bytes) on the current device. Free counts the
+    """(reserved, all-time reserved peak, allocated, free, device total) bytes on the current device. Free counts the
     device's free memory plus torch's cached but unallocated blocks, which the next training step reuses first."""
     stats = torch.cuda.memory_stats()
     free, total = torch.cuda.mem_get_info()
     reserved = int(stats.get("reserved_bytes.all.current", 0))
-    cached = max(0, reserved - int(stats.get("allocated_bytes.all.current", 0)))
-    return reserved, int(stats.get("reserved_bytes.all.peak", 0)), int(free) + cached, int(total)
+    allocated = int(stats.get("allocated_bytes.all.current", 0))
+    return reserved, int(stats.get("reserved_bytes.all.peak", 0)), allocated, int(free) + max(0, reserved - allocated), int(total)
 pass
 
 
 def _standby_close_measurement():
-    """At the first wake_up after a sleep or a kept-awake step: how far the training step grew torch's reserved memory.
-    reserved only grows between the two points unless something empties the cache, so the step's high water is the
-    later of now and the all-time peak when the step set a new peak; otherwise the step stayed under the old peak, and
-    that old peak bounds it from above."""
+    """At the first wake_up after a sleep or a kept-awake step: the training step's working set, from what was
+    allocated when it started to torch's reserved high water during it. reserved only grows between the two points
+    unless something empties the cache, so the high water is the later of now and the all-time peak when the step set
+    a new peak; otherwise the step stayed under the old peak, which bounds it from above. Counting from allocated (not
+    reserved) keeps the cached blocks a kept-awake step reuses in its working set, so the estimate never decays."""
     s = _STANDBY_KEEP_AWAKE
     pend = s["pending"]
     if pend is None: return
     s["pending"] = None
     if pend["tokens"] <= 0: return  # no rollout since that sleep (the trainer's first sleep at init): nothing trained
-    reserved, peak, _, _ = _standby_memory_point()
+    reserved, peak, _, _, _ = _standby_memory_point()
     high = max(reserved, peak) if peak > pend["peak"] else max(reserved, pend["peak"])
-    s["measured"].append((max(0, high - pend["reserved"]), pend["tokens"]))
+    s["measured"].append((max(0, high - pend["allocated"]), pend["tokens"]))
     del s["measured"][:-_STANDBY_KEEP_AWAKE_HISTORY]
 pass
 
@@ -1419,7 +1420,7 @@ def _standby_fits(tokens):
     with the safety factor and a margin, judged from the training steps measured so far."""
     s = _STANDBY_KEEP_AWAKE
     if not s["measured"]: return False, None
-    reserved, peak, free, total = _standby_memory_point()
+    _, _, _, free, total = _standby_memory_point()
     need = _STANDBY_KEEP_AWAKE_SAFETY * max(g * max(1.0, tokens / t) for g, t in s["measured"])
     margin = max(1 << 30, int(0.05 * total))
     info = {"need_gb": round(need / 1e9, 3), "free_gb": round(free / 1e9, 3), "margin_gb": round(margin / 1e9, 3),
@@ -1463,7 +1464,8 @@ def patch_vllm_standby_keep_awake():
         try: level = int(level)
         except Exception: level = 1
         if level < 1:
-            # level 0 only pauses scheduling: always honour it
+            # level 0 only pauses scheduling: always honour it, and let its wake_up reach vLLM to resume
+            self._unsloth_standby_awake = False
             return _orig_sleep(self, *args, **kwargs)
         # Only the sleep that ends a rollout may be skipped. With no rollout since the last wake (the trainer's first
         # sleep, a resume, a user freeing the GPU) vLLM always sleeps.
@@ -1475,8 +1477,8 @@ def patch_vllm_standby_keep_awake():
             try:
                 _standby_close_measurement()
                 fits, info = _standby_fits(tokens)
-                reserved, peak, _, _ = _standby_memory_point()
-                s["pending"] = {"reserved": reserved, "peak": peak, "tokens": tokens}
+                _, peak, allocated, _, _ = _standby_memory_point()
+                s["pending"] = {"allocated": allocated, "peak": peak, "tokens": tokens}
             except Exception as e:
                 fits, info = False, {"error": repr(e)}
             s["last"] = dict(info or {}, kept_awake = bool(fits))
@@ -1495,8 +1497,8 @@ def patch_vllm_standby_keep_awake():
         if s["pending"] is not None:
             # Measure the training step from after the sleep released the KV and emptied the cache.
             try:
-                reserved, peak, _, _ = _standby_memory_point()
-                s["pending"].update(reserved = reserved, peak = peak)
+                _, peak, allocated, _, _ = _standby_memory_point()
+                s["pending"].update(allocated = allocated, peak = peak)
             except Exception:
                 s["pending"] = None
         return result

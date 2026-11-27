@@ -113,14 +113,25 @@ def test_first_step_sleeps_then_a_fitting_step_stays_awake(env):
     llm, mem, calls = env()
     llm.sleep(level = 2)  # the trainer's sleep at init: no rollout yet, measures nothing
     assert trl_step(llm, mem, calls, 2 * GB) == ["wake_up", "wake_up", "sleep"]
-    # 2 GB measured; 6 GB free beside the mapped KV clears 1.2 x 2 GB + a 1.2 GB margin
-    # the step after a sleep still wakes, then stays awake: no sleep
-    assert trl_step(llm, mem, calls, 2 * GB) == ["wake_up", "wake_up"]
+    # 2 GB measured; 6 GB free beside the mapped KV clears 1.2 x 2 GB + a 1.2 GB margin. The step after a sleep
+    # still wakes, then stays awake; its training step reuses the 2 GB torch kept cached
+    assert trl_step(llm, mem, calls, 0) == ["wake_up", "wake_up"]
     for _ in range(3):
-        # awake: neither wake_up nor sleep reaches vLLM; the kept training cache is reused, no new growth
+        # awake: neither wake_up nor sleep reaches vLLM
         assert trl_step(llm, mem, calls, 0) == []
     stats = vu.standby_keep_awake_stats()
     assert stats["kept_awake"] == 4 and stats["slept"] == 1 and stats["last"]["kept_awake"]
+
+
+def test_reused_cache_keeps_the_working_set_in_the_estimate(env):
+    # many kept-awake steps that only reuse cached blocks must not decay the estimate: a 4x longer rollout still
+    # scales the 2 GB working set to 8 GB, which does not fit, so vLLM sleeps
+    llm, mem, calls = env()
+    trl_step(llm, mem, calls, 2 * GB)
+    for _ in range(vu._STANDBY_KEEP_AWAKE_HISTORY + 4):
+        trl_step(llm, mem, calls, 0)
+    assert calls == [("generate",)]
+    assert trl_step(llm, mem, calls, 0, length = 4 * 120 - 20) == ["sleep"]
 
 
 def test_a_training_step_that_does_not_fit_keeps_sleeping(env):
@@ -182,7 +193,8 @@ def test_level_zero_pause_is_always_honoured(env):
     trl_step(llm, mem, calls, 0)
     del calls[:]
     llm.sleep(level = 0)
-    assert calls == [("sleep", 0)]
+    llm.wake_up(tags = ["scheduling"])
+    assert calls == [("sleep", 0), ("wake_up", ["scheduling"])]
 
 
 def test_patch_is_idempotent(env):
