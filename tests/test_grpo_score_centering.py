@@ -441,3 +441,63 @@ def test_score_centering_gate(monkeypatch):
     assert grpo_score_centering_k(types.SimpleNamespace(use_vllm = True), is_on, True, kept_set_scoring = True) == 0
     monkeypatch.setenv(sc.SCORE_CENTERING_ENV, "0")
     assert grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 0
+
+
+def test_score_centering_refuses_untruncated_filtered_logprobs(monkeypatch):
+    # Colocated vLLM with the IS correction returns logprobs from before top_k / top_p / min_p; under a filter
+    # those are not the sampler's q, so score centering is off (as unsloth_distillation_coef refuses it).
+    import unsloth_zoo.rl_replacements as rl
+    vllm_utils = pytest.importorskip("unsloth_zoo.vllm_utils")
+    state = vllm_utils.UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
+    monkeypatch.setitem(state, "on", True)
+    monkeypatch.setitem(state, "installed", True)
+    monkeypatch.setenv(sc.SCORE_CENTERING_ENV, "32")
+    is_on = {"vllm_importance_sampling_correction": True}
+    args = types.SimpleNamespace(top_k = None, top_p = 1.0, min_p = 0.1, temperature = 1.0)
+    trainer = types.SimpleNamespace(use_vllm = True, vllm_importance_sampling_correction = True, args = args,
+                                    _unsloth_vllm_untruncated_logprobs = True)
+    assert rl.grpo_sampling_support(trainer) == (0, 1.0, 0.1)
+    assert rl.grpo_truncated_support_kwargs(trainer) == {}
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 0
+    assert trainer._unsloth_score_centering_off_warned is True
+    # Unfiltered sampling: untruncated logprobs are the sampler's.
+    args.min_p = 0.0
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+    # Processed (kept-set) logprobs from the engine: the sampler's again.
+    args.min_p = 0.1
+    trainer._unsloth_vllm_untruncated_logprobs = False
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+    monkeypatch.setitem(state, "on", False)
+    trainer._unsloth_vllm_untruncated_logprobs = True
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+
+
+@pytest.mark.parametrize("rule", [TIS, ICEPOP])
+def test_centering_needs_the_filtered_sampler_q(rule):
+    # fp64 oracle, on-policy (p = pre-filter q), min_p = 0.1 sampler q'. With constant A the centered estimator's
+    # expected gradient under y ~ q' is zero with q' as the head q, and the full sum_y q'(y) grad log p(y) with the
+    # pre-filter q (whose correction is zero when q = p): untruncated logprobs bias it.
+    gen = torch.Generator().manual_seed(1)
+    V, k = 200, 32
+    logits = torch.randn(16, V, generator = gen, dtype = D64) * 3.0
+    logits.requires_grad_(True)
+    logp = torch.log_softmax(logits, -1)
+    probs = logp.detach().exp()
+    keep = probs >= 0.1 * probs.max(-1, keepdim = True).values
+    assert int(keep.sum(-1).max()) <= k and bool((~keep).any(-1).all())
+    q_filtered = torch.where(keep, probs, 0.0)
+    q_filtered = q_filtered / q_filtered.sum(-1, keepdim = True)
+    wfn = sc.score_centering_weight_fn(*rule)
+
+    def expected_grad(log_q_used):
+        ids = probs.topk(k, dim = -1).indices
+        corr, _, _ = sc.score_centering_correction(logp.gather(-1, ids), log_q_used.gather(-1, ids), wfn)
+        with torch.no_grad():
+            w = wfn(torch.where(q_filtered > 0, (logp - log_q_used).exp(), 0.0))
+        sampled = (q_filtered * w * logp).sum(-1)
+        (g,) = torch.autograd.grad((sampled - corr).sum(), logits, retain_graph = True)
+        return g.abs().max().item()
+
+    # Up to the eps clamp of the tail mass (q'(H) = 1).
+    assert expected_grad(q_filtered.log()) < 1e-5
+    assert expected_grad(logp.detach()) > 1e-2
