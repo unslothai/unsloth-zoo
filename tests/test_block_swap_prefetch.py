@@ -274,14 +274,14 @@ def test_load_time_spill_is_encoded_in_place_at_install(monkeypatch):
     for i in state.indices:
         state.evict(i)
     assert len(state.disk) >= 6
-    size = _disk._SPILL[0].size
+    size = _disk.live_spill().size
     for name, p in layers.named_parameters():
         p.requires_grad_("lora_" in name)
     sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
     loaded = [b for li, b in zip(sw.indices, sw.blocks) if li in state.disk]
     assert loaded and all(b.compressed() for b in loaded)
     # Rewritten over their raw regions: the spill file did not grow for them.
-    assert _disk._SPILL[0].size == size + sum(n for b in sw.blocks if b.disk is not None and b not in loaded
+    assert _disk.live_spill().size == size + sum(n for b in sw.blocks if b.disk is not None and b not in loaded
                                               for _, n, _ in b.disk_runs)
     got, _ = _train(layers, sw)
     _equal(ref, got)

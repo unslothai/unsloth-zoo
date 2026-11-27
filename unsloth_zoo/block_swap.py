@@ -976,6 +976,7 @@ class BlockSwap:
     _hwm_base = {}
     _peak_devs = ()
     _to_spill = frozenset()
+    _spill_hold = None
     _disk_tier = None
     _disk_seen = {}
     _disk_decoders = {}
@@ -1267,7 +1268,8 @@ class BlockSwap:
         if spread is not None and sum(self.blocks[k].nbytes() for k in movable if k not in spread) \
                 + sum(b.nbytes() for k, b in enumerate(self.blocks) if b.disk is None and k not in movable) <= budget:
             spill = spread
-        mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
+        # Held until remove(): the shared file is weakly referenced, and the blocks only take it as they spill.
+        self._spill_hold = mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
         self._to_spill = spill
         return True
 
@@ -1894,6 +1896,8 @@ class BlockSwap:
         if tier is not None:
             tier.close()
             self._disk_tier = None
+        # The spill file closes (its disk space comes back) once no other model still reads from it.
+        self._spill_hold = None
         # A removed controller must not keep the model's layers (and their restored GPU weights) alive.
         self._reserve_layers, self._reserve_owner = (), None
         for dev in self.streams:
