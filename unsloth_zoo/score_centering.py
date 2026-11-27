@@ -195,8 +195,21 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
     n_rows = flat_x.shape[0]
     if n_rows == 0:
         return hidden_states.new_zeros((R, T, k), dtype = torch.float32)
-    chunks = max(1, min(int(chunks), n_rows))
-    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    # Only positions with a recorded head reach the vocabulary projection: padding after a completion's end
+    # and unmatched rows have every slot < 0, which the caller masks out (grpo_score_centering_term).
+    # Rows per chunk stay as before, so the peak does not grow.
+    keep = (flat_ids >= 0).any(dim = -1)
+    rows = None
+    n_keep = int(keep.sum())
+    if n_keep < n_rows:
+        rows = keep.nonzero().squeeze(1)
+        chunks = -(-int(chunks) * n_keep // n_rows)
+        flat_x, flat_ids = flat_x.index_select(0, rows), flat_ids.index_select(0, rows)
+        if n_keep == 0:
+            return hidden_states.new_zeros((R, T, k), dtype = torch.float32) + 0 * flat_x.sum()
+    n = flat_x.shape[0]
+    chunks = max(1, min(int(chunks), n))
+    bounds = [(i * n) // chunks for i in range(chunks + 1)]
     needs_grad = torch.is_grad_enabled() and (
         flat_x.requires_grad or (from_hidden and lm_head.requires_grad)
         or (lm_head_bias is not None and lm_head_bias.requires_grad)
@@ -213,7 +226,10 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
             outs.append(_torch_checkpoint()(_head_chunk_logps, *args, use_reentrant = False))
         else:
             outs.append(_head_chunk_logps(*args))
-    return torch.cat(outs, dim = 0).reshape(R, T, k)
+    out = torch.cat(outs, dim = 0)
+    if rows is not None:
+        out = out.new_zeros((n_rows, k)).index_copy(0, rows, out)
+    return out.reshape(R, T, k)
 
 
 class _TopKState:
