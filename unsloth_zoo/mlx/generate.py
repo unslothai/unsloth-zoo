@@ -3028,9 +3028,8 @@ def _media_token_ids(config) -> set[int]:
 
 
 def _splices_alike(rows, config, prepared: bool) -> bool:
-    """Whether every row gains the same spliced columns: rows encoded from prompts of one media
-    shape, each holding as many placeholders. Prepared vision inputs group by layout alone, so
-    their values (an image's spatial shape) may still differ per row."""
+    """Whether every row gains the same spliced columns: prompt-encoded rows with equal placeholder
+    counts. Prepared vision inputs group by layout only, so their image shapes may differ."""
     if len(rows) == 1:
         return True
     media = _media_token_ids(config)
