@@ -18,6 +18,7 @@
 wins, safetensors < 0.8.0 keeps mmap, and the unified-memory check never creates a CUDA context."""
 
 import sys
+import types
 
 import pytest
 
@@ -60,10 +61,10 @@ def test_pread_backend_kwargs(monkeypatch, platform, env, uma, supported, device
 
 
 def test_safetensors_without_backend_keeps_mmap(monkeypatch):
-    def old_safe_open(filename, framework, device = "cpu"):
-        raise AssertionError("not called")
+    import safetensors._safetensors_rust as rust
 
-    monkeypatch.setattr(safetensors, "safe_open", old_safe_open)
+    # safetensors < 0.8.0's extension class, as far as detection can see
+    monkeypatch.setattr(rust, "safe_open", types.SimpleNamespace(__text_signature__ = "(filename, framework, device=...)"))
     sp.safetensors_supports_backend.cache_clear()
     assert sp.safetensors_supports_backend() is False
     monkeypatch.setenv(sp.PREAD_ENV, "1")
@@ -80,6 +81,23 @@ def test_installed_safetensors_detection_matches_the_keyword(tmp_path):
         accepts = True
     except TypeError:
         accepts = False
+    assert sp.safetensors_supports_backend() is accepts
+
+
+def test_detection_sees_through_a_wrapped_safe_open(monkeypatch, tmp_path):
+    """Another library wrapping safetensors.safe_open as (*args, **kwargs) must not hide the keyword."""
+    from safetensors.torch import save_file
+
+    real = safetensors.safe_open
+    path = str(tmp_path / "x.safetensors")
+    save_file({"w": torch.arange(4, dtype = torch.float32)}, path)
+    try:
+        real(path, framework = "pt", device = "cpu", backend = "pread")
+        accepts = True
+    except TypeError:
+        accepts = False
+    monkeypatch.setattr(safetensors, "safe_open", lambda *a, **k: real(*a, **k))
+    sp.safetensors_supports_backend.cache_clear()
     assert sp.safetensors_supports_backend() is accepts
 
 

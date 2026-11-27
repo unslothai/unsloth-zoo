@@ -44,15 +44,21 @@ def _env():
 @functools.lru_cache(maxsize = None)
 def safetensors_supports_backend():
     """safetensors >= 0.8.0 (the first release with ``safe_open(..., backend=)``)."""
+    # The extension's own class: safetensors.safe_open may be wrapped by another library as (*args, **kwargs).
     try:
-        import inspect
-
-        from safetensors import safe_open
+        from safetensors._safetensors_rust import safe_open
 
         text = getattr(safe_open, "__text_signature__", None) or ""
         if text:
             return "backend" in text
-        return "backend" in inspect.signature(safe_open).parameters
+    except Exception:
+        pass
+    try:
+        from packaging.version import Version
+
+        import safetensors
+
+        return Version(safetensors.__version__) >= Version("0.8.0rc1")
     except Exception:
         return False
 

@@ -2180,6 +2180,10 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         for _fused_key, _experts in _perexpert.items():
             if _fused_key in processed_mxfp4_keys:
                 continue
+            # header only: a pread handle would read a skipped stack in full
+            _fused_meta = header_metadata.get(_fused_key, {})
+            if len(_fused_meta.get("shape", (0, 0, 0))) != 3 or _fused_meta.get("dtype") in ("F8_E4M3", "F8_E5M2"):
+                continue
             _fused_W = file.get_tensor(_fused_key)
             if _fused_W.dim() != 3 or _fused_W.dtype in _FP8_WEIGHT_DTYPES:
                 continue
