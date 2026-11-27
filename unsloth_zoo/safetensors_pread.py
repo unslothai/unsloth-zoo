@@ -17,15 +17,14 @@
 """safetensors ``backend="pread"`` for CPU opens whose tensors are each read once and copied to the GPU.
 
 On a CUDA unified-memory GPU (DGX Spark / GB10, Jetson, Thor) copying an mmap view to the device is many times slower
-than copying a pread buffer (measured on DGX Spark: two Qwen3-30B-A3B layers, 19.6 s mmap vs 0.84 s pread). Windows
-reads with pread too (mmap charges the whole file to the commit limit). Discrete Linux GPUs keep mmap: there pread
-only adds a host copy. Tensors that stay on the host keep mmap everywhere (pread turns each into a private copy).
+than copying a pread buffer (measured on DGX Spark: two Qwen3-30B-A3B layers, 19.6 s mmap vs 0.84 s pread). Discrete
+GPUs keep mmap, Windows included: there pread is slower and only adds a host copy. Tensors that stay on the host keep
+mmap everywhere (pread turns each into a private copy).
 ``UNSLOTH_SAFETENSORS_PREAD`` = 0 never, 1 always; safetensors < 0.8.0 has no ``backend`` and keeps mmap.
 """
 
 import functools
 import os
-import sys
 
 __all__ = ["pread_backend_kwargs", "safetensors_supports_backend"]
 
@@ -94,6 +93,6 @@ def pread_backend_kwargs(device = "cpu"):
     value = _env()
     if value is False or str(device) != "cpu":
         return {}
-    if value is None and sys.platform != "win32" and not _unified_memory_now():
+    if value is None and not _unified_memory_now():
         return {}
     return {"backend": "pread"} if safetensors_supports_backend() else {}

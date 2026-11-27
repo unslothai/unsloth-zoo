@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""pread_backend_kwargs: Windows and CUDA unified-memory GPUs get pread, discrete Linux keeps mmap, the env switch
-wins, safetensors < 0.8.0 keeps mmap, and the unified-memory check never creates a CUDA context."""
+"""pread_backend_kwargs: CUDA unified-memory GPUs get pread, discrete GPUs (Linux and Windows) keep mmap, the env
+switch wins, safetensors < 0.8.0 keeps mmap, and the unified-memory check never creates a CUDA context."""
 
 import sys
 import types
@@ -47,8 +47,10 @@ def _clean(monkeypatch):
         ("linux", None, "1", True, "cuda:0", {}),
         ("linux", "0", "1", True, "cpu", {}),
         ("linux", "1", "0", True, "cpu", {"backend": "pread"}),
-        ("win32", None, "0", True, "cpu", {"backend": "pread"}),
-        ("win32", "off", "0", True, "cpu", {}),
+        # discrete Windows keeps mmap (pread is slower there)
+        ("win32", None, "0", True, "cpu", {}),
+        ("win32", None, "1", True, "cpu", {"backend": "pread"}),
+        ("win32", "off", "1", True, "cpu", {}),
     ],
 )
 def test_pread_backend_kwargs(monkeypatch, platform, env, uma, supported, device, expected):
