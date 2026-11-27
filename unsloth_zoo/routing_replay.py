@@ -60,6 +60,7 @@ __all__ = [
 
 import functools
 import inspect
+import math
 import os
 import re
 import typing
@@ -452,12 +453,13 @@ def _as_routes(routed):
 
 
 def _clean_weights(rows, weights):
-    # Usable top-k weights are finite, in [0, 1] and sum to at most 1 (scaled or garbage ones are
-    # not this router's); an all zero row is an ids-only capture.
+    # Usable top-k weights are finite and non-negative; an all zero row is an ids-only capture. Their scale is
+    # the router's (DeepSeek-V3 multiplies by routed_scaling_factor, so rows may sum past 1): whether a row
+    # matches this router's normalisation and values is checked per router where it is used
+    # (_apply_rollout_weights).
     w = weights.float()
-    eps = 1e-3
-    ok = torch.isfinite(w).all(-1) & (w >= 0).all(-1) & (w <= 1 + eps).all(-1)
-    ok &= (w.sum(-1) <= 1 + eps) & (w > 0).any(-1) & ~(rows < 0).any(-1)
+    ok = torch.isfinite(w).all(-1) & (w >= 0).all(-1)
+    ok &= (w > 0).any(-1) & ~(rows < 0).any(-1)
     return torch.where(ok.unsqueeze(-1), w, torch.full_like(w, float("nan")))
 
 
@@ -1058,10 +1060,81 @@ def _probs_gather(probs, ids, renorm):
     return torch.where(ok, out, torch.zeros_like(out))
 
 
-def _apply_rollout_weights(weights, rollout, valid, renorm):
+_DEFAULT_RENORM_EPS = 1e-20
+_RENORM_EPS_RE = re.compile(r"\.sum\([^()]*\)\s*\+\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\)")
+
+
+def _sigmoid_gather(logits, ids, renorm, eps = _DEFAULT_RENORM_EPS):
+    # DeepSeek-V3 / GLM-4 MoE style: the score correction bias only picks the experts; the weights are the
+    # unbiased sigmoid scores over the picked ones, renormalised with the router's own floor (1e-20 there).
+    w = logits.float().sigmoid().gather(-1, ids)
+    if not renorm:
+        return w
+    return w / (w.sum(dim = -1, keepdim = True) + eps)
+
+
+def _renorm_eps(module):
+    """The constant the router adds to the top-k sum before dividing (LFM2-MoE: 1e-6, DeepSeek-V3 / HY-V3:
+    1e-20), read once from its forward's source. On natural selections it is negligible, so detection cannot tell
+    it apart; on forced low-score experts it decides the weights. 1e-20 when the source has none."""
+    eps = getattr(module, "_unsloth_replay_eps", None)
+    if eps is not None:
+        return eps
+    eps = _DEFAULT_RENORM_EPS
+    try:
+        found = _RENORM_EPS_RE.findall(inspect.getsource(type(module).forward))
+        values = {float(v) for v in found}
+        if len(values) == 1:
+            eps = max(values.pop(), _DEFAULT_RENORM_EPS)
+    except (OSError, TypeError, ValueError):
+        pass
+    module._unsloth_replay_eps = eps
+    return eps
+
+
+def _reweight(formula, module, logits, ids):
+    if formula == "sigmoid_renorm":
+        return _sigmoid_gather(logits, ids, True, _renorm_eps(module))
+    return _formulas()[formula](logits, ids)
+
+
+def _replay_scale(module):
+    """The factor the router multiplies its top-k weights by (routed_scaling_factor), 1.0 when it has none."""
+    return float(getattr(module, "_unsloth_replay_scale", 1.0))
+
+
+def _scale_candidates(module):
+    # A router may apply its scaling factor itself (DeepSeek-V3, HY-V3, LFM2-MoE) or leave it to its MoE block:
+    # try both.
+    for name in ("routed_scaling_factor", "router_scaling_factor"):
+        scale = getattr(module, name, None)
+        try:
+            scale = float(scale)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(scale) and scale > 0 and scale != 1.0:
+            return (scale, 1.0)
+    return (1.0,)
+
+
+_BIAS_ARGS = ("e_score_correction_bias", "expert_bias")
+
+
+def _bias_routed(module):
+    """True for a router that picks experts by biased scores: it holds the bias, or its forward takes it."""
+    if any(hasattr(module, name) for name in _BIAS_ARGS):
+        return True
+    try:
+        params = inspect.signature(type(module).forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return any(name in params for name in _BIAS_ARGS)
+
+
+def _apply_rollout_weights(weights, rollout, valid, renorm, total = 1.0):
     """Straight-through: the rollout's weight values, the gradient of the trainer's `weights`.
-    Rows whose rollout weights are missing, not normalised like this router's, or far from the
-    trainer's keep the trainer's. The delta is built without grad, so autograd saves nothing new
+    Rows whose rollout weights are missing, not normalised like this router's (to `total`, its
+    routed_scaling_factor), or far from the trainer's keep the trainer's. The delta is built without grad, so autograd saves nothing new
     (a non-reentrant checkpoint compares what its recompute saves)."""
     with torch.no_grad():
         trainer = weights.detach().float()
@@ -1070,7 +1143,7 @@ def _apply_rollout_weights(weights, rollout, valid, renorm):
         ok = valid & torch.isfinite(rollout).all(-1, keepdim = True)
         ok = ok & (diff.abs() <= _WEIGHT_TOLERANCE).all(-1, keepdim = True)
         if renorm:
-            ok = ok & ((rollout.sum(-1, keepdim = True) - 1).abs() <= 1e-2)
+            ok = ok & ((rollout.sum(-1, keepdim = True) - total).abs() <= 1e-2 * max(1.0, total))
         delta = torch.where(ok, diff, torch.zeros_like(diff)).to(weights.dtype)
     return weights + delta, ok.sum()
 
@@ -1083,7 +1156,18 @@ def _formulas():
         softmax = lambda logits, ids: _softmax_gather(logits, ids, False),
         probs_renorm = lambda probs, ids: _probs_gather(probs, ids, True),
         probs = lambda probs, ids: _probs_gather(probs, ids, False),
+        sigmoid_renorm = lambda logits, ids: _sigmoid_gather(logits, ids, True),
+        sigmoid = lambda logits, ids: _sigmoid_gather(logits, ids, False),
     )
+
+
+def _formula_order(module):
+    """Formula names in the order they are tried: sigmoid first for a router with a score correction bias, since
+    near-zero logits make a renormalised sigmoid and a renormalised softmax agree (both about 1/k)."""
+    names = list(_formulas())
+    if _bias_routed(module):
+        names = [n for n in names if n.startswith("sigmoid")] + [n for n in names if not n.startswith("sigmoid")]
+    return names
 
 
 def _looks_like_probs(logits2):
@@ -1203,15 +1287,20 @@ def _router_hook(layer_index, compact = None):
             # A router that states whether it renormalises the top-k decides it: top-k mass near
             # one would otherwise pass a normalised formula for an unnormalised router.
             renorm = getattr(module, "norm_topk_prob", None)
-            for name, fn in _formulas().items():
+            for name in _formula_order(module):
                 if name.startswith("probs") != probs:
                     continue
                 if isinstance(renorm, bool) and name.endswith("_renorm") != renorm:
                     continue
                 with torch.no_grad():
-                    candidate = fn(logits2, ids2).to(weights2.dtype).float()
-                if torch.allclose(candidate, weights2.float(), rtol = 2e-2, atol = 2e-3):
-                    formula = name
+                    candidate = _reweight(name, module, logits2, ids2).float()
+                for scale in _scale_candidates(module):
+                    scaled = (candidate * scale).to(weights2.dtype).float()
+                    if torch.allclose(scaled, weights2.float(), rtol = 2e-2, atol = 2e-3):
+                        formula = name
+                        module._unsloth_replay_scale = scale
+                        break
+                if formula is not None:
                     break
             else:
                 formula = False
@@ -1251,9 +1340,11 @@ def _router_hook(layer_index, compact = None):
                 _STATE.record[layer_index] = (
                     _fingerprint(ids2), forced.clone(), valid, signature, layer_input, None,
                 )
-        reweight = _formulas()[formula]
-        new_weights = reweight(logits2, forced)
-        if formula == "probs_renorm":
+        new_weights = _reweight(formula, module, logits2, forced)
+        scale = _replay_scale(module)
+        if scale != 1.0:
+            new_weights = new_weights * scale
+        if formula in ("probs_renorm", "sigmoid_renorm"):
             # The forced probabilities (nearly) all underflowed: nothing to replay with, so keep the
             # natural routing (_probs_gather returns zeros there).
             valid = valid & (new_weights.sum(dim = -1, keepdim = True) > 0)
@@ -1261,7 +1352,7 @@ def _router_hook(layer_index, compact = None):
         weight_rows = None
         if rollout_weights is not None:
             new_weights, weight_rows = _apply_rollout_weights(
-                new_weights, rollout_weights, valid, formula.endswith("_renorm"),
+                new_weights, rollout_weights, valid, formula.endswith("_renorm"), scale,
             )
         new_weights = new_weights.to(weights2.dtype)
         new_weights = torch.where(valid, new_weights, weights2)
