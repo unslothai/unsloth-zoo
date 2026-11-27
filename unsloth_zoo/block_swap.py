@@ -204,6 +204,11 @@ def _pin_budget():
         return 0
 
 
+def _host_share(free):
+    """This local rank's share of the host's free RAM: every local rank reads the same `free`."""
+    return free // _local_world_size()
+
+
 # Re-reads of free RAM and the peers' reservations before refusing, while a peer may be mid-copy.
 _PEER_RETRIES = 8
 _PEER_RETRY_S = 0.25
@@ -1262,7 +1267,7 @@ class BlockSwap:
             _, free = _host_free()
         except Exception:
             return False
-        budget = free + sum(self._host_credit)
+        budget = _host_share(free) + sum(self._host_credit)
         limit = mod.host_limit_bytes()
         if limit is not None:
             budget = min(budget, limit)
@@ -2443,7 +2448,7 @@ def _disk_tier_indices(layers, indices, host_free_bytes = None, prefetch_depth =
     sizes = [sum(p.nbytes for _, p in _swappable(layers[i])) for i in indices]
     if host_free_bytes is None:
         try:
-            host_free_bytes = _host_free()[1] + sum(
+            host_free_bytes = _host_share(_host_free()[1]) + sum(
                 p.nbytes for i in indices for _, p in _swappable(layers[i]) if p.device.type == "cpu")
         except Exception:
             return []
