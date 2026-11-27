@@ -294,3 +294,16 @@ def test_grpo_scorer_fp32_defaults_agree_with_score_centering(wheel, want, reque
         assert default is want, fn.__name__
     mode, _ = _score_centering_head_mode(monkeypatch)
     assert (mode != "plain") is want
+
+
+def test_is_rocm_torch_traces_under_fullgraph():
+    # Called from compiled code (mxfp4 / MoE gates): torch.__version__ is a TorchVersion whose C str() Dynamo
+    # cannot trace, so the version-tag fallback must read the plain-str torch.version.__version__.
+    from unsloth_zoo.rocm_build import is_rocm_torch
+    torch._dynamo.reset()
+
+    def fn(x):
+        return x + int(is_rocm_torch(torch))
+
+    x = torch.zeros(2)
+    assert torch.equal(torch.compile(fn, backend = "eager", fullgraph = True)(x), fn(x))
