@@ -2290,7 +2290,13 @@ def _run_grouped_mm_crash_probe(device):
     return False
 
 
+def _is_out_of_memory(exc):
+    oom = getattr(torch, "OutOfMemoryError", None)
+    return (isinstance(oom, type) and isinstance(exc, oom)) or "out of memory" in str(exc).lower()
+
+
 def _grouped_mm_runs_on(device):
+    """True / False, or None when the probe ran out of memory (no verdict: callers must not cache it)."""
     _GROUPED_MM_LAST_REFUSAL[0] = None
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
@@ -2303,8 +2309,9 @@ def _grouped_mm_runs_on(device):
 
         torch._grouped_mm(x, w, offs=offs)
         del x, w, offs
-    except Exception:
-        return False
+    except Exception as exc:
+        # Out of memory says nothing about the kernel: no verdict, so the next call probes again.
+        return None if _is_out_of_memory(exc) else False
     _GROUPED_MM_LAST_REFUSAL[0] = _grouped_mm_trains_on(device)
     return _GROUPED_MM_LAST_REFUSAL[0] is None
 
@@ -2377,6 +2384,7 @@ def _probe_torch_grouped_mm_supported(device = None):
         supported = _TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind)
         if supported is None:
             supported = _TORCH_GROUPED_MM_AVAILABLE and _grouped_mm_survives_out_of_process(device) and _grouped_mm_runs_on(device)
+            if supported is None: return False  # out of memory: loop for now, probe again next call
             _TORCH_GROUPED_MM_SUPPORTED_BY_KIND[kind] = supported
             # Same eager region: a traced first use of this model must not break again on the view check.
             if kind not in _TRANSPOSED_VIEW_SAFE_BY_KIND:
@@ -2390,7 +2398,9 @@ def _probe_torch_grouped_mm_supported(device = None):
     if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
     else:
-        _TORCH_GROUPED_MM_SUPPORTED = _grouped_mm_runs_on(device)
+        supported = _grouped_mm_runs_on(device)
+        if supported is None: return False  # out of memory: loop for now, probe again next call
+        _TORCH_GROUPED_MM_SUPPORTED = supported
     _GROUPED_MM_TRAINING_PROBE_FAILURE = _GROUPED_MM_LAST_REFUSAL[0]
     # Answer the view check here so a cold compiled block does not graph-break on it.
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is None:
