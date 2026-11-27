@@ -466,9 +466,16 @@ def _pinned_adapter_class():
     return _PinnedAddressAdapter
 
 
+def _resolve_no_redirects(*args, **kwargs):
+    return iter(())
+
+
 def _guarded_session():
     """A session whose connections only reach addresses the guard checked."""
     session = requests.Session()
+    # Hops are followed by hand (allow_redirects=False), but requests still reads each redirect's whole body into
+    # memory to precompute `response.next`, past the download cap. No redirect is ever resolved by requests here.
+    session.resolve_redirects = _resolve_no_redirects
     try:
         adapter_class = _pinned_adapter_class()
     except Exception as exception:
