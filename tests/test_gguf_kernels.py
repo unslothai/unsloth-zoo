@@ -197,19 +197,21 @@ def test_compile_fullgraph_no_breaks():
         y = gguf_linear(x, packed, T.Q5_K, (64, 512)) * 2
         z = gguf_grouped_mm(xs, stack, T.IQ4_XS, (3, 32, 256), counts)
         w = dequantize_gguf(packed, T.Q5_K, (64, 512), x.dtype)
-        return y.float().sum() + z.float().sum() + w.float().mean()
+        return y, z, w
 
     torch._dynamo.reset()
     compiled = torch.compile(fn, fullgraph = True)
     # small inputs: float16 outputs of random K-quant weights (|w| up to ~60) must not overflow
     x = (torch.randn(4, 512, device = "cuda") * 1e-2).to(dtype).requires_grad_()
     xs = (torch.randn(6, 256, device = "cuda") * 1e-2).to(dtype).requires_grad_()
-    out = compiled(x, xs)
-    assert torch.isfinite(out)
-    out.backward()
-    want = fn(x.detach().requires_grad_(), xs.detach().requires_grad_())
-    assert torch.allclose(out, want, rtol = 1e-3, atol = 1e-2)
-    assert x.grad is not None and xs.grad is not None
+    got = compiled(x, xs)
+    want = fn(x, xs)
+    for name, g, w in zip(("linear", "grouped", "dequant"), got, want):
+        assert torch.isfinite(w).all(), f"eager {name} not finite"
+        assert torch.isfinite(g).all(), f"compiled {name} not finite"
+        assert torch.equal(g, w), f"compiled {name} differs from eager"
+    (got[0].float().sum() + got[1].float().sum()).backward()
+    assert x.grad is not None and xs.grad is not None and torch.isfinite(x.grad).all() and torch.isfinite(xs.grad).all()
 
 
 @cuda
@@ -252,7 +254,7 @@ def test_kill_switches(monkeypatch):
 @pytest.mark.skipif(os.environ.get("UNSLOTH_GGUF_BIG_TEST") != "1", reason = "needs ~8 GB; set UNSLOTH_GGUF_BIG_TEST=1")
 def test_int64_offsets():
     # packed bytes past 2^31 and dequantized elements past 2^31
-    rows, K = (1 << 31) // 2176 + 1024, 2048
+    rows, K = (1 << 31) // 2048 + 1024, 2048  # 2.28 GB of Q8_0 blocks, 2^31 + 2M values
     packed = torch.randint(0, 127, (rows, 2176), dtype = torch.uint8, device = "cuda")
     packed.view(-1, 34)[:, 1] = 0x3C  # Q8_0 scales near 1.0
     last = packed[-3:].cpu()
