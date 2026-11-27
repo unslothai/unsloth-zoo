@@ -2612,11 +2612,11 @@ def _host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, sk
 
 
 # Largest 1-D weight the load-time spill keeps in host RAM.
-_SPILL_MIN_1D_BYTES = 1 << 20
+_RAM_1D_MAX_BYTES = 1 << 20
 
 
 def _stays_in_ram(p):
-    return p.dim() <= 1 and p.data.nbytes <= _SPILL_MIN_1D_BYTES
+    return p.dim() <= 1 and p.data.nbytes <= _RAM_1D_MAX_BYTES
 
 
 def _spill_layer_weights(layer, shared_ids, need_bytes):
