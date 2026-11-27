@@ -86,6 +86,7 @@ def spoof(monkeypatch):
         # The view probe builds real tensors on the card, which on a GPU host would run on the real device and log extra
         # _grouped_mm calls; answer from failing instead (view-probe tests override it)
         monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
+        monkeypatch.setattr(moe_utils, "_grouped_mm_trains_on", lambda d: None, raising = False)
         return probed
     return make
 
@@ -682,3 +683,79 @@ def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
     assert kind is not None and moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND.get(kind) is True
     monkeypatch.setattr(torch, "xpu", real_xpu, raising = False)   # Dynamo itself reads the real backend
     assert _fullgraph_gate(monkeypatch, xpu).tolist() == [1.0, 1.0]
+
+
+
+def _oom_on_first_probe(monkeypatch):
+    # The spoofed grouped_mm, but its first call runs out of memory (a nearly full card at the first MoE forward).
+    real, calls = torch._grouped_mm, []
+
+    def grouped_mm(x, w, offs = None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 MiB")
+        return real(x, w, offs = offs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+    return calls
+
+
+def test_out_of_memory_home_probe_records_no_verdict(spoof, monkeypatch):
+    # One out-of-memory probe must not turn grouped_mm off for the process: the next call probes again.
+    seen = spoof(1)
+    calls = _oom_on_first_probe(monkeypatch)
+    assert moe_utils._check_torch_grouped_mm_supported() is False
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is None
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is None
+    assert moe_utils._check_torch_grouped_mm_supported() is True
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is True
+    assert len(calls) == 2 and seen == [0]
+
+
+def test_out_of_memory_foreign_probe_records_no_verdict(spoof, monkeypatch):
+    seen = spoof(2, models = ["H100", "RTX 4090"])
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(0)) is True
+    calls = _oom_on_first_probe(monkeypatch)
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is False
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED_BY_KIND == {}
+    assert moe_utils._check_torch_grouped_mm_supported(cuda(1)) is True
+    assert len(calls) == 2 and seen == [0, 1]
+
+
+def test_out_of_memory_probe_is_not_latched_by_the_modulelist_patch(spoof, monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+    spoof(1)
+    monkeypatch.setattr(ML, "_GROUPED_MM_SUPPORTED", None)
+    _oom_on_first_probe(monkeypatch)
+    assert ML._grouped_mm_supported() is False
+    assert ML._GROUPED_MM_SUPPORTED is None
+    assert ML._grouped_mm_supported() is True
+    assert ML._GROUPED_MM_SUPPORTED is True
+
+
+def test_out_of_memory_local_fallback_probe_is_not_latched(monkeypatch):
+    # moe_utils unavailable: the modulelist patch's own tiny probe must not latch an out-of-memory either.
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+    from unsloth_zoo.temporary_patches import moe_utils as MU
+
+    def broken():
+        raise ImportError("no moe_utils")
+
+    monkeypatch.setattr(MU, "_check_torch_grouped_mm_supported", broken)
+    monkeypatch.setattr(ML, "_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    real_ones, real_tensor = torch.ones, torch.tensor
+    monkeypatch.setattr(torch, "ones", lambda *a, device = None, **k: real_ones(*a, **k))
+    monkeypatch.setattr(torch, "tensor", lambda *a, device = None, **k: real_tensor(*a, **k))
+    calls = []
+
+    def grouped_mm(x, w, offs = None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 MiB")
+
+    monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
+    assert ML._grouped_mm_supported() is False
+    assert ML._GROUPED_MM_SUPPORTED is None
+    assert ML._grouped_mm_supported() is True
+    assert ML._GROUPED_MM_SUPPORTED is True

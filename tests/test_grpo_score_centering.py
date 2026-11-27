@@ -316,6 +316,49 @@ def test_topk_head_logprobs_matches_full_softmax(softcap, mult, div, temp):
     assert (out - torch.log_softmax(lz / temp, -1).gather(-1, ids)).abs().max().item() < 1e-12
 
 
+@pytest.mark.parametrize("chunks", [1, 4, 9])
+def test_topk_head_logprobs_skips_positions_without_a_head(chunks, monkeypatch):
+    gen = torch.Generator().manual_seed(11)
+    R, T, H, V, k = 4, 9, 16, 97, 5
+    h = torch.randn(R, T, H, generator = gen, dtype = D64, requires_grad = True)
+    W = torch.randn(V, H, generator = gen, dtype = D64, requires_grad = True)
+    ids = torch.randint(0, V, (R, T, k), generator = gen)
+    lengths = [9, 3, 0, 6]  # row 2 unmatched
+    for r, n in enumerate(lengths):
+        ids[r, n:] = -1
+    ids[3, 2, 3:] = -1  # a short head keeps its position
+    seen = []
+    real = sc._head_chunk_logps
+
+    def counting(x, *a, **kw):
+        seen.append(x.shape[0])
+        return real(x, *a, **kw)
+
+    monkeypatch.setattr(sc, "_head_chunk_logps", counting)
+    out = sc.grpo_topk_head_logprobs(h, W, ids, chunks, temperature = 0.8)
+    kept = (ids >= 0).any(-1)
+    assert sum(seen) == int(kept.sum()) == sum(lengths)
+    assert max(seen) <= -(-R * T // min(chunks, R * T))  # rows per chunk do not grow
+    ref = torch.log_softmax(torch.nn.functional.linear(h, W) / 0.8, -1).gather(-1, ids.clamp_min(0))
+    assert (out[kept] - ref[kept]).abs().max().item() < 1e-12
+    assert (out[~kept] == 0).all()
+    mask = ids >= 0
+    gw = torch.randn(R, T, k, generator = gen, dtype = D64)
+    g1 = torch.autograd.grad(torch.where(mask, out * gw, 0.0).sum(), [h, W])
+    g2 = torch.autograd.grad(torch.where(mask, ref * gw, 0.0).sum(), [h, W])
+    for a, b in zip(g1, g2):
+        assert (a - b).abs().max().item() < 1e-12
+    none = sc.grpo_topk_head_logprobs(h, W, torch.full_like(ids, -1), chunks)
+    assert none.shape == (R, T, k) and (none == 0).all() and none.requires_grad
+    # Raw logits are not gathered (that would copy the [rows, V] input outside the checkpoints).
+    seen.clear()
+    logits = torch.nn.functional.linear(h, W).detach().requires_grad_()
+    raw = sc.grpo_topk_head_logprobs(logits, W, ids, chunks)
+    assert sum(seen) == R * T
+    ref_raw = torch.log_softmax(logits, -1).gather(-1, ids.clamp_min(0))
+    assert (raw[kept] - ref_raw[kept]).abs().max().item() < 1e-12
+
+
 class _LP:
     def __init__(self, logprob, rank):
         self.logprob, self.rank = logprob, rank
@@ -373,6 +416,54 @@ def test_record_lookup_align_roundtrip():
         assert torch.equal(a[..., slot], align_logprobs_with_mask(logps[..., slot], cmask, float("-inf")))
 
 
+def _trl1_sampled_logprobs(outputs):
+    """Mirrors TRL >= 1.x extract_logprobs: rank-sort, keep entry 0."""
+    rows = []
+    for o in outputs:
+        for c in o.outputs:
+            rows.append([sorted(lp.items(), key = lambda x: x[1].rank)[0][1].logprob for lp in c.logprobs])
+    return rows
+
+
+@pytest.mark.parametrize("asked", [0, None, 2, 8])
+def test_wrapped_generate_returns_the_requested_logprobs(asked):
+    # Centering raises logprobs to k for its head; TRL must still read the sampled token's logprob.
+    sc.reset_score_centering()
+    gen = torch.Generator().manual_seed(3)
+    V, k = 50, 4
+    completion = [7, 21, 33, 2, 40]
+    outs, truth = zip(*[_fake_output([1, 2, 3], completion, V, k, gen), _fake_output([4, 5], completion[:3], V, k, gen)])
+    seen = {}
+
+    class _LLM:
+        def generate(self, prompts, sampling_params = None):
+            seen["logprobs"] = sampling_params.logprobs
+            return list(outs)
+
+    llm = sc.wrap_vllm_generate_topk(_LLM(), k)
+    params = types.SimpleNamespace(logprobs = asked)
+    got = llm.generate(["a", "b"], sampling_params = params)
+    assert seen["logprobs"] == (k if asked is None or asked < k else asked)
+    assert params.logprobs == asked
+    assert sc.score_centering_stats()["recorded"] == 2
+    head_ids, _ = sc._lookup(sc._make_key([1, 2, 3] + completion, None), None)
+    assert head_ids[0].tolist() == truth[0][0][1]
+    if asked is None:
+        assert all(c.logprobs is None for o in got for c in o.outputs)
+        return
+    if asked == 0:
+        sampled = [[float(pos[0][tok].logprob) for pos, tok in zip(t, o.outputs[0].token_ids)]
+                   for t, o in zip(truth, got)]
+        assert _trl1_sampled_logprobs(got) == sampled
+    for o in got:
+        for lp, tok in zip(o.outputs[0].logprobs, o.outputs[0].token_ids):
+            assert tok in lp
+            if asked < k:
+                assert all(t == tok or v.rank <= asked for t, v in lp.items())
+            else:
+                assert len(lp) >= k
+
+
 def test_raise_logprobs_and_env():
     p = types.SimpleNamespace(logprobs = 0)
     sc._raise_logprobs(p, 32)
@@ -409,7 +500,26 @@ def test_existing_loss_types_unchanged_by_reinforce_edit():
 
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA head precision path")
+def _cuda_head_precision_path(torch_mod = torch):
+    """The fp32 head default the next test checks: an NVIDIA CUDA build. ROCm keeps the head in its own dtype
+    (score_centering._head_projection, is_rocm_torch), and torch.cuda.is_available() is True there too."""
+    from unsloth_zoo.rocm_build import is_rocm_torch
+    return torch_mod.cuda.is_available() and not is_rocm_torch(torch_mod)
+
+
+@pytest.mark.parametrize("hip, version, cuda, expected", [
+    (None, "2.11.0+cu130", True, True),
+    ("7.13.99004", "2.11.0+rocm7.13.0", True, False),  # Linux ROCm wheel
+    (None, "2.11.0+rocm7.14.0", True, False),          # AMD SDK wheel: version.hip unset
+    (None, "2.11.0+cpu", False, False),
+])
+def test_cuda_head_precision_skip_excludes_rocm(hip, version, cuda, expected):
+    fake = types.SimpleNamespace(version = types.SimpleNamespace(hip = hip), __version__ = version,
+                                 cuda = types.SimpleNamespace(is_available = lambda: cuda))
+    assert _cuda_head_precision_path(fake) is expected
+
+
+@pytest.mark.skipif(not _cuda_head_precision_path(), reason = "NVIDIA CUDA head precision path (ROCm keeps the head dtype)")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_head_logprobs_match_policy_scorer_cuda(dtype):
     # Same projection precision as the sampled-token scorer, so p and the loss describe one policy.
@@ -441,3 +551,63 @@ def test_score_centering_gate(monkeypatch):
     assert grpo_score_centering_k(types.SimpleNamespace(use_vllm = True), is_on, True, kept_set_scoring = True) == 0
     monkeypatch.setenv(sc.SCORE_CENTERING_ENV, "0")
     assert grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 0
+
+
+def test_score_centering_refuses_untruncated_filtered_logprobs(monkeypatch):
+    # Colocated vLLM with the IS correction returns logprobs from before top_k / top_p / min_p; under a filter
+    # those are not the sampler's q, so score centering is off (as unsloth_distillation_coef refuses it).
+    import unsloth_zoo.rl_replacements as rl
+    vllm_utils = pytest.importorskip("unsloth_zoo.vllm_utils")
+    state = vllm_utils.UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
+    monkeypatch.setitem(state, "on", True)
+    monkeypatch.setitem(state, "installed", True)
+    monkeypatch.setenv(sc.SCORE_CENTERING_ENV, "32")
+    is_on = {"vllm_importance_sampling_correction": True}
+    args = types.SimpleNamespace(top_k = None, top_p = 1.0, min_p = 0.1, temperature = 1.0)
+    trainer = types.SimpleNamespace(use_vllm = True, vllm_importance_sampling_correction = True, args = args,
+                                    _unsloth_vllm_untruncated_logprobs = True)
+    assert rl.grpo_sampling_support(trainer) == (0, 1.0, 0.1)
+    assert rl.grpo_truncated_support_kwargs(trainer) == {}
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 0
+    assert trainer._unsloth_score_centering_off_warned is True
+    # Unfiltered sampling: untruncated logprobs are the sampler's.
+    args.min_p = 0.0
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+    # Processed (kept-set) logprobs from the engine: the sampler's again.
+    args.min_p = 0.1
+    trainer._unsloth_vllm_untruncated_logprobs = False
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+    monkeypatch.setitem(state, "on", False)
+    trainer._unsloth_vllm_untruncated_logprobs = True
+    assert rl.grpo_score_centering_k(trainer, is_on, rollout_logps_as_old = True) == 32
+
+
+@pytest.mark.parametrize("rule", [TIS, ICEPOP])
+def test_centering_needs_the_filtered_sampler_q(rule):
+    # fp64 oracle, on-policy (p = pre-filter q), min_p = 0.1 sampler q'. With constant A the centered estimator's
+    # expected gradient under y ~ q' is zero with q' as the head q, and the full sum_y q'(y) grad log p(y) with the
+    # pre-filter q (whose correction is zero when q = p): untruncated logprobs bias it.
+    gen = torch.Generator().manual_seed(1)
+    V, k = 200, 32
+    logits = torch.randn(16, V, generator = gen, dtype = D64) * 3.0
+    logits.requires_grad_(True)
+    logp = torch.log_softmax(logits, -1)
+    probs = logp.detach().exp()
+    keep = probs >= 0.1 * probs.max(-1, keepdim = True).values
+    assert int(keep.sum(-1).max()) <= k and bool((~keep).any(-1).all())
+    q_filtered = torch.where(keep, probs, 0.0)
+    q_filtered = q_filtered / q_filtered.sum(-1, keepdim = True)
+    wfn = sc.score_centering_weight_fn(*rule)
+
+    def expected_grad(log_q_used):
+        ids = probs.topk(k, dim = -1).indices
+        corr, _, _ = sc.score_centering_correction(logp.gather(-1, ids), log_q_used.gather(-1, ids), wfn)
+        with torch.no_grad():
+            w = wfn(torch.where(q_filtered > 0, (logp - log_q_used).exp(), 0.0))
+        sampled = (q_filtered * w * logp).sum(-1)
+        (g,) = torch.autograd.grad((sampled - corr).sum(), logits, retain_graph = True)
+        return g.abs().max().item()
+
+    # Up to the eps clamp of the tail mass (q'(H) = 1).
+    assert expected_grad(q_filtered.log()) < 1e-5
+    assert expected_grad(logp.detach()) > 1e-2

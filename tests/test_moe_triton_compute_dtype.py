@@ -27,6 +27,8 @@ import torch.nn.functional as F
 from unsloth_zoo.temporary_patches import moe_utils
 from unsloth_zoo.temporary_patches.moe_utils import forward_triton_grouped_gemm
 
+pytestmark = pytest.mark.usefixtures("triton_moe_on_cpu")
+
 CALLS = []
 TUNED = []
 

@@ -70,6 +70,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.granitemoehybrid",
     "unsloth_zoo.temporary_patches.hub_kernel_export_check",
     "unsloth_zoo.temporary_patches.inductor_stride_guard",
+    "unsloth_zoo.temporary_patches.inductor_nonowning_inplace",
     "unsloth_zoo.temporary_patches.inkling",
     "unsloth_zoo.temporary_patches.inkling2",
     "unsloth_zoo.temporary_patches.hybrid_sliding_masks",

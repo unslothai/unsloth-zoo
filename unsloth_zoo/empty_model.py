@@ -46,12 +46,15 @@ from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
+from .vllm_qwen4_exp import is_qwen4_exp_config, qwen4_exp_empty_config_attrs
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
 _CLAMP_BOUND_SUFFIXES = (".input_min", ".input_max", ".output_min", ".output_max")
 QWEN_VL_MERGED_QKV_TYPES = (
     "qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision",
     "qwen3_5", "qwen3_5_vision", "qwen3_5_moe", "qwen3_5_moe_vision",
+    # Qwen3.8-Flash-Next: the checkpoint's vision_config says qwen4_exp, transformers' default qwen4_exp_vision
+    "qwen4_exp", "qwen4_exp_vision",
 )
 
 
@@ -327,6 +330,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         "linear_value_head_dim": 1,
         "linear_conv_kernel_dim": 1,
     })
+    if is_qwen4_exp_config(causal_config):
+        _set_config_attrs(new_config, qwen4_exp_empty_config_attrs(new_config))
 
     # Set attention module head_dim
     head_dim = _global_config_value(
@@ -705,6 +710,9 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "num_attention_heads": 1,
     })
 
+    if is_qwen4_exp_config(config):
+        _set_config_attrs(new_config.text_config, qwen4_exp_empty_config_attrs(new_config.text_config))
+
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
@@ -884,12 +892,14 @@ def set_additional_modules(new_model, quant_state_dict, config):
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     # LFM2 calls its final norm embedding_norm, Nemotron-H norm_f
-    norm_name = next(x for x in ("norm", "embedding_norm", "norm_f") if hasattr(language_model, x))
+    # Qwen4Exp has no final norm (its hyper_connection_mixer is set below with the other non-layered keys)
+    norm_name = next((x for x in ("norm", "embedding_norm", "norm_f") if hasattr(language_model, x)), None)
     norm_key = f"{language_model_prefix}.{norm_name}.weight"
-    norm = quant_state_dict[norm_key]
-    norm = _unwrap_tensor(norm)
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    getattr(language_model, norm_name).weight = norm
+    if norm_name is not None or not is_qwen4_exp_config(config):
+        norm = quant_state_dict[norm_key]
+        norm = _unwrap_tensor(norm)
+        norm = torch.nn.Parameter(norm, requires_grad = False)
+        getattr(language_model, norm_name).weight = norm
 
     # LM Head. For some models (e.g. Mistral3ForConditionalGeneration)
     # tie_word_embeddings can differ between config and text_config; prefer
@@ -1295,6 +1305,24 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.router.scale",
             "model.layers.{kk}.router.per_expert_scale",
 
+            # DeepSeek-V2 / V3 multi-head latent attention and MoE (vLLM fused_qkv_a_proj / gate_up_proj split back)
+            "model.layers.{kk}.self_attn.q_a_proj",
+            "model.layers.{kk}.self_attn.q_b_proj",
+            "model.layers.{kk}.self_attn.kv_a_proj_with_mqa",
+            "model.layers.{kk}.self_attn.kv_b_proj",
+            "model.layers.{kk}.mlp.gate.e_score_correction_bias",
+            "model.layers.{kk}.mlp.shared_experts.gate_proj",
+            "model.layers.{kk}.mlp.shared_experts.up_proj",
+            "model.layers.{kk}.mlp.shared_experts.down_proj",
+            "model.language_model.layers.{kk}.self_attn.q_a_proj",
+            "model.language_model.layers.{kk}.self_attn.q_b_proj",
+            "model.language_model.layers.{kk}.self_attn.kv_a_proj_with_mqa",
+            "model.language_model.layers.{kk}.self_attn.kv_b_proj",
+            "model.language_model.layers.{kk}.mlp.gate.e_score_correction_bias",
+            "model.language_model.layers.{kk}.mlp.shared_experts.gate_proj",
+            "model.language_model.layers.{kk}.mlp.shared_experts.up_proj",
+            "model.language_model.layers.{kk}.mlp.shared_experts.down_proj",
+
             # MuseGlimmer attention output gate (vLLM self_attn.output_gate_proj)
             "model.language_model.layers.{kk}.self_attn.gate_proj",
 
@@ -1366,6 +1394,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.ffn_norm",
             "model.layers.{kk}.self_attn.q_layernorm",
             "model.layers.{kk}.self_attn.k_layernorm",
+
+            # DeepSeek-V2 / V3 MLA
+            "model.layers.{kk}.self_attn.q_a_layernorm",
+            "model.layers.{kk}.self_attn.kv_a_layernorm",
+            "model.language_model.layers.{kk}.self_attn.q_a_layernorm",
+            "model.language_model.layers.{kk}.self_attn.kv_a_layernorm",
 
             # Gemma4 per-layer input norm
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
@@ -1553,6 +1587,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.vision_model.post_layernorm",
         }
     }
+
+    # Qwen3.8-Flash-Next (qwen4_exp): hyper-connections, PLE, QSA indexer
+    from .vllm_qwen4_exp import qwen4_exp_layer_templates
+    for key, value in qwen4_exp_layer_templates().items():
+        layer_templates[key] |= value
 
     # Convert sets to sorted lists for deterministic order
     return {key: sorted(list(value)) for key, value in layer_templates.items() if key!='non_layered_components' or return_non_layered}
@@ -2075,6 +2114,10 @@ def extract_moe_layers(
         gate_weight = getattr(getattr(gate, "base_layer", gate), "weight", None)
         if gate_weight is not None:
             store(f"{prefix}.gate.weight", gate_weight.data)
+        # DeepSeek-V3 noaux_tc router bias (an HF buffer, a float32 vLLM parameter)
+        bias = getattr(gate, "e_score_correction_bias", None)
+        if bias is not None:
+            store(f"{prefix}.gate.e_score_correction_bias", bias.data)
 
     shared_expert_gate = getattr(moe_block, "shared_expert_gate", None)
     if shared_expert_gate is not None:
@@ -2098,6 +2141,19 @@ def extract_moe_layers(
         get_state_dict(f"{prefix}.shared_expert.gate_proj", 0, state_dict, shared_expert.gate_up_proj)
         get_state_dict(f"{prefix}.shared_expert.up_proj",   1, state_dict, shared_expert.gate_up_proj)
         get_state_dict(f"{prefix}.shared_expert.down_proj", 0, state_dict, shared_expert.down_proj, slice_weights = False)
+
+    # DeepSeek-V2 / V3: shared_experts (plural) is a gated MLP with a fused gate_up_proj
+    shared_experts = getattr(moe_block, "shared_experts", None)
+    if shared_experts is not None and hasattr(shared_experts, "gate_up_proj"):
+        get_state_dict(f"{prefix}.shared_experts.gate_proj", 0, state_dict, shared_experts.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_experts.up_proj",   1, state_dict, shared_experts.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_experts.down_proj", 0, state_dict, shared_experts.down_proj, slice_weights = False)
+    elif getattr(moe_block, "is_fused_shared_expert_enabled", False):
+        raise NotImplementedError(
+            f"Unsloth: vLLM fused {prefix}'s shared experts into the routed experts (ROCm AITER), so "
+            "fast_inference cannot share them with training; "
+            "set fast_inference = False."
+        )
 
     experts = getattr(moe_block, "experts", None)
     if experts is None: return

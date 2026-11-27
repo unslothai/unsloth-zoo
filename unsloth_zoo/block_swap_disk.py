@@ -27,6 +27,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -40,9 +41,11 @@ __all__ = [
     "DiskTier",
     "DiskRef",
     "spill_params",
+    "live_spill",
     "placeholder_like",
     "disk_ref",
     "read_bytes",
+    "consume_cuda_error",
 ]
 
 ALIGN = 4096
@@ -59,6 +62,65 @@ _RAM_FS = {"tmpfs", "ramfs", "devtmpfs", "hugetlbfs", "squashfs", "proc", "sysfs
 
 def _round_up(n, a = ALIGN):
     return -(-int(n) // a) * a
+
+
+_GET_LAST_ERROR = []
+
+
+def _resolve_get_last_error():
+    """cudaGetLastError (hipGetLastError on ROCm) of the runtime torch already loaded; torch does not expose it."""
+    import ctypes
+    hip = bool(getattr(torch.version, "hip", None))
+    sym = "hipGetLastError" if hip else "cudaGetLastError"
+    if sys.platform == "win32":
+        import glob
+        # torch's wheels ship the runtime DLL next to torch's own; loading it again returns the mapped module.
+        pattern = "amdhip64*.dll" if hip else "cudart64_*.dll"
+        for path in sorted(glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", pattern))):
+            fn = getattr(ctypes.CDLL(path), sym, None)
+            if fn is not None:
+                return fn
+        return None
+    # Through torch's own extension first (its dependency tree only): a global lookup could reach a second
+    # libcudart that another package or LD_PRELOAD mapped.
+    fn = getattr(ctypes.CDLL(torch._C.__file__), sym, None)
+    if fn is not None:
+        return fn
+    lib = "libamdhip64.so" if hip else "libcudart.so"
+    major = ((torch.version.hip if hip else torch.version.cuda) or "").split(".")[0]
+    mapped = []
+    try:
+        with open("/proc/self/maps", encoding = "utf-8") as maps:
+            for ln in maps:
+                path = ln.split()[-1]
+                if lib in os.path.basename(path) and path not in mapped:
+                    mapped.append(path)
+    except OSError:
+        pass
+    own = [p for p in mapped if os.path.basename(p).startswith(f"{lib}.{major}")] if major else []
+    for path in own or mapped:
+        fn = getattr(ctypes.CDLL(path), sym, None)
+        if fn is not None:
+            return fn
+    # No /proc (or a static runtime): torch usually loads the runtime globally.
+    return getattr(ctypes.CDLL(None), sym, None)
+
+
+def consume_cuda_error():
+    """Clear this thread's pending CUDA / HIP error after a handled failure (a refused cudaHostRegister or
+    cudaHostUnregister): left pending, the thread's next kernel launch raises it. Never raises."""
+    try:
+        if not _GET_LAST_ERROR:
+            import ctypes
+            fn = _resolve_get_last_error()
+            if fn is None:
+                return
+            fn.argtypes = []
+            fn.restype = ctypes.c_int
+            _GET_LAST_ERROR.append(fn)
+        _GET_LAST_ERROR[0]()
+    except Exception:  # no runtime symbol (CPU build): nothing is pending
+        pass
 
 
 def disk_tier_reason():
@@ -190,8 +252,12 @@ class _HostBuf:
         if pin and nbytes and torch.cuda.is_available() and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1":
             try:
                 cudart = torch.cuda.cudart()
-                if hasattr(cudart, "cudaHostRegister") and int(cudart.cudaHostRegister(self.view.data_ptr(), nbytes, 1)) == 0:
-                    self.ptr = self.view.data_ptr()
+                if hasattr(cudart, "cudaHostRegister"):
+                    if int(cudart.cudaHostRegister(self.view.data_ptr(), nbytes, 1)) == 0:
+                        self.ptr = self.view.data_ptr()
+                    else:
+                        # The refusal stays this thread's pending error; the next kernel launch would raise it.
+                        consume_cuda_error()
             except Exception:
                 self.ptr = None
 
@@ -202,7 +268,9 @@ class _HostBuf:
     def __del__(self):
         if self.ptr is not None:
             try:
-                torch.cuda.cudart().cudaHostUnregister(self.ptr)
+                if int(torch.cuda.cudart().cudaHostUnregister(self.ptr)) != 0:
+                    # As a refused register: pending on whichever thread dropped the last reference.
+                    consume_cuda_error()
             except Exception:
                 pass
             self.ptr = None
@@ -277,13 +345,19 @@ class SpillFile:
             self._bounce = _aligned_empty(_WRITE_CHUNK, pin = torch.cuda.is_available())
         return self._bounce[1]
 
-    def write_region(self, pieces, region_bytes):
+    def write_region(self, pieces, region_bytes, at = None):
         """Append one region of `region_bytes`: `pieces` [(tensor, offset in region)] laid back to back, the gaps
-        zeroed. Returns the region's file offset (ALIGN aligned)."""
+        zeroed. Returns the region's file offset (ALIGN aligned). `at` rewrites a region already in the file
+        there instead (the caller keeps it no longer than the region it replaces)."""
+        total = _round_up(region_bytes)
         with self.lock:
-            base = self.size
-            total = _round_up(region_bytes)
-            self.size = base + total
+            if at is None:
+                base = self.size
+                self.size = base + total
+            else:
+                base = int(at)
+                if base % ALIGN or base + total > self.size:
+                    raise ValueError("Unsloth: a spill file rewrite must stay inside an aligned region already written.")
         flat = []
         for t, off in pieces:
             src = t.detach()
@@ -307,7 +381,8 @@ class SpillFile:
             while done < n:
                 done += os.pwrite(self.fd, mv[done:], base + pos + done)
             pos += n
-        self.written += total
+        if at is None:
+            self.written += total
         return base
 
     def read(self, offset, dst):
@@ -325,26 +400,53 @@ class SpillFile:
             except (AttributeError, OSError):
                 pass
 
-    def close(self):
+    def close(self, _close = os.close):
+        # `_close` is bound at definition: __del__ can run at interpreter exit, after `os` is torn down.
         fd, self.fd = getattr(self, "fd", None), None
+        self._bounce = None
         if fd is not None:
             try:
-                os.close(fd)
+                _close(fd)
             except OSError:
                 pass
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
+# [weakref to the shared SpillFile]. Weak: the file (unlinked, so its blocks) and its bounce buffer go with the last
+# DiskRef / block / BlockSwap that uses it, not at process exit.
 _SPILL = []
 
 
+def live_spill():
+    """The process's shared spill file while some model still uses it, else None."""
+    store = _SPILL[0]() if _SPILL else None
+    if store is None or store.fd is None:
+        _SPILL[:] = []
+        return None
+    return store
+
+
+def _has_room(directory, need_bytes):
+    try:
+        st = os.statvfs(directory)
+    except (OSError, AttributeError):  # no statvfs off POSIX: as before, trust the first check
+        return True
+    return st.f_bavail * st.f_frsize >= need_bytes + _MARGIN_BYTES
+
+
 def _shared_spill(need_bytes):
-    """One spill file per process: layers spilled at load and at install share it."""
-    if not _SPILL or _SPILL[0].fd is None:
-        _SPILL[:] = [SpillFile(need_bytes)]
-    return _SPILL[0]
+    """One spill file per process: layers spilled at load and at install share it. Reused only while its directory
+    still holds `need_bytes` plus the margin; else a fresh pick (another directory, or the refusal)."""
+    store = live_spill()
+    if store is None or not _has_room(store.directory, need_bytes):
+        store = SpillFile(need_bytes)
+        _SPILL[:] = [weakref.ref(store)]
+    return store
 
 
 def spill_params(params, layout, region_bytes, need_bytes = None, store = None):
@@ -459,15 +561,29 @@ class DiskTier:
         """Enqueue the staging -> slot copy of a block whose read finished; frees its staging slot after it."""
         stage = self.ring[block.stage][1]
         bufs, _ = block.slot
+        codecs = getattr(block, "codec", None) or {}
         for d, event in block.events.items():
             stream = block.streams[d]
             stream.wait_event(block.disk_ready[d])
+            # The slot may still be written by a decode into it from a block stolen or reset mid-step.
+            fences = getattr(block, "fences", None)
+            ev = fences.pop(bufs[d].data_ptr(), None) if fences else None
+            if ev is not None:
+                stream.wait_event(ev)
+            c = codecs.get(d)
             with torch.cuda.stream(stream):
                 if block.t_copy is not None:
                     block.t_copy[d].record(stream)
-                n = block.sizes[d]
-                bufs[d][:n].copy_(stage[:n], non_blocking = True)
-                event.record(stream)
+                if c is None:
+                    n = block.sizes[d]
+                    bufs[d][:n].copy_(stage[:n], non_blocking = True)
+                    event.record(stream)
+            if c is not None:
+                # Stored encoded (lossless): the encoded bytes go over the bus and decode into the slot on the card.
+                block.decoders[d].fetch(c, stage[:c.nbytes], bufs[d], stream, event)
+                fences = getattr(block, "fences", None)
+                if fences is not None:
+                    fences[bufs[d].data_ptr()] = event
         done = torch.cuda.Event()
         done.record(block.streams[next(iter(block.events))])
         self.slot_done[block.stage] = done

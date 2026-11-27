@@ -243,3 +243,151 @@ def test_trainer_scores_the_full_vocabulary_when_untruncated(monkeypatch):
     assert kwargs["support_excluded_ids"] is excluded
     trainer._unsloth_vllm_untruncated_logprobs = False
     assert rl.grpo_rollout_logprobs_untruncated(trainer) is False
+
+
+class MinPLogitsProcessor:
+    # Name-matched stand-in for vLLM's built-in (vllm/v1/sample/logits_processor/builtin.py).
+    def __init__(self, count):
+        self.min_p_count = count
+
+    def apply(self, logits):
+        return _min_p_mask(logits, 0.1) if self.min_p_count else logits
+
+
+def _fake_v1_metadata_driven(monkeypatch):
+    # V1 Sampler.sample: temperature, argmax-invariant processors, then top_k (the stand-in's only filter).
+    class Sampler:
+        def __init__(self, mode):
+            self.logprobs_mode = mode
+
+        @staticmethod
+        def apply_temperature(logits, temp, all_random):
+            return logits.div_(temp.unsqueeze(1))
+
+        def sample(self, logits, md, logprobs_mode_override = None):
+            logits = self.apply_temperature(logits, md.temperature, True)
+            for processor in md.logitsprocs.argmax_invariant:
+                logits = processor.apply(logits)
+            if md.top_k is not None:
+                kth = logits.topk(int(md.top_k[0]), -1).values[:, -1:]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            mode = logprobs_mode_override or self.logprobs_mode
+            processed = logits if mode == "processed_logits" else logits.log_softmax(dim = -1, dtype = torch.float32)
+            return logits.argmax(-1), processed
+
+    module = types.ModuleType("vllm.v1.sample.sampler")
+    module.Sampler = Sampler
+    for name in ("vllm", "vllm.v1", "vllm.v1.sample"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.sample.sampler", module)
+    return Sampler
+
+
+def _v1_md(min_p_count = 0, top_k = None, processors = None):
+    if processors is None:
+        processors = [MinPLogitsProcessor(min_p_count)]
+    return SimpleNamespace(
+        temperature = torch.full((4,), 0.7), max_num_logprobs = 0, logprob_token_ids = None,
+        top_k = top_k, top_p = None, logitsprocs = SimpleNamespace(argmax_invariant = processors),
+    )
+
+
+def _count_clones(monkeypatch):
+    copies = []
+    original = torch.Tensor.clone
+    monkeypatch.setattr(torch.Tensor, "clone", lambda self, *a, **k: copies.append(1) or original(self, *a, **k))
+    return copies
+
+
+@pytest.mark.parametrize("mode", ["processed_logprobs", "processed_logits"])
+def test_v1_unfiltered_steps_skip_the_capture_with_identical_logprobs(monkeypatch, mode):
+    Sampler = _fake_v1_metadata_driven(monkeypatch)
+    ns = _load()
+    state = ns["UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS"]
+    logits = _logits()
+    # The capture path's answer for the same unfiltered step (an unrecognised metadata layout forces it).
+    forced = _v1_md()
+    forced.logitsprocs = SimpleNamespace(argmax_invariant = [SimpleNamespace(apply = lambda x: x)])
+    ns["set_vllm_untruncated_logprobs"](True)
+    _, captured = Sampler(mode).sample(logits.clone(), forced)
+    assert state["calls"] == 1 and state.get("unfiltered", 0) == 0
+    inputs = logits.clone()
+    copies = _count_clones(monkeypatch)
+    sampled, fast = Sampler(mode).sample(inputs, _v1_md())
+    assert copies == [] and state["calls"] == 1 and state.get("unfiltered", 0) == 1
+    assert torch.equal(fast, captured)
+    ns["set_vllm_untruncated_logprobs"](False)
+    _, off = Sampler(mode).sample(logits.clone(), _v1_md())
+    assert torch.equal(fast, off)
+
+
+@pytest.mark.parametrize("case", ["min_p", "top_k", "unknown_processor"])
+def test_v1_filtered_steps_keep_the_capture(monkeypatch, case):
+    Sampler = _fake_v1_metadata_driven(monkeypatch)
+    ns = _load()
+    ns["set_vllm_untruncated_logprobs"](True)
+    md = {
+        "min_p": _v1_md(min_p_count = 1),
+        "top_k": _v1_md(top_k = torch.full((4,), 5)),
+        "unknown_processor": _v1_md(processors = [MinPLogitsProcessor(0), SimpleNamespace(apply = lambda x: x)]),
+    }[case]
+    logits = _logits()
+    _, logprobs = Sampler("processed_logprobs").sample(logits.clone(), md)
+    torch.testing.assert_close(logprobs, torch.log_softmax(logits / 0.7, -1))
+    state = ns["UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS"]
+    assert state["calls"] == 1 and state.get("unfiltered", 0) == 0
+
+
+def _fake_v2_states(monkeypatch, vocab):
+    Sampler = _fake_v2(monkeypatch)
+    import numpy as np
+
+    def states(sampler, min_p = 0.0, top_p = 1.0, top_k = None):
+        st = sampler.sampling_states
+        st.vocab_size = vocab
+        st.min_p = SimpleNamespace(np = np.full(8, min_p, dtype = np.float32))
+        st.top_p = SimpleNamespace(np = np.full(8, top_p, dtype = np.float32))
+        st.top_k = SimpleNamespace(np = np.full(8, vocab if top_k is None else top_k, dtype = np.int32))
+        return sampler
+
+    def apply_min_p(self, logits):
+        # vLLM skips the min_p kernel when no request uses it.
+        if (self.min_p.np != 0.0).any():
+            logits.copy_(_min_p_mask(logits, 0.1))
+
+    monkeypatch.setattr(sys.modules["vllm.v1.worker.gpu.sample.states"].SamplingStates, "apply_min_p", apply_min_p)
+    return Sampler, states
+
+
+def test_v2_unfiltered_batches_skip_the_capture_with_identical_logprobs(monkeypatch):
+    import numpy as np
+    Sampler, states = _fake_v2_states(monkeypatch, 50)
+    ns = _load()
+    state = ns["UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS"]
+    ns["set_vllm_untruncated_logprobs"](True)
+    logits = _logits()
+    batch = SimpleNamespace(idx_mapping_np = np.arange(4))
+    # Capture path for the same batch (no idx_mapping_np: the layout is not recognised).
+    captured = states(Sampler("processed_logprobs", torch.full((4,), 1.3)))(logits.clone(), SimpleNamespace())
+    assert state["calls"] == 1 and state.get("unfiltered", 0) == 0
+    inputs = logits.clone()
+    copies = _count_clones(monkeypatch)
+    fast = states(Sampler("processed_logprobs", torch.full((4,), 1.3)))(inputs, batch)
+    assert len(copies) == 1  # the stand-in's own copy only
+    assert state["calls"] == 1 and state.get("unfiltered", 0) == 1
+    assert torch.equal(fast, captured)
+
+
+@pytest.mark.parametrize("case", ["min_p", "top_p", "top_k"])
+def test_v2_filtered_batches_keep_the_capture(monkeypatch, case):
+    import numpy as np
+    Sampler, states = _fake_v2_states(monkeypatch, 50)
+    ns = _load()
+    ns["set_vllm_untruncated_logprobs"](True)
+    kwargs = {"min_p": {"min_p": 0.1}, "top_p": {"top_p": 0.9}, "top_k": {"top_k": 5}}[case]
+    sampler = states(Sampler("processed_logprobs", torch.full((4,), 1.3)), **kwargs)
+    sampler(_logits(), SimpleNamespace(idx_mapping_np = np.arange(4)))
+    state = ns["UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS"]
+    assert state.get("unfiltered", 0) == 0
+    # The stand-in's min_p only runs for min_p (top_k / top_p are not modelled): the capture still swapped in.
+    assert state["calls"] == 1

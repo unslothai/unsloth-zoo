@@ -129,9 +129,12 @@ def _head_projection(lm_head, lm_head_bias):
     logits under UNSLOTH_VLLM_FP32_LM_HEAD=1, or by default for a 16-bit CUDA head; otherwise the head's own
     dtype under the caller's autocast. Returns (mode, lm_head, lm_head_bias)."""
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    from unsloth_zoo.rocm_build import is_rocm_torch
     flag = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower()
+    # is_rocm_torch, not torch.version.hip: ROCm SDK wheels leave hip unset, and the fp32 default would then copy
+    # the whole head to float32 on every call (fp32_out_linear_ok is off on ROCm).
     fp32_cuda_default = (
-        flag == "" and torch.version.hip is None and torch.cuda.is_available()
+        flag == "" and not is_rocm_torch(torch) and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
     )
@@ -192,8 +195,20 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
     n_rows = flat_x.shape[0]
     if n_rows == 0:
         return hidden_states.new_zeros((R, T, k), dtype = torch.float32)
-    chunks = max(1, min(int(chunks), n_rows))
-    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    # Skip headless positions (all slots < 0, masked by the caller); keep rows per chunk so the peak does not grow.
+    # Hidden states only: gathering [rows, V] raw logits would copy the whole input outside the checkpoints.
+    rows = None
+    keep = (flat_ids >= 0).any(dim = -1) if from_hidden else None
+    n_keep = int(keep.sum()) if from_hidden else n_rows
+    if n_keep < n_rows:
+        rows = keep.nonzero().squeeze(1)
+        chunks = -(-int(chunks) * n_keep // n_rows)
+        flat_x, flat_ids = flat_x.index_select(0, rows), flat_ids.index_select(0, rows)
+        if n_keep == 0:
+            return hidden_states.new_zeros((R, T, k), dtype = torch.float32) + 0 * flat_x.sum()
+    n = flat_x.shape[0]
+    chunks = max(1, min(int(chunks), n))
+    bounds = [(i * n) // chunks for i in range(chunks + 1)]
     needs_grad = torch.is_grad_enabled() and (
         flat_x.requires_grad or (from_hidden and lm_head.requires_grad)
         or (lm_head_bias is not None and lm_head_bias.requires_grad)
@@ -206,11 +221,14 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
         args = (flat_x[a:b], lm_head, lm_head_bias, flat_ids[a:b], logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature, from_hidden, mode)
         if needs_grad:
-            from torch.utils.checkpoint import checkpoint
-            outs.append(checkpoint(_head_chunk_logps, *args, use_reentrant = False))
+            from .gradient_checkpointing import _torch_checkpoint
+            outs.append(_torch_checkpoint()(_head_chunk_logps, *args, use_reentrant = False))
         else:
             outs.append(_head_chunk_logps(*args))
-    return torch.cat(outs, dim = 0).reshape(R, T, k)
+    out = torch.cat(outs, dim = 0)
+    if rows is not None:
+        out = out.new_zeros((n_rows, k)).index_copy(0, rows, out)
+    return out.reshape(R, T, k)
 
 
 class _TopKState:
@@ -297,14 +315,66 @@ def record_rollout_topk(request_outputs, k):
 
 
 def _raise_logprobs(params, k):
-    # TRL asks for logprobs=0 (the sampled token); a larger request is left alone.
+    """Raise logprobs to k; returns each params' prior value (False = no logprobs field)."""
     items = params if isinstance(params, (list, tuple)) else [params]
+    asked = []
     for p in items:
         if p is None or not hasattr(p, "logprobs"):
+            asked.append(False)
             continue
         current = getattr(p, "logprobs", None)
+        asked.append(current)
         if current is None or current < k:
             p.logprobs = k
+    return asked
+
+
+def _lower_logprobs(params, asked, k):
+    items = params if isinstance(params, (list, tuple)) else [params]
+    for p, before in zip(items, asked):
+        if before is not False and (before is None or before < k) and getattr(p, "logprobs", None) == k:
+            p.logprobs = before
+
+
+def _as_requested(completion, asked):
+    """Keep only the sampled token plus ranks <= asked: TRL >= 1.x reads rank-sorted entry 0 as the sampled logprob."""
+    positions = getattr(completion, "logprobs", None)
+    if positions is None:
+        return
+    if asked is None:
+        completion.logprobs = None
+        return
+    token_ids = list(getattr(completion, "token_ids", None) or [])
+    cut = []
+    for j, position in enumerate(positions):
+        if position is None or j >= len(token_ids):
+            cut.append(position)
+            continue
+        sampled = int(token_ids[j])
+        kept = {}
+        for token_id, logprob in position.items():
+            rank = getattr(logprob, "rank", None)
+            if int(token_id) == sampled or (rank is not None and rank <= asked):
+                kept[token_id] = logprob
+        cut.append(kept)
+    completion.logprobs = cut
+
+
+def _restore_requested(outputs_list, asked, k):
+    asked = [a for a in asked if a is not False]
+    if not asked:
+        return 0
+    if len(asked) != 1 and len(asked) != len(outputs_list):
+        return 0
+    done = 0
+    for i, request_output in enumerate(outputs_list):
+        want = asked[0] if len(asked) == 1 else asked[i]
+        if want is not None and want >= k:
+            continue
+        for completion in getattr(request_output, "outputs", None) or []:
+            _as_requested(completion, want)
+            done += 1
+    return done
 
 
 def _lift_engine_max_logprobs(llm, k):
@@ -330,16 +400,30 @@ def wrap_vllm_generate_topk(llm, k):
 
     @functools.wraps(generate)
     def generate_with_topk_record(*args, **kwargs):
+        asked, params = [], None
         if "sampling_params" in kwargs:
-            _raise_logprobs(kwargs["sampling_params"], k)
+            params = kwargs["sampling_params"]
         elif len(args) > 1:
-            _raise_logprobs(args[1], k)
-        outputs = generate(*args, **kwargs)
+            params = args[1]
+        if params is not None:
+            asked = _raise_logprobs(params, k)
         try:
-            outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+            outputs = generate(*args, **kwargs)
+        finally:
+            if params is not None:
+                _lower_logprobs(params, asked, k)
+        outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+        try:
             record_rollout_topk(outputs_list, k)
         except Exception as error:
             warnings.warn(f"Unsloth: score centering could not record the sampler top-k head: {error}")
+        try:
+            _restore_requested(outputs_list, asked, k)
+        except Exception as error:
+            warnings.warn(
+                "Unsloth: score centering could not cut vLLM's logprobs back to the sampled token, so TRL may "
+                f"read the top-1 token's logprob as the sampled one: {error}"
+            )
         return outputs
 
     generate_with_topk_record._unsloth_score_centering = True
