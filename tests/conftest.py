@@ -314,6 +314,36 @@ def _restore_selected_moe_backend():
         module._SELECTED_MOE_BACKEND = before
 
 
+_PATCH_UTILS = "unsloth_zoo.temporary_patches.utils"
+# Per-step state: a checkpointed compiled forward + backward with no optimizer step after it (most model tests) leaves
+# the packed marker set and its labels compiled-ok / pending eager, as it should mid-step. Nothing ends that step in a
+# test, so on the same xdist worker a later eager-fallback test saw a live compiled pack (_give_up re-raised instead of
+# falling back) or applied the previous test's pending latches.
+_STEP_MARKERS = ("_PACKED_COMPILED_IN_CHECKPOINT", "_RAISED_INSIDE_CHECKPOINT")
+_STEP_LABEL_SETS = ("_COMPILED_OK_LABELS", "_PENDING_EAGER_LABELS")
+
+
+def _end_the_step():
+    module = sys.modules.get(_PATCH_UTILS)
+    if module is None:
+        return
+    for name in _STEP_MARKERS:
+        if hasattr(module, name):
+            setattr(module, name, False)
+    for name in _STEP_LABEL_SETS:
+        labels = getattr(module, name, None)
+        if isinstance(labels, set):
+            labels.clear()
+
+
+@_pytest.fixture(autouse = True)
+def _each_test_starts_a_new_step():
+    """Each test starts at a step boundary, as apply_pending_eager_fallbacks() leaves it, and ends its own step."""
+    _end_the_step()
+    yield
+    _end_the_step()
+
+
 # UNSLOTH_COMPILE_DISABLE only stops torch.compile, but since PR/issue 1866 fused losses and maybe_compile honour it
 # too; compile-path tests opt in via pytest.mark.usefixtures('compile_enabled'), which clears it and re-enables frozen
 # flags in every loaded module for the test.
