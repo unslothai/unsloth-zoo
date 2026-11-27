@@ -44,6 +44,10 @@ mode (no reentrant checkpoint), a recompute whose hidden states differ in any bi
 window back too. Every abort, and every error a window raises, puts back the gradients and RNG state it found and
 releases the block swap's held blocks; after an abort the caller runs the step the standard way.
 UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
+
+Data parallel: the caller passes `agree` (a MIN all-reduce over the ranks), runs the micro-batches on the module
+inside DDP (no reduction in their backwards) and reduces the gradients once after a window. The ranks vote before the
+first loss part and after the decoder backward, so they all keep their windows or all roll back.
 """
 
 import functools
@@ -130,6 +134,33 @@ def boundary_bytes(num_tokens, hidden_size, num_layers, element_size = 2):
 
 class _ReplayAbort(Exception):
     """A decoder recompute that does not match its forward: the window rolls back."""
+
+
+_DISAGREE = "another rank stopped its layer-major window"
+
+
+class _Agreement:
+    """The ranks' votes on one window (data parallel): `agree(ok, stage)` must be a collective that returns True
+    only if every rank passed True. Each rank votes exactly twice, in the same order: "forward" once every
+    micro-batch has run the decoder layers (before any loss part, so before the loss parts' own collectives), and
+    "commit" after the decoder backward. A False "forward" result ends the voting; any rank that stops before a vote
+    casts False for it, so every rank rolls back together and runs the step the standard way."""
+    def __init__(self, agree):
+        self.agree = agree
+        self.stage = 0 if agree is not None else 2   # 0: forward vote due, 1: commit vote due, 2: done
+
+    def vote(self, ok):
+        if self.stage == 2:
+            return ok and self.agree is None
+        stage = "forward" if self.stage == 0 else "commit"
+        result = bool(self.agree(bool(ok), stage))
+        self.stage = 2 if (stage == "commit" or not result) else 1
+        return result
+
+    def close(self):
+        """A window that stops early: False for every vote still due."""
+        while self.stage != 2:
+            self.vote(False)
 
 
 def _saved_tensor_hooks_active():
@@ -562,6 +593,11 @@ class _Window:
         if l in self.held and m == self.n - 1:
             self.held.discard(l)
             self.swapper.unhold(l)
+        if l == self.L - 1 and m == self.n - 1 and self.agreement.stage == 0:
+            # Every micro-batch is through the decoder and no loss part has run: the ranks vote before any of
+            # them issues a loss part's collectives.
+            if not self.agreement.vote(self.abort_reason is None):
+                self._abort(_DISAGREE)
         _STATS["layer_calls"] += 1
         self.next_layer[m] = l + 1
         # The output tensor itself becomes the leaf (it has no graph): anything that kept a reference to it inside
@@ -764,30 +800,41 @@ _WINDOW_LOCK = threading.Lock()
 _WINDOW_PID = os.getpid()
 
 
-def run_layer_major(layers, micro_fns, swapper = None, model = None):
+def run_layer_major(layers, micro_fns, swapper = None, model = None, agree = None):
     """Run `micro_fns` (one full training step per micro-batch: forward, loss, its scaling and backward) layer-major
     over `layers`. Returns (results, None) with every gradient accumulated, or (None, reason) after a safe abort or
     refusal: every trainable gradient of `model` (and of `layers`) and the RNG state are as they were, so the caller
     can run the same micro-batches the standard way. A real error in a micro-batch is raised. One window per process
-    at a time: a concurrent caller is refused (the decoder classes and the worker pool are shared)."""
+    at a time: a concurrent caller is refused (the decoder classes and the worker pool are shared).
+
+    Data parallel (world size > 1) needs `agree(ok, stage) -> bool`, a MIN all-reduce over the ranks (see
+    _Agreement): every rank then returns results, or every rank rolls back. The micro-batches must not reduce
+    gradients themselves (run them on the module inside DDP); the caller reduces once after a window. An error the
+    loss parts raise after the forward vote propagates, as it would from a standard data-parallel step."""
+    agreement = _Agreement(agree)
     if os.getpid() != _WINDOW_PID:
+        agreement.close()
         return None, "layer-major workers cannot be reused after fork"
     if model is None:
         # Every trainable gradient the micro-batches can write must be snapshotted for a rollback.
+        agreement.close()
         return None, "layer-major accumulation needs the full model (gradient rollback)"
     if not _WINDOW_LOCK.acquire(blocking = False):
+        agreement.close()
         return None, "another layer-major window is running in this process"
     try:
         reset = getattr(swapper, "reset", None)
         try:
-            results, why = _run_layer_major(layers, micro_fns, swapper, model)
+            results, why = _run_layer_major(layers, micro_fns, swapper, model, agreement)
         except BaseException:
             # The gradients and RNG are already put back; blocks a raising window left pending are released.
             if reset is not None:
                 reset()
             raise
-        if results is None and reset is not None:
-            reset()       # an interrupted window leaves blocks pending: release them all
+        if results is None:
+            if reset is not None:
+                reset()       # an interrupted window leaves blocks pending: release them all
+            agreement.close()
         return results, why
     finally:
         _WINDOW_LOCK.release()
@@ -823,13 +870,14 @@ def _tied_trainable_io(model):
     return any(id(p) in trainable for p in head.parameters())
 
 
-def _run_layer_major(layers, micro_fns, swapper, model):
+def _run_layer_major(layers, micro_fns, swapper, model, agreement):
     n = len(micro_fns)
     if n < 1 or not len(layers):
         return None, "nothing to run"
-    if torch.distributed.is_available() and torch.distributed.is_initialized() and \
+    if agreement.agree is None and torch.distributed.is_available() and torch.distributed.is_initialized() and \
             torch.distributed.get_world_size() > 1:
-        # DDP reduces in the loss parts' backwards, before the window's decoder backward exists.
+        # DDP reduces in the loss parts' backwards, before the window's decoder backward exists; without a rank
+        # vote one rank could also roll back while another keeps its window.
         return None, "distributed training (gradient reduction would miss the decoder backward)"
     if model is not None and _tied_trainable_io(model):
         return None, "the input embedding and the output head share a trainable weight"
@@ -886,7 +934,7 @@ def _run_layer_major(layers, micro_fns, swapper, model):
     scope = getattr(swapper, "layer_major_window", None)
     try:
         with scope() if scope is not None else nullcontext():
-            results, why = _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back)
+            results, why = _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement)
         if results is not None:
             if scope is not None:
                 try:
@@ -906,7 +954,7 @@ def _run_layer_major(layers, micro_fns, swapper, model):
         raise
 
 
-def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
+def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement):
     device, streams = None, ()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         device = torch.device("cuda", torch.cuda.current_device())
@@ -915,6 +963,7 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
             devices.update(t.device for t in (*owner.parameters(), *owner.buffers()) if t.is_cuda)
         streams = tuple(torch.cuda.current_stream(d) for d in sorted(devices, key = lambda d: d.index or 0))
     w = _Window(layers, n, swapper, device, streams)
+    w.agreement = agreement
     w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
     try:
         with _intercept(w, layers) as orig_calls:
@@ -957,7 +1006,10 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
     if w.abort_reason is not None:
         w.saved = w.outs = w.h0 = None
         error, w.error = w.error, None
-        if error is not None and not isinstance(error, torch.OutOfMemoryError) and not _recompile_limit(error):
+        if error is not None and (agreement.stage == 1 or
+                                  (not isinstance(error, torch.OutOfMemoryError) and not _recompile_limit(error))):
+            # After the ranks' forward vote the loss parts may have run collectives (metrics gathers) another rank
+            # is still in: a rollback here could pair its vote with them. Raise, as a standard step would.
             raise error
         if error is not None:
             # Its traceback's frames hold the failed forward's tensors (and the window): free them now, before
@@ -980,4 +1032,8 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
         del error
         w.saved = w.outs = w.h0 = None
         return roll_back(reason)
+    if not agreement.vote(True):
+        # Another rank rolled back (or could not finish its window): all ranks run the step the standard way.
+        w.saved = w.outs = w.h0 = None
+        return roll_back(_DISAGREE)
     return w.results, None
