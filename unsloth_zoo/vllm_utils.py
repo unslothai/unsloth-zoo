@@ -2957,7 +2957,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             kwargs["quant_storage"] = _get_dtype(bnb_config.bnb_4bit_quant_storage)
 
     pass
-    from bitsandbytes.nn.modules import Linear4bit, Params4bit
     from torch.nn.modules import Linear
 
     layernorm_names = [
@@ -3088,6 +3087,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer.weight_scale_inv = torch.nn.Parameter(fp8_weight_scale, requires_grad = False)
                     layer.quant_method = "fp8"
             elif f"{layer_name}.weight.quant_state" in quant_state_dict:
+                # Only 4-bit weights need bitsandbytes; 16-bit and fp8 loads must work without it installed.
+                from bitsandbytes.nn.modules import Linear4bit, Params4bit
                 quant_state = quant_state_dict[f"{layer_name}.weight.quant_state"]
                 layer = Linear4bit(0, 0, device = get_target_device(), bias = has_bias, compute_dtype = compute_dtype, **kwargs)
                 layer.in_features  = quant_state.shape[1]
