@@ -1291,11 +1291,10 @@ def test_dspark_drafts_trees_over_its_markov_lattice_and_keeps_its_replies(qwen_
         anchor, stash, logits = ids[0][24], [], dspark._logits
         monkeypatch.setattr(dspark, "_logits", lambda h: stash.append(logits(h)) or stash[-1])
         for quantized in (False, True):
-            # A head of a real rank, strong enough to lift the chain past the block's own top candidates.
             mx.random.seed(0)
             markov = type(dspark.markov_head)(dspark.config.vocab_size, 64)
             markov.markov_w1.weight = markov.markov_w1.weight * 64
-            markov.set_dtype(mx.bfloat16)   # as checkpoints ship it, so the native steps round as in production
+            markov.set_dtype(mx.bfloat16)   # as checkpoints ship it
             if quantized:
                 markov.markov_w1, markov.markov_w2 = nn.QuantizedEmbedding.from_embedding(markov.markov_w1, 64, 4), nn.QuantizedLinear.from_linear(markov.markov_w2, 64, 4)
             dspark.markov_head, dspark.confidence_head = markov, None
@@ -1303,10 +1302,8 @@ def test_dspark_drafts_trees_over_its_markov_lattice_and_keeps_its_replies(qwen_
             chain = dspark.draft_block(anchor, context, dspark.make_cache(), block, lambda x: mx.argmax(x, axis = -1))
             tree = drafter._draft.tree(anchor, context, dspark.make_cache(), block, 16)
             tokens, parents, depths, logq = (a.tolist() for a in (tree.tokens, tree.parent, tree.block.depth, tree.logq))
-            # The first children are the block's own chain, which the Markov steps may lift past the top candidates.
             first = next((i for i in range(1, 16) if parents[i] != i - 1), 16)
             assert tokens[0] == anchor and first > 2 and tokens[1:first] == chain[0, : first - 1].tolist()
-            # Siblings' log q differ by their Markov step logits from their parent, whatever the candidates around them.
             pairs = [(a, b) for a in range(1, 16) for b in range(a + 1, 16) if parents[a] == parents[b]]
             assert any(depths[a] > 1 for a, _ in pairs)
             for a, b in pairs:
@@ -1315,7 +1312,6 @@ def test_dspark_drafts_trees_over_its_markov_lattice_and_keeps_its_replies(qwen_
                 # Under the chain's token, exactly DSpark's own step; elsewhere within float32 against its rounding.
                 native = depths[up] == 0 or tokens[up] == chain[0, depths[up] - 1].item()
                 assert abs((logq[a] - logq[b]) - (step[tokens[a]] - step[tokens[b]]).item()) < (1e-3 if native else 0.05)
-        # Tree rounds of the real lattice keep a greedy reply decoding's.
         _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
         drafter.predraft_rows, rounds = 0, []
         engine = S.SpeculativeEngine(model, _script(("draft", 4), ("plain", 2)), drafter)
@@ -1324,8 +1320,7 @@ def test_dspark_drafts_trees_over_its_markov_lattice_and_keeps_its_replies(qwen_
         tree_round = engine._tree_round
         monkeypatch.setattr(engine, "_tree_round", lambda *args: rounds.append(1) or tree_round(*args))
         assert _scored_reply(model, ids, engine, 48)[0] == _solo(model, ids[0], 48, SamplingParams()) and rounds
-        # Ties go as `draft_block`'s argmax breaks them, the lower token: one where the Markov step lifts 7 level with the
-        # block's leading 3, one where bf16 rounds two distinct sums level that float32 would tell apart.
+        # Ties go to the lower token as argmax breaks them: an exact tie, and two sums only bf16 rounds level.
         vocab = mx.arange(dspark.config.vocab_size)
         for (base3, base7), (lift3, lift7) in (((1.0, 0.0), (0.0, 1.0)), ((0.0, 3 * 2.0 ** -22), (-16.0, -16.0))):
             markov = type(dspark.markov_head)(dspark.config.vocab_size, 64)

@@ -3088,7 +3088,7 @@ def _built(wrapper, model: nn.Module, target: nn.Module, *, lazy: bool = False, 
                 drafter.tree_widths = tuple(range(_MIN_SIZED_TREE, drafter.trained_depth + 2))
         if (isinstance(drafter._draft, _MarkovTreeDrafter) and fast_verify_covers(target)
                 and not any(hasattr(module, "switch_mlp") for _, module in target.named_modules())):
-            # A tree of the block's rows verifies at the block's cost and accepts more along its branches.
+            # The block's width verifies at the chain's cost; wider trees cross the next row tile and cost more than they gain.
             drafter.tree_widths = (drafter.trained_depth + 1,)
         if not lazy and fast_verify_covers(target):
             language.__dict__["_unsloth_warm_drafter"] = weakref.ref(drafter)  # for `warm_speculative_rounds`
