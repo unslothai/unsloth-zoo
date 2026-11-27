@@ -392,7 +392,6 @@ def test_a_long_prompt_priming_is_charged_once_per_reply_not_per_round():
     assert controller.round_seconds(plan, [state], expected = state.stats.expected(plan.rows[0])) == pytest.approx(full - 4096 * per_pair + share)
     hopeful = state.stats.expected(plan.rows[0], 1.0)
     assert controller.score(plan, [state], optimism = 1.0) == hopeful / controller.round_seconds(plan, [state], expected = hopeful)
-    # A probe is admitted at its full price: the reply's plain decoding never primes.
     controller._probe, controller._probe_left, controller._credit = controller._identity(plan, 1), 2, 0.0
     assert controller._choose([RoundPlan("plain", 1), plan], [state], 1)[1] is False
     pair = RoundPlan("round", rows = (RowPlan("draft", 1), RowPlan()), split = True)
@@ -400,7 +399,6 @@ def test_a_long_prompt_priming_is_charged_once_per_reply_not_per_round():
     assert controller._choose([RoundPlan("plain", 1), pair], [state, RowState(state.stats)], _bucket(2))[1] is True
     assert controller._regret(plan, RoundPlan("plain", 1), [state]) == pytest.approx(
         full - state.stats.expected(plan.rows[0]) * controller._plain_step(1))
-    # A plain window's backlog recurs and a batch shares its verify, so both keep the full charge.
     state.priming = 0
     assert controller.round_seconds(plan, [state], expected = state.stats.expected(plan.rows[0])) == full
     state.priming = 4000
