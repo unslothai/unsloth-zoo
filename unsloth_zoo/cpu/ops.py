@@ -108,7 +108,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         if softcap > 0:
             logits.div_(softcap).tanh_()
             if need_hidden_grad or need_weight_grad:
-                slope = 1 - logits * logits
+                slope = logits.square().neg_().add_(1)
             logits.mul_(softcap)
         safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
         logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
@@ -780,12 +780,18 @@ def _lm_head_transform(model):
     """(softcap, logit_scale) of the logits the model's forward feeds its CE, or None when chunked CE cannot match."""
     if _plain_lm_head(model):
         return None, 1.0
-    config = getattr(model, "config", None)
-    entry = _CHUNKED_CE_TRANSFORMED.get(type(model).__name__)
-    # Top-level config only: a composite (vision) config keeps its own forward.
-    if entry is None or getattr(config, "model_type", None) != entry[0]:
+    if type(model).__name__ not in _CHUNKED_CE_TRANSFORMED or not _plain_head_and_inner(model):
         return None
-    _, knob, how = entry
+    return _config_transform(model)
+
+
+def _config_transform(model):
+    """The transform read from the config as the forward reads it on every call; None if chunked CE cannot match."""
+    config = getattr(model, "config", None)
+    model_type, knob, how = _CHUNKED_CE_TRANSFORMED[type(model).__name__]
+    # Top-level config only: a composite (vision) config keeps its own forward.
+    if getattr(config, "model_type", None) != model_type:
+        return None
     for name in _LOGIT_KNOBS:
         if name != knob and getattr(config, name, None) not in (None, 1, 1.0):
             return None
@@ -796,10 +802,8 @@ def _lm_head_transform(model):
     if how == "multiply":
         value = getattr(model, "logit_scale", value)  # Cohere's forward reads self.logit_scale
     if value is None and how == "softcap":
-        return (None, 1.0) if _plain_head_and_inner(model) else None
+        return None, 1.0
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        return None
-    if not _plain_head_and_inner(model):
         return None
     value = float(value)
     if how == "softcap":
@@ -864,12 +868,11 @@ def patch_chunked_causal_lm_loss(model):
     so unsloth_zoo.cpu.trainer makes TRL skip logits-only metrics. Returns True when installed."""
     if os.environ.get("UNSLOTH_CPU_CHUNKED_CE", "1") == "0":
         return False
-    transform = _lm_head_transform(model)
-    if transform is None:
+    if _lm_head_transform(model) is None:
         return False
     if getattr(model, "_unsloth_cpu_chunked_ce", False):
         return True
-    softcap, logit_scale = transform
+    transformed = not _plain_lm_head(model)
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     original_forward = model.forward
@@ -893,6 +896,11 @@ def patch_chunked_causal_lm_loss(model):
             past_key_values = cache
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
+        # Re-read per call: a cap or scale changed after patching must not train on the old one.
+        transform = _config_transform(self) if transformed else (None, 1.0)
+        if transform is None:
+            head_weight = None  # the stock forward
+        softcap, logit_scale = transform or (None, 1.0)
         logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
         if logps_targets is not None and head_weight is not None and labels is None and shift_labels is None:
             # A preference trainer's next-token log-probs from the last hidden state in row chunks (trainer.py). The

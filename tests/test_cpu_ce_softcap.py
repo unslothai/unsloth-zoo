@@ -120,8 +120,9 @@ def _tiny_model(name, softcap = None):
         cls = transformers.Qwen3ForCausalLM
     config._attn_implementation = "eager"
     model = cls(config).float()
-    with torch.no_grad():  # logits large enough that the soft cap is active
-        model.get_output_embeddings().weight.mul_(40.0)
+    if softcap or name == "gemma2":
+        with torch.no_grad():  # logits large enough that the soft cap is active
+            model.get_output_embeddings().weight.mul_(40.0)
     return model
 
 
@@ -200,3 +201,28 @@ def test_preference_logps_use_the_transformed_logits(name, softcap):
     expected = logits.log_softmax(-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     assert torch.allclose(out["log_probs"].double(), expected, rtol = 1e-5, atol = 1e-5)
     assert torch.allclose(out["mean_logits"].double(), logits.mean(-1), rtol = 1e-5, atol = 1e-5)
+
+
+@pytest.mark.parametrize("name, knob, value", [("gemma2", "final_logit_softcapping", 5.0),
+                                              ("gemma2", "final_logit_softcapping", None),
+                                              ("granite", "logits_scaling", 1.5),
+                                              ("gemma2", "final_logit_softcapping", 0.0)])
+def test_cap_or_scale_changed_after_patching(name, knob, value):
+    from unsloth_zoo.cpu import ops
+    stock = _tiny_model(name, 2.0)
+    model = _tiny_model(name, 2.0)
+    model.load_state_dict(stock.state_dict())
+    assert ops.patch_chunked_causal_lm_loss(model)
+    model._unsloth_cpu_chunked_ce_active = True
+    setattr(model.config, knob, value)
+    setattr(stock.config, knob, value)
+    torch.manual_seed(1)
+    ids = torch.randint(0, 96, (2, 12))
+    labels = ids.clone()
+    labels[:, :6] = -100
+    if value == 0.0:  # a cap the chunked loss cannot apply: the stock forward runs (and divides by zero alike)
+        assert model(input_ids = ids, labels = labels).logits is not None
+        return
+    out, ref = model(input_ids = ids, labels = labels), stock(input_ids = ids, labels = labels)
+    assert out.logits is None
+    assert torch.allclose(out.loss, ref.loss, rtol = 1e-5, atol = 1e-6), (out.loss, ref.loss)
