@@ -57,8 +57,27 @@ _PASSTHROUGH = {T.F32: torch.float32, T.F16: torch.float16, T.BF16: torch.bfloat
 _SPLIT_MM = frozenset((T.IQ2_XXS, T.IQ3_XXS, T.IQ4_XS, T.Q3_K, T.Q6_K))
 # The GEMV and dequantize kernels index group fields per group for every format.
 _NO_SPLIT_GEMV = frozenset()
-# Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights).
-_FUSED_MAX_ROWS = int(os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS", "128"))
+# Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights), from interleaved
+# sweeps at 17408 x 5120: on HBM datacenter parts (A100 / H100 / B200: sm80, sm90, sm100) dequantize + cuBLAS is
+# cheap, so 256-value formats leave the fused path above 8 rows and the rest above 64; elsewhere (T4 / L4 / consumer
+# cards) fused wins up to 128. UNSLOTH_GGUF_FUSED_MAX_ROWS overrides.
+_FUSED_MAX_ROWS_ENV = os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS")
+_FUSED_MAX_ROWS = int(_FUSED_MAX_ROWS_ENV) if _FUSED_MAX_ROWS_ENV else None
+_HBM_ARCHS = frozenset(((8, 0), (9, 0), (10, 0)))
+_ROW_CAPS = {}
+
+
+def _fused_max_rows(device, ggml_type):
+    if _FUSED_MAX_ROWS is not None:
+        return _FUSED_MAX_ROWS
+    big_blocks = GGML_BLOCK[ggml_type][0] >= 256
+    key = (device.index, big_blocks)
+    cap = _ROW_CAPS.get(key)
+    if cap is None:
+        hbm = torch.version.hip is None and torch.cuda.get_device_capability(device) in _HBM_ARCHS
+        cap = (8 if big_blocks else 64) if hbm else 128
+        _ROW_CAPS[key] = cap
+    return cap
 
 
 def _env_on(name):
@@ -217,7 +236,8 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
 
 def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
     qk, bs = GGML_BLOCK[ggml_type]
-    BLOCK_N, NB = 16, max(1, 256 // qk)
+    # 4 rows x 512 values per step: best or near-best for every format on A100 and L4 (interleaved sweep)
+    BLOCK_N, NB = 4, max(1, 512 // qk)
     grid = (-(-N // BLOCK_N),)
     _tk.gemv_kernel[grid](
         x1, packed, out, x1 if bias is None else bias, _table(x1.device), N, K, ggml_row_bytes(ggml_type, K),
@@ -236,7 +256,7 @@ def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
     M = x2.shape[0]
     gemv = M == 1 and trans_b
     # tl.dot rounds float32 inputs to tf32: float32 activations use the GEMV or dequantize + matmul only.
-    if M > 0 and M <= _FUSED_MAX_ROWS and _fused_ok(x, ggml_type) and (gemv or x.dtype != torch.float32):
+    if M > 0 and _fused_ok(x, ggml_type) and (gemv or (M <= _fused_max_rows(x.device, ggml_type) and x.dtype != torch.float32)):
         try:
             x2 = x2.contiguous()
             out = torch.empty((M, outer), dtype = x.dtype, device = x.device)

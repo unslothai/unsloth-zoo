@@ -325,3 +325,29 @@ def test_grouped_schedules(ggml_type, host_sched, monkeypatch):
         stock = torch.bmm(x.unsqueeze(1), w32.to(dtype)[rows].transpose(1, 2)).squeeze(1)
         assert torch.isfinite(y).all() and (guard == 7.0).all()
         assert (y.double() - ref).abs().mean() <= 1.5 * (stock.double() - ref).abs().mean() + 1e-12
+
+
+@cuda
+@pytest.mark.parametrize("ggml_type", [T.Q4_0, T.Q8_0, T.Q4_K, T.Q6_K, T.IQ2_XXS, T.IQ3_S, T.NVFP4, T.Q1_0], ids = _id)
+@pytest.mark.parametrize("M", [40, 130])
+def test_fused_large_tiles(ggml_type, M, monkeypatch):
+    # the per-GPU row cap may route these through dequantize + cuBLAS; force the 64 / 128-row tile configs
+    monkeypatch.setattr(gguf_ops, "_FUSED_MAX_ROWS", 1 << 30)
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    N, K = 96, _row_length(ggml_type, 2 if GGML_BLOCK[ggml_type][0] >= 128 else 8)
+    packed = random_packed(ggml_type, N, K, seed = M, special = False).cuda()
+    w32 = dequantize_reference(packed, ggml_type, (N, K))
+    calls = {"mm": 0}
+    real = gguf_ops._mm_launch
+
+    def mm(*a, **k):
+        calls["mm"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(gguf_ops, "_mm_launch", mm)
+    x = torch.randn(M, K, device = "cuda", dtype = dtype)
+    ok, _ = _fp64_bound_ok(gguf_linear(x, packed, ggml_type, (N, K)), x, w32, torch.nn.functional.linear(x, w32.to(dtype)))
+    assert ok
+    gy = torch.randn(M, N, device = "cuda", dtype = dtype)
+    ok, _ = _fp64_bound_ok(gguf_linear_backward_input(gy, packed, ggml_type, (N, K)), gy, w32.t().contiguous(), gy @ w32.to(dtype))
+    assert ok and calls["mm"] == 2
