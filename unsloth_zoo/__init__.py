@@ -587,6 +587,11 @@ if not _SKIP_GPU_INIT:
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
 if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
+    # Before vLLM imports flashinfer, which can point Triton at an older system ptxas for sm_100+.
+    from .triton_ptxas import keep_newest_blackwell_ptxas as _keep_newest_blackwell_ptxas
+    _keep_newest_blackwell_ptxas()
+    del _keep_newest_blackwell_ptxas
+
     from unsloth_zoo.temporary_patches import (
         encode_conversations_with_harmony,
     )
