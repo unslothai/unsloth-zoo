@@ -1525,8 +1525,7 @@ class SpeculativeEngine:
         self._invariant = (call is _language_call("qwen4_exp") and callable(supports) and supports()
                            and callable(getattr(self.lm, "speculative_verify_logits", None))
                            and getattr(drafter, "features", None) is None)
-        # Inkling 2 takes its verify kernels (grouped expert projections) only from a call marked as verifying, as mlx-vlm's own loop makes it;
-        # a longer block keeps verify_forward's decode-sized chunks, and their kernels.
+        # Inkling 2's grouped expert verify kernels need speculative_verify=True; past DECODE_BLOCK_SIZE that call switches kernels.
         self._marked_rows = 0
         if call is _language_call("inkling2"):
             from mlx_vlm.models.linear import DECODE_BLOCK_SIZE

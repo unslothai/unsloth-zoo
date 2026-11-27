@@ -899,7 +899,7 @@ def test_lane_projections_serve_a_family_with_no_exact_verifier(qwen_4bit, monke
 
 @pytest.fixture(scope = "module")
 def inkling2():
-    """Random 4-bit looped Inkling 2 (Inkling 2 Mini's shape): only a loop passes speculative_verify to the expert layers."""
+    """Random 4-bit looped Inkling 2: only a loop passes speculative_verify to its expert layers."""
     import mlx.nn as nn
     from mlx.utils import tree_map
     language = pytest.importorskip("mlx_vlm.models.inkling2.language", reason = "mlx-vlm < 0.8.1 has no Inkling 2")

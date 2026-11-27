@@ -11946,8 +11946,7 @@ SPECULATIVE_FAMILIES = {
         gdn_qk_eps = _qwen4_qk_eps, gdn_l2 = True, capabilities = {"attention": _QWEN4_ATTENTION_CONTRACT, "lanes": {}},
         causal_mask = _qwen4_causal_mask),
 }
-# By checkpoint model type, the language modules whose targets Fast Verify's lane projections serve with no exact
-# verifier forward: their speculative calls' projections alone, where that measured faster.
+# Model type -> language module whose speculative calls take lane projections with no exact verifier (Gemma 4 measured slower).
 LANE_FAMILIES = {"inkling2": "mlx_vlm.models.inkling2.language", "inkling2_loop": "mlx_vlm.models.inkling2.language"}
 
 
