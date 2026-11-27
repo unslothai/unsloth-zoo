@@ -91,7 +91,8 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
                     values[metric.replace("/", " / ")] = logs[metric]
             pass
 
-            # 2) Dynamic rewards/* metrics: user-defined names, sorted for stable column order.
+            # 2) Dynamic per-reward-function metrics (rewards/*): user-defined
+            #    names, so sort for stable column ordering across steps.
             dynamic_reward_keys = sorted(
                 k for k in logs
                 if k.startswith("rewards/") and k not in set_Trainer_metrics

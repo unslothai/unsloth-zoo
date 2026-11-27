@@ -148,6 +148,7 @@ def _bump(**kw):
 
 
 # ----------------------------------------------------------------------------------------------
+# safetensors headers
 # ----------------------------------------------------------------------------------------------
 _ST_DTYPES = {
     "BOOL": (torch.bool, 1),
@@ -395,6 +396,7 @@ def _release_files(files: List["_MappedFile"]):
 
 
 # ----------------------------------------------------------------------------------------------
+# Decoders
 # ----------------------------------------------------------------------------------------------
 def decode_bf16_rows(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """Single plane of bf16 rows (Qwen4Exp n-gram table)."""
@@ -476,6 +478,7 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
 
 
 # ----------------------------------------------------------------------------------------------
+# Mode
 # ----------------------------------------------------------------------------------------------
 _MODES = ("auto", "disk", "ram", "gpu")
 
@@ -526,6 +529,7 @@ def resolve_frozen_table_mode(table_bytes: int, device: Optional[torch.device] =
 
 
 # ----------------------------------------------------------------------------------------------
+# Store
 # ----------------------------------------------------------------------------------------------
 @dataclass
 class _Shard:
@@ -1214,6 +1218,7 @@ def iter_frozen_table_modules(model: nn.Module):
 
 
 # ----------------------------------------------------------------------------------------------
+# Binding to a checkpoint
 # ----------------------------------------------------------------------------------------------
 # Plane name to key-suffix regexes after the prefix, in order; group 1 is the shard index.
 DEFAULT_CHECKPOINT_PLANES = {"weight": (r"shard_(\d+)\.weight", r"weight")}

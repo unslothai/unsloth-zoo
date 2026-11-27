@@ -319,6 +319,7 @@ def detect_logit_transforms(model_or_config) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# headroom formula
 # --------------------------------------------------------------------------- #
 def logit_headroom_bytes(
     vocab_size: int,
@@ -375,6 +376,7 @@ def logit_headroom_bytes(
 
 
 # --------------------------------------------------------------------------- #
+# plan object
 # --------------------------------------------------------------------------- #
 # Plan notes warning that the load may still fail; DeviceMapPlan.summary keeps them visible.
 _PLAN_RISK_NOTES = ("run out of memory", "device mismatch")
@@ -1371,6 +1373,7 @@ def _usable_devices(max_memory: Mapping[Any, Any] | None) -> list[int]:
 
 
 # --------------------------------------------------------------------------- #
+# the planner
 # --------------------------------------------------------------------------- #
 def plan_device_map(
     model: nn.Module,
@@ -2128,6 +2131,7 @@ def plan_device_map(
 
 
 # --------------------------------------------------------------------------- #
+# pre-load convenience
 # --------------------------------------------------------------------------- #
 def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     """The quantisation the CALLER asked for, popped out of the loader kwargs.

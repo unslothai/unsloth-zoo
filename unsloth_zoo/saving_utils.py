@@ -8565,12 +8565,15 @@ def check_local_model_exists(model_path):
 
     paths_to_check = []
 
+    # 1. Exact path as given
     paths_to_check.append(model_path)
 
+    # 2. Case-insensitive version of full path
     case_insensitive_full = find_case_insensitive_path(model_path)
     if case_insensitive_full:
         paths_to_check.append(case_insensitive_full)
 
+    # 3. If path contains "/", also check just the model name part
     if "/" in model_path:
         model_name = model_path.split("/")[-1]  # Get part after last "/"
 

@@ -830,6 +830,7 @@ pass
 
 
 # ---------------------------------------------------------------------------
+# Gradient-checkpoint recompute marker
 # ---------------------------------------------------------------------------
 # Thread-local, True only while checkpoint backward re-runs forward (MoE recompute policy reads it);
 # context manager always restores the prior value, is idempotent, safe under nesting and exceptions,

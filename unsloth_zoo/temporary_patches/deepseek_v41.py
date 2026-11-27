@@ -422,7 +422,8 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_moe)
 
 
-# Config has n_routed_experts (alias num_local_experts) but TRL's MoE helpers read num_experts.
+# 4. `num_experts`: the text config names its routed experts `n_routed_experts` (aliased only as `num_local_experts`),
+#    while TRL's MoE load-balancing path (and other MoE helpers) read `config.num_experts`.
 def patch_deepseek_v41_config_aliases():
     modeling = _modeling()
     if modeling is None:
