@@ -93,7 +93,9 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         mm_weight = weight.to(amp_dtype)
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
-    grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0)
+    # The head gradient is [V, H] fp32 (622 MB for a 151k vocab): the first chunk's product becomes the buffer, so
+    # it is never zero filled first; later chunks add into it in place.
+    grad_weight = None
     total = torch.zeros((), dtype = torch.float32)
     for start in range(0, rows, chunk_rows):
         end = min(start + chunk_rows, rows)
@@ -129,9 +131,18 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                 else:
                     grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
             if need_weight_grad:
-                grad_weight.addmm_(logits.t(), h.float())
+                if grad_weight is None:
+                    grad_weight = torch.empty(weight.shape, dtype = torch.float32)
+                    with torch.autocast("cpu", enabled = False):
+                        torch.mm(logits.t(), h.float(), out = grad_weight)
+                else:
+                    grad_weight.addmm_(logits.t(), h.float())
         # Free logits before the next projection, else two chunks' logits coexist beside the head copy.
         del logits
+    if not need_weight_grad:
+        grad_weight = torch.empty(0)
+    elif grad_weight is None:  # no rows
+        grad_weight = torch.zeros(weight.shape, dtype = torch.float32)
     return total, grad_hidden, grad_weight
 
 
@@ -152,12 +163,135 @@ def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
     )
 
 
+# torch 2.8+: whether this backward pass keeps the graph (retain_graph); older torch scales out of place.
+_KEEP_GRAPH = getattr(torch._C._autograd, "_get_current_graph_task_keep_graph", None)
+_TOP_SAVED_HOOKS = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+
+
+def _owned_ptr(buffer):
+    """The forward's head-gradient address, or None under compile / a saved-tensor hook (which may hand back a
+    shared or substituted buffer that must not be scaled in place)."""
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        if _TOP_SAVED_HOOKS is not None and _TOP_SAVED_HOOKS(True) is not None:
+            return None
+        return buffer.data_ptr()
+    except (RuntimeError, TypeError):  # fake / functional tensors have no storage
+        return None
+
+
+def _scale_in_place_ok(owned, buffer):
+    """In place only in an eager backward that frees the graph (a retained graph runs backward again on the same
+    buffer), without create_graph, on the exact buffer forward made."""
+    if owned is None or _KEEP_GRAPH is None or torch.compiler.is_compiling() or torch.is_grad_enabled():
+        return False
+    if os.environ.get("UNSLOTH_CPU_HEAD_GRAD_REUSE", "1") == "0":
+        return False
+    if type(buffer) is not torch.Tensor or buffer.requires_grad or not buffer.is_contiguous():
+        return False
+    try:
+        if buffer.data_ptr() != owned or _KEEP_GRAPH():
+            return False
+    except RuntimeError:  # not inside a backward pass
+        return False
+    return True
+
+
+_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
+_WILL_EXECUTE = getattr(torch._C, "_will_engine_execute_node", None)
+
+
+def _will_execute(node):
+    try:
+        return node is not None and bool(_WILL_EXECUTE(node))
+    except (RuntimeError, TypeError):
+        return False
+
+
+class _TiedHeadGradLink:
+    """Moves the chunked CE's head gradient to the tied embedding's backward in the same pass. The CE then returns
+    no weight gradient and the embedding returns the head gradient with its own rows added, so whatever else reaches
+    the shared weight (a second forward, a regulariser) still accumulates through autograd as usual."""
+
+    __slots__ = ("weight", "node", "grad", "task")
+
+    def __init__(self, weight):
+        self.weight, self.node, self.grad, self.task = weight, None, None, None
+
+    def offer(self, grad):
+        self.grad, self.task = grad, _GRAPH_TASK_ID()
+
+    def claim(self):
+        grad, self.grad = self.grad, None  # never keep a reference: autograd adopts the buffer only if it is the last
+        if grad is None or self.task != _GRAPH_TASK_ID():
+            return None
+        return grad
+
+
+class _TiedEmbedding(torch.autograd.Function):
+    """F.embedding that returns the tied head gradient plus its rows when the chunked CE handed it over."""
+
+    @staticmethod
+    def forward(ctx, input_ids, weight, padding_idx, link):
+        ctx.save_for_backward(input_ids)
+        ctx.num_weights, ctx.padding_idx, ctx.link = weight.shape[0], padding_idx, link
+        return F.embedding(input_ids, weight, padding_idx)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_ids, = ctx.saved_tensors
+        padding_idx = -1 if ctx.padding_idx is None else ctx.padding_idx
+        head_grad = ctx.link.claim()
+        if head_grad is None:
+            if not ctx.needs_input_grad[1]:
+                return None, None, None, None
+            return None, torch.ops.aten.embedding_dense_backward(
+                grad_output, input_ids, ctx.num_weights, padding_idx, False), None, None
+        ids = input_ids.reshape(-1)
+        grad = grad_output.reshape(ids.numel(), -1)
+        if padding_idx >= 0:
+            keep = ids != padding_idx
+            ids, grad = ids[keep], grad[keep]
+        # The same kernel over the distinct tokens sums each row in the same order as the dense backward, and each row
+        # is then added once: bitwise what autograd's head grad + embedding grad gives, without the [V, H] zeros.
+        rows, inverse = torch.unique(ids, return_inverse = True)
+        summed = torch.ops.aten.embedding_dense_backward(grad, inverse, rows.numel(), -1, False)
+        head_grad.index_add_(0, rows, summed.to(head_grad.dtype))
+        return None, head_grad, None, None
+
+
+def _tied_embedding_link(model, head_weight, input_ids, inputs_embeds):
+    """A link when the training forward can fold the tied input embedding's gradient into the head gradient, else
+    None: eager only, a plain nn.Embedding sharing the trainable leaf head weight, no hooks beyond transformers'
+    enable_input_require_grads (a no-op here: the output already requires grad)."""
+    if os.environ.get("UNSLOTH_CPU_HEAD_GRAD_REUSE", "1") == "0" or None in (_GRAPH_TASK_ID, _KEEP_GRAPH, _WILL_EXECUTE):
+        return None
+    if input_ids is None or inputs_embeds is not None or torch.compiler.is_compiling() or not torch.is_grad_enabled():
+        return None
+    if head_weight is None or not head_weight.requires_grad or not head_weight.is_leaf or head_weight.is_sparse:
+        return None
+    embed = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+    if type(embed) is not torch.nn.Embedding or embed.weight is not head_weight or "forward" in vars(embed):
+        return None
+    if embed.max_norm is not None or embed.scale_grad_by_freq or embed.sparse or input_ids.dtype not in (torch.long, torch.int):
+        return None
+    if embed._forward_pre_hooks or embed._backward_hooks or getattr(embed, "_backward_pre_hooks", None):
+        return None
+    if any(getattr(hook, "__name__", "") != "make_inputs_require_grads" for hook in embed._forward_hooks.values()):
+        return None
+    if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
+        return None
+    return _TiedHeadGradLink(head_weight)
+
+
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     """Sums CE(hidden @ weight.T, labels) / divisor; grads are formed per chunk in forward, so peak extra memory
     is one (chunk, vocab) fp32 block in both eager and compiled calls."""
 
     @staticmethod
-    def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index, softcap = 0.0, logit_scale = 1.0):
+    def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index, softcap = 0.0, logit_scale = 1.0,
+                head_grad_link = None):
         need_hidden_grad = hidden.requires_grad
         need_weight_grad = weight.requires_grad
         # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
@@ -180,6 +314,12 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             loss = total / (1.0 if divisor == 0 else divisor)
             ctx.divisor = divisor
         ctx.save_for_backward(*saved)
+        ctx.owned_weight_grad = _owned_ptr(grad_weight) if need_weight_grad else None
+        ctx.head_grad_link = head_grad_link if head_grad_link is not None and head_grad_link.weight is weight else None
+        ctx.embed_node = None
+        if head_grad_link is not None:
+            # The embedding's node lives on this ctx, not on the link the embedding holds (that would be a cycle).
+            ctx.embed_node, head_grad_link.node = head_grad_link.node, None
         ctx.has_hidden = need_hidden_grad
         ctx.has_weight = need_weight_grad
         ctx.weight_dtype = weight.dtype
@@ -200,8 +340,22 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             empty = math.isnan(ctx.divisor) or ctx.divisor == 0
             scale = torch.zeros_like(grad_output) if empty else grad_output / ctx.divisor
         dh = (grad_hidden * scale.to(grad_hidden.dtype)).to(ctx.hidden_dtype) if ctx.has_hidden else None
-        dw = (grad_weight * scale).to(ctx.weight_dtype) if ctx.has_weight else None
-        return dh, dw, None, None, None, None, None, None
+        dw = None
+        if ctx.has_weight:
+            if _scale_in_place_ok(ctx.owned_weight_grad, grad_weight):
+                # Scale the op's own [V, H] buffer in place (bitwise equal to the product) and hand it on, so it is
+                # adopted as .grad instead of a fresh 622 MB copy; a unit scale (plain backward()) skips the pass.
+                if not bool(scale == 1):
+                    grad_weight.mul_(scale)
+                dw = grad_weight.to(ctx.weight_dtype)
+                # Hand the gradient to the tied embedding only if its backward runs in this pass (it is reachable and
+                # needed); it then returns head + embedding rows as one gradient.
+                if ctx.head_grad_link is not None and _will_execute(ctx.embed_node):
+                    ctx.head_grad_link.offer(dw)
+                    dw = None
+            else:
+                dw = (grad_weight * scale).to(ctx.weight_dtype)
+        return dh, dw, None, None, None, None, None, None, None
 
 
 _LOGPROB_OUTPUTS = ("entropy", "log_sum_sq_probs", "mean_logits", "is_top1")
@@ -697,7 +851,7 @@ def patch_causal_conv1d_fallback(model):
 
 def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = None,
                                  ignore_index = -100, shift_labels = None, chunk_rows = None,
-                                 softcap = None, logit_scale = 1.0):
+                                 softcap = None, logit_scale = 1.0, head_grad_link = None):
     """Causal-LM loss with the same shift and normalisation as transformers' ForCausalLMLoss."""
     if shift_labels is None:
         labels = F.pad(labels, (0, 1), value = ignore_index)
@@ -726,6 +880,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         chunk_rows = max(16, int(os.environ.get("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", 16 * 1024 * 1024)) // weight.shape[0])
     return _ChunkedLinearCrossEntropy.apply(
         hidden, weight, shift_labels, divisor, chunk_rows, ignore_index, float(softcap or 0.0), float(logit_scale),
+        head_grad_link,
     )
 
 
@@ -937,6 +1092,12 @@ def patch_chunked_causal_lm_loss(model):
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
         ignore_index = kwargs.pop("ignore_index", -100)
         kwargs.pop("return_dict", None)
+        # Full fine-tuning with tied embeddings: the embedding's gradient rows go into the head gradient buffer.
+        link = _tied_embedding_link(self, head_weight, input_ids, inputs_embeds)
+        if link is not None:
+            embed = self.get_input_embeddings()
+            inputs_embeds, input_ids = _TiedEmbedding.apply(input_ids, head_weight, embed.padding_idx, link), None
+            link.node = inputs_embeds.grad_fn
         outputs = getattr(self, inner_name)(
             input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
             **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, use_cache = use_cache,
@@ -946,7 +1107,7 @@ def patch_chunked_causal_lm_loss(model):
         loss = chunked_linear_cross_entropy(
             hidden, head_weight, labels,
             num_items_in_batch = num_items_in_batch, shift_labels = shift_labels, ignore_index = ignore_index,
-            softcap = softcap, logit_scale = logit_scale,
+            softcap = softcap, logit_scale = logit_scale, head_grad_link = link,
         )
         return CausalLMOutputWithPast(
             loss = loss, logits = None,
