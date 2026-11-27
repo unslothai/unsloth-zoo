@@ -15310,9 +15310,8 @@ def _scaled_quantized_weight_components(module):
 
 
 def _dense_quantized_modules_mlx_lm_skips(model):
-    """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
-    embedding) and mlx-vlm's own QuantizedSwitchLinear experts, and would save their packed weights as dense; dequantize
-    them here, folding in the global scale and any AWQ pre_quant_scale."""
+    """Dequantize what mlx-lm's dequantize_model skips and would save packed (global-scale NVFP4, mlx-vlm's
+    QuantizedSwitchLinear), folding in the global scale and any AWQ pre_quant_scale."""
     vlm_switch = getattr(sys.modules.get("mlx_vlm.models.switch_layers"), "QuantizedSwitchLinear", None)
     vlm_switch = vlm_switch if isinstance(vlm_switch, type) else ()
     dense = []
@@ -15321,7 +15320,6 @@ def _dense_quantized_modules_mlx_lm_skips(model):
         if components is not None:
             weight = components[1].astype(mx.bfloat16)
         elif isinstance(module, vlm_switch) and getattr(module.weight, "dtype", None) == mx.uint32:
-            # as dequantize_model does for mlx-lm's own experts
             weight = mx.dequantize(module.weight, module.scales, getattr(module, "biases", None),
                                    module.group_size, module.bits, module.mode)
         else:
@@ -17269,8 +17267,7 @@ def _restore_mlx_gguf_source_layout(path):
     for name, (source, tensor) in restored.items():
         shards[shard_of[source]][name] = tensor
     del weights, restored, tensor
-    # Loaded arrays hold their source file open, so a shard can be replaced while a later one still reads it. Only the
-    # names are kept once a shard is written, so its evaluated tensors are not held while later shards are written.
+    # Loaded arrays keep their file open, so a shard a later one still reads can be replaced; written shards keep names only.
     for file in files:
         tensors, shards[file.name] = shards[file.name], sorted(shards[file.name])
         if tensors:
