@@ -1848,7 +1848,7 @@ def _load_mlx_lm_with_strict_fallback(
     hf_token=None,
 ):
     """Load text models via mlx-lm, retrying strict=False only for registered extra-tensor mismatches, since its public load() does not expose strict=False."""
-    from mlx_lm.utils import _download, load_model, load_tokenizer
+    from mlx_lm.utils import load_model, load_tokenizer
 
     tokenizer_config = mlx_load_kwargs.get("tokenizer_config") or {}
     model_config = mlx_load_kwargs.get("model_config") or {}
@@ -1857,7 +1857,7 @@ def _load_mlx_lm_with_strict_fallback(
     want_config = mlx_load_kwargs.get("return_config", False)
 
     with _temporary_hf_token_env(hf_token):
-        model_path = _download(model_name, revision=revision)
+        model_path = _mlx_download(model_name, revision=revision)
     model_config = _mlx_lm_config_backfill(model_name, model_path, model_config)
 
     try:
@@ -1893,6 +1893,46 @@ def _load_mlx_lm_with_strict_fallback(
     if want_config:
         return model, tokenizer, config
     return model, tokenizer
+
+
+def _mlx_download(path_or_hf_repo, revision=None, allow_patterns=None, download=None):
+    """`download` (mlx-lm's), else the cached snapshot: huggingface_hub 1.26-2.1.1 lists the tree for a pinned commit offline."""
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import LocalEntryNotFoundError, OfflineModeIsEnabled
+
+    if download is None:
+        import mlx_lm.utils as mlx_lm_utils
+
+        download = mlx_lm_utils._download
+    try:
+        return download(path_or_hf_repo, revision=revision, allow_patterns=allow_patterns)
+    except OfflineModeIsEnabled:
+        pass
+    hint = "Download it once with network access, or disable offline mode (HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE)."
+    where = f"'{path_or_hf_repo}' (revision {revision or 'main'})"
+    try:
+        path = Path(snapshot_download(path_or_hf_repo, revision=revision, local_files_only=True))
+    except LocalEntryNotFoundError as error:
+        if type(error) is not LocalEntryNotFoundError:
+            raise
+        missing_snapshot = LocalEntryNotFoundError(
+            f"Unsloth: {where} is not in the Hugging Face cache and offline mode is enabled. {hint}"
+        )
+        # from_pretrained re-raises only this: mlx-vlm would retry the repo id and hide it.
+        missing_snapshot._unsloth_offline_cache_miss = True
+        raise missing_snapshot from error
+    # No tree listing, so the Hub cannot check the folder; a strict=False load would skip a missing named shard.
+    missing = [
+        pattern for pattern in allow_patterns or ()
+        if pattern.endswith(".safetensors")
+        and not any(char in pattern for char in "*?[")
+        and not (path / pattern).exists()
+    ]
+    if missing:
+        raise LocalEntryNotFoundError(
+            f"Unsloth: {where} is cached without {', '.join(missing)} and offline mode is enabled. {hint}"
+        )
+    return path
 
 
 def _download_missing_index_shards(model_name, local_path, revision, download):
@@ -2003,7 +2043,7 @@ def _load_mlx_lm_distributed(
     sharding defeats pipeline parallelism's memory savings."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
-    from mlx_lm.utils import _download, load_model, load_tokenizer
+    from mlx_lm.utils import load_model, load_tokenizer
 
     pipeline_group, tensor_group = _mlx_active_distributed_groups(
         pipeline_group,
@@ -2015,7 +2055,7 @@ def _load_mlx_lm_distributed(
     want_config = mlx_load_kwargs.get("return_config", False)
 
     with _temporary_hf_token_env(hf_token):
-        model_path = _download(
+        model_path = _mlx_download(
             model_name,
             revision=revision,
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
@@ -2099,7 +2139,7 @@ def _load_mlx_lm_distributed(
                             )
                         local_files.add(file_name)
 
-        _download(model_name, revision=revision, allow_patterns=sorted(local_files))
+        _mlx_download(model_name, revision=revision, allow_patterns=sorted(local_files))
         final_model_path = _mlx_lm_snapshot_view(model_path, weight_files=local_files)
         cleanup_final_model_path = True
 
@@ -2286,7 +2326,11 @@ def _load_mlx_vlm_distributed(
 
     try:
         with _temporary_hf_token_env(hf_token):
-            resolved_path = str(get_model_path(model_name, revision=revision))
+            resolved_path = str(_mlx_download(
+                model_name,
+                revision=revision,
+                download=lambda repo, revision, allow_patterns: get_model_path(repo, revision=revision),
+            ))
             load_config = config_override_data or _read_json_file(
                 os.path.join(resolved_path, "config.json")
             )
@@ -9421,7 +9465,6 @@ class FastMLXModel:
                     )
         try:
             from mlx_lm import load as mlx_load
-            from mlx_lm.utils import _download
         except ImportError:
             raise ImportError(
                 "Unsloth: mlx-lm is required for Apple Silicon. "
@@ -9491,7 +9534,7 @@ class FastMLXModel:
                 if distributed_requested:
                     config_allow_patterns = _mlx_lm_metadata_allow_patterns()
                 local_path = str(
-                    _download(
+                    _mlx_download(
                         model_name,
                         revision=revision,
                         allow_patterns=config_allow_patterns,
@@ -9499,11 +9542,11 @@ class FastMLXModel:
                 )
                 if not distributed_requested:
                     local_path = _download_missing_index_shards(
-                        model_name, local_path, revision, _download,
+                        model_name, local_path, revision, _mlx_download,
                     )
                 original_local_path = local_path
-        except Exception:
-            if distributed_requested:
+        except Exception as error:
+            if distributed_requested or getattr(error, "_unsloth_offline_cache_miss", False):
                 raise
             local_path = None
 
@@ -10124,7 +10167,7 @@ class FastMLXModel:
                         if _mlx_distributed_requested(pipeline_group, tensor_group):
                             base_allow_patterns = _mlx_lm_metadata_allow_patterns()
                         base_local = str(
-                            _download(
+                            _mlx_download(
                                 base_model_id,
                                 revision=adapter_base_revision,
                                 allow_patterns=base_allow_patterns,
