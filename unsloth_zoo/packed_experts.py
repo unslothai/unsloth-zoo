@@ -568,7 +568,7 @@ def _fused_grouped_ok(inputs, codes, fmt):
     mode = mxfp4_gemm.packed_grouped_mm_mode()
     if mode == "0":
         return False
-    if mode == "auto" and inputs.shape[0] >= mxfp4_gemm.packed_grouped_mm_max_rows() * codes.shape[0]:
+    if mode == "auto" and inputs.shape[0] >= mxfp4_gemm.packed_grouped_mm_max_rows(inputs.device) * codes.shape[0]:
         return False
     return mxfp4_gemm.packed_grouped_mm_available(inputs.device, fmt, inputs.dtype)
 

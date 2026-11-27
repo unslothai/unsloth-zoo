@@ -1080,13 +1080,31 @@ def packed_grouped_mm_mode():
     return mode if mode in ("0", "1") else "auto"
 
 
-def packed_grouped_mm_max_rows():
-    """Routed rows per expert below which the fused kernel runs under auto (UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS)."""
+_PACKED_MAX_ROWS = {}
+
+
+def packed_grouped_mm_max_rows(device = None):
+    """Routed rows per expert below which the fused kernel runs under auto (UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS).
+    The dense chunk costs bandwidth, so the cutoff follows it. Qwen3-30B-A3B experts, fwd + dX vs dequantize:
+    L4 (sm_89) 2.0-5.1x at 16-64 rows, 1.4-2.1x at 128, 0.84-0.96x at 256 -> 192 on sm_86 / sm_89 / sm_12x;
+    A100 (sm_80) 1.2-1.6x at 16 rows, 0.85-1.18x at 64, 0.8-1.0x at 128 -> 32 elsewhere."""
     import os
-    try:
-        return max(int(os.environ.get("UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS", "128")), 0)
-    except ValueError:
-        return 128
+    value = os.environ.get("UNSLOTH_PACKED_EXPERTS_FUSED_MAX_ROWS")
+    if value is not None:
+        try:
+            return max(int(value), 0)
+        except ValueError:
+            pass
+    index = None
+    if device is not None:
+        index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    rows = _PACKED_MAX_ROWS.get(index)
+    if rows is None:
+        cap = torch.cuda.get_device_capability(index)
+        rows = _PACKED_MAX_ROWS[index] = 192 if cap in ((8, 6), (8, 7), (8, 9)) or cap[0] == 12 else 32
+    return rows
 
 
 def packed_grouped_mm_available(device, fmt, dtype = torch.bfloat16) -> bool:
