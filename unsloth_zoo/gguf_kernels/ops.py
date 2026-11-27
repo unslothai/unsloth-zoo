@@ -55,8 +55,8 @@ _PASSTHROUGH = {T.F32: torch.float32, T.F16: torch.float16, T.BF16: torch.bfloat
 # Formats whose 8-value group fields (u32 aux words, sign bytes, sub-block scales) dominate the decode: the tile GEMM
 # indexes those per group (4-D tile); for the rest the cheaper reshape into a dot operand wins (L4 / A100 timings).
 _SPLIT_MM = frozenset((T.IQ2_XXS, T.IQ3_XXS, T.IQ4_XS, T.Q3_K, T.Q6_K))
-# The GEMV and dequantize kernels index group fields per group for every format except these.
-_NO_SPLIT_GEMV = frozenset((T.Q4_K, T.Q5_K))
+# The GEMV and dequantize kernels index group fields per group for every format.
+_NO_SPLIT_GEMV = frozenset()
 # Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights).
 _FUSED_MAX_ROWS = int(os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS", "128"))
 
@@ -187,12 +187,15 @@ def _fused_ok(x, ggml_type):
 def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b, grouped):
     qk, bs = GGML_BLOCK[ggml_type]
     row_bytes = ggml_row_bytes(ggml_type, K if trans_b else N)
-    if grouped:
-        BLOCK_M = 16 if M <= 4 * E else (32 if M <= 32 * E else 64)
+    rows_per_tile = M / E if grouped else M
+    BLOCK_M = 16 if rows_per_tile <= 16 else (32 if rows_per_tile <= 32 else (64 if rows_per_tile <= 64 else 128))
+    # Two tile configs from an L4 sweep (17408 x 5120, M = 16 / 64 / 128); the value axis holds whole blocks.
+    if BLOCK_M <= 32:
+        packed_rows, values, warps, stages = 32, 256, 4, (3 if qk <= 64 else 2)
+    elif qk <= 64:
+        packed_rows, values, warps, stages = 128, 128, 8, 3
     else:
-        BLOCK_M = 16 if M <= 16 else (32 if M <= 32 else 64)
-    # The value axis of a decoded tile holds whole blocks; 256-value blocks get fewer packed rows and more warps.
-    packed_rows, values, warps = (64, max(64, qk), 4) if qk <= 64 else (32, qk, 8)
+        packed_rows, values, warps, stages = 32, 256, 8, 2
     BLOCK_N, BLOCK_K = (packed_rows, values) if trans_b else (values, packed_rows)
     tiles_m = (-(-M // BLOCK_M) + min(E, M)) if grouped else -(-M // BLOCK_M)
     grid = (tiles_m, -(-N // BLOCK_N))
@@ -207,7 +210,7 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
         TYPE = ggml_type, QK = qk, BS = bs, TRANS_B = trans_b, GROUPED = grouped,
         E_POW2 = 1 << max(E - 1, 0).bit_length(), HAS_BIAS = bias is not None, HOST_SCHED = host_sched,
         BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, SPLIT = ggml_type in _SPLIT_MM,
-        num_warps = warps, num_stages = 2,
+        num_warps = warps, num_stages = stages,
     )
     return out
 
