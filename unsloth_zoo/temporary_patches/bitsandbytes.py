@@ -46,9 +46,8 @@ _QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0.dev0", "5.6.0.dev0")
 
 
 def _transformers_drops_prequantized_quant_state():
-    """True in the transformers window from 5.4.0 (PR 44300) until 5.6.0 (PR 45567) fixed it, which drops bnb
-    quant_state sidecars; necessary, not sufficient, as a text submodel mapping must also strip the composite prefix
-    (qwen3_5_text, gemma3n_text)."""
+    """Holds for transformers 5.4.0 (PR 44300) until 5.6.0 (PR 45567), which drops bnb quant_state
+    sidecars; necessary, not sufficient: text submodel mapping must strip composite prefix."""
     installed = _installed_transformers_version()
     if installed == "unknown": return False
     try:
@@ -61,8 +60,7 @@ def _transformers_drops_prequantized_quant_state():
 
 
 def _installed_transformers_version():
-    """Installed transformers version, or unknown; falls back to the already-imported transformers.__version__ for
-    source or frozen builds, and never triggers an import."""
+    """Transformers version or 'unknown'; imported __version__ for source/frozen; won't import."""
     try:
         from importlib.metadata import version as _version
         return _version("transformers")

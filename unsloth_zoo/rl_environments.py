@@ -273,24 +273,19 @@ def check_signal_escape_patterns(code: str):
             func = node.func
             func_name = None
 
-            # Get the function name for pattern matching
             if isinstance(func, ast.Attribute):
-                # signal.signal(...), signal.setitimer(...), etc.
                 if isinstance(func.value, ast.Name):
                     if func.value.id in self.signal_aliases:
                         func_name = f"signal.{func.attr}"
                 elif isinstance(func.value, ast.Attribute):
-                    # Handle chained attributes
                     pass
             elif isinstance(func, ast.Name):
                 # Direct call like setitimer(...) after from signal import setitimer
                 if func.id in ("signal", "setitimer", "alarm", "pthread_sigmask"):
                     func_name = func.id
 
-            # Check for signal tampering patterns
             if func_name:
                 if func_name in ("signal.signal", "signal"):
-                    # Check if setting SIGALRM handler
                     if len(node.args) >= 1:
                         arg0 = node.args[0]
                         if _ast_name_matches(arg0, ("SIGALRM", "signal.SIGALRM")):
@@ -301,7 +296,6 @@ def check_signal_escape_patterns(code: str):
                             })
 
                 elif func_name in ("signal.setitimer", "setitimer"):
-                    # Check if disabling ITIMER_REAL
                     if len(node.args) >= 1:
                         arg0 = node.args[0]
                         if _ast_name_matches(arg0, ("ITIMER_REAL", "signal.ITIMER_REAL")):
@@ -333,7 +327,6 @@ def check_signal_escape_patterns(code: str):
                 self.generic_visit(node)
                 return
 
-            # Check for bare except or catching TimeoutError/BaseException inside a loop
             if node.type is None:
                 exception_catching.append({
                     "type": "bare_except_in_loop",
@@ -348,7 +341,6 @@ def check_signal_escape_patterns(code: str):
                         "description": f"Catches {node.type.id} in loop - may suppress timeout and continue",
                     })
             elif isinstance(node.type, ast.Tuple):
-                # except (TimeoutError, ValueError):
                 for elt in node.type.elts:
                     if isinstance(elt, ast.Name):
                         if elt.id in ("TimeoutError", "BaseException", "Exception"):
@@ -488,9 +480,8 @@ def validate_single_function_source(
 pass
 
 
-# Modules generated code may import; excludes filesystem, network and process modules (os, subprocess, socket, ctypes);
-# string (Formatter.get_field reaches real builtins, str.format is checked in _reject_dunder_access); dataclasses
-# (sys.modules lookup fails for synthetic globals).
+# Excludes os/subprocess/socket/ctypes; string's Formatter.get_field reaches builtins; str.format
+# checked in _reject_dunder_access; dataclasses sys.modules lookup fails for synthetic globals.
 _SAFE_IMPORT_MODULES = frozenset({
     "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
     "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
@@ -524,9 +515,7 @@ _SELF_MATCHING_TYPES = frozenset({
     "set", "str", "tuple",
 })
 
-# Interpreter object-graph walks invisible to the private-attribute and import rules: gi_frame.f_back.f_back.f_builtins
-# reaches the real builtins of the trusted caller; indexing __import__ out restores everything; frames, generators,
-# coroutines and tracebacks all expose them.
+# Interpreter walks reach real builtins unseen by checks; indexing __import__ restores them.
 _DENIED_ATTR_NAMES = frozenset({
     "ag_await", "ag_code", "ag_frame",
     "cr_await", "cr_code", "cr_frame", "cr_origin",
@@ -541,9 +530,7 @@ _DENIED_ATTR_NAMES = frozenset({
 if sys.version_info >= (3, 14):
     _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
-# Dunders generated helper classes may define; a def name is invisible to the Name and Attribute walk, so without this
-# list generated code could define __setattr__ or __getattr__ and hook copy helpers' attribute machinery; __init__ and
-# comparison/arithmetic dunders stay.
+# Def names escape the Name/Attribute walk; __setattr__/__getattr__ would hook copy helpers.
 _ALLOWED_DUNDER_DEFS = frozenset({
     "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
     "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
@@ -633,8 +620,7 @@ def _allowlist_builtins():
         "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
         "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
         "str", "sum", "tuple", "type", "zip",
-        # Class machinery for generated helper classes; hasattr only answers yes or no, and object/super expose nothing
-        # new, since going further needs a dunder the AST check rejects.
+        # hasattr is yes/no only; object/super expose nothing new without a rejected dunder.
         "bytearray", "classmethod", "hasattr", "object", "property",
         "staticmethod", "super",
         # Generated code routinely uses try/except.
@@ -645,8 +631,7 @@ def _allowlist_builtins():
         "ZeroDivisionError",
     )
     exposed = {name: getattr(_py_builtins, name) for name in names}
-    # Comparison and arithmetic dunders return NotImplemented for operands they do not handle, so the singleton must be
-    # reachable; it is a value, not a capability.
+    # Comparison/arithmetic dunders return NotImplemented: a reachable value, not a capability.
     exposed["NotImplemented"] = _py_builtins.NotImplemented
     # Required for `class` statements.
     exposed["__build_class__"] = _py_builtins.__build_class__
@@ -657,16 +642,14 @@ def _allowlist_builtins():
 pass
 
 
-# Allowlisted modules hand out real classes (collections.Counter, random.Random, ...), and type(x) reaches the class
-# of any host object, so `Counter.most_common = f` would rewrite the host's class: every later evaluation and the
-# reward code see it. _guard_attribute_targets routes every attribute store/delete target through this check, which
-# refuses classes the generated code did not define itself; instances and its own classes stay assignable.
+# Allowlisted modules expose real classes; type(x) reaches any host class, so `Counter.most_common =
+# f` would rewrite the host class for later evaluations and reward code; _guard_attribute_targets
+# refuses stores on classes generated code did not define (instances stay assignable).
 _ATTR_TARGET_GUARD = "__unsloth_attr_target__"
 
 
 def _is_host_class(cls):
-    # A host class is one its module publishes under its qualname. Classes the strategy makes itself (class blocks,
-    # type(...), namedtuple) resolve to nothing, so they stay assignable.
+    # Host classes: published under their qualname; generated classes stay assignable.
     if getattr(cls, "__module__", None) == "__user_code__":
         return False
     target = sys.modules.get(getattr(cls, "__module__", None) or "")
@@ -689,8 +672,7 @@ pass
 
 
 class _GuardAttributeTargets(ast.NodeTransformer):
-    # `X.a = v` becomes `guard(X).a = v`: X is still evaluated once, in the same order, in every target position
-    # (assign, augmented, for, with, unpacking, del).
+    # `X.a = v` becomes `guard(X).a = v`; X is evaluated once, in order, in every target form.
     def visit_Attribute(self, node):
         self.generic_visit(node)
         if isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -909,8 +891,7 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
-        # case object(__class__=x) is a getattr with no Attribute node; kwd_attrs is the only identifier field that
-        # reads an attribute, and the Name rule refuses it.
+        # kwd_attrs reads an attribute with no Attribute node; the Name rule refuses it.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
             if node.patterns and bindings is None:
                 bindings = _bound_names(tree)
@@ -1098,7 +1079,6 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
             raise _TimeLimitExceeded()
         fired = True
         fired_at = time.monotonic()
-        # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
     setattr(_handler, "__time_limit_handler__", True)
@@ -1126,7 +1106,6 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
             finally:
                 _retry_eintr(signal.signal, signal.SIGALRM, old_handler)
 
-            # Restore prior timer with corrected remaining time.
             if prev_remaining != 0.0 or prev_interval != 0.0:
                 elapsed = max(time.monotonic() - start, 0.0)
                 remaining = max(prev_remaining - elapsed, 0.0)
@@ -1183,7 +1162,6 @@ def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kil
                 name, msg, tb = payload
                 raise RemoteTracebackError(f"{name}: {msg}\nRemote traceback:\n{tb}")
         else:
-            # Timeout: terminate, then kill if stubborn
             proc.terminate()
             proc.join(kill_grace)
             if proc.is_alive():
@@ -1421,7 +1399,6 @@ def execute_with_time_limit(
         )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        # Determine effective backend based on function safety
         effective_backend = backend
         if backend in ("signal", "auto"):
             try:
@@ -1556,16 +1533,13 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         # Old structure: everything in src
         return src_path
     else:
-        # Fallback: try both paths
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
-# Maps endpoint (host, port) to the Popen we spawned there; /health only shows something listens, not that it is ours;
-# two children can hold one port on different addresses.
+# Endpoint -> our Popen; /health can't prove a child is ours (same port, other address).
 _OPENENV_CHILDREN = {}
 
-# Held on every registry access: poll() calls waitpid, releasing the GIL, so iteration can be resized and get-poll-pop
-# is check-then-mutate (python/cpython#87664); WNOHANG does not block, so holding it across poll() is cheap.
+# Held on every access: poll() releases the GIL, so get-poll-pop races (python/cpython#87664).
 _OPENENV_CHILDREN_LOCK = threading.Lock()
 
 # Endpoints claimed but not yet spawned onto; the lock makes each operation atomic, not check-then-spawn-then-register;
@@ -1810,7 +1784,6 @@ def launch_openenv(
     healthy and yours: a second uvicorn is spawned and the passed client dropped.
     /health cannot distinguish it from a process that took the port.
     """
-    # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
@@ -1824,8 +1797,7 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    # Client shares the server's address family, never localhost: asyncio create_server sets IPV6_V6ONLY, so a :: server
-    # answers on ::1 and not 127.0.0.1 even on dual stack hosts.
+    # Client shares server family, not localhost; a :: server (IPV6_V6ONLY) ignores 127.0.0.1.
     client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
     localhost = _openenv_url(client_host, port)
     _reap_exited_openenv_children()
@@ -1845,14 +1817,12 @@ def launch_openenv(
                     except: pass
                     process = None
                 else:
-                    # It should work, so simply return the old one!
                     return process
             except:
                 process = None
         return process
     openenv_process = check_openenv_works(openenv_process)
 
-    # Otherwise, find the next port which can be used
     trials = 0
     while openenv_process is None:
         # Port ID must be less than uint16_MAX

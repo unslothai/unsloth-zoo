@@ -58,10 +58,9 @@ def current_umask():
 
 
 def keep_mode(temporary, final, source_mode = None, like = (), add = 0):
-    """Before publishing `temporary` as `final`: take the mode of the existing `final` (or the first existing path in
-    `like`), so a re-export never widens weights the user restricted. With nothing existing, a copied file's
-    `source_mode` is narrowed by the umask; else the temp keeps the mode it was written with. `add` bits are ORed in.
-    Idempotent, never raises; on Windows only the `add` bits are applied (a read-only copy would block the next replace)."""
+    """Temp takes the mode of existing final (or first existing in like), so re-exports never widen
+    it; with none, source_mode narrowed by umask; add bits ORed in; idempotent, never raises; on
+    Windows only add applies (read-only copy would block replace)."""
     if os.name == "nt":
         if add:
             try:
@@ -90,9 +89,7 @@ def keep_mode(temporary, final, source_mode = None, like = (), add = 0):
 
 
 def copy_keep_mode(src, dst, *, follow_symlinks = True):
-    """shutil.copy2 (also as a copytree copy_function) that keeps an existing `dst`'s mode, or narrows the source's
-    mode by the umask on a first copy, instead of copying a wider source mode across. The bytes go in through
-    copyfile (an existing dst keeps its mode while written), then the times and the mode."""
+    """shutil.copy2 replacement: keeps an existing dst's mode, else narrows the source mode by the umask."""
     try:
         existing = stat.S_IMODE(os.stat(dst).st_mode)
     except OSError:
@@ -127,9 +124,7 @@ def copy_keep_mode(src, dst, *, follow_symlinks = True):
 
 
 def copytree_keep_mode(src, dst):
-    """shutil.copytree(dirs_exist_ok = True) with copy_keep_mode, where a folder that already existed keeps its own mode
-    instead of the source folder's (copytree copies that onto every folder last), so a re-save never reopens a folder
-    the user restricted. New folders take the source's mode as copytree gives it."""
+    """copytree with copy_keep_mode: existing folders keep their mode, so a re-save never reopens them."""
     existing = {}
     if os.name != "nt":
         for root, dirs, _ in os.walk(dst):

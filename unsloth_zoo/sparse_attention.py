@@ -213,9 +213,8 @@ def _flex_eligible(q, kv_len = None):
     return kv_len is None or q.shape[0] * q.shape[1] * kv_len <= _FLEX_MAX_TABLE
 
 
-# The sink is applied through flex's log-sum-exp (out * sigmoid(lse - sink)); its gradients need flex to propagate
-# LSE gradients. Numerically verified on torch 2.14 (B200 oracle, Colab T4 / L4 / G4); CPU flex has no backward,
-# so older releases could not be checked here and keep the reference for differentiable calls with a sink.
+# Sink goes via flex's LSE (needs LSE grads); verified on torch 2.14 (B200, T4/L4/G4) only; CPU flex
+# has no backward, so older releases keep the reference for differentiable sink calls.
 _FLEX_SINK_VERIFIED_TORCH = (2, 14)
 
 
@@ -264,8 +263,7 @@ def window_topk_idxs(seq_len, window_size, batch, device):
 
 
 def _connected_zeros(q, *others):
-    """Zero output that stays in every input's autograd graph (zero gradients, not None): empty-slice sums connect
-    without reading values (a disabled -inf sink would make `x * 0` NaN)."""
+    """Zeros connected to all inputs (zero grads, not None); no values read: -inf * 0 is NaN."""
     out = q.new_zeros(q.shape)
     for t in (q,) + others:
         if t is not None and t.is_floating_point():
@@ -303,8 +301,7 @@ def _reference_chunk_rows(q, k):
     return max(1, min(s, _TORCH_CHUNK_ELEMS // max(1, k * d * b)))
 
 
-# Compiled code runs the chunked reference as one opaque op; unrolled, the first step never
-# finished.
+# Compiled code runs the chunked reference as one opaque op (unrolled, step 1 never finished).
 _REF_V = "v1"
 
 
@@ -326,8 +323,7 @@ def _(q, kv, sink, topk_idxs, softmax_scale):
 
 
 def _reference_block_backward(grad_out, q_chunk, kv_pad, sink, safe_chunk, valid_chunk, softmax_scale, dkv_pad):
-    """Gradients of _reference_block (recomputed forward): returns dq_chunk and dsink [h] (accumulation dtype),
-    adds the kv gradient into dkv_pad [b, n + 1, d] (accumulation dtype)."""
+    """Returns dq_chunk, dsink [h] (accum dtype); adds kv grad into dkv_pad [b, n + 1, d]."""
     b, c, h, _ = q_chunk.shape
     acc = sink.dtype
     batch_index = torch.arange(b, device = q_chunk.device).view(b, 1, 1).expand_as(safe_chunk)
@@ -453,8 +449,7 @@ def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window)
         width = max(16, 1 << (k - 1).bit_length())
         if width != k:
             idxs = torch.cat([idxs, idxs.new_full((*idxs.shape[:-1], width - k), -1)], dim = -1)
-    # One KV head ([b, 1, n, d]): gather_attn records share_kv = True, so the backward keeps the shared schedule
-    # (a pre-expanded [b, heads, n, d] view is treated as per-head KV and allocates per-head gradients).
+    # One KV head with share_kv = True; a pre-expanded view would allocate per-head grads.
     out = _gather_fn()(
         q.transpose(1, 2), _single_kv_head(local_kv), _single_kv_head(sparse_kv), idxs, sink,
         sliding_window_size = int(window), scale = float(softmax_scale),
@@ -497,8 +492,7 @@ def _flex_kernel_options(q):
         return _FLEX_KERNEL_OPTIONS_D512
     if d > 128 and torch.cuda.get_device_capability(q.device)[0] < 9:
         return _FLEX_KERNEL_OPTIONS_SMALL_TILES
-    # Training / prefill only: below 128 queries Inductor otherwise picks flex_decoding, which rejects this
-    # block mask's tiles ("Q and KV block sizes must be divisible") and is forward only.
+    # Training/prefill only: flex_decoding (<128 queries, fwd only) rejects this mask's tiles.
     return {"FORCE_USE_FLEX_ATTENTION": True}
 
 
@@ -690,13 +684,10 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
 
 
 def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = None):
-    """Softmax attention of each query over its listed keys only (no sink), K != V, grouped-query heads.
-
-    query [b, hq, s, dk], key [b, hk, n, dk], value [b, hk, n, dv], topk_idxs [b, s, K] shared by every head
-    (-1 = unused) -> [b, s, hq, dv]. Head j reads kv head j // (hq // hk), as transformers' repeat_kv does.
-    The shared-KV kernels take one tensor as both key and value, so this runs them on [K | V] with the query
-    zero-padded over V: the logits are exactly q.K and the second half of the output is the V-weighted sum.
-    """
+    """Softmax over listed keys (no sink, K != V, GQA): query [b,hq,s,dk], key [b,hk,n,dk], value
+    [b,hk,n,dv], topk_idxs [b,s,K] (-1 unused) -> [b,s,hq,dv]; head j reads kv head j//(hq//hk);
+    shared-KV kernels run on [K|V] with zero-padded query (logits exact q.K, second half
+    V-weighted)"""
     if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
         raise ValueError("sparse_gqa_attn expects query [b, hq, s, dk], key [b, hk, n, dk], value [b, hk, n, dv]")
     b, hq, s, dk = query.shape
@@ -786,8 +777,7 @@ def _contiguous_rows(visible):
     hi = n - 1 - visible.flip(-1).to(torch.int8).argmax(-1)
     ok = (count > 0) & (count == hi - lo + 1)
     if n == s:
-        # Every key inside [lo, hi] must start at the same first key, not only the endpoints: rows with equal lo
-        # must form one run (segment id equal at both ends of the interval).
+        # Every key in [lo, hi] must start at the same first key; equal lo rows form one run.
         seg = torch.cat([lo.new_zeros(b, 1), (lo[:, 1:] != lo[:, :-1]).long()], 1).cumsum(1)
         ok = ok & (lo.gather(1, lo) == lo) & (seg.gather(1, lo) == seg.gather(1, hi))
     else:
@@ -798,9 +788,7 @@ def _contiguous_rows(visible):
 
 
 def _qsa_geometry(attention_mask, ratio):
-    """(lo, hi, block starts per batch row) for an interval-shaped mask, else None. The scan and the start lists
-    need host syncs, so the result is cached on the mask tensor (every QSA layer of a forward, and its gradient
-    checkpoint recompute, gets the same mask object), keyed by its version; inference tensors are rescanned."""
+    """Returns (lo, hi, block starts) or None; cached per _version, not for inference tensors."""
     # One shared selection per batch row: per-head masks ([b, h > 1, s, n]) cannot be represented.
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
         return None
@@ -819,7 +807,6 @@ def _qsa_geometry(attention_mask, ratio):
         positions = torch.arange(seq, device = visible.device)
         starts = []
         for b in range(lo.shape[0]):
-            # Block starts: every ratio-th key from its row's first visible key, whole block inside the sequence.
             is_start = ((positions - lo[b]) % ratio == 0) & (positions + ratio - 1 < seq)
             starts.append(torch.nonzero(is_start).flatten())
         result = (lo, hi, starts)

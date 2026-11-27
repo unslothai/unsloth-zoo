@@ -39,8 +39,7 @@ def _file_name_escapes(value):
         return True
     # Convert backslashes to slashes first: datasets does so before joining, so normpath of the raw value would miss dot-dot paths written with backslashes.
     relpath = posixpath.normpath(value.replace("\\", "/"))
-    # Windows: Python 3.13 isabs() no longer counts a root-relative /x, and C:x is drive-relative, yet os.path.join(dir,
-    # either) leaves dir, so check root and drive directly.
+    # py3.13 isabs() ignores root-relative /x; C:x is drive-relative, so check root and drive.
     return (
         os.path.isabs(value)
         or relpath.startswith("/")
@@ -51,8 +50,7 @@ def _file_name_escapes(value):
 
 
 def _is_path_key(name, list_depth):
-    # Only shapes datasets resolves: a singular key holding a string, or a plural key holding a list of strings; a list
-    # under a *_file_name key stays ordinary metadata.
+    # Singular string key or plural list of strings only; other shapes stay ordinary metadata.
     if list_depth == 0:
         return name == "file_name" or name.endswith("_file_name")
     if list_depth == 1:
@@ -61,8 +59,7 @@ def _is_path_key(name, list_depth):
 
 
 def _file_name_arrays(name, array, list_depth = 0):
-    # Folder builders resolve these keys at any depth, and Parquet metadata may wrap them in dictionary encoding or any
-    # list type, so unwrap by type rather than layout.
+    # Keys resolve at any depth; Parquet may wrap them (dictionary or list), so unwrap by type.
     import pyarrow as pa
 
     def is_any(kind, *checks):

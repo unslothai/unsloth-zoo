@@ -43,8 +43,7 @@ def _detect_windows_on_arm() -> bool:
         return False
     if platform.machine().lower() in ("arm64", "aarch64"):
         return True
-    # Emulated x64 on ARM64 reports AMD64 on Python below 3.12, which reads only PROCESSOR_ARCHITECTURE/ARCHITEW6432;
-    # IsWow64Process2 pNativeMachine names the real host.
+    # Py<3.12 shows AMD64 under x64 emulation; IsWow64Process2 pNativeMachine names real host.
     try:
         import ctypes
 
@@ -75,7 +74,6 @@ def _hf_transfer_importable() -> bool:
 
 _hf_transfer_installed = _hf_transfer_importable()
 
-# Hugging Face Hub faster downloads (skipped when offline mode is requested).
 if (
     "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
     and not _offline_env
@@ -84,7 +82,6 @@ if (
 ):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
-# More stable downloads
 if os.environ.get("UNSLOTH_STABLE_DOWNLOADS", "0") == "1":
     os.environ["HF_HUB_ETAG_TIMEOUT"] = "30" # Default is 10 seconds
     os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "30" # Default is 10 seconds
@@ -162,10 +159,8 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches
 redirect_hf_cache_if_readonly()
 
-# Size hf_xet buffers from this machine's RAM and cores; HF_XET_HIGH_PERFORMANCE=1 (old default here) meant a 64GB
-# buffer cap and multi-GB RSS spikes, so it is turned off unless the user set it.
-# _active_caches mirrors Hub's env layering (XDG_CACHE_HOME included) and returns None entries
-# instead of raising when home is unresolvable.
+# HF_XET_HIGH_PERFORMANCE=1 stays opt-in (64GB buffer cap, multi-GB RSS spikes); _active_caches
+# mirrors Hub env layering (XDG_CACHE_HOME) and returns None entries rather than raising.
 from .hf_xet_tuning import apply_xet_env
 _, _, xet_cache = _active_caches()
 apply_xet_env(throttled = has_429_exact_full_read(xet_cache / "logs") if xet_cache is not None else False)
@@ -213,7 +208,6 @@ from .model_lists import FORCE_FLOAT32
 _is_mlx_only = is_mlx_available()
 
 if _is_mlx_only:
-    # MLX mode: skip all CUDA/torch-specific initialization.
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
     UNSLOTH_ZOO_IS_PRESENT = True
     DEVICE_TYPE = "mlx"
@@ -228,10 +222,9 @@ if _is_mlx_only:
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
 else:
-    # Opt-in: a download-only helper child (e.g. hf_xet_fallback) sets
-    # UNSLOTH_ZOO_DISABLE_GPU_INIT=1 to skip the heavy torch/transformers/device
-    # init it never uses. Off by default, so normal CUDA/CPU runs are unchanged.
-    # The HF cache redirect above still runs, so the child shares the parent's cache.
+    # Opt-in via UNSLOTH_ZOO_DISABLE_GPU_INIT=1 (off by default) skips heavy
+    # torch/transformers/device init for download-only children like hf_xet_fallback; the HF cache
+    # redirect still runs so they share the parent's cache.
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
     if _SKIP_GPU_INIT:
@@ -243,8 +236,7 @@ else:
 
 _IS_CPU_BACKEND = False
 
-# Stub CUDA-only imports when GPU init is skipped (MLX host or download child) so they resolve to a loud no-op, not a
-# hard ImportError; CUDA/CPU keeps real modules.
+# Skipped GPU init stubs CUDA-only imports as loud no-ops, not ImportError; CUDA/CPU stay real.
 if _SKIP_GPU_INIT:
     from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as _inject_triton
     _inject_triton()
@@ -287,15 +279,13 @@ class _LazyMLXAlias(_types.ModuleType):
         return real
 
     def __getattr__(self, name):
-        # Dunder lookups raise AttributeError so torch walking sys.modules during init does not trigger an mlx import;
-        # real attributes such as FastMLXModel still resolve.
+        # Dunder lookups raise AttributeError so torch's sys.modules walk does not import mlx.
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         try:
             real = self._resolve()
         except ModuleNotFoundError:
-            # mlx is Apple-only; raising AttributeError instead of ModuleNotFoundError lets sys.modules walkers such as
-            # the torch._inductor FX hash pickler skip this stub.
+            # Raise AttributeError so torch._inductor FX hash pickler skips this stub.
             raise AttributeError(name)
         return getattr(real, name)
 
@@ -334,8 +324,7 @@ if not _SKIP_GPU_INIT:
     def _is_wsl():
         if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
             return True
-        # Docker on WSL2 lacks WSL_* env vars but shares the *-microsoft-standard-WSL2 kernel, where expandable_segments
-        # dies with a CUDA driver error (unslothai/unsloth issue 3511).
+        # WSL2 Docker: no WSL_* vars; expandable_segments fails (unslothai/unsloth issue 3511)
         try:
             return "microsoft" in os.uname().release.lower()
         except Exception:
@@ -343,8 +332,7 @@ if not _SKIP_GPU_INIT:
     IS_WSL_OR_WINDOWS = os.name == "nt" or _is_wsl()
     del _is_wsl
 
-    # Also unsupported on NVIDIA Tegra boards, where the CUDA VMM calls fail even with memory free (unslothai/unsloth
-    # issue 2401); detection is filesystem-only since torch is not yet imported; see unsloth_zoo/integrated_device.py.
+    # Tegra also fails CUDA VMM (unslothai/unsloth issue 2401); filesystem check, no torch yet.
     from .integrated_device import expandable_segments_unsupported
     EXPANDABLE_SEGMENTS_UNSUPPORTED = expandable_segments_unsupported()
 
@@ -413,7 +401,6 @@ if not _SKIP_GPU_INIT:
         raise ImportError("Unsloth only supports Pytorch 2 for now. Please update your Pytorch to 2.1.\n"\
                           "We have some installation instructions on our Github page.")
     elif (major_torch == 2) and (minor_torch < 2):
-        # Disable expandable_segments
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
         delete_key("PYTORCH_HIP_ALLOC_CONF")
         delete_key("PYTORCH_ALLOC_CONF")
@@ -423,8 +410,7 @@ if not _SKIP_GPU_INIT:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
-    # Unified-memory boards get no roundup fallback, unlike WSL: there is no separate VRAM pool to defragment and
-    # rounding up wastes shared RAM. Same ordering rule as ROCm: runs before torch import.
+    # No roundup fallback on unified memory (wastes shared RAM); must run before torch import.
     if EXPANDABLE_SEGMENTS_UNSUPPORTED:
         remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
@@ -450,7 +436,6 @@ if not _SKIP_GPU_INIT:
     torchao_logger.addFilter(HideLoggingMessage("Skipping import"))
     del logging, torchao_logger, HideLoggingMessage
 
-    # Get device types and other variables
     from .device_type import (
         is_hip,
         get_device_type,
@@ -465,7 +450,6 @@ if not _SKIP_GPU_INIT:
 
     # Torch >= 2.10 reads PYTORCH_ALLOC_CONF and treats legacy per-backend vars as deprecated.
     if IS_TORCH_2_10_OR_NEWER:
-        # Preserve explicit legacy allocator settings when user did not directly set PYTORCH_ALLOC_CONF.
         if not _HAS_ORIGINAL_PYTORCH_ALLOC_CONF:
             promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
             if promoted is None:
@@ -482,7 +466,6 @@ if not _SKIP_GPU_INIT:
         delete_key("PYTORCH_CUDA_ALLOC_CONF")
         delete_key("PYTORCH_HIP_ALLOC_CONF")
 
-    # Specify PYTORCH_CUDA_ALLOC_CONF or PYTORCH_HIP_ALLOC_CONF
     if IS_HIP_RUNTIME:
         if IS_TORCH_2_10_OR_NEWER:
             # PyTorch >= 2.10 uses PYTORCH_ALLOC_CONF. expandable_segments is unsupported on HIP.
@@ -530,9 +513,8 @@ if not _SKIP_GPU_INIT:
         # CCE also fails in HIP / AMD
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
 
-    # ROCm RDNA2/3/3.5/4: prefer rocBLAS (hipBLASLt can lack fallback Tensile kernels, so odd GEMMs JIT on first step);
-    # DISABLE_ADDMM_HIP_LT set early since addmm reads it at dispatch and runtime setter is a no-op on Windows; NVIDIA,
-    # Intel, Mac, CDNA untouched; UNSLOTH_ROCM_PREFER_ROCBLAS=0 disables.
+    # RDNA2-4: rocBLAS over hipBLASLt (may lack Tensile kernels); DISABLE_ADDMM_HIP_LT set early
+    # (addmm reads it at dispatch; Windows setter no-op); UNSLOTH_ROCM_PREFER_ROCBLAS=0 disables.
     if IS_HIP_RUNTIME and os.environ.get(
         "UNSLOTH_ROCM_PREFER_ROCBLAS", "1"
     ).strip().lower() not in ("0", "off", "false", "no"):
@@ -584,7 +566,6 @@ if not _SKIP_GPU_INIT:
         except:
             print("Unsloth: Will patch your computer to enable 2x faster free finetuning.")
 
-    # Log Unsloth-Zoo Utilities
     os.environ["UNSLOTH_ZOO_IS_PRESENT"] = "1"
 
 if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
@@ -614,7 +595,6 @@ if not _SKIP_GPU_INIT and not _IS_CPU_BACKEND:
         launch_openenv,
     )
 
-    # Top some pydantic warnings
     try:
         # Silences pydantic UnsupportedFieldAttributeWarning: frozen=True on Field() has no effect inside type-statement aliases or union members.
         from pydantic.warnings import UnsupportedFieldAttributeWarning

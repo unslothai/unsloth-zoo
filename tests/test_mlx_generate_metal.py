@@ -324,6 +324,38 @@ def _record_widths(monkeypatch, module):
 
 
 @metal_only
+@pytest.mark.parametrize("stream, rows", ((False, 1), (True, 1), (False, 2)))
+def test_spliced_image_rows_report_the_columns_their_prompt_filled(monkeypatch, stream, rows):
+    from PIL import Image
+    from mlx_vlm import load
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchStream, GenerationDefaults, GenerationRequest, generate_batch
+    model, processor = load(VLM_MODEL)  # FastVLM: one <image> id becomes hundreds of columns
+    model._is_vlm_model = True
+    prompt = apply_chat_template(processor, model.config, "Name the colour.", num_images=1)
+    requests = [GenerationRequest(prompt=prompt, image=Image.new("RGB", (64, 64), c), max_tokens=1) for c in ("red", "blue")[:rows]]
+    widths, embed = [], type(model).get_input_embeddings
+    def recording(self, *args, **kwargs):
+        out = embed(self, *args, **kwargs)
+        widths.append(out.inputs_embeds.shape[1])
+        return out
+    monkeypatch.setattr(type(model), "get_input_embeddings", recording)
+    defaults = GenerationDefaults(max_tokens=1, prefill_batch_size=rows, completion_batch_size=rows)
+    if stream:
+        with BatchStream(model, processor, defaults=defaults) as batch:
+            batch.add(requests[0])
+            results = [None]
+            while results[0] is None:
+                for event in batch.step():
+                    results[0] = event.result or results[0]
+    else:
+        results = generate_batch(model, processor, requests, defaults=defaults)
+    # One chunk embeds every row at the same width.
+    assert widths and max(widths) > 200, widths
+    assert [result.prompt_token_count for result in results] == [max(widths)] * rows
+
+
+@metal_only
 @pytest.mark.parametrize("vlm", (False, True))
 def test_batch_rows_prefill_in_the_given_step_and_decode_as_a_single_request_would(monkeypatch, vlm):
     from mlx_lm.sample_utils import make_sampler

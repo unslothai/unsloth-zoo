@@ -109,8 +109,7 @@ MHC_PROJECTION_REWRITES = (
 )
 
 
-# Unsloth's native DeepSeek-V4.1 (unsloth/models/deepseek_v41/modeling.py): the reference order, projection first and
-# the one RMS statistic of the flattened streams applied after it (inference/model.py:953-956), local `eps`.
+# Per inference/model.py:953-956: projection, then one RMS stat on flattened streams; local eps
 MHC_NATIVE_SINKHORN_SOURCE = (
     "        comb = comb / (comb.sum(dim = -2, keepdim = True) + eps)\n"
     "        for _ in range(self.sinkhorn_iters - 1):\n"
@@ -147,8 +146,7 @@ def _mhc_projection_rsqrt(hidden_streams, fn, eps):
 
 
 def unsloth_mhc_projection_rsqrt(hidden_streams, fn, eps):
-    """MHC_NATIVE_PROJECTION_SOURCE with the same memory saving as unsloth_mhc_projection: backward reruns the FP32
-    upcast instead of keeping it. Bitwise identical."""
+    """Same saving as unsloth_mhc_projection: backward reruns the FP32 upcast; bit-identical."""
     if (
         torch.compiler.is_compiling()
         or not torch.is_grad_enabled()
@@ -169,8 +167,7 @@ def _mhc_projection(hidden_streams, input_norm, fn):
 
 
 def unsloth_mhc_projection(hidden_streams, input_norm, fn):
-    """Runs F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float()) and saves hidden_streams (alive anyway),
-    not its FP32 upcast, for backward, which reruns the math."""
+    """Saves hidden_streams (alive anyway), not its FP32 upcast; backward reruns the math."""
     if (
         torch.compiler.is_compiling()
         or not torch.is_grad_enabled()

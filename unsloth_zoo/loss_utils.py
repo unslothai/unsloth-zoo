@@ -93,8 +93,7 @@ if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
-    # Checks every visible device, not just the current one: device_map can put lm_head on an sm_75 GPU while device 0
-    # is sm_80; the failure aborts rather than raises.
+    # All visible devices: device_map may put lm_head on sm_75 while device 0 is sm_80; aborts.
     _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
@@ -225,7 +224,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         )
     pass
 
-    # Now patch the losses!
     UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
@@ -316,8 +314,7 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-# Heads whose labels are not shifted next-token targets, so the counter cannot describe them; matched on the top-level
-# class name, since the walk descends into the backbone.
+# Non-next-token heads, not counted; matched on top-level class name since the walk descends.
 NON_CAUSAL_HEADS = (
     "ForSequenceClassification",
     "ForTokenClassification",
@@ -325,8 +322,7 @@ NON_CAUSAL_HEADS = (
     "ForMultipleChoice",
 )
 
-# loss_types that shift labels, snapshotted at import: patch_loss_functions() swaps every causal entry for
-# UnslothForCausalLMLoss, so the live mapping would read False for causal models.
+# Snapshot at import: patch_loss_functions() swaps causal keys; live mapping would read False.
 try:
     from transformers.loss.loss_utils import LOSS_MAPPING as _LOSS_MAPPING, ForCausalLMLoss
     CAUSAL_LOSS_TYPES = frozenset(
@@ -400,9 +396,8 @@ def _normalize_packed_seq_lengths(seq_lengths):
             lengths = torch.as_tensor(seq_lengths, dtype = torch.long)
         if lengths.ndim != 1:
             lengths = lengths.reshape(-1)
-        # Filtering is mandatory (a 0 length duplicates a start, a negative one corrupts later cumsums) and must stay
-        # inside this try: the mask lowers to aten.nonzero, which raises DynamicOutputShapeException under
-        # FakeTensorMode and vmap; escaping into the caller's except kills the run.
+        # Filtering is mandatory (0 duplicates a start, negatives corrupt cumsums); keep it in this
+        # try since aten.nonzero raises under FakeTensorMode/vmap and escaping kills the run.
         lengths = lengths[lengths > 0]
         if lengths.numel() <= 1: return None
     except Exception:

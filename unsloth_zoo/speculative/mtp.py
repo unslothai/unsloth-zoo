@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Native MTP heads trained outside the target: Qwen3.5/3.6 use Qwen35MTPHead, other mtp_families use nextn.NextNHead;
-position p takes post-output_norm hidden of p-1 and token p, predicts p+1; recursive steps feed back the normed
-output as h (llama.cpp graph_mtp)."""
+"""MTP heads: Qwen3.5/3.6 use Qwen35MTPHead, others nextn.NextNHead; position p takes normed hidden
+of p-1 and token p, predicts p+1; recursion feeds normed output as h (llama.cpp graph_mtp)."""
 
 __all__ = [
     "MTP_PREFIX_RE",
@@ -119,9 +118,8 @@ def _declared_mtp_layers(source, revision = None):
 
 
 def load_mtp_state_dict(source, revision = None, config = None):
-    """Read only MTP tensors (transformers drops them on load); returns (state_dict, info); Qwen3.5 names are
-    head-relative (fc.weight), others keep full names (info["prefix"] is empty); only shards holding the head are
-    opened."""
+    """Returns (state_dict, info) of MTP tensors only (transformers drops them on load) from shards
+    holding the head; Qwen3.5 names are head-relative, others full (info["prefix"] empty)."""
     from safetensors import safe_open
     from unsloth_zoo.safetensors_pread import pread_backend_kwargs
     text = _text_config(config) if config is not None else _source_text_config(source, revision)
@@ -312,9 +310,8 @@ class Qwen35MTPHead(nn.Module):
         num_steps = 1,
         position_ids = None,
     ):
-        """Teacher-forced recursive drafting: chain p starts from (hidden_final[p-1], x_p) at position p; step k sits at
-        p+k with token x_{p+k}, takes step k-1's h, predicts x_{p+k+1}; attends step-0 keys at positions <= p plus
-        its own chain keys; returns per-step dicts."""
+        """Teacher-forced drafting: chain p starts at (hidden_final[p-1], x_p); step k takes step
+        k-1's h, predicts x_{p+k+1}; step-0 keys <= p plus own chain; returns per-step dicts."""
         B, S = input_ids.shape
         device = input_ids.device
         if attention_mask is None:

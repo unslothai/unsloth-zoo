@@ -68,8 +68,7 @@ _ENGAGED = [0]           # count of FA2-path invocations (debug)
 _BANDED_ENGAGED = [0]    # count of banded-path invocations (debug)
 _DEFERRED = [0]          # count of sliding calls that fell through (debug)
 
-# Below 2w the band covers nearly the whole causal triangle, so blocking costs about 2x the causal FLOPs (a slowdown);
-# engage only from 3w, the first clear win, and leave shorter lengths untouched.
+# Blocking costs ~2x causal FLOPs below 2w (band spans the triangle); engage only from 3w.
 _MIN_SEQ_MULTIPLE_OF_WINDOW = 3
 
 
@@ -103,8 +102,7 @@ def _force_banded():
 
 
 def _is_muse_glimmer_sliding_module(module):
-    """Strict gate for sliding Muse Glimmer text attention; matches the class-name prefix, not isinstance, since
-    Unsloth's compiler regenerates the class in unsloth_compiled_cache; vision is excluded."""
+    """Matches class-name prefix, not isinstance (compiled copies); vision excluded."""
     if not getattr(module, "is_local_attention", False): return False
     cls = type(module).__name__
     return cls.startswith("MuseGlimmerText") and cls.endswith("Attention")

@@ -13,9 +13,8 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Runs DiffusionGemma in Unsloth Studio over GGUF via llama-diffusion-gemma-visual-server behind an OpenAI-compatible
-shim; no tokenizer files are needed, fastapi/uvicorn load only when the shim runs; autoregressive flows are
-untouched."""
+"""Runs DiffusionGemma GGUF via llama-diffusion-gemma-visual-server behind an OpenAI shim; no
+tokenizer files needed; fastapi/uvicorn load only for the shim; autoregressive flows untouched."""
 import os
 
 from .visual_engine import VisualServer, generate_visual, CANVAS

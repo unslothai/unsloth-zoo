@@ -981,8 +981,7 @@ def _decorator_name(node: ast.AST) -> str | None:
 
 
 def _softcap_module_cap_attr(module_cls) -> str | None:
-    """`C` when `module_cls.forward(self, x)` is exactly `return tanh(x / self.C) * self.C` (Inkling's
-    `Inkling2Softcap`), else None."""
+    """Returns `C` when forward is exactly `return tanh(x / self.C) * self.C`, else None."""
     import inspect
 
     try:
@@ -1045,14 +1044,10 @@ def _init_assigned_class(cls, attr):
 
 
 def inline_softcap_modules(source: str, cls) -> str:
-    """Spell `logits = self.<m>(logits)` as `logits = torch.tanh(logits / self.<m>.<C>) * self.<m>.<C>` when
-    `cls.__init__` builds `self.<m>` from a module whose whole forward is that softcap (Inkling 2's final
-    `self.logit_softcap`). The statement form is what the triplet rewriters hand to the fused CE kernel as
-    `logit_softcapping`; any other module call is left alone. Only that statement's text changes.
-
-    Skipped while fused CE would run behind torch.compiler.disable (UNSLOTH_FUSED_LINEAR=0 and the other non-default
-    CE switches), so such a forward stays the stock, compilable one. `restore_softcap_modules` puts the module call
-    back wherever the rewrite kept the statement (the materialised branches)."""
+    """Rewrites self.m(logits) to tanh softcap only when cls.__init__ builds a softcap-only module;
+    other calls untouched; skipped while fused CE is behind torch.compiler.disable
+    (UNSLOTH_FUSED_LINEAR=0 etc.) so the stock forward stays compilable; restore_softcap_modules
+    undoes it where kept."""
     if cls is None or "self." not in source or not _fused_ce_traceable():
         return source
 

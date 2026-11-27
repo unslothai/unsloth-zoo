@@ -78,8 +78,7 @@ pass
 def generate_sliding_window_with_sink(window_size: int):
     def sliding_window(batch, head, q_idx, kv_idx):
         causal_mask = (q_idx + 1) >= kv_idx
-        # Official PyTorch attends 1 extra token (windowed_mask q_idx - kv_idx <= window_size); HuggingFace and official
-        # GPT OSS attend only 128 tokens, not 128+1.
+        # Official PyTorch attends 1 extra token; HF and GPT OSS attend only 128, not 128+1.
         windowed_mask = (q_idx + 1) - kv_idx < window_size
         sink_first_column = kv_idx == 0
         return (causal_mask & windowed_mask) | sink_first_column
@@ -90,7 +89,6 @@ pass
 @functools.lru_cache
 def generate_sink_score_mod(sink_weights : torch.Tensor):
     def sink_score_mod(score, batch, head, q_idx, kv_idx):
-        # Sink token is at the first location
         return torch.where(
             kv_idx == 0,
             sink_weights[head].to(score.dtype) + 0.0, # Add +0 to allow gradients
@@ -110,8 +108,7 @@ def old_flex_attention_with_sink(
     sliding_window = None,
     compile = True,
 ):
-    """One sink token for full/sliding window attention (cf. Efficient Streaming Language Models with Attention Sinks),
-    primarily GPT-OSS; training only, since inference breaks KV cache absolute positioning."""
+    """One sink token; training only, since inference breaks KV cache absolute positioning."""
     if not self_attn.training:
         raise NotImplementedError("Unsloth: This version of flex attention only works for training")
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
@@ -218,7 +215,6 @@ def flex_attention_with_sink(
             block_mask = self_attn._flex_attention_cache(key)
         pass
     pass
-    # mask_mod for training and decoding steps
     if mask_mod is None:
         mask_mod = \
             generate_sliding_window_mask(sliding_window) \
@@ -248,7 +244,6 @@ def flex_attention_with_sink(
     
     # Version 2 (commented out) uses logaddexp, i.e. log(exp(x1) + exp(x2)), to add the sink to the logsumexp.
 
-    ### Version 3: Most simple uses sigmoid and scale
     sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
     # All 3 versions scale the original attn_output!
@@ -384,7 +379,6 @@ def flash_attention_left_padded(
         scale = 1.0 / math.sqrt(head_dim)
 
     kwargs = dict( scale = scale,)
-    # Only pass window sizes if you actually want sliding window
     if window_size_left is not None:
         kwargs["window_size_left"] = int(window_size_left)
         kwargs["window_size_right"] = 0  # causal right window

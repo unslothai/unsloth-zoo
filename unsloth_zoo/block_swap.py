@@ -601,12 +601,11 @@ class _Block:
             self.params.append(p)
             self.devices.append(device if p.data.device.type in ("cpu", "meta") else p.data.device)
         self.index = index
-        # Each device's weights sit back to back, so a fetch is one copy per device, not one per tensor.
-        self.layout, self.sizes = [], {}
-        for p, d in zip(self.params, self.devices):
-            off = self.sizes.get(d, 0)
-            self.layout.append(off)
-            self.sizes[d] = off + -(-p.data.nbytes // _ALIGN) * _ALIGN
+        refs = [_disk().disk_ref(p) if getattr(p, "_unsloth_disk", None) is not None else None for p in self.params]
+        # Small 1-D weights (norms, biases) go last, in every block alike so identical layers share one slot
+        # signature: a layer spilled at load kept them in RAM (refs None), and they fill the tail its spill reserved.
+        tail = {k for k, p in enumerate(self.params) if _stays_in_ram(p)}
+        self.layout, self.sizes = _slot_layout(self.params, self.devices, tail)
         for d in self.devices:
             if d not in streams:
                 streams[d] = torch.cuda.Stream(device = d)
@@ -631,34 +630,59 @@ class _Block:
         self.disk, self.disk_store, self.disk_runs, self.disk_state = None, None, (), 0
         self.disk_ready, self.disk_futs, self.stage, self.tier = {}, None, None, None
         self.fences = None
-        refs = [_disk().disk_ref(p) if getattr(p, "_unsloth_disk", None) is not None else None for p in self.params]
         if any(r is not None for r in refs):
-            if not all(r is not None for r in refs):
+            # The load-time spill keeps small 1-D weights (norms, biases) in host RAM; they join the region here,
+            # in whatever dtype they have now. Anything else missing a ref is a layer only partly spilled.
+            if any(r is None and (p.device.type == "meta" or not _stays_in_ram(p)) for p, r in zip(self.params, refs)):
                 raise RuntimeError("Unsloth: offload_layers found a layer only partly spilled to disk.")
             self.set_disk(refs)
 
     def set_disk(self, refs):
-        """Serve this block from the spill file (rewritten once if its layout differs from the slot's)."""
+        """Serve this block from the spill file (rewritten once if its layout differs from the slot's). A None
+        ref is a weight still in memory (kept out of the load-time spill): it is written into the region."""
         mod = _disk()
-        store = refs[0].store
+        store = next(r.store for r in refs if r is not None)
         if len(self.sizes) != 1:
             raise RuntimeError("Unsloth: offload_layers serves a layer from disk only when it fetches onto one card.")
-        bases = {r.offset - off for r, off in zip(refs, self.layout)}
-        if any(r.store is not store for r in refs) or len(bases) != 1 or next(iter(bases)) % mod.ALIGN:
+        bases = {r.offset - off for r, off in zip(refs, self.layout) if r is not None}
+        rewrite = any(r is not None and r.store is not store for r in refs) or len(bases) != 1 \
+            or next(iter(bases)) % mod.ALIGN
+        if not rewrite and any(r is None for r in refs):
+            refs = self._fill_tail(refs, store, next(iter(bases)))
+            rewrite = any(r is None for r in refs)
+        if rewrite:
             hold = []
             pieces = []
             for p, r, off in zip(self.params, refs, self.layout):
+                if r is None:
+                    pieces.append((p.data, off))
+                    continue
                 buf, owner = mod.read_bytes(r.store, r.offset, r.nbytes)
                 hold.append(owner)
                 pieces.append((buf.view(r.dtype).view(r.shape) if r.nbytes else buf, off))
             base = store.write_region(pieces, self.nbytes())
-            refs = [mod.DiskRef(store, base + off, r.nbytes, r.shape, r.dtype) for r, off in zip(refs, self.layout)]
+            refs = [mod.DiskRef(store, base + off, p.data.nbytes, tuple(p.shape), p.dtype)
+                    for p, off in zip(self.params, self.layout)]
             del hold, pieces
         else:
             base = next(iter(bases))
         self.disk = {"refs": refs, "base": base}
         self.disk_store = store
         self.disk_runs = ((base, mod._round_up(self.nbytes()), 0),)
+
+    def _fill_tail(self, refs, store, base):
+        """Write the in-memory weights (None refs) into the tail their load-time spill reserved, in place.
+        Returns the refs, still holding None when the tail cannot take them (then the region is rewritten)."""
+        mod = _disk()
+        kept = [(p, off) for p, r, off in zip(self.params, refs, self.layout) if r is None]
+        region = min((r.region for r in refs if r is not None and r.region is not None), default = None)
+        lo = min(off for _, off in kept)
+        hi = max(off + p.data.nbytes for p, off in kept)
+        if region is None or lo % mod.ALIGN or hi > region:
+            return refs
+        store.write_region([(p.data, off - lo) for p, off in kept], hi - lo, at = base + lo)
+        return [r if r is not None else mod.DiskRef(store, base + off, p.data.nbytes, tuple(p.shape), p.dtype)
+                for p, r, off in zip(self.params, refs, self.layout)]
 
     def nbytes(self):
         return sum(self.sizes.values())
@@ -975,6 +999,21 @@ def swap_indices(total, n, placement = "spread"):
     return [(k + 1) * total // n - 1 for k in range(n)]
 
 
+# Installed controllers, for offload_active(): dataset workers must not fork while one is live.
+_LIVE_SWAPS = weakref.WeakSet()
+
+
+def offload_active():
+    """Whether an installed BlockSwap holds layers in this process. Its host weights are page-locked in place
+    (cudaHostRegister), and Linux copies page-locked anonymous pages into every forked child at fork time instead
+    of sharing them copy-on-write, so each `Dataset.map` worker would duplicate the whole host tier; its copy,
+    prefetch and disk threads may also hold locks a forked child inherits locked. dataset_num_proc reads this."""
+    try:
+        return any(sw.blocks for sw in list(_LIVE_SWAPS))
+    except Exception:
+        return False
+
+
 class BlockSwap:
     """Install on a layer list; layers at `n` (a count or explicit indices) live on the host.
     `prefetch_depth = "auto"` starts at 1 and deepens while copies stall a step that could hide them; `model`
@@ -1235,6 +1274,7 @@ class BlockSwap:
                     self._hwm_fresh = True
                 except Exception:
                     self._hwm_fresh = False
+            _LIVE_SWAPS.add(self)
             # Only once installed: a failed install must leave load-time spills tagged for a retry.
             for b in self.blocks:
                 if b.disk is not None:
@@ -1887,6 +1927,10 @@ class BlockSwap:
         self._arm(forward = True)
 
     def remove(self):
+        try:
+            _LIVE_SWAPS.discard(self)
+        except TypeError:   # not weak-referenceable (a stand-in object), so never registered
+            pass
         self.__dict__.pop("_held", None)
         for h in self.handles:
             h.remove()
@@ -2592,14 +2636,54 @@ def _host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, sk
     return total
 
 
+# Largest 1-D weight (elements) the load-time spill keeps in host RAM: 1 MiB at float32. By count, not bytes, so
+# the same weights qualify before and after a dtype change.
+_RAM_1D_MAX_NUMEL = 1 << 18
+# Bytes per element the spill reserves for each kept weight: room for an upcast up to float32.
+_RAM_1D_RESERVE = 4
+# The kept weights' tail starts on the spill file's alignment (block_swap_disk.ALIGN), so it is rewritten in place.
+_TAIL_ALIGN = 4096
+
+
+def _stays_in_ram(p):
+    return p.dim() <= 1 and p.numel() <= _RAM_1D_MAX_NUMEL
+
+
+def _slot_layout(params, devices, tail = ()):
+    """(offsets, {device: bytes}): each device's weights back to back, so a fetch is one copy per device, not one
+    per tensor. Indices in `tail` go after the rest, starting on _TAIL_ALIGN."""
+    layout, sizes = [None] * len(params), {}
+    for last in (False, True):
+        started = set()
+        for k, (p, d) in enumerate(zip(params, devices)):
+            if (k in tail) != last:
+                continue
+            off = sizes.get(d, 0)
+            if last and d not in started:
+                off = -(-off // _TAIL_ALIGN) * _TAIL_ALIGN
+                started.add(d)
+            layout[k] = off
+            sizes[d] = off + -(-p.data.nbytes // _ALIGN) * _ALIGN
+    return layout, sizes
+
+
 def _spill_layer_weights(layer, shared_ids, need_bytes):
     """Spill a frozen layer's swappable weights in _Block's slot layout (a fetch is one read); the rest goes to
     host RAM as usual. Returns the region's bytes."""
-    params = [p for _, p in _swappable(layer) if id(p) not in shared_ids]
+    # Small 1-D weights (norms, biases) stay in host RAM: a spill saves nothing there, and a later dtype change
+    # (a norm upcast to float32) is then an ordinary in-memory cast; BlockSwap writes them into the region.
+    own = [p for _, p in _swappable(layer) if id(p) not in shared_ids]
+    params = [p for p in own if not _stays_in_ram(p)]
     layout, off = [], 0
     for p in params:
         layout.append(off)
         off += -(-p.data.nbytes // _ALIGN) * _ALIGN
+    # The region reserves a tail for the kept weights (as _Block lays them out, at up to float32), so the install
+    # writes them in place instead of rewriting the layer.
+    tail = [p for p in own if _stays_in_ram(p)]
+    if params and tail:
+        off = -(-off // _TAIL_ALIGN) * _TAIL_ALIGN + sum(
+            -(-p.numel() * max(_RAM_1D_RESERVE, p.element_size()) // _ALIGN) * _ALIGN for p in tail)
     if params:
         _disk().spill_params(params, layout, off, need_bytes = need_bytes(off))
     spilled = {id(p) for p in params}

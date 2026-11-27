@@ -39,7 +39,6 @@ DEFAULT_BITS = 8
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 # Below this many elements, packing saves bytes that do not matter on parameters that tolerate error poorly; matches bitsandbytes min_8bit_size default.
 MIN_QUANTIZE_SIZE = 4096
-# Names already announced in this process; see announce_quantized_optimizer.
 _ANNOUNCED = set()
 
 
@@ -74,9 +73,8 @@ class _QuantizedFirstMomentMixin:
         self.bits = bits
 
     def is_quantizable(self, parameter):
-        """Eligibility is by element count, not shape: mx.quantize only constrains the last axis, so flattened moments
-        admit 3-D expert stacks and LoRA_B at rank 16/32; tensors under MIN_QUANTIZE_SIZE (norms, biases) stay full
-        width, as bitsandbytes min_8bit_size does."""
+        """Eligibility is by element count, not shape: mx.quantize only constrains the last axis, so
+        flattened moments fit 3-D expert stacks and LoRA_B; small tensors stay full width."""
         return (
             parameter.size >= MIN_QUANTIZE_SIZE
             and parameter.size % self.group_size == 0
@@ -173,8 +171,7 @@ def describe_quantized_optimizer(optimizer_name, group_size = DEFAULT_GROUP_SIZE
 def announce_quantized_optimizer(
     optimizer_name, group_size = DEFAULT_GROUP_SIZE, enabled = True,
 ):
-    """Prints the routing line once per process, returning whether it printed; _build_optimizer runs per run and rank,
-    so an unguarded print repeats per rank and notebook re-run."""
+    """Prints once per process, returns whether it did; _build_optimizer runs per run and rank."""
     if not enabled or optimizer_name in _ANNOUNCED:
         return False
     _ANNOUNCED.add(optimizer_name)
@@ -183,9 +180,8 @@ def announce_quantized_optimizer(
 
 
 def unpack_quantized_moments(state, group_size = DEFAULT_GROUP_SIZE, bits = DEFAULT_BITS):
-    """Dequantizes packed first moments so a quantized checkpoint loads into plain optim.Adam/AdamW (else b1 * m on a
-    list raises TypeError); applies the v == 0 mask as apply_single does, since carried residue would move inactive
-    coordinates."""
+    """Dequantizes packed first moments so a quantized checkpoint loads into plain optim.Adam/AdamW
+    (b1 * m fails on a list); applies v == 0 mask, since residue moves inactive coordinates."""
     if isinstance(state, dict):
         out = {}
         for key, value in state.items():

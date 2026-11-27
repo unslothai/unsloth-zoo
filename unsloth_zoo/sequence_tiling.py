@@ -44,15 +44,13 @@ pass
 
 
 def _owned(fn, x, *args):
-    """Checkpointed tile body on its own copy of the rows: a kernel writing dX into its input in backward
-    (fused LoRA MLP, inplace=True) would otherwise corrupt the input every other tile's checkpoint saved."""
+    """Runs on a copy of the rows: a fused LoRA MLP with inplace=True writes dX into the shared input."""
     return fn(x.clone(), *args)
 pass
 
 
 def _checkpoint(fn, args, preserve_rng_state):
-    # Inductor min-cut partitioner fails on checkpointed one-row tiles (torch 2.14+); skip
-    # checkpoint.
+    # Inductor min-cut fails on checkpointed one-row tiles (torch 2.14+); skip checkpoint.
     if _is_compiling() and args[0].numel() <= args[0].shape[-1]:
         return _owned(fn, *args)
     body = functools.partial(_owned, fn)
@@ -86,16 +84,13 @@ pass
 
 
 def _tile_gc_flag():
-    # Both runs must read "not in a checkpoint recompute" (same saved tensors); pinning in every tile replay instead
-    # raised the eager OLMoE 8k peak by 2.5 GiB on G4.
+    # Runs must read 'not in a checkpoint recompute'; per-tile pinning raised eager peak on G4.
     return None if _gc_tls() is None else False
 pass
 
 
 def _replay_tile(fn, gc_flag, *args, choice = None, inline = None):
-    """One eager tile whose forward and recompute read the same in_gradient_checkpoint_recompute() value: Unsloth's
-    MoE kernels save a different tensor count per value, which raised CheckpointError (OLMoE: 29 vs 27). `choice`
-    pins a _TileBody's side and `inline` the forward's UNSLOTH_DECODE_COMPILE for the recompute."""
+    """Forward and recompute must read the same in_gradient_checkpoint_recompute(); else CheckpointError."""
     tls = _gc_tls() if gc_flag is not None else None
     previous = getattr(tls, "active", False) if tls is not None else None
     if tls is not None:
@@ -112,9 +107,8 @@ def _replay_tile(fn, gc_flag, *args, choice = None, inline = None):
             return fn(*args)
         return _dynamic_inner_compiles(fn, *args)
     except BaseException as exc:
-        # Checkpoint ends a recompute early by raising; a helper that re-raises it makes the traceback a reference cycle
-        # that keeps every tile's recomputed intermediates alive until the cycle collector runs. Drop it on the raise
-        # itself: a bare raise on Python 3.9 / 3.10 re-attaches the traceback stored in the thread state.
+        # with_traceback(None) breaks the cycle a re-raise creates, which keeps every tile
+        # recomputed intermediates alive; bare raise re-attaches the traceback on Py 3.9/3.10.
         if _STOP_RECOMPUTATION is not None and isinstance(exc, _STOP_RECOMPUTATION):
             raise exc.with_traceback(None)
         raise
@@ -138,8 +132,7 @@ pass
 
 
 def _dynamic_inner_compiles(fn, *args):
-    """Compile code inside a tile dynamic from its first call: a tile forwarded on a static graph and recomputed
-    on the later dynamic one saves different tensors ("A different number of tensors was saved")."""
+    """Compile dynamic from first call, else recompute raises "A different number of tensors was saved"."""
     try:
         patch = torch._dynamo.config.patch(assume_static_by_default = False)
     except Exception:
@@ -223,10 +216,9 @@ pass
 
 
 def tiled_call(fn, x, *token_args, n_tiles, needs_rng = True, output_contract = None):
-    """Run token-local `fn(x, *token_args)` over `n_tiles` row tiles of `x`, each under non-reentrant checkpoint.
-
-    x: [B, S, H], [1, N, H] or [N, H]; 3-D gives `fn` [1, t, H] tiles, 2-D gives [t, H]. token_args share x's row
-    boundaries. output_contract: per output, "rows", "rows_flat", "sum" or "none"; None infers it."""
+    """Runs token-local fn(x, *token_args) over n_tiles row tiles of x under non-reentrant
+    checkpoint; x is [B, S, H], [1, N, H] or [N, H] (3-D tiles [1, t, H], 2-D [t, H]); token_args
+    share row bounds; output_contract per output: rows, rows_flat, sum or none; None infers it."""
     n_tiles = int(n_tiles)
     if n_tiles <= 1:
         return fn(x, *token_args)
@@ -329,9 +321,8 @@ _ENV_COMPILE = "UNSLOTH_TILED_COMPILE"
 
 
 def _outside_graph_mode():
-    """Modes: unroll, op, compile_tile, break (UNSLOTH_TILED_COMPILE forces one); unrolling costs
-    ~1.1 s compile per tile and loses most of the overlap, so blocks use op (tile loop as one
-    opaque node); a user compile with fullgraph=True unrolls."""
+    """Modes: unroll, op, compile_tile, break (UNSLOTH_TILED_COMPILE forces one); blocks use op as
+    unrolling costs compile time and loses overlap; fullgraph=True user compiles unroll."""
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
     if mode in ("unroll", "op", "compile_tile", "break"):
         return mode

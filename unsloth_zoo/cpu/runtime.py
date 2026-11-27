@@ -84,8 +84,7 @@ def cpu_bf16_supported():
     return False
 
 
-# Runs in a child interpreter: a bf16 matmul on a CPU whose torch build picks an instruction the CPU lacks dies with
-# an illegal instruction (Windows 0xc000001d, exit 132), which would otherwise kill the user's process.
+# Child interpreter: bf16 matmul on unsupported instructions (exit 132) would kill the user.
 _BF16_PROBE_CODE = """
 import time
 import torch
@@ -194,8 +193,7 @@ def _linux_physical_cores(cpus, root = "/sys/devices/system/cpu"):
                 core = f.read().strip()
             with open(base + "physical_package_id") as f:
                 package = f.read().strip()
-            # Unknown topology reads as package -1 (and core 0 everywhere): it names no real core, so the caller
-            # falls back to counting CPUs instead of collapsing them all into one.
+            # Negative package/core: unknown topology; callers count CPUs, not one merged core.
             if int(package) < 0 or int(core) < 0:
                 return None
             cores.add((package, core))
@@ -214,8 +212,7 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
         return None
     for line in lines:
         hierarchy, _, path = line.partition(":")[2].partition(":")
-        # The process's own cgroup and every ancestor up to the mount root bound it; a path that does not exist under
-        # the mount (a host path seen inside a container) just falls through to the levels that do.
+        # Own cgroup and ancestors up to the mount root bound it; absent paths are skipped.
         parts = [p for p in path.split("/") if p]
         if hierarchy == "":  # v2 unified
             for depth in range(len(parts), -1, -1):
@@ -349,8 +346,7 @@ def _binding_narrowed_default(current):
 
 
 def cpu_compute_cores():
-    """Cores this process can really compute on: physical cores in its affinity mask (SMT siblings share one core's
-    vector / AMX units), capped by a cgroup CPU quota. Linux only; None elsewhere (keep torch's default)."""
+    """Physical cores (SMT siblings share units), affinity mask, quota-capped; None off Linux."""
     if not sys.platform.startswith("linux"):
         return None
     try:
@@ -368,9 +364,7 @@ def cpu_compute_cores():
 
 
 def _affinity_split_per_rank(ranks):
-    """True when a launcher pinned this rank to its own slice of CPUs (torchrun --numa-binding, mpirun --bind-to):
-    the parent launcher's affinity is wider than ours and holds a slice this size for every local rank. A whole job
-    pinned with taskset shares one mask with its parent, so its ranks still split it."""
+    """True if torchrun --numa-binding or mpirun --bind-to gave the rank a slice; not taskset."""
     if ranks <= 1 or not sys.platform.startswith("linux"):
         return False
     try:
@@ -482,9 +476,8 @@ def fit_cpu_threads():
 
 
 def _pin_omp_env(threads):
-    """Accelerate's PartialState (built later by TrainingArguments) sets torch threads to physical cores / local
-    ranks on a multi-CPU launch whenever OMP_NUM_THREADS is unset (mpirun), undoing this fit and UNSLOTH_CPU_THREADS.
-    Exporting the fitted count keeps it there, and hands the same count to spawned workers."""
+    """Exports the fitted count as OMP_NUM_THREADS, since Accelerate's PartialState sets torch
+    threads when unset (mpirun), undoing this fit and UNSLOTH_CPU_THREADS; workers inherit it."""
     if not os.environ.get("OMP_NUM_THREADS", "").strip():
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(threads)))
 
@@ -494,8 +487,7 @@ _PROC_SELF_CGROUP = "/proc/self/cgroup"
 
 
 def _cgroup_memory_headroom():
-    """Smallest memory.max - memory.current over this process's cgroup v2 and every ancestor (a limit set on an
-    enclosing job / slice applies even when the leaf says max), or None when no finite limit is readable."""
+    """Min memory.max - memory.current over cgroup v2 and ancestors; None if no finite limit."""
     try:
         with open(_PROC_SELF_CGROUP) as f:
             path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
@@ -543,8 +535,7 @@ def available_ram():
         headroom = None
     if headroom is not None:
         available = min(available or 1 << 62, headroom)
-    # memory_budget also knows cgroup v1 (a v1 container sees the host's MemAvailable), memory.high and the ancestors
-    # it can read; the stricter of the two readings wins.
+    # memory_budget reads cgroup v1 and memory.high (v1 sees host MemAvailable); stricter wins.
     try:
         from unsloth_zoo.memory_budget import host_memory_bytes
         budget = host_memory_bytes()[1]
@@ -576,9 +567,8 @@ def apply_cpu_security_patches():
 
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temporary_patches")
     applied = []
-    # deepseek_v41: device-independent training fixes for the DeepSeek-V4.1 port (no-ops without it).
-    # fp8_partial_block_dequant: FP8 checkpoints are dequantized on load on CPU; keep partial edge blocks right.
-    # hybrid_sliding_masks: StaticCache generate on Inkling models past the sliding window.
+    # Guards: deepseek_v41 (DeepSeek-V4.1 port fixes; no-op without it), fp8_partial_block_dequant
+    # (CPU FP8 edge blocks), hybrid_sliding_masks (StaticCache on Inkling past sliding window).
     for name in ("datasets_folder_metadata", "deepseek_v41", "fp8_partial_block_dequant", "hybrid_sliding_masks"):
         module_name = f"{__package__}._guard_{name}"
         module = sys.modules.get(module_name)

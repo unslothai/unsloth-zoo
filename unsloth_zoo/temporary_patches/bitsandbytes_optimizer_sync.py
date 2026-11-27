@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skips bitsandbytes' per-parameter sync in non-paged steps (the legacy default stream already orders them; the sync
-only blocks the host); paged, non-CUDA and side-stream params keep it; unknown step shapes are left alone;
-UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores the original step."""
+"""Skips bitsandbytes per-param sync when the legacy default stream orders steps; paged, non-CUDA,
+side-stream and unknown-shape cases keep it; UNSLOTH_BNB_OPTIMIZER_SYNC=1 restores it."""
 
 import ast
 import inspect
@@ -131,8 +130,7 @@ def _bnb_version_in_window():
 
 
 def _default_stream_on(p):
-    # bitsandbytes launches optimizer kernels on the legacy default stream (raw handle 0); skipping the sync preserves
-    # order only if torch also runs on that stream for p's device.
+    # bnb launches on the legacy default stream (raw 0); skip sync only if torch uses it for p.
     return p.device.type == "cuda" and torch._C._cuda_getCurrentRawStream(p.device.index) == 0
 
 

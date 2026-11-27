@@ -75,8 +75,7 @@ from .flex_attention_bwd import *
 from .inductor_stride_guard import *
 from .inductor_nonowning_inplace import *
 from .remote_code_vlm import *
-# Eager-fallback hook unsloth calls when backward dies inside activation checkpointing; imported by name since utils
-# exports names this package never re-exports.
+# Eager fallback for backward in checkpointing; imported by name as utils exports extra names.
 from .utils import (
     eager_fallback_state,
     force_eager_fallback,

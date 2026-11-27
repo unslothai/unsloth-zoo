@@ -194,11 +194,8 @@ pass
 
 
 import functools
-# ROCm on Windows ships a stubbed torch.distributed missing these attributes
-# entirely (https://github.com/ROCm/TheRock/issues/3284). Bind the real
-# functions directly when present; only the stub hits the AttributeError path.
-# Avoids per-name getattr and the throwaway lambdas it builds on every other
-# platform.
+# ROCm on Windows ships a torch.distributed stub missing these attributes
+# (https://github.com/ROCm/TheRock/issues/3284), so only the stub takes the AttributeError path.
 try:
     torch_distributed_is_initialized = dist.is_initialized
     torch_distributed_is_torchelastic_launched = dist.is_torchelastic_launched
@@ -231,10 +228,8 @@ pass
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
-    # Run independently when the process group isn't initialized: not
-    # distributed, or torchrun launched but init_process_group() not yet
-    # called (e.g. during module imports).
-    # Ref: https://github.com/unslothai/unsloth/issues/3703
+    # Runs without an initialized process group (not distributed, or torchrun before
+    # init_process_group(), e.g. at import); see https://github.com/unslothai/unsloth/issues/3703
     if not torch_distributed_is_initialized():
         out = function(*args, **kwargs)
         return out if n == 1 else out
@@ -356,6 +351,21 @@ def get_quant_type(config):
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+def _is_out_of_memory(error):
+    """True for a device or host out-of-memory error, also when a compile error carries it (inner_exception /
+    __cause__). An out-of-memory capability probe says nothing about the capability: record no verdict."""
+    oom = getattr(torch, "OutOfMemoryError", None)
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, MemoryError) or (isinstance(oom, type) and isinstance(error, oom)):
+            return True
+        if "out of memory" in str(error).lower():
+            return True
+        error = getattr(error, "inner_exception", None) or error.__cause__
+    return False
 
 
 def is_activation_checkpointing(model, default = False):

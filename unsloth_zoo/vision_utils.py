@@ -96,7 +96,6 @@ MIN_PIXELS = 4 * 28 * 28
 MAX_PIXELS = 16384 * 28 * 28
 MAX_RATIO = 200
 
-# Fire degenerate-aspect warning once per process.
 _WARNED_DEGENERATE_ASPECT = False
 
 VIDEO_MIN_PIXELS = 128 * 28 * 28
@@ -136,9 +135,7 @@ def resolve_file_uri_to_path(path):
     return url2pathname(path_part) or path
 
 
-# Dataset rows carry arbitrary http(s) URLs fetched server-side, so without a destination check they can reach
-# 127.0.0.1, the LAN or the metadata endpoint; public URLs and local files are unaffected; serving media from a private
-# host needs UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1
+# Server-side dataset URL fetches block private hosts unless UNSLOTH_ALLOW_PRIVATE_URL_FETCH=1.
 UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR = "UNSLOTH_ALLOW_PRIVATE_URL_FETCH"
 UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR   = "UNSLOTH_MAX_MEDIA_DOWNLOAD_MB"
 _MAX_MEDIA_REDIRECTS = 5
@@ -152,8 +149,7 @@ _BLOCKED_CIDRS = (
     "::/128", "::1/128", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
 )
 
-# Metadata services answer on a fixed name too, which is what a configured HTTP
-# proxy resolves instead of us.
+# Metadata services answer on fixed names too; a configured proxy resolves them instead of us.
 _BLOCKED_HOSTNAMES = frozenset((
     "metadata.google.internal", "metadata.goog", "metadata",
     "instance-data", "instance-data.ec2.internal",
@@ -191,7 +187,6 @@ def _is_blocked_ip(ip) -> bool:
         return True
     for network in _blocked_networks():
         if ip.version == network.version and ip in network: return True
-    # IPv4-mapped / 6to4 wrappers around an internal v4 address
     mapped = getattr(ip, "ipv4_mapped", None) or getattr(ip, "sixtofour", None)
     if mapped is not None and _is_blocked_ip(mapped): return True
     return False
@@ -375,8 +370,7 @@ def _check_fetchable_url(url: str):
     return (_host_forms(host), tuple(str(ip) for ip in addresses or ()))
 
 
-# Resolving twice (check, then HTTP client) lets an attacker answer the two lookups differently (public, then private);
-# connect to the checked address but keep the hostname for Host, SNI and certificate checks.
+# Resolving twice allows rebinding; dial the checked IP, keep hostname for Host, SNI, certs.
 _PINNED_ADDRESSES = contextvars.ContextVar("unsloth_pinned_addresses", default = None)
 # The address is not ours to choose here: the guard is off, or a proxy picks it.
 _UNPINNED = "unsloth_unpinned"
@@ -466,9 +460,16 @@ def _pinned_adapter_class():
     return _PinnedAddressAdapter
 
 
+def _resolve_no_redirects(*args, **kwargs):
+    return iter(())
+
+
 def _guarded_session():
     """A session whose connections only reach addresses the guard checked."""
     session = requests.Session()
+    # Hops are followed by hand (allow_redirects=False), but requests still reads each redirect's whole body into
+    # memory to precompute `response.next`, past the download cap. No redirect is ever resolved by requests here.
+    session.resolve_redirects = _resolve_no_redirects
     try:
         adapter_class = _pinned_adapter_class()
     except Exception as exception:
@@ -645,8 +646,7 @@ def smart_resize(
 
 
 def _refuse_network_share_image(path):
-    # Same rule as fetch_video: on Windows even os.path.isfile on a UNC path opens an SMB connection.
-    # PIL also opens bytes / PathLike paths (a dict row's binary "path" column), so check their decoded form too.
+    # Windows os.path.isfile on UNC opens SMB; PIL opens bytes/PathLike, so check decoded form.
     try:
         name = os.fsdecode(path) if isinstance(path, (bytes, os.PathLike)) else path
     except Exception:
@@ -1534,7 +1534,6 @@ def process_vision_info(
     
     vision_infos = extract_vision_info(conversations)
    
-    ## Read images or videos
     image_inputs = []
     video_inputs = []
     video_sample_fps_list = []
@@ -2152,13 +2151,11 @@ class UnslothVisionDataCollator:
             self.size_func = _ImageSide(resize_dimension)
         self.resize_dimension = resize_dimension
 
-        # Sequence lengths
         if max_seq_length is None:
             if hasattr(model, "max_seq_length"): max_seq_length = model.max_seq_length
         self.max_seq_length = max(max_seq_length, 0) if type(max_seq_length) is int else None
         self.truncation = self.max_seq_length is not None
 
-        # Train on reponses if provided
         if train_on_responses_only:
             assert(isinstance(instruction_part, str) and isinstance(response_part, str))
             self.train_on_responses_only = _train_on_responses_only(
@@ -2261,9 +2258,8 @@ class UnslothVisionDataCollator:
             audio = self._extract_audio_for_example(example, messages)
             audios.extend(audio)
 
-        # With audio, omit max_length/truncation from the top-level processor call: _merge_kwargs broadcasts them into
-        # audio_kwargs, which truncates the waveform to max_length samples instead of leaving it intact; truncate
-        # input_ids manually after the call.
+        # With audio, omit max_length/truncation from the top-level call: _merge_kwargs broadcasts
+        # them into audio_kwargs, truncating the waveform; truncate input_ids manually.
         proc_kwargs = dict(
             text=texts,
             padding=True,
@@ -2271,7 +2267,6 @@ class UnslothVisionDataCollator:
             add_special_tokens=False,
         )
         if not audios:
-            # Safe to pass truncation kwargs top-level when no audio is involved
             proc_kwargs["truncation"] = self.truncation
             proc_kwargs["max_length"] = self.max_seq_length
         has_images = any(len(x) > 0 for x in images)
@@ -2301,7 +2296,6 @@ class UnslothVisionDataCollator:
         if 'pixel_values_videos' in batch:
             batch = self._cast_pixel_values_dtype_inplace(batch, 'pixel_values_videos')
 
-        # Mask image tokens and pad tokens
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
@@ -2404,8 +2398,7 @@ class UnslothVisionDataCollator:
                 and "videos" not in proc_kwargs and "audio" not in proc_kwargs
             ):
                 return self._call_processor_mixed_rows(proc_kwargs)
-            # Nemotron Omni returns per-image pixel tensors BatchFeature cannot stack; the error reads Unable to convert
-            # output on transformers 5.x, Unable to create tensor on 4.x.
+            # BatchFeature can't stack Nemotron Omni pixels; error text differs on 4.x vs 5.x.
             if not has_images or not any(m in str(e) for m in ("Unable to convert output", "Unable to create tensor")):
                 raise
             proc_kwargs = dict(proc_kwargs, return_tensors = None)
@@ -2542,7 +2535,6 @@ class UnslothVisionDataCollator:
                     if clip is not None:
                         clips.append(clip)
         else:
-            # Raw ndarray or other single-clip value
             clips = [audio_val]
         return self._normalize_audio_clips(clips)
 
@@ -2645,9 +2637,7 @@ class UnslothVisionDataCollator:
 
         if image is None or self.image_size is None or (isinstance(self.image_size, (tuple, list)) and len(self.image_size) == 0):
             return image or []
-        # Resize images
         image_size = self.image_size
-        # Hoist loop invariants.
         is_tuple = type(image_size) is tuple
         snap = self.snap_to_patch_size
         if snap:
@@ -2861,7 +2851,6 @@ class UnslothVisionDataCollator:
         for ex in examples:
             p, c = ex["prompt"], ex["completion"]
 
-            # Determine chat vs plain for each side
             is_p_msgs = isinstance(p, list) and (len(p) == 0 or isinstance(p[0], dict))
             is_c_msgs = isinstance(c, list) and (len(c) == 0 or isinstance(c[0], dict))
 
@@ -2954,7 +2943,6 @@ class UnslothVisionDataCollator:
         else:
             token_type_ids = None
 
-        # Flush to tokenizer default padding side
         pad_id = self._pad_token_id_or_fail()
         flush_side = self._tokenizer_padding_side()
         pre_flush = (attention_mask, input_ids)
@@ -2963,7 +2951,6 @@ class UnslothVisionDataCollator:
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask, token_type_ids)
             )
 
-            # Truncate with side awareness
             if self.max_seq_length is not None:
                 input_ids, attention_mask, completion_mask, token_type_ids = self._truncate_by_side(
                     input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length, token_type_ids=token_type_ids
@@ -2979,7 +2966,6 @@ class UnslothVisionDataCollator:
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask,)
             )
 
-            # Truncate with side awareness
             if self.max_seq_length is not None:
                 input_ids, attention_mask, completion_mask = self._truncate_by_side(
                     input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length

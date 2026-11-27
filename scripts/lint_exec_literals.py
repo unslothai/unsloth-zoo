@@ -62,10 +62,8 @@ def _is_written_out(node: ast.AST) -> bool:
     if isinstance(node, ast.Constant):
         return isinstance(node.value, (str, bytes))
     if isinstance(node, ast.JoinedStr):
-        # An f-string without placeholders is a plain string; one with a placeholder is the whole point of this check and is not written out.
         return not any(isinstance(part, ast.FormattedValue) for part in node.values)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        # `"import " + "torch"` is still written out; `"import " + name` is not.
         return _is_written_out(node.left) and _is_written_out(node.right)
     return False
 
