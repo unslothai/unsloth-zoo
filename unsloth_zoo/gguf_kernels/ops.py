@@ -119,8 +119,6 @@ def _warn_fallback(what, err):
         warnings.warn(f"Unsloth: GGUF Triton {what} failed ({type(err).__name__}: {err}); using the torch path.")
 
 
-# ---------------------------------------------------------------------------------------------------- dequantize
-
 def _dequant_triton(packed, ggml_type, shape, dtype):
     qk, bs = GGML_BLOCK[ggml_type]
     K = shape[-1]
@@ -145,7 +143,7 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
 def _dequantize_impl(packed, ggml_type, shape, dtype):
     if ggml_type in _PASSTHROUGH:
         out = dequantize_reference(packed, ggml_type, shape, dtype)
-        # an F32 -> float32 (F16 -> float16 never: it goes through float32) result is a view of the input bytes
+        # F32 -> float32 is a view of the input bytes; a custom op must return a fresh tensor
         return out.clone() if out.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr() else out
     if _triton_ok(packed):
         try:
@@ -174,8 +172,6 @@ def dequantize_gguf(packed: torch.Tensor, ggml_type, shape, dtype = torch.bfloat
     _check(packed, ggml_type, shape)
     return _dequantize_op(packed, ggml_type, shape, dtype)
 
-
-# ---------------------------------------------------------------------------------------------------- linear
 
 def _fused_ok(x, ggml_type):
     if not (_triton_ok(x) and _env_on("UNSLOTH_GGUF_FUSED")) or ggml_type in _PASSTHROUGH:
@@ -321,8 +317,6 @@ def gguf_linear_backward_input(grad_out: torch.Tensor, packed: torch.Tensor, ggm
         raise ValueError(f"Unsloth: grad_out has {grad_out.shape[-1]} features, the GGUF weight has {shape[0]} rows")
     return _linear_bwd_op(grad_out, packed, ggml_type, shape)
 
-
-# ---------------------------------------------------------------------------------------------------- grouped
 
 def _grouped_impl(x, packed, ggml_type, shape, counts, trans_b):
     E, N, K = shape
