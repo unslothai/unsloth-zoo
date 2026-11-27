@@ -13,7 +13,7 @@ from unsloth_zoo.mlx.speculative import (
     SizedTreeBudget,
     TreeBudget,
     TreeCalibration,
-    DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
+    DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _bucket, _upper,
 )
 
 
@@ -366,6 +366,65 @@ def test_folded_replay_does_not_make_a_profitable_draft_lose_to_plain():
     assert controller.plan(states).kind == "round"
     states[0].catch_up, states[0].folded_replay = 2, True
     assert controller.plan(states).kind == "round"
+
+
+def test_a_long_prompt_priming_is_charged_once_per_reply_not_per_round():
+    controller = DraftController(max_depth = 1, can_copy = False)
+    states = []
+    _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0, overhead = 0.7), [([0.2], None)],
+         rounds = 500, states = states)
+    controller._credit = 0
+    state = states[0]
+    state.stats.probe_at["draft"] = state.stats.tokens + 1000
+    state.catch_up, state.folded_replay, state.priming = 4096, False, 4096
+    for timed in (False, True):
+        controller.catch_up_cost = _Ema()
+        if timed:
+            controller.catch_up_cost.update_time(controller._plain_step(1) / 100, 1.0)
+        state.remaining = 256
+        assert controller.plan(states).kind == "round"
+        state.remaining = 2
+        assert controller.plan(states).kind == "plain"
+    per_pair, state.remaining, state.priming = controller.catch_up_cost.value, 256, 4000
+    plan = RoundPlan("round", rows = (RowPlan("draft", 1),), split = True)
+    share = 96 * per_pair + 4000 * per_pair * state.stats.expected(plan.rows[0]) / 256
+    full = controller.round_seconds(plan, [state])
+    assert controller.round_seconds(plan, [state], expected = state.stats.expected(plan.rows[0])) == pytest.approx(full - 4096 * per_pair + share)
+    hopeful = state.stats.expected(plan.rows[0], 1.0)
+    assert controller.score(plan, [state], optimism = 1.0) == hopeful / controller.round_seconds(plan, [state], expected = hopeful)
+    controller._probe, controller._probe_left, controller._credit = controller._identity(plan, 1), 2, 0.0
+    assert controller._choose([RoundPlan("plain", 1), plan], [state], 1)[1] is False
+    pair = RoundPlan("round", rows = (RowPlan("draft", 1), RowPlan()), split = True)
+    controller._probe, controller._probe_left = controller._identity(pair, _bucket(2)), 2
+    assert controller._choose([RoundPlan("plain", 1), pair], [state, RowState(state.stats)], _bucket(2))[1] is True
+    assert controller._regret(plan, RoundPlan("plain", 1), [state]) == pytest.approx(
+        full - state.stats.expected(plan.rows[0]) * controller._plain_step(1))
+    state.priming = 0
+    assert controller.round_seconds(plan, [state], expected = state.stats.expected(plan.rows[0])) == full
+    state.priming = 4000
+    lone = RoundPlan("round", rows = (RowPlan("draft", 1), RowPlan()), split = True)
+    other = RowState(state.stats, remaining = 256)
+    assert controller.round_seconds(lone, [state, other], expected = 3.0) == controller.round_seconds(lone, [state, other])
+    assert controller.score(lone, [state, other]) == controller.score(lone, [state, other], planning = False)
+    assert controller._replay_seconds(4096, [state, other], 3.0) == 4096 * per_pair
+    state.remaining = 2
+    assert controller.round_seconds(plan, [state], expected = state.stats.expected(plan.rows[0])) == full
+    rows = [SimpleNamespace(state = RowState(controller.new_reply()), remaining = 256, speculates = False,
+                            draft = SimpleNamespace(ready = True, pending_pairs = 4096, prefix = prefix))
+            for prefix in (SimpleNamespace(tokens = [0] * 4000), None)]
+    engine = _bare_engine(SpeculativeEngine, _rows = rows, controller = controller)
+    assert [row.priming for row in engine._states()] == [4000, 0]
+
+
+def test_a_priming_draft_competes_with_a_copy_at_its_share():
+    controller = DraftController(max_depth = 1)
+    states = []
+    _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0, overhead = 0.7), [([0.9], None)], rounds = 500, states = states)
+    controller.catch_up_cost.update_time(controller._plain_step(1) / 100, 1.0)
+    state = states[0]
+    state.catch_up, state.folded_replay, state.priming, state.remaining, state.copy_available = 4096, False, 4096, 256, 1
+    state.stats.copy = _Ema(0.0)
+    assert [row.source for row in controller._round_at(2, [state]).rows] == ["draft"]
 
 
 @pytest.mark.parametrize("backlogs", [(10,), (10, 2)])
