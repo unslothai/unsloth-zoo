@@ -410,9 +410,9 @@ _SMEM = {}
 
 
 def _generic_family(device):
-    """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's."""
+    """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's; ROCm (64 KB LDS) sm120's."""
     cap = _capability(device)
-    if cap[0] == 12:
+    if cap[0] == 12 or torch.version.hip is not None or "rocm" in torch.__version__:
         return "sm120"
     if cap[0] >= 9 or cap == (8, 0):
         return "sm80"
@@ -427,7 +427,8 @@ def _smem_limit(device):
         if device.type == "cuda":
             index = device.index if device.index is not None else torch.cuda.current_device()
             props = torch.cuda.get_device_properties(index)
-            lim = getattr(props, "shared_memory_per_block_optin", 0) or lim
+            lim = (getattr(props, "shared_memory_per_block_optin", 0)
+                   or getattr(props, "shared_memory_per_block", 0) or lim)
         _SMEM[key] = lim
     return lim
 
@@ -877,13 +878,13 @@ def _self_check_generic(device):
 
 
 def triton_grouped_available(device) -> bool:
-    """Self-check once per device; a failure disables the generic path for the process (OOM propagates)."""
+    """Self-check once per device; a failure disables the generic path for the process (OOM propagates). ROCm is
+    admitted here; moe_utils' policy decides which archs route to it."""
     global _GENERIC_DISABLED_REASON
     if (
         triton is None
         or _GENERIC_DISABLED_REASON is not None
         or getattr(device, "type", None) != "cuda"
-        or torch.version.hip is not None
         or os.environ.get("TRITON_INTERPRET", "0") == "1"
     ):
         return False
