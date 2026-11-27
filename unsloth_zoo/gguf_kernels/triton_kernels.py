@@ -120,7 +120,10 @@ def _signed(v, s):
 
 
 @triton.jit
-def _decode(b, j, jh, m, tab, TYPE: tl.constexpr):
+def _decode(
+    b, j, jh, m, tab,
+    TYPE: tl.constexpr,  # ggml type id (GGMLType), selects the block decoder
+):
     """Values of element ``j`` (int32, 0 <= j < block size) of the blocks starting at byte pointer ``b``.
     ``jh`` is ``j`` rounded down to a multiple of 8 (same shape or broadcastable): every field that depends on
     ``j // 8`` or coarser is indexed by it, so it loads once per 8 values."""
@@ -300,8 +303,14 @@ def _decode(b, j, jh, m, tab, TYPE: tl.constexpr):
 
 
 @triton.jit
-def _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab,
-           TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr):
+def _tile3(
+    P, rows, blk0, rmask, row_bytes, nblk, tab,
+    TYPE: tl.constexpr,  # ggml type id (GGMLType), selects the block decoder
+    QK: tl.constexpr,  # values per ggml block
+    BS: tl.constexpr,  # bytes per ggml block
+    NB: tl.constexpr,  # ggml blocks per tile along the value axis
+    SPLIT: tl.constexpr,  # decode in 8-value groups (group fields load once per 8 values), else one group per block
+):
     """Decoded float32 tile (rows, NB blocks, G groups, QK // G values) of a packed matrix starting at block
     ``blk0``. SPLIT: 8-value groups, so group fields load once per 8 values; else one group of the whole block on
     the last axis (cheaper to reshape into a dot operand; group fields then load per value). Block fields load once
@@ -321,7 +330,12 @@ def _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab,
 
 
 @triton.jit
-def _cols(blk0, QK: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr):
+def _cols(
+    blk0,
+    QK: tl.constexpr,  # values per ggml block
+    NB: tl.constexpr,  # ggml blocks per tile along the value axis
+    SPLIT: tl.constexpr,  # decode in 8-value groups (group fields load once per 8 values), else one group per block
+):
     """Column index of every value of a ``_tile3`` tile, shape (1, NB, G, QK // G)."""
     G: tl.constexpr = QK // 8 if (QK >= 8 and SPLIT) else 1
     W: tl.constexpr = QK // G
@@ -332,8 +346,12 @@ def _cols(blk0, QK: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr):
 @triton.jit
 def dequantize_kernel(
     P, OUT, tab, ROWS, K, row_bytes,
-    TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr,
-    BLOCK_R: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr,
+    TYPE: tl.constexpr,  # ggml type id (GGMLType), selects the block decoder
+    QK: tl.constexpr,  # values per ggml block
+    BS: tl.constexpr,  # bytes per ggml block
+    BLOCK_R: tl.constexpr,  # packed rows per program
+    NB: tl.constexpr,  # ggml blocks per tile along the value axis
+    SPLIT: tl.constexpr,  # decode in 8-value groups (group fields load once per 8 values), else one group per block
 ):
     rows = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
     blk0 = tl.program_id(1) * NB
@@ -348,8 +366,13 @@ def dequantize_kernel(
 @triton.jit
 def gemv_kernel(
     X, P, OUT, BIAS, tab, N, K, row_bytes,
-    TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr, HAS_BIAS: tl.constexpr,
-    BLOCK_N: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr,
+    TYPE: tl.constexpr,  # ggml type id (GGMLType), selects the block decoder
+    QK: tl.constexpr,  # values per ggml block
+    BS: tl.constexpr,  # bytes per ggml block
+    HAS_BIAS: tl.constexpr,  # add BIAS to the output
+    BLOCK_N: tl.constexpr,  # output columns per program
+    NB: tl.constexpr,  # ggml blocks per tile along the value axis
+    SPLIT: tl.constexpr,  # decode in 8-value groups (group fields load once per 8 values), else one group per block
 ):
     """out[n] = sum_k x[k] * W[n, k] (+ bias[n]) for one row of x."""
     rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -373,10 +396,18 @@ def gemv_kernel(
 def mm_kernel(
     X, P, OUT, BIAS, COUNTS, SCHED, tab,
     M, N, K, E, R, row_bytes, stride_xm, stride_om,
-    TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr,
-    TRANS_B: tl.constexpr, GROUPED: tl.constexpr, E_POW2: tl.constexpr, HAS_BIAS: tl.constexpr,
-    HOST_SCHED: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT: tl.constexpr,
+    TYPE: tl.constexpr,  # ggml type id (GGMLType), selects the block decoder
+    QK: tl.constexpr,  # values per ggml block
+    BS: tl.constexpr,  # bytes per ggml block
+    TRANS_B: tl.constexpr,  # out = x @ W[e]^T (forward) instead of x @ W[e] (backward)
+    GROUPED: tl.constexpr,  # rows of x sorted by expert, COUNTS[e] rows each
+    E_POW2: tl.constexpr,  # E rounded up to a power of two, for the per-expert aranges
+    HAS_BIAS: tl.constexpr,  # add BIAS to the output
+    HOST_SCHED: tl.constexpr,  # tile / row prefix sums come precomputed in SCHED (Triton < 3.3)
+    BLOCK_M: tl.constexpr,  # rows of x per program
+    BLOCK_N: tl.constexpr,  # output columns per program
+    BLOCK_K: tl.constexpr,  # reduction elements per loop step
+    SPLIT: tl.constexpr,  # decode in 8-value groups (group fields load once per 8 values), else one group per block
 ):
     """Packed weight ``W[e]`` is (R, C) with C values per packed row (R rows per expert).
     TRANS_B: out (M, N = R) = x (M, K = C) @ W[e]^T.  Else: out (M, N = C) = x (M, K = R) @ W[e].
