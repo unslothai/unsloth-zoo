@@ -542,8 +542,7 @@ def test_distributed_is_refused(monkeypatch):
 
 
 class _Votes:
-    """A stand-in for the ranks' MIN all-reduce: records this rank's votes, answers with the other ranks' (True
-    unless `others` says otherwise for a stage)."""
+    """Fake MIN all-reduce: records votes; other ranks vote True unless `others` overrides a stage."""
     def __init__(self, events = None, **others):
         self.calls, self.others = [], others
         self.events = events if events is not None else []
@@ -566,8 +565,7 @@ def _voting_fns(model, batches, items, events, fail = None):
 
 
 def test_ranks_vote_before_the_loss_parts_and_after_the_backward():
-    """Data parallel: one vote once every micro-batch is through the decoder (before any loss part, so before any
-    collective a loss part issues) and one after the decoder backward; gradients bitwise as standard."""
+    """Forward vote before any loss part, commit vote after the decoder backward; gradients bitwise as standard."""
     model = _model()
     batches, items = _batches(3)
     _, base = _standard(model, batches, items)
@@ -699,8 +697,7 @@ def test_a_backward_abort_votes_no_at_commit():
 
 
 def test_an_out_of_memory_error_in_a_loss_part_after_the_vote_is_raised():
-    """After the forward vote a rollback could pair this rank's commit vote with another rank's loss-part
-    collective, so the error propagates (as from a standard data-parallel step); alone it is still an abort."""
+    """An error after the forward vote propagates (a rollback could pair with another rank's collective)."""
     model = _model(train_head = True)
     batches, items = _batches(2)
 

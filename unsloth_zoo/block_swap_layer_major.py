@@ -140,11 +140,8 @@ _DISAGREE = "another rank stopped its layer-major window"
 
 
 class _Agreement:
-    """The ranks' votes on one window (data parallel): `agree(ok, stage)` must be a collective that returns True
-    only if every rank passed True. Each rank votes exactly twice, in the same order: "forward" once every
-    micro-batch has run the decoder layers (before any loss part, so before the loss parts' own collectives), and
-    "commit" after the decoder backward. A False "forward" result ends the voting; any rank that stops before a vote
-    casts False for it, so every rank rolls back together and runs the step the standard way."""
+    """Data-parallel votes on one window; `agree(ok, stage)` is a MIN all-reduce. Every rank votes "forward" (before
+    any loss part's collectives) then "commit" (after the decoder backward); a rank stopping early votes False."""
     def __init__(self, agree):
         self.agree = agree
         self.stage = 0 if agree is not None else 2   # 0: forward vote due, 1: commit vote due, 2: done
@@ -594,8 +591,7 @@ class _Window:
             self.held.discard(l)
             self.swapper.unhold(l)
         if l == self.L - 1 and m == self.n - 1 and self.agreement.stage == 0:
-            # Every micro-batch is through the decoder and no loss part has run: the ranks vote before any of
-            # them issues a loss part's collectives.
+            # Vote before any loss part issues its own collectives.
             if not self.agreement.vote(self.abort_reason is None):
                 self._abort(_DISAGREE)
         _STATS["layer_calls"] += 1
@@ -807,10 +803,8 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None, agree = Non
     can run the same micro-batches the standard way. A real error in a micro-batch is raised. One window per process
     at a time: a concurrent caller is refused (the decoder classes and the worker pool are shared).
 
-    Data parallel (world size > 1) needs `agree(ok, stage) -> bool`, a MIN all-reduce over the ranks (see
-    _Agreement): every rank then returns results, or every rank rolls back. The micro-batches must not reduce
-    gradients themselves (run them on the module inside DDP); the caller reduces once after a window. An error the
-    loss parts raise after the forward vote propagates, as it would from a standard data-parallel step."""
+    Data parallel needs `agree` (see _Agreement): all ranks keep or all roll back. Micro-batches must not reduce
+    gradients (run them on the module inside DDP); the caller reduces after the window."""
     agreement = _Agreement(agree)
     if os.getpid() != _WINDOW_PID:
         agreement.close()
@@ -876,8 +870,7 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
         return None, "nothing to run"
     if agreement.agree is None and torch.distributed.is_available() and torch.distributed.is_initialized() and \
             torch.distributed.get_world_size() > 1:
-        # DDP reduces in the loss parts' backwards, before the window's decoder backward exists; without a rank
-        # vote one rank could also roll back while another keeps its window.
+        # DDP would reduce before the decoder backward exists, and ranks could disagree on rollback.
         return None, "distributed training (gradient reduction would miss the decoder backward)"
     if model is not None and _tied_trainable_io(model):
         return None, "the input embedding and the output head share a trainable weight"
@@ -1008,8 +1001,8 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
         error, w.error = w.error, None
         if error is not None and (agreement.stage == 1 or
                                   (not isinstance(error, torch.OutOfMemoryError) and not _recompile_limit(error))):
-            # After the ranks' forward vote the loss parts may have run collectives (metrics gathers) another rank
-            # is still in: a rollback here could pair its vote with them. Raise, as a standard step would.
+            # After the forward vote, loss parts may have run collectives another rank is still in: a rollback
+            # vote could pair with them, so raise as a standard step would.
             raise error
         if error is not None:
             # Its traceback's frames hold the failed forward's tensors (and the window): free them now, before
@@ -1033,7 +1026,6 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
         w.saved = w.outs = w.h0 = None
         return roll_back(reason)
     if not agreement.vote(True):
-        # Another rank rolled back (or could not finish its window): all ranks run the step the standard way.
         w.saved = w.outs = w.h0 = None
         return roll_back(_DISAGREE)
     return w.results, None
