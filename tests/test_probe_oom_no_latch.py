@@ -165,3 +165,36 @@ def test_cpu_loader_out_of_memory_in_training_restarts_eagerly_once(monkeypatch,
     assert "_unsloth_eager_once" not in layer.__dict__
     assert layer._compiled_call_impl is not None
     assert "training eagerly" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("reentrant", [False, True])
+def test_cpu_loader_out_of_memory_retry_recomputes_eagerly_in_its_checkpoint(monkeypatch, capsys, reentrant):
+    import torch.utils.checkpoint as checkpoint
+    from unsloth_zoo.cpu import loader
+
+    torch.manual_seed(0)
+    block = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.ReLU(), torch.nn.Linear(8, 8))
+    compiled_forward = torch.compile(block._call_impl, backend = "aot_eager")
+    calls = []
+
+    def compiled(*args, **kwargs):
+        calls.append(torch.is_grad_enabled())
+        if len(calls) == 1:
+            raise MemoryError()
+        return compiled_forward(*args, **kwargs)
+
+    block._compiled_call_impl = compiled
+    loader._fall_back_to_eager_on_compile_error([block])
+    x = torch.randn(4, 8)
+    grads = []
+    try:
+        for _ in range(2):  # the out-of-memory step (eager forward and recompute), then a compiled one
+            block.zero_grad()
+            h = x.clone().requires_grad_(True)
+            checkpoint.checkpoint(block, h, use_reentrant = reentrant).square().sum().backward()
+            grads.append(torch.cat([p.grad.flatten() for p in block.parameters()]))
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(grads[0], grads[1])
+    assert block._compiled_call_impl is not None
+    assert "training eagerly" not in capsys.readouterr().out
