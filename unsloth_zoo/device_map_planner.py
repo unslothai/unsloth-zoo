@@ -2592,6 +2592,15 @@ def plan_device_map_for_pretrained(
     return plan
 
 
+def _lora_training_bytes(params: int) -> int:
+    """Card bytes a LoRA step holds per trainable param under adamw_8bit, the optimizer Unsloth's trainers default
+    to: the fp32 weight and its fp32 grad (4 + 4) plus two 8-bit moments with one fp32 absmax per 256-value block each
+    (2 + 8 / 256). The 32-bit AdamW this used to assume (two fp32 moments and the foreach step's temporary, 20 in
+    all) charged a 128-expert MoE twice what its adapters take: Inkling-2-Mini at rank 16 is 427M LoRA params, 7.95
+    GiB at 20 bytes against 3.98 GiB at this rate, which alone refused every count on a 15 GiB T4."""
+    return int(params) * 10 + int(params) // 32
+
+
 @dataclass
 class BlockSwapPlan:
     """Result of :func:`plan_block_swap`."""
@@ -2609,6 +2618,8 @@ class BlockSwapPlan:
     """Move the input embedding to host RAM after the load (tried before any layer)."""
     embedding_bytes: int = 0
     notes: list[str] = field(default_factory=list)
+    reserve_basis: str = ""
+    """What an estimated ``reserve_bytes`` was sized for (empty when the caller passed it)."""
 
     def describe(self) -> str:
         moved = []
@@ -2621,6 +2632,8 @@ class BlockSwapPlan:
         else:
             head = (f"block swap: {' and '.join(moved)} stay in host RAM so "
                     f"{self.reserve_bytes / _GiB:.2f} GiB stays free for training")
+        if self.reserve_basis:
+            head += f" ({self.reserve_basis})"
         lines = [head]
         if self.device_plan is not None:
             lines.append(self.device_plan.describe())
@@ -2720,11 +2733,17 @@ def plan_block_swap(
     total = sizes.get("", sum(layer_bytes))
     L = len(layers)
 
+    reserve_basis = ""
     if reserve_bytes is None:
-        # fp32 LoRA weights, grads, AdamW's two moments and the foreach step's temporary.
-        lora_bytes = lora_param_count(layers, lora_rank) * 20
+        lora_params = lora_param_count(layers, lora_rank)
         reserve_bytes = estimate_training_reserve_bytes(
-            config, seq_len, batch_size, extra_bytes = lora_bytes
+            config, seq_len, batch_size, extra_bytes = _lora_training_bytes(lora_params)
+        )
+        reserve_basis = f"LoRA rank {lora_rank} with adamw_8bit"
+        notes.append(
+            f"the reserve assumes LoRA rank {lora_rank} on every linear and expert stack, trained with adamw_8bit "
+            f"(Unsloth's default optimizer); a 32-bit AdamW needs {lora_params * 10 / _GiB:.2f} GiB more: "
+            "pass reserve_bytes or a fixed layer count"
         )
     reserve_bytes = int(reserve_bytes)
 
@@ -2806,7 +2825,9 @@ def plan_block_swap(
         if not ok_hi:
             raise DeviceMapInfeasible(
                 f"Even with {hi} of {L} decoder layers in host RAM the model does not fit while "
-                f"keeping {reserve_bytes / _GiB:.2f} GiB free for training on "
+                f"keeping {reserve_bytes / _GiB:.2f} GiB free for training"
+                + (f" ({reserve_basis})" if reserve_basis else "")
+                + " on "
                 + ", ".join(f"cuda:{d} ({budgets[d] / _GiB:.2f} GiB free)" for d in devices)
                 + ". Lower max_seq_length or the batch size, or add a GPU."
             )
@@ -2838,4 +2859,5 @@ def plan_block_swap(
         offload_embedding = use_embedding,
         embedding_bytes = embedding + streamed if use_embedding else 0,
         notes = notes,
+        reserve_basis = reserve_basis,
     )
