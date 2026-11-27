@@ -292,47 +292,51 @@ def _decode(b, j, m, tab, TYPE: tl.constexpr):
 
 
 @triton.jit
-def _tile(P, rows, cols, rmask, cmask, row_bytes, tab, TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr):
-    """Decoded float32 tile W[rows, cols] of a packed matrix with ``row_bytes`` bytes per row."""
-    blk = cols // QK
-    j = cols % QK
-    b = P + rows.to(tl.int64)[:, None] * row_bytes + (blk * BS)[None, :]
-    m = rmask[:, None] & cmask[None, :]
-    return _decode(b, tl.broadcast_to(j[None, :], (rows.shape[0], cols.shape[0])), m, tab, TYPE)
+def _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab,
+           TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr, NB: tl.constexpr):
+    """Decoded float32 tile (rows, NB blocks, QK values) of a packed matrix starting at block ``blk0``. Block-level
+    fields (scales) load once per (row, block); index math runs on the (1, 1, QK) in-block index only."""
+    blk = blk0 + tl.arange(0, NB)
+    b = P + rows.to(tl.int64)[:, None, None] * row_bytes + (blk * BS)[None, :, None]
+    m = rmask[:, None, None] & (blk < nblk)[None, :, None]
+    j = tl.arange(0, QK)[None, None, :]
+    return _decode(b, j, m, tab, TYPE)
 
 
 @triton.jit
 def dequantize_kernel(
     P, OUT, tab, ROWS, K, row_bytes,
     TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr,
-    BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_R: tl.constexpr, NB: tl.constexpr,
 ):
     rows = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
-    cols = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    blk0 = tl.program_id(1) * NB
+    nblk = K // QK
     rmask = rows < ROWS
-    cmask = cols < K
-    w = _tile(P, rows, cols, rmask, cmask, row_bytes, tab, TYPE, QK, BS)
-    out = OUT + rows[:, None] * K + cols[None, :]
-    tl.store(out, w.to(OUT.dtype.element_ty), mask = rmask[:, None] & cmask[None, :])
+    w = _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab, TYPE, QK, BS, NB)
+    cols = (blk0 + tl.arange(0, NB))[None, :, None] * QK + tl.arange(0, QK)[None, None, :]
+    out = OUT + rows[:, None, None] * K + cols
+    tl.store(out, w.to(OUT.dtype.element_ty), mask = rmask[:, None, None] & (cols < K))
 
 
 @triton.jit
 def gemv_kernel(
     X, P, OUT, BIAS, tab, N, K, row_bytes,
     TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr, HAS_BIAS: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, NB: tl.constexpr,
 ):
     """out[n] = sum_k x[k] * W[n, k] (+ bias[n]) for one row of x."""
     rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     rmask = rows < N
-    acc = tl.zeros((BLOCK_N, BLOCK_K), dtype = tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        cols = k0 + tl.arange(0, BLOCK_K)
-        cmask = cols < K
-        x = tl.load(X + cols, mask = cmask, other = 0.0).to(tl.float32)
-        w = _tile(P, rows, cols, rmask, cmask, row_bytes, tab, TYPE, QK, BS)
-        acc += w * x[None, :]
-    out = tl.sum(acc, axis = 1)
+    nblk = K // QK
+    acc = tl.zeros((BLOCK_N, NB, QK), dtype = tl.float32)
+    j = tl.arange(0, QK)[None, None, :]
+    for blk0 in range(0, nblk, NB):
+        cols = (blk0 + tl.arange(0, NB))[None, :, None] * QK + j
+        x = tl.load(X + cols, mask = cols < K, other = 0.0).to(tl.float32)
+        w = _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab, TYPE, QK, BS, NB)
+        acc += w * x
+    out = tl.sum(tl.sum(acc, axis = 2), axis = 1)
     if HAS_BIAS:
         out += tl.load(BIAS + rows, mask = rmask, other = 0.0).to(tl.float32)
     tl.store(OUT + rows, out.to(OUT.dtype.element_ty), mask = rmask)
@@ -348,7 +352,8 @@ def mm_kernel(
 ):
     """Packed weight ``W[e]`` is (R, C) with C values per packed row (R rows per expert).
     TRANS_B: out (M, N = R) = x (M, K = C) @ W[e]^T.  Else: out (M, N = C) = x (M, K = R) @ W[e].
-    GROUPED: rows of x sorted by expert, ``COUNTS[e]`` rows each."""
+    GROUPED: rows of x sorted by expert, ``COUNTS[e]`` rows each. The packed-row axis of a tile is
+    BLOCK_N (TRANS_B) or BLOCK_K wide; the value axis is the other one, a whole number of blocks."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     if GROUPED:
@@ -376,15 +381,24 @@ def mm_kernel(
     x_rows = X + offs_m.to(tl.int64)[:, None] * stride_xm
     Pe = P + row0 * row_bytes
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < K
-        a = tl.load(x_rows + offs_k[None, :], mask = mask_m[:, None] & mask_k[None, :], other = 0.0)
-        if TRANS_B:
-            w = _tile(Pe, offs_n, offs_k, mask_n, mask_k, row_bytes, tab, TYPE, QK, BS)
+    if TRANS_B:
+        NBK: tl.constexpr = BLOCK_K // QK
+        nblk = K // QK
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            a = tl.load(x_rows + offs_k[None, :], mask = mask_m[:, None] & (offs_k < K)[None, :], other = 0.0)
+            w = _tile3(Pe, offs_n, k0 // QK, mask_n, row_bytes, nblk, tab, TYPE, QK, BS, NBK)
+            w = tl.reshape(w, (BLOCK_N, BLOCK_K))
             acc = tl.dot(a, tl.trans(w.to(a.dtype)), acc)
-        else:
-            w = _tile(Pe, offs_k, offs_n, mask_k, mask_n, row_bytes, tab, TYPE, QK, BS)
+    else:
+        NBN: tl.constexpr = BLOCK_N // QK
+        nblk = N // QK
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < K
+            a = tl.load(x_rows + offs_k[None, :], mask = mask_m[:, None] & mask_k[None, :], other = 0.0)
+            w = _tile3(Pe, offs_k, (pid_n * BLOCK_N) // QK, mask_k, row_bytes, nblk, tab, TYPE, QK, BS, NBN)
+            w = tl.reshape(w, (BLOCK_K, BLOCK_N))
             acc = tl.dot(a, w.to(a.dtype), acc)
     if HAS_BIAS:
         acc += tl.load(BIAS + offs_n, mask = mask_n, other = 0.0).to(tl.float32)[None, :]

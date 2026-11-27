@@ -53,7 +53,7 @@ except Exception:
 
 _PASSTHROUGH = {T.F32: torch.float32, T.F16: torch.float16, T.BF16: torch.bfloat16}
 # Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights).
-_FUSED_MAX_ROWS = int(os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS", "16"))
+_FUSED_MAX_ROWS = int(os.environ.get("UNSLOTH_GGUF_FUSED_MAX_ROWS", "128"))
 
 
 def _env_on(name):
@@ -114,13 +114,13 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
     out = torch.empty(shape, dtype = dtype, device = packed.device)
     if out.numel() == 0:
         return out
-    BLOCK_K = 256 if K >= 256 else max(32, 1 << (K - 1).bit_length())
-    BLOCK_R = max(1, 4096 // BLOCK_K)
-    grid = (-(-rows // BLOCK_R), -(-K // BLOCK_K))
+    NB = max(1, 256 // qk)
+    BLOCK_R = 16
+    grid = (-(-rows // BLOCK_R), -(-(K // qk) // NB))
     with torch.cuda.device(packed.device):
         _tk.dequantize_kernel[grid](
             packed, out, _table(packed.device), rows, K, ggml_row_bytes(ggml_type, K),
-            TYPE = ggml_type, QK = qk, BS = bs, BLOCK_R = BLOCK_R, BLOCK_K = BLOCK_K,
+            TYPE = ggml_type, QK = qk, BS = bs, BLOCK_R = BLOCK_R, NB = NB,
             num_warps = 4, enable_fp_fusion = False,
         )
     return out
@@ -179,7 +179,9 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
         BLOCK_M = 16 if M <= 4 * E else (32 if M <= 32 * E else 64)
     else:
         BLOCK_M = 16 if M <= 16 else (32 if M <= 32 else 64)
-    BLOCK_N, BLOCK_K = 64, 64
+    # The value axis of a decoded tile holds whole blocks; 256-value blocks get fewer packed rows and more warps.
+    packed_rows, values, warps = (64, max(64, qk), 4) if qk <= 64 else (32, qk, 8)
+    BLOCK_N, BLOCK_K = (packed_rows, values) if trans_b else (values, packed_rows)
     tiles_m = (-(-M // BLOCK_M) + min(E, M)) if grouped else -(-M // BLOCK_M)
     grid = (tiles_m, -(-N // BLOCK_N))
     _tk.mm_kernel[grid](
@@ -187,19 +189,19 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
         M, N, K, E, R, row_bytes, x2.stride(0), out.stride(0),
         TYPE = ggml_type, QK = qk, BS = bs, TRANS_B = trans_b, GROUPED = grouped,
         E_POW2 = 1 << max(E - 1, 0).bit_length(), HAS_BIAS = bias is not None,
-        BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, num_warps = 4, num_stages = 2,
+        BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, num_warps = warps, num_stages = 2,
     )
     return out
 
 
 def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
     qk, bs = GGML_BLOCK[ggml_type]
-    BLOCK_N, BLOCK_K = 16, 256
+    BLOCK_N, NB = 16, max(1, 256 // qk)
     grid = (-(-N // BLOCK_N),)
     _tk.gemv_kernel[grid](
         x1, packed, out, x1 if bias is None else bias, _table(x1.device), N, K, ggml_row_bytes(ggml_type, K),
         TYPE = ggml_type, QK = qk, BS = bs, HAS_BIAS = bias is not None,
-        BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, num_warps = 4,
+        BLOCK_N = BLOCK_N, NB = NB, num_warps = 4,
     )
     return out
 
