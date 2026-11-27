@@ -1571,7 +1571,7 @@ def test_small_row_first_use_check_refuses_a_kernel_that_fails_to_build(monkeypa
     monkeypatch.setattr(matmul, "_SIMD_QMM_ROWS", _EVERY_ROW)
     monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
     native = model.proj(x := mx.random.normal((3, 512), key = mx.random.key(3)).astype(mx.bfloat16))
-    with inference.nax_quantized_linear(model):   # an input's failed build is not the kernel's
+    with inference.nax_quantized_linear(model):
         with pytest.raises(RuntimeError, match = re.escape(inference._FAILED_BUILD)):
             mx.eval(model.proj(unbuilt(x)))
     assert inference._NAX_QMM_VERIFIED == {}
@@ -1581,7 +1581,7 @@ def test_small_row_first_use_check_refuses_a_kernel_that_fails_to_build(monkeypa
         for _ in range(2):
             assert mx.array_equal(model.proj(x), native).item()
     assert len(checks) == 1 and list(inference._NAX_QMM_VERIFIED.values()) == [False]
-    assert inference.first_use_work() == work + 1   # the failed compile is first-use cost, not a round's
+    assert inference.first_use_work() == work + 1
 
 
 class _PrefillProjections(nn.Module):
