@@ -196,9 +196,10 @@ def grpo_topk_head_logprobs(hidden_states, lm_head, head_ids, chunks = 4, logit_
     if n_rows == 0:
         return hidden_states.new_zeros((R, T, k), dtype = torch.float32)
     # Skip headless positions (all slots < 0, masked by the caller); keep rows per chunk so the peak does not grow.
-    keep = (flat_ids >= 0).any(dim = -1)
+    # Hidden states only: gathering [rows, V] raw logits would copy the whole input outside the checkpoints.
     rows = None
-    n_keep = int(keep.sum())
+    keep = (flat_ids >= 0).any(dim = -1) if from_hidden else None
+    n_keep = int(keep.sum()) if from_hidden else n_rows
     if n_keep < n_rows:
         rows = keep.nonzero().squeeze(1)
         chunks = -(-int(chunks) * n_keep // n_rows)

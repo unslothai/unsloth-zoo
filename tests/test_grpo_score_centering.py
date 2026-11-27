@@ -350,6 +350,13 @@ def test_topk_head_logprobs_skips_positions_without_a_head(chunks, monkeypatch):
         assert (a - b).abs().max().item() < 1e-12
     none = sc.grpo_topk_head_logprobs(h, W, torch.full_like(ids, -1), chunks)
     assert none.shape == (R, T, k) and (none == 0).all() and none.requires_grad
+    # Raw logits are not gathered (that would copy the [rows, V] input outside the checkpoints).
+    seen.clear()
+    logits = torch.nn.functional.linear(h, W).detach().requires_grad_()
+    raw = sc.grpo_topk_head_logprobs(logits, W, ids, chunks)
+    assert sum(seen) == R * T
+    ref_raw = torch.log_softmax(logits, -1).gather(-1, ids.clamp_min(0))
+    assert (raw[kept] - ref_raw[kept]).abs().max().item() < 1e-12
 
 
 class _LP:
