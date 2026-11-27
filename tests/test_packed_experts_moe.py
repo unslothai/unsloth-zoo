@@ -25,6 +25,13 @@ from unsloth_zoo.temporary_patches import mxfp4 as mx
 QUANTIZE = {"nvfp4": quantize_experts_nvfp4, "mxfp8": quantize_experts_mxfp8}
 
 
+@pytest.fixture(autouse = True)
+def _dequantize_path(monkeypatch):
+    # These pin the dequantize + grouped GEMM path bitwise; the fused decode-in-GEMM path is covered by
+    # test_packed_experts_fused.py.
+    monkeypatch.setenv("UNSLOTH_PACKED_EXPERTS_FUSED", "0")
+
+
 @pytest.fixture
 def grouped_mm_device(monkeypatch):
     if torch.cuda.is_available() and mu._check_torch_grouped_mm_supported():
