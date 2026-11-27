@@ -1072,6 +1072,41 @@ def _restore_block(module):
     return True
 
 
+_MOE_CONFIG_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
+
+
+def _config_has_experts(config, depth=0):
+    """True if this config or a nested sub-config (text_config, DBRX ffn_config, ...) sets an expert count."""
+    if config is None or depth > 3:
+        return False
+    if isinstance(config, dict):
+        attrs = config
+    else:
+        attrs = getattr(config, "__dict__", None)
+        if not isinstance(attrs, dict):
+            return False
+    if any(attrs.get(key) for key in _MOE_CONFIG_KEYS):
+        return True
+    for value in attrs.values():
+        if (isinstance(value, dict) or hasattr(value, "to_dict")) and _config_has_experts(value, depth + 1):
+            return True
+    return False
+
+
+def _may_have_moe(model) -> bool:
+    """False only if no config expert count, MoE block, experts submodule or prior grouped patch exists."""
+    try:
+        if _config_has_experts(getattr(model, "config", None)):
+            return True
+        for module in model.modules():
+            if (hasattr(module, "_orig_moe_forward") or type(module).__name__ in _BLOCK_SPECS
+                    or hasattr(module, "experts")):
+                return True
+        return False
+    except Exception:
+        return True   # unsure: probe as before
+
+
 def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lora=False):
     """Patch eligible ModuleList MoE blocks (frozen experts, optionally with a supported expert
     LoRA) to the grouped forward; returns #patched. Re-entrant (a now-ineligible block is
@@ -1081,6 +1116,8 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lo
     if os.environ.get("UNSLOTH_MOE_GROUPED", "1") == "0":
         for module in model.modules():
             _restore_block(module)
+        return 0
+    if not _may_have_moe(model):   # dense: skip the grouped_mm probe
         return 0
     if not _grouped_mm_supported():
         return 0
