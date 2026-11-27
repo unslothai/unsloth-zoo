@@ -19,11 +19,12 @@ standard accumulation bitwise on a tiny Llama with LoRA (CPU), layer calls / rec
 aborts before a decoder-layer gradient exists and puts the other gradients back. GPU tests run a real BlockSwap
 (RAM and disk tiers): bitwise against standard accumulation and copies / reads per step divided by the micro-batch count."""
 
-import copy
+import contextlib
 import functools
 import importlib.util
 import os
 import sys
+import warnings
 
 import pytest
 import torch
@@ -43,14 +44,29 @@ _cuda = pytest.mark.skipif(not torch.cuda.is_available() or not sys.platform.sta
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
+# Standard dense decoders: (config class, model class, extra config) by family, as transformers names them.
+FAMILIES = {
+    "llama": ("LlamaConfig", "LlamaForCausalLM", {"tie_word_embeddings": False}),
+    "qwen2": ("Qwen2Config", "Qwen2ForCausalLM", {"tie_word_embeddings": False}),
+    "qwen3": ("Qwen3Config", "Qwen3ForCausalLM", {"head_dim": 16, "tie_word_embeddings": False}),
+    "mistral": ("MistralConfig", "MistralForCausalLM", {"tie_word_embeddings": False}),
+    # Gemma: tied embedding / head (frozen under LoRA), soft-capping, sliding-window layers shorter than the batches.
+    "gemma2": ("Gemma2Config", "Gemma2ForCausalLM", {"head_dim": 16, "sliding_window": 8}),
+    "gemma3": ("Gemma3TextConfig", "Gemma3ForCausalLM", {"head_dim": 16, "sliding_window": 8}),
+}
+
+
 def _model(reentrant = True, layers = 4, dtype = torch.float32, device = "cpu", train_embed = False,
-           train_head = False, seed = 0):
+           train_head = False, seed = 0, arch = "llama"):
     torch.manual_seed(seed)
-    cfg = transformers.LlamaConfig(hidden_size = 64, intermediate_size = 128, num_hidden_layers = layers,
-                                   num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 256,
-                                   max_position_embeddings = 256, tie_word_embeddings = False)
+    cfg_name, model_name, extra = FAMILIES[arch]
+    if not hasattr(transformers, model_name):
+        pytest.skip(f"transformers {transformers.__version__} has no {model_name}")
+    cfg = getattr(transformers, cfg_name)(hidden_size = 64, intermediate_size = 128, num_hidden_layers = layers,
+                                          num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 256,
+                                          max_position_embeddings = 256, **extra)
     cfg._attn_implementation = "eager"
-    model = transformers.LlamaForCausalLM(cfg).to(dtype = dtype, device = device)
+    model = getattr(transformers, model_name)(cfg).to(dtype = dtype, device = device)
     model.config.use_cache = False
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": reentrant})
     model = peft.get_peft_model(model, peft.LoraConfig(r = 4, lora_alpha = 8, target_modules = TARGETS,
@@ -821,6 +837,241 @@ def test_forward_input_keeps_requires_grad():
     assert (False, True) in seen
 
 
+# ---------------------------------------------------------------- round 2 review fixes
+@pytest.mark.parametrize("arch", sorted(FAMILIES))
+def test_dense_families_bitwise(arch):
+    """Every standard dense decoder family the trainer engages automatically: losses and LoRA gradients bitwise."""
+    model = _model(False, arch = arch)
+    batches, items = _batches()
+    base_losses, base_grads = _standard(model, batches, items)
+    losses, grads = _layer_major(model, batches, items)
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, grads)
+
+
+def test_kv_shared_layers_are_refused():
+    """Gemma 4 style: a consumer layer reads the key / value states a producer wrote (no-grad in the window)."""
+    layers = _toy_stack()
+    layers[2].attn = torch.nn.Module()
+    layers[2].attn.is_kv_shared_layer = True
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "share key / value states" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_gemma4_kv_sharing_is_refused(monkeypatch):
+    """The real case: Gemma 4's KV-sharing layers (transformers 5.x). Refused up front, and the runtime mapping
+    check catches it without the up-front check too."""
+    if not hasattr(transformers, "Gemma4ForCausalLM"):
+        pytest.skip(f"transformers {transformers.__version__} has no Gemma 4")
+    torch.manual_seed(0)
+    cfg = transformers.Gemma4TextConfig(hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4,
+                                        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16,
+                                        vocab_size = 256, vocab_size_per_layer_input = 256,
+                                        hidden_size_per_layer_input = 8, num_kv_shared_layers = 2,
+                                        layer_types = ["sliding_attention", "full_attention"] * 2,
+                                        sliding_window = 8, max_position_embeddings = 256)
+    cfg._attn_implementation = "eager"
+    model = transformers.Gemma4ForCausalLM(cfg)
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+    model = peft.get_peft_model(model, peft.LoraConfig(r = 4, lora_alpha = 8, target_modules = TARGETS,
+                                                       lora_dropout = 0.0, init_lora_weights = False))
+    model.enable_input_require_grads()
+    model.train()
+    layers = model.get_base_model().model.layers
+    assert any(getattr(m, "is_kv_shared_layer", False) is True for m in layers.modules())
+    batches, items = _batches(2)
+    fns = [lambda b = b: _step(model, b, items) for b in batches]
+    model.zero_grad(set_to_none = True)
+    losses, why = lm.run_layer_major(layers, fns, model = model)
+    assert losses is None and "share key / value states" in why
+    monkeypatch.setattr(lm, "_kv_shared_layers", lambda layers: False)
+    losses, why = lm.run_layer_major(layers, fns, model = model)
+    # The shared KV mapping, or the per-layer inputs that need gradients here, whichever the window meets first.
+    assert losses is None and ("mapping" in why or "needs gradients" in why), why
+    assert _grads(model) == {}
+
+
+def test_state_shared_through_a_mapping_aborts():
+    """A mapping passed to every layer (shared KV states without the flag): a producer's tensors would reach a
+    later layer detached, dropping that path's gradient."""
+    class Shared(_Toy):
+        def forward(self, x, shared = None, **kwargs):
+            if "kv" in shared:
+                x = x + shared["kv"]
+            h = torch.tanh(self.lin(x))
+            shared.setdefault("kv", h * 0.5)
+            return h
+
+    layers = _toy_stack(Shared)
+
+    def fn(m):
+        x, shared = _toy_x(m), {}
+        for layer in layers:
+            x = layer(x, shared = shared)
+        x.sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "mapping" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_loss_part_writing_a_decoder_weight_gradient_aborts():
+    """A regulariser on a decoder weight: its gradients would all land before any recompute contribution."""
+    layers = _toy_stack()
+    weight = layers[1].lin.weight
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        (x.sum() + 1e-3 * weight.square().sum()).backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "decoder layer weight" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_recompute_with_other_values_rolls_back():
+    """A layer whose math depends on grad mode: same structure, other values, so the gradient is of another
+    function."""
+    class Flips(_Toy):
+        def forward(self, x, **kwargs):
+            h = torch.tanh(self.lin(x))
+            return h if torch.is_grad_enabled() else -h
+
+    layers = _toy_stack(Flips)
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.square().sum().backward()
+
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    assert losses is None and "changed the hidden states" in why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+@pytest.mark.parametrize("reentrant", [True, None, False])
+def test_grad_mode_dependent_layers_under_a_checkpoint(reentrant):
+    """A reentrant checkpoint runs standard training's forward without gradients too: the window is then that
+    exact computation (no value check). Non-reentrant runs it under grad mode: the window must refuse."""
+    class Ckpt(_Toy):
+        def __init__(self):
+            super().__init__()
+            self.gradient_checkpointing = True
+            kw = {} if reentrant is None else {"use_reentrant": reentrant}
+            self._gradient_checkpointing_func = functools.partial(torch.utils.checkpoint.checkpoint, **kw)
+
+        def _inner(self, x):
+            h = torch.tanh(self.lin(x))
+            return h if torch.is_grad_enabled() else h * 0.5
+
+        def forward(self, x, **kwargs):
+            if self.gradient_checkpointing and self.training:
+                return self._gradient_checkpointing_func(self._inner, x)
+            return self._inner(x)
+
+    layers = _toy_stack(Ckpt)
+
+    def fn(m):
+        x = _toy_x(m).requires_grad_(True)
+        for layer in layers:
+            x = layer(x)
+        loss = x.square().sum()
+        loss.backward()
+        return loss.detach()
+
+    for p in layers.parameters():
+        p.grad = None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        base = [fn(m) for m in range(2)]
+        base_grads = [p.grad.clone() for p in layers.parameters()]
+        losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
+    if reentrant is False:
+        assert losses is None and "changed the hidden states" in why
+        assert all(p.grad is None for p in layers.parameters())
+    else:
+        assert why is None
+        assert all(torch.equal(a, b) for a, b in zip(base, losses))
+        assert all(torch.equal(a, p.grad) for a, p in zip(base_grads, layers.parameters()))
+
+
+def test_a_raising_window_restores_gradients_rng_and_swapper():
+    layers = _toy_stack()
+    head = torch.nn.Parameter(torch.ones(16))
+    owner = torch.nn.ModuleList(list(layers))
+    owner.head = torch.nn.Module()
+    owner.head.w = head
+
+    class Swap(_Holds):
+        resets = 0
+
+        def reset(self):
+            Swap.resets += 1
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        (x * head).sum().backward()
+        torch.rand(3)
+        if m == 1:
+            raise ValueError("loss part failed")
+
+    head.grad = torch.full((16,), 7.0)
+    rng = torch.get_rng_state()
+    with pytest.raises(ValueError, match = "loss part failed"):
+        lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], swapper = Swap(), model = owner)
+    assert torch.equal(head.grad, torch.full((16,), 7.0))
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert Swap.resets == 1
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_out_of_memory_ending_the_step_keeps_the_window():
+    """The step's end (next step's prefetch, pool growth) running out of memory: the gradients are complete."""
+    layers = _toy_stack()
+
+    class Swap(_Holds):
+        resets = 0
+
+        @contextlib.contextmanager
+        def layer_major_window(self):
+            yield
+
+        def _end_step(self):
+            raise torch.OutOfMemoryError("simulated")
+
+        def reset(self):
+            Swap.resets += 1
+
+    def fn(m):
+        x = _toy_x(m)
+        for layer in layers:
+            x = layer(x)
+        x.sum().backward()
+        return m
+
+    for p in layers.parameters():
+        p.grad = None
+    losses, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], swapper = Swap(),
+                                     model = layers)
+    assert why is None and losses == [0, 1]
+    assert Swap.resets == 1
+    assert all(p.grad is not None for p in layers.parameters())
+
+
 def test_boundary_bytes():
     assert lm.boundary_bytes([2 * 12, 2 * 17], 64, 4, 2) == (24 + 34) * 64 * 5 * 2
 
@@ -858,9 +1109,9 @@ def _spill_dir(tmp_path, monkeypatch):
     yield
 
 
-def _gpu_run(layer_major, depth, disk, steps = 2, n = 3, reentrant = True):
+def _gpu_run(layer_major, depth, disk, steps = 2, n = 3, reentrant = True, arch = "llama"):
     bs = _block_swap()
-    model = _model(reentrant, layers = 6, dtype = torch.bfloat16, device = "cuda")
+    model = _model(reentrant, layers = 6, dtype = torch.bfloat16, device = "cuda", arch = arch)
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -987,4 +1238,40 @@ def test_gpu_block_swap_step_ends_once_per_window_and_resets_after_an_abort(_spi
         for b in batches:
             _step(model, b, items)
     finally:
+        sw.remove()
+
+
+@_cuda
+@pytest.mark.parametrize("arch", sorted(FAMILIES))
+@pytest.mark.parametrize("disk", [False, True])
+def test_gpu_block_swap_dense_families_bitwise(_spill_dir, arch, disk):
+    base = _gpu_run(False, 1, disk, arch = arch)
+    head = _gpu_run(True, 1, disk, arch = arch)
+    for (bl, bg, bc, br, _), (hl, hg, hc, hr, _) in zip(base, head):
+        assert all(torch.equal(a, b) for a, b in zip(bl, hl))
+        _assert_same(bg, hg)
+    bc, hc = base[-1][2], head[-1][2]
+    assert bc == 3 * hc and hc > 0, (bc, hc)
+
+
+@_cuda
+def test_gpu_pool_growth_out_of_memory_keeps_the_pool(monkeypatch):
+    bs = _block_swap()
+    model = _model(True, layers = 6, dtype = torch.bfloat16, device = "cuda")
+    layers = _layers(model)
+    sw = bs.BlockSwap(layers, 5, prefetch_depth = 1, placement = "spread", model = model)
+    try:
+        before = {k: len(v) for k, v in sw.free.items()}
+        calls = []
+
+        def new_slot(sig):
+            calls.append(sig)
+            raise torch.cuda.OutOfMemoryError("simulated")
+
+        monkeypatch.setattr(sw, "_new_slot", new_slot)
+        monkeypatch.setattr(bs, "_free_device_bytes", lambda dv: 1 << 50)
+        assert sw._grow_pool() is False
+        assert calls and {k: len(v) for k, v in sw.free.items()} == before
+    finally:
+        monkeypatch.undo()
         sw.remove()

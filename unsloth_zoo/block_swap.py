@@ -2157,8 +2157,13 @@ class BlockSwap:
             transient += reserve.get(_cuda_index(dv), 0)
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
-        for s in want:
-            self.free[s].append(self._new_slot(s))
+        try:
+            slots = [(s, self._new_slot(s)) for s in want]
+        except torch.cuda.OutOfMemoryError:
+            # Optional: a deeper lookahead that does not fit keeps the current depth (and the step's results).
+            return False
+        for s, slot in slots:
+            self.free[s].append(slot)
         return True
 
     def _shrink_pool(self):

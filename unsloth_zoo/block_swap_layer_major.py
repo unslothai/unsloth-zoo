@@ -36,20 +36,26 @@ so with dropout they differ from standard accumulation's). The price is memory: 
 held at once (gradient checkpointing holds one micro-batch's), see `boundary_bytes`.
 
 Anything outside the protocol (a layer called out of order or twice, hidden states changed or written in place between
-layers, a layer input other than the hidden states that needs gradients, a checkpoint around the layer call, forward
-hooks or wrappers added to a layer during the window, saved-tensor hooks) aborts the window before any decoder-layer
-gradient exists; gradients the loss part already wrote are put back, and the caller runs the step
-the standard way. UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
+layers, a layer input other than the hidden states that needs gradients, a mapping passed between layers (shared KV
+states), a checkpoint around the layer call, forward hooks or wrappers added to a layer during the window, saved-tensor
+hooks, a loss part writing a decoder weight's gradient) aborts the window before any decoder-layer gradient exists;
+layers that share key / value states are refused up front. Where standard training runs a layer's forward under grad
+mode (no reentrant checkpoint), a recompute whose hidden states differ in any bit from the window's forward rolls the
+window back too. Every abort, and every error a window raises, puts back the gradients and RNG state it found and
+releases the block swap's held blocks; after an abort the caller runs the step the standard way.
+UNSLOTH_OFFLOAD_LAYER_MAJOR = 0 turns it off.
 """
 
 import functools
 import os
+from collections.abc import Mapping
 import sys
 import threading
 import traceback
 from contextlib import ExitStack, contextmanager, nullcontext
 
 import torch
+import torch.utils.checkpoint
 
 __all__ = [
     "LayerMajorAbort",
@@ -272,9 +278,71 @@ def _needs_grad(obj, depth = 0):
         return obj.requires_grad
     if depth < 3 and isinstance(obj, (tuple, list)):
         return any(_needs_grad(o, depth + 1) for o in obj)
-    if depth < 3 and isinstance(obj, dict):
+    if depth < 3 and isinstance(obj, Mapping):
         return any(_needs_grad(o, depth + 1) for o in obj.values())
     return False
+
+
+def _shared_state(obj, depth = 0):
+    """A mapping among a decoder layer's inputs: per-call state one layer can write and a later one read (Gemma 4's
+    shared key / value states). The window's no-grad forward would hand the later layer detached tensors."""
+    if isinstance(obj, Mapping):
+        return True
+    if depth < 3 and isinstance(obj, (tuple, list)):
+        return any(_shared_state(o, depth + 1) for o in obj)
+    return False
+
+
+def _kv_shared_layers(layers):
+    """Decoder layers that reuse another layer's key / value states (Gemma 4 is_kv_shared_layer)."""
+    for layer in layers:
+        for module in layer.modules():
+            if getattr(module, "is_kv_shared_layer", False) is True:
+                return True
+    return False
+
+
+_CKPT_SHIMS = ("unsloth_checkpoint", "unsloth_gradient_checkpoint", "unsloth_offloaded_gradient_checkpoint")
+
+
+def _forward_without_grad(layer):
+    """Whether standard training runs this layer's forward without gradients: a reentrant checkpoint wrapper
+    (torch's checkpoint with use_reentrant True or unset, or Unsloth's, autograd Functions). The window's no-grad
+    forward and grad-mode recompute are then exactly standard accumulation's, also where the two differ in the
+    last bit (a compiled block's inference and training graphs). False for a non-reentrant checkpoint, no
+    checkpointing, or a wrapper not recognised here: the forward would run under grad mode there."""
+    if not (getattr(layer, "gradient_checkpointing", False) and getattr(layer, "training", False)):
+        return False
+    fn, reentrant = getattr(layer, "_gradient_checkpointing_func", None), None
+    pristine = getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
+    for _ in range(8):
+        if fn is None:
+            return False
+        if isinstance(fn, functools.partial):
+            if reentrant is None and "use_reentrant" in fn.keywords:
+                reentrant = fn.keywords["use_reentrant"]
+            fn = fn.func
+            continue
+        name, module = getattr(fn, "__name__", ""), getattr(fn, "__module__", "") or ""
+        if name in _CKPT_SHIMS and module.startswith("unsloth_zoo"):
+            return reentrant is not False
+        if fn is torch.utils.checkpoint.checkpoint or fn is pristine or \
+                (name == "checkpoint" and module == "torch.utils.checkpoint"):
+            return reentrant is None or reentrant is True   # torch: unset means reentrant
+        fn = getattr(fn, "__wrapped__", None)   # block swap's checkpoint wrapper, torch's dynamo-disable wrapper
+    return False
+
+
+_INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _differs(a, b):
+    """Device-side flag: whether two tensors of the same shape and dtype differ in any bit (NaN-safe)."""
+    view = _INT_VIEW.get(a.element_size())
+    a, b = a.detach().contiguous(), b.detach().contiguous()
+    if view is None or a.dtype.is_complex:
+        return a.ne(b).any()
+    return a.view(view).ne(b.view(view)).any()
 
 
 def _split_output(out):
@@ -319,6 +387,8 @@ class _Window:
         self.held = set()
         self.signatures = [self._call_signature(l) for l in range(self.L)]
         self.layer_devices = [{p.device for p in layer.parameters() if p.is_cuda} for layer in self.layers]
+        # Layers whose standard forward runs under grad mode: the window's no-grad forward must match its recompute.
+        self.check_values = [True] * self.L
         self.in_backward = False
         self.input_used = [False] * n
 
@@ -380,6 +450,8 @@ class _Window:
             others = (args, {k: v for k, v in kwargs.items() if k != where})
         if _needs_grad(others):
             self._abort("a decoder layer input other than the hidden states needs gradients")
+        if _shared_state(tuple(others[0]) + tuple(others[1].values())):
+            self._abort("a decoder layer input is a mapping (state shared between layers, such as shared KV)")
         if _saved_tensor_hooks_active():
             # Entered inside the micro-batch (a callback): the window's decoder replay would bypass them.
             self._abort("saved-tensor hooks are active inside the micro-batch")
@@ -404,6 +476,8 @@ class _Window:
             # the recompute would update it a second time.
             self._abort("a decoder layer call with a live KV cache")
         args2, kwargs2 = _with_hidden(args, kwargs, where, x)
+        if m == 0:
+            self.check_values[l] = not _forward_without_grad(layer)
         devices = self.layer_devices[l] | ({x.device} if x.is_cuda else set())
         self.saved[l][m] = (args2, kwargs2, where, _autocast_state(), _rng_state(sorted(devices, key = str)))
         if m == 0 and self.swapper is not None:
@@ -480,6 +554,10 @@ class _Window:
     def backward(self, orig_calls):
         self.in_backward = True
         g = [None] * self.n
+        # One flag per device, read once after the decoder backward: where standard training's forward runs under
+        # grad mode, a recompute whose hidden states differ in any bit from the window's no-grad forward (a layer
+        # that computes something else under grad mode) would train a different function than standard.
+        differs = {}
         for l in range(self.L - 1, -1, -1):
             layer = self.layers[l]
             orig_call = orig_calls[type(layer)]
@@ -493,8 +571,9 @@ class _Window:
                     extra = leaf.grad if leaf is not None else None
                     if extra is not None:
                         g[m] = extra if g[m] is None else g[m] + extra
-                    del leaf, extra
+                    del extra
                     if saved is None or g[m] is None:
+                        del leaf
                         continue
                     args2, kwargs2, where, ac, rng = saved
                     x = args2[0] if where == 0 else kwargs2[where]
@@ -502,8 +581,16 @@ class _Window:
                     with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng):
                         out = orig_call(layer, *args2, **kwargs2)
                     out_h, _ = _split_output(out)
-                    if out_h is None or not out_h.requires_grad:
+                    if out_h is None or not out_h.requires_grad or leaf is None or \
+                            (out_h.shape, out_h.dtype, out_h.device) != (leaf.shape, leaf.dtype, leaf.device):
                         raise _ReplayAbort("a decoder recompute returned an output its forward did not")
+                    if self.check_values[l]:
+                        with torch.no_grad():
+                            flag = _differs(out_h, leaf)
+                            prev = differs.get(flag.device)
+                            differs[flag.device] = flag if prev is None else prev.logical_or_(flag)
+                        del flag, prev
+                    del leaf
                     torch.autograd.backward(out_h, g[m])
                     _STATS["recomputes"] += 1
                     g[m] = x.grad
@@ -511,6 +598,9 @@ class _Window:
             finally:
                 if self.swapper is not None:
                     self.swapper.unhold(l)
+        if any(bool(flag) for flag in differs.values()):
+            raise _ReplayAbort("a decoder recompute changed the hidden states its forward produced")
+        differs.clear()
         # Input-side modules (a trainable embedding): their graph ends at layer 0's input, in micro-batch order.
         for m in range(self.n):
             if self.h0[m] is not None and g[m] is not None:
@@ -598,13 +688,25 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None):
         return None, "another layer-major window is running in this process"
     try:
         scope = getattr(swapper, "layer_major_window", None)
-        with scope() if scope is not None else nullcontext():
-            results, why = _run_layer_major(layers, micro_fns, swapper, model)
+        reset = getattr(swapper, "reset", None)
+        try:
+            with scope() if scope is not None else nullcontext():
+                results, why = _run_layer_major(layers, micro_fns, swapper, model)
+        except BaseException:
+            # The gradients and RNG are already put back; blocks a raising window left pending are released.
+            if reset is not None:
+                reset()
+            raise
         if swapper is not None:
             if results is not None and scope is not None:
-                swapper._end_step()   # the step's single end, once its whole backward is done
-            elif results is None and hasattr(swapper, "reset"):
-                swapper.reset()       # an interrupted window leaves blocks pending: release them all
+                try:
+                    swapper._end_step()   # the step's single end, once its whole backward is done
+                except torch.OutOfMemoryError:
+                    # Only the optional prefetch for the next step ran out: the step's gradients are complete.
+                    if reset is not None:
+                        reset()
+            elif results is None and reset is not None:
+                reset()       # an interrupted window leaves blocks pending: release them all
         return results, why
     finally:
         _WINDOW_LOCK.release()
@@ -636,6 +738,9 @@ def _run_layer_major(layers, micro_fns, swapper, model):
         return None, "distributed training (gradient reduction would miss the decoder backward)"
     if model is not None and _tied_trainable_io(model):
         return None, "the input embedding and the output head share a trainable weight"
+    if _kv_shared_layers(layers):
+        # A consumer layer replays before its producer and would read the producer's no-grad key / value states.
+        return None, "decoder layers share key / value states (KV sharing)"
     if _saved_tensor_hooks_active():
         # Saved-tensor hooks (activation offloading) are thread-local: the workers' loss parts would run without.
         return None, "saved-tensor hooks are active (activation offloading)"
@@ -651,15 +756,37 @@ def _run_layer_major(layers, micro_fns, swapper, model):
     except torch.OutOfMemoryError:
         return None, "out of memory while saving the gradients a window would have to restore"
     rng = _all_rng_state()
+    # Decoder weights get gradients only from the window's backward; one the loss parts write (a regulariser on a
+    # decoder weight) would be added before every recompute contribution instead of interleaved with them.
+    decoder, seen_dec = [], set()
+    for layer in layers:
+        for p in layer.parameters():
+            if p.requires_grad and id(p) not in seen_dec:
+                seen_dec.add(id(p))
+                decoder.append(p)
+    watched = [(p, p.grad, None if p.grad is None else p.grad._version) for p in decoder]
 
-    def roll_back(reason):
+    def restore():
         for p, g in outside:
             p.grad = g
         _set_all_rng_state(rng)   # draws made by the abandoned window (NEFTune noise, dropout) are not consumed
+
+    def roll_back(reason):
+        restore()
         _STATS["aborts"] += 1
         _STATS["last_abort"] = reason
         return None, reason
 
+    try:
+        return _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back)
+    except BaseException:
+        # A real error (or an interrupt) propagates, but a caller that catches it must not inherit a partial
+        # accumulation or consumed RNG draws.
+        restore()
+        raise
+
+
+def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back):
     device, streams = None, ()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         device = torch.device("cuda", torch.cuda.current_device())
@@ -687,6 +814,9 @@ def _run_layer_major(layers, micro_fns, swapper, model):
             if w.abort_reason is None and any(w.input_used):
                 w.abort_reason = ("a loss part backpropagated into the first decoder layer's input directly "
                                   "(a loss on the embedding output)")
+            if w.abort_reason is None and any(p.grad is not g or (g is not None and g._version != v)
+                                              for p, g, v in watched):
+                w.abort_reason = "a loss part wrote a decoder layer weight's gradient (a regulariser on it)"
     finally:
         # The first-input hooks only watch the loss parts; a reused input tensor must not keep the window alive.
         for handle in w.input_hooks:
