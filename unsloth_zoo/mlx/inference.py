@@ -5888,8 +5888,7 @@ class _SmallRowRoute(NamedTuple):
         return kernel(*args, reader = self.reader) if self.reader and not suffix else kernel(*args)
 
 
-# Stock MLX's NAX kernels serve every row count: this route has no kernel and carries the int8 prefill, sorted gather
-# and dense prefill routes.
+# Stock NAX kernels serve every row count: this scope only carries int8 prefill, sorted gather and dense prefill.
 _NAX_QMM_ROUTE = _SmallRowRoute(nax, None, "Nax", "NAX", None, None, None, True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
 _SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
@@ -6173,8 +6172,7 @@ def _nax_qmm_classes(route, *cache_key):
     if bindings is None:
         return {}
 
-    # Calls no route takes (below every route, in a route's stock rows, between small-row and the next, a native block)
-    # skip the checks.
+    # Calls no route takes (including a route's stock rows) skip the checks.
     def declined(self, x):
         if type(x) is not mx.array:
             return False

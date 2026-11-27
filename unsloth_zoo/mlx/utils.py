@@ -1027,9 +1027,8 @@ _MLX_GELU_APPROX_FINITE_GRAD = None
 
 
 def _gelu_approx_finite_grad(x):
-    # mlx before 0.32.5 gives NaN fp16 grads for |x| >= ~148 (3x**2 overflows, meets sech^2 = 0); its fix is this clipped
-    # body. Other dtypes cannot overflow and keep the plain formula, as the clipped graph is deep enough for mlx's
-    # shapeless compile to return a stale shape when first traced inside a gradient on inputs it does not track.
+    # Before mlx 0.32.5 fp16 grads are NaN for |x| >= ~148 (4906 is this clipped body). Other dtypes stay plain:
+    # the clipped graph trips shapeless compile's stale-shape bug when first traced inside a gradient.
     if x.dtype != mx.float16:
         return 0.5 * x * (1 + mx.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)))
     t = mx.clip(x, -10, 10)

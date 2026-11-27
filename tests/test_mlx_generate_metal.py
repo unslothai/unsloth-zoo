@@ -1376,12 +1376,10 @@ def test_nax_quantized_linear_scope_routes_without_nax(monkeypatch, caplog):
         for rows, native in natives.items():
             routed = run(rows)
             assert calls == ([rows] * 3 if takes_kernel(rows) else [])
-            # Rows no route takes, the route's stock rows among them, return to the native call unchecked; dense
-            # prefill starts at 1024.
+            # Unrouted rows (stock band included) return native unchecked; dense prefill starts at 1024.
             assert len(checked) == (3 if takes_kernel(rows) or rows == 1024 else 0)
             for a, b in zip(routed, native):
                 assert mx.allclose(a, b, rtol = 2e-2, atol = 2e-2).item()
-        # Four routed row counts (2, 5, 13, 20) on three projections.
         assert len(inference._NAX_QMM_VERIFIED) == 12 and all(inference._NAX_QMM_VERIFIED.values())
         block = mx.random.normal((1, 4, 512), key = mx.random.key(4)).astype(mx.bfloat16)
         for x, routes in ((block, False), (block.reshape(4, 1, 512), True), (block.reshape(2, 2, 512), True),

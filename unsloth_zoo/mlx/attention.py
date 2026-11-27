@@ -127,8 +127,7 @@ def _vector_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
 
 
 def _mask_reaches_fused_heads(mask, shape):
-    # mlx broadcasts a mask against [B, HQ, L, S] from the right; runtimes that align it to their own scores read a
-    # 3-D mask's leading axis as the batch, so only an unambiguous one keeps its meaning on the fused kernel.
+    # mlx right-aligns masks to [B, HQ, L, S], runtimes read a 3-D mask's axis 0 as batch: fuse unambiguous ones only.
     lead = mask.shape[:-2]
     return (len(lead) == 1 and lead[0] == 1) or (len(lead) == 2 and lead[0] in (1, shape[0]) and lead[1] in (1, shape[1]))
 
