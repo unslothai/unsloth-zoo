@@ -184,6 +184,20 @@ def test_eos_only_completion_keeps_its_head_when_pad_is_eos():
     assert torch.equal(ids, ref_ids)
 
 
+def test_whole_match_wins_over_a_sibling_sharing_its_first_tokens():
+    sc.reset_score_centering()
+    gen = torch.Generator().manual_seed(7)
+    V, k = 30, 4
+    longer, _ = _output([5, 6], [11, 12, 13, PAD], V, k, gen)  # a sibling that shares token 11 (pad == eos)
+    exact, tr = _output([5, 6], [11, PAD], V, k, gen)
+    sc.record_rollout_topk([longer, exact], k)
+    L = 4
+    ids, logps, matched = sc.lookup_rollout_topk(_batch([([5, 6], [11, PAD])], 2, L), L, k, PAD)
+    ref_ids, ref_logps = _reference_heads(1, L, k, [(0, 0, tr)])
+    assert matched.tolist() == [True]
+    assert torch.equal(ids, ref_ids) and torch.equal(logps, ref_logps)
+
+
 def test_store_is_bounded_without_a_lookup():
     sc.reset_score_centering()
     gen = torch.Generator().manual_seed(4)

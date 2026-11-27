@@ -537,9 +537,9 @@ def lookup_rollout_topk(input_ids, logits_to_keep, k, pad_token_id = None):
         kept = [i for i, t in enumerate(row) if pad_token_id is None or t != pad_token_id]
         stripped = [row[i] for i in kept]
         p0 = sum(1 for i in kept if i < prompt_width)
-        filled = [False] * logits_to_keep
+        segments = []
         prefix_hash = None
-        for rollout, (by_prompt, lengths) in indexes:
+        for rank, (rollout, (by_prompt, lengths)) in enumerate(indexes):
             # m == len(stripped): a generation of pad-id tokens only (pad == eos, an EOS-only completion).
             if not lengths or lengths[0] > len(stripped) or lengths[-1] < p0:
                 continue
@@ -576,14 +576,26 @@ def lookup_rollout_topk(input_ids, logits_to_keep, k, pad_token_id = None):
                     # A shorter match is a row cut after j tokens: only padding may follow.
                     if j == 0 or (j < n and any(t != pad_token_id for t in row[start + j:])):
                         continue
-                    c = start - prompt_width
-                    if any(filled[c:c + j]):
-                        continue
-                    kk = min(head_ids.shape[1], k)
-                    ids[b, c:c + j, :kk] = head_ids[:j, :kk]
-                    logps[b, c:c + j, :kk] = head_logps[:j, :kk]
-                    filled[c:c + j] = [True] * j
-                    matched[b] = True
+                    # Whole matches first (a prefix match may be a sibling that shares the first tokens), then the
+                    # newest rollout, then the longest.
+                    segments.append((j < n, rank, -j, start - prompt_width, len(segments), head_ids, head_logps))
+        filled = [False] * logits_to_keep
+        for _, _, neg_j, c, _, head_ids, head_logps in sorted(segments, key = lambda x: x[:5]):
+            kk = min(head_ids.shape[1], k)
+            # Every column of a segment was checked against the row, so a partly covered one fills the rest.
+            i, j = 0, -neg_j
+            while i < j:
+                if filled[c + i]:
+                    i += 1
+                    continue
+                e = i
+                while e < j and not filled[c + e]:
+                    e += 1
+                ids[b, c + i:c + e, :kk] = head_ids[i:e, :kk]
+                logps[b, c + i:c + e, :kk] = head_logps[i:e, :kk]
+                filled[c + i:c + e] = [True] * (e - i)
+                matched[b] = True
+                i = e
     n_matched = int(matched.sum())
     _STATE.stats["rows_matched"] += n_matched
     _STATE.stats["rows_unmatched"] += B - n_matched
