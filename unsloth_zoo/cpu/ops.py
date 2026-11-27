@@ -501,6 +501,11 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
         dtype = torch.get_autocast_dtype(hidden.device.type)
         hidden, weight = hidden.to(dtype), weight.to(dtype)
         bias = bias.to(dtype) if bias is not None else None
+    elif weight.dtype != hidden.dtype or (bias is not None and bias.dtype != hidden.dtype):
+        # Autocast off (fp32 trainable lm_head, bf16=False eval): compute in hidden's dtype, as TRL's kernel does.
+        # `.to` is differentiable, so a trainable head still gets its gradient in its own dtype.
+        weight = weight.to(hidden.dtype)
+        bias = bias.to(hidden.dtype) if bias is not None else None
     if hidden.shape[0] == 0:
         empty = (hidden @ weight.t()).float().sum(-1) * 0
         pick = lambda name, value: value if name in outputs else None  # noqa: E731
