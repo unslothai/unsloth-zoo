@@ -63,6 +63,8 @@ _DELIBERATE_FALSE = {
     "gpt_oss_decode_fused.py:_sink_scale_kernel",
     # Replaces the compiled apply_rotary_pos_emb region and is checked against it bitwise.
     "gpt_oss_decode_fused.py:_rope_decode_kernel",
+    # Mirrors gguf_kernels/reference.py op for op and is checked against it bitwise.
+    "gguf_kernels/ops.py:_tk.dequantize_kernel",
 }
 
 
