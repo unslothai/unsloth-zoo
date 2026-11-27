@@ -10422,19 +10422,33 @@ class _MarkovTreeDrafter:
         masks = mx.full((1, length - own), int(model.config.mask_token_id), dtype = mx.int32)
         proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)
         block = model._logits(proposed if own else proposed[:, 1:])
-        # The block's own chain at every depth, so the tree's first children are the chain its budget prices.
-        chain = markov.sample_block(block, first_prev_tokens = anchor, sampler = lambda x: mx.argmax(x, axis = -1))[0]
-        logits = block[0].astype(mx.float32)
-        candidates = mx.argpartition(logits, -_MARKOV_TREE_TOP, axis = -1)[:, -_MARKOV_TREE_TOP:]
-        chain = chain.astype(candidates.dtype)[:, None]
-        held = (candidates == chain).any(axis = -1, keepdims = True)
-        candidates = mx.where(held, candidates, mx.concatenate([chain, candidates[:, 1:]], axis = -1)).astype(mx.int32)
+        # The block's own chain, walked as `draft_block` walks it, and its step logits along the way.
+        steps = []
+        chain = markov.sample_block(block, first_prev_tokens = anchor,
+                                    sampler = lambda x: (steps.append(x), mx.argmax(x, axis = -1))[1])[0]
+        logits, top = block[0].astype(mx.float32), _MARKOV_TREE_TOP
+        partition = mx.argpartition(logits, -top, axis = -1)[:, -top:].astype(mx.int32)
+        chain = chain.astype(mx.int32)[:, None]
+        # The chain's token in slot 0 at every depth, then the block's best others: ties go to the earlier slot.
+        pool = mx.concatenate([chain, partition], axis = -1)
+        key = mx.concatenate([mx.full(chain.shape, mx.inf), mx.where(partition == chain, -mx.inf,
+                                                                       mx.take_along_axis(logits, partition, axis = -1))], axis = -1)
+        candidates = mx.take_along_axis(pool, mx.argsort(-key, axis = -1)[:, :top], axis = -1)
+        unary = mx.take_along_axis(logits, candidates, axis = -1)
         # The kernel reads its tables by token: here by candidate slot, the anchor last, and maps the slots back.
         tokens = mx.concatenate([candidates.reshape(-1), anchor])
         pred, succ = (_table_rows(table, tokens).astype(mx.float32) for table in (markov.markov_w1, markov.markov_w2))
-        slots = mx.arange(length * _MARKOV_TREE_TOP, dtype = mx.int32).reshape(1, length, _MARKOV_TREE_TOP)
-        tree = _lattice_tree(pred, mx.ones((1, length, pred.shape[-1]), mx.float32), succ, mx.array([length * _MARKOV_TREE_TOP], mx.int32),
-                             slots, mx.take_along_axis(logits, candidates, axis = -1)[None], rows, taken, calibration)
+        # A first-order step depends on its parent's token alone, so under a chain token the score is DSpark's own step
+        # logit, read whole from one rank (every other term zero): the first children are `draft_block`'s chain, ties and
+        # all. Under other parents the block's logit rides in another rank, beside their Markov terms.
+        native = mx.take_along_axis(mx.concatenate(steps).astype(mx.float32), candidates, axis = -1)
+        chained = ((mx.arange(tokens.size) % top == 0) | (mx.arange(tokens.size) == tokens.size - 1))[:, None]
+        pred = mx.concatenate([mx.where(chained, 0.0, pred), chained.astype(mx.float32), 1.0 - chained], axis = -1)
+        extra = lambda a: mx.concatenate([a.reshape(-1), mx.zeros((1,))])[:, None]
+        succ = mx.concatenate([succ, extra(native), extra(unary)], axis = -1)
+        slots = mx.arange(length * top, dtype = mx.int32).reshape(1, length, top)
+        tree = _lattice_tree(pred, mx.ones((1, length, pred.shape[-1]), mx.float32), succ, mx.array([length * top], mx.int32),
+                             slots, mx.zeros((1, length, top), mx.float32), rows, taken, calibration)
         return tree._replace(tokens = tokens[tree.tokens])
 
 
