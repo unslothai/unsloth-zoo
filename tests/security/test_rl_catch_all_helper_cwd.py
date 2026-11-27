@@ -46,6 +46,8 @@ def test_helper_does_not_import_from_cwd(tmp_path):
         R._stop_catch_all_helper()
     """))
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONSAFEPATH", "PYTHONPATH")}
+    # conftest disables GPU init only for pytest itself; this fresh interpreter needs it too.
+    env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     result = subprocess.run(
         [sys.executable, str(script)], cwd = planted, env = env, capture_output = True, text = True, timeout = 180,
     )
