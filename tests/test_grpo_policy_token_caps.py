@@ -14,8 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO policy pass must keep packing and PrefixGrouper within one padded mini-batch's tokens, and keep
-PrefixGrouper off when forwards are collective (sharded FSDP2), so every rank runs the same forwards."""
+"""The GRPO policy pass must keep packing and PrefixGrouper within one padded mini-batch's tokens (a batch over it
+packs in several bins of whole rows), and keep both off when forwards are collective (sharded FSDP2), so every rank
+runs the same forwards."""
 
 import collections
 import importlib.util
@@ -123,25 +124,57 @@ def _prefix_grouper(monkeypatch):
     monkeypatch.setattr(rr.grpo_accumulated_loss, "_pg_funcs", funcs, raising = False)
 
 
-def _run(mini_batch, model = None):
+def _run(mini_batch, model = None, result = None):
     model = model or _Model()
     model.train(True)
     mask = (_IDS[:, -_COMPLETION:] != 0).long()
+    advantages = torch.linspace(-1.0, 1.0, ROWS)
     out = rr.grpo_accumulated_loss(
-        _trainer(model, mini_batch), _IDS, (_IDS != 0).long(), _COMPLETION, mask, torch.ones(ROWS), None, None,
+        _trainer(model, mini_batch), _IDS, (_IDS != 0).long(), _COMPLETION, mask, advantages, None, None,
         loss_type = "dapo", max_completion_length = 8, num_items_in_batch = mask.sum().float(),
         current_gradient_accumulation_steps = 1, epsilon_low = 0.2, epsilon_high = 0.28,
     )
     out[0].backward()
+    if result is not None:
+        result["loss"] = out[0].detach()
+        result["grads"] = {k: p.grad.detach().clone() for k, p in model.named_parameters() if p.grad is not None}
     return model.calls
+
+
+_REAL = [int(n) for n in (_IDS != 0).sum(dim = 1)]
+
+
+def test_packing_bins_are_whole_rows_within_the_cap():
+    assert rr.grpo_packing_bins(_REAL, 3 * L) == [(0, 4), (4, 6)]
+    assert rr.grpo_packing_bins(_REAL, sum(_REAL)) == [(0, ROWS)]
+    assert rr.grpo_packing_bins(_REAL, L) == [(i, i + 1) for i in range(ROWS)]
+    assert rr.grpo_packing_bins(_REAL, max(_REAL) - 1) is None
+    assert rr.grpo_packing_bins([], L) == []
 
 
 def test_packing_stays_within_the_mini_batch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
-    # 6 splits: one row of L tokens per forward.
+    # 6 splits: at most L tokens per forward, so each row packs on its own.
     calls = _run(mini_batch = ROWS)
-    assert all(kind == "padded" for kind, _ in calls), calls
+    assert [n for kind, n in calls if kind == "packed"] == _REAL, calls
     assert max(n for _, n in calls) <= L, calls
+
+
+def test_batch_over_the_mini_batch_packs_in_bins(monkeypatch):
+    # 2 splits of 3 rows: 36 real tokens over a 24-token mini-batch. Two packed forwards of whole rows
+    # replace the padded loop, with the loss and gradients of one packed forward over the whole batch.
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    assert sum(_REAL) > 3 * L
+    binned, whole = {}, {}
+    calls = _run(mini_batch = 2, result = binned)
+    packed = [n for kind, n in calls if kind == "packed"]
+    assert packed == [sum(_REAL[:4]), sum(_REAL[4:])], calls
+    assert max(n for _, n in calls) <= 3 * L, calls
+    assert [n for _, n in _run(mini_batch = 1, result = whole) if _ == "packed"] == [sum(_REAL)]
+    torch.testing.assert_close(binned["loss"], whole["loss"], rtol = 1e-6, atol = 1e-7)
+    assert binned["grads"].keys() == whole["grads"].keys() and binned["grads"]
+    for name, grad in binned["grads"].items():
+        torch.testing.assert_close(grad, whole["grads"][name], rtol = 1e-5, atol = 1e-7)
 
 
 def test_packing_still_runs_when_it_fits(monkeypatch):
@@ -150,9 +183,10 @@ def test_packing_still_runs_when_it_fits(monkeypatch):
 
 
 def test_prefix_grouper_stays_within_the_mini_batch(monkeypatch):
+    # The grouped layout is over the cap, so it is declined; packing then runs one row per forward.
     _prefix_grouper(monkeypatch)
     calls = _run(mini_batch = ROWS)
-    assert all(kind == "padded" for kind, _ in calls), calls
+    assert "grouped" not in [kind for kind, _ in calls], calls
     assert max(n for _, n in calls) <= L, calls
 
 

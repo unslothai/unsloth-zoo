@@ -4217,6 +4217,26 @@ def grpo_host_lengths_to_device(lengths, device):
 pass
 
 
+def grpo_packing_bins(lengths, cap):
+    """Contiguous row ranges [(lo, hi), ...] whose real tokens each fit one packed forward of at most `cap` tokens
+    (one padded [batch_size, L] mini-batch's). Greedy, so it never needs more forwards than the padded loop's
+    mini-batches. None when one row alone does not fit (the padded loop runs instead)."""
+    limit = int(cap)
+    bins, lo, total = [], 0, 0
+    for i, n in enumerate(lengths):
+        n = int(n)
+        if n > limit:
+            return None
+        if total + n > limit and i > lo:
+            bins.append((lo, i))
+            lo, total = i, 0
+        total += n
+    if lo < len(lengths):
+        bins.append((lo, len(lengths)))
+    return bins
+pass
+
+
 # Rows a re-verify of already trusted packing scores one at a time. The first verify scores every row.
 GRPO_PACKING_REVERIFY_ROWS = 3
 
@@ -5188,16 +5208,20 @@ def grpo_accumulated_loss(
                 _pack_ctgt_2d = (_pack_keep & (_pack_csum > 1)) & (
                     torch.arange(_pack_L, device = input_ids.device) >= _pack_cstart.to(input_ids.device).unsqueeze(1)
                 )
-                # The one host read per packed batch: row lengths, completion tokens per row, active rows, target count.
+                # The one host read per packed batch: row lengths, completion tokens per row, loss targets per row,
+                # active rows, target count.
+                _pack_rows = _pack_lengths.shape[0]
                 _pack_ccount = completion_mask.sum(dim = 1).to(device = _pack_lengths.device, dtype = torch.long)
                 _pack_meta_cpu = torch.cat([
                     _pack_lengths.to(torch.long),
                     _pack_ccount,
+                    _pack_ctgt_2d.sum(dim = 1).to(torch.long),
                     (_pack_ccount > 0).sum().reshape(1),
                     _pack_ctgt_2d.sum().to(torch.long).reshape(1),
                 ]).tolist()
-                _pack_lengths_cpu = _pack_meta_cpu[:_pack_lengths.shape[0]]
-                _pack_ccount_cpu = _pack_meta_cpu[_pack_lengths.shape[0]:-2]
+                _pack_lengths_cpu = _pack_meta_cpu[:_pack_rows]
+                _pack_ccount_cpu = _pack_meta_cpu[_pack_rows : 2 * _pack_rows]
+                _pack_ntgt_cpu = _pack_meta_cpu[2 * _pack_rows : 3 * _pack_rows]
                 _pack_active_cpu, _pack_ntgt = _pack_meta_cpu[-2], _pack_meta_cpu[-1]
                 _pack_nz_cpu = [_n for _n in _pack_lengths_cpu if _n > 0]
                 _pack_T = sum(_pack_nz_cpu)
@@ -5210,80 +5234,112 @@ def grpo_accumulated_loss(
                 # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
                 # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
                 _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
-                # Over one padded [batch_size, L] mini-batch's tokens: the chunked loop keeps the mini-batch cap.
-                _pack_capped = _pack_capped or _pack_T > batch_size * _pack_L
+                # One packed forward per bin of whole rows, each within one padded [batch_size, L] mini-batch's
+                # tokens (the chunked loop's cap): a batch that fits is one bin, as before, and a larger one packs
+                # in a few bins instead of falling back to the padded loop. None: one row alone does not fit.
+                from unsloth_zoo.rl_replacements import grpo_packing_bins
+                _pack_bins = None if _pack_capped else grpo_packing_bins(_pack_lengths_cpu, batch_size * _pack_L)
+                _pack_capped = _pack_bins is None
+                if _pack_bins is not None and len(_pack_bins) > 1:
+                    # From here on _pack_T is the longest packed forward's tokens: the length the trusted envelope,
+                    # the unsafe mark and an OOM refer to.
+                    _pack_T = max(sum(_pack_lengths_cpu[_b_lo:_b_hi]) for _b_lo, _b_hi in _pack_bins)
                 if not _pack_capped:
-                    _pack_nz_idx = grpo_nonzero_static(_pack_keep, _pack_T)     # [T, 2] = (row, col)
-                    _pack_flat_ids = input_ids[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
                     _pack_active = _pack_active_cpu
                 if (not _pack_capped) and _pack_T >= 2 and len(_pack_nz_cpu) > 0 and _pack_sw_ok \
                         and (_pack_ok is True or _pack_active >= 2):
-                    _pack_psl = grpo_host_lengths_to_device(_pack_nz_cpu, input_ids.device)
-                    # reset 0-based position_ids per segment
-                    _pack_pos = (_pack_csum - 1)[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
-                    _pack_chunks = max(1, total_rows * multiplier)
-                    _pack_within = _pack_nz_idx[1:, 0] == _pack_nz_idx[:-1, 0]     # [T-1]
-                    _pack_ctgt = (_pack_nz_idx[1:, 1] >= _pack_cstart[_pack_nz_idx[1:, 0]]) & _pack_within
-                    _pack_ctgt_idx = grpo_nonzero_static(_pack_ctgt, _pack_ntgt).squeeze(1)
-                    _pack_in_packed = True
                     _pack_defer = (
                         _fused_route and _pg_layout is None and _pack_ok is True
                         and os.environ.get("UNSLOTH_GRPO_SEQ_PACKING_VERIFY", "0") != "1"
                         and _pack_T <= int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_T", 0))
                         and _pack_maxseg <= int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_seg", 0))
                     )
-                    with autocaster:
-                        # use_cache=False: a KV cache silently disables varlen packing
-                        _pack_hidden = unwrapped_model(
-                            input_ids = _pack_flat_ids,
-                            position_ids = _pack_pos,
-                            packed_seq_lengths = _pack_psl,
-                            use_cache = False,
-                        ).logits
-                        _refresh_lm_head()
-                        # `.logits` carries hidden states only when the forward is the
-                        # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
-                        # otherwise it is real [T, vocab] logits and the lm_head matmul
-                        # dies. Dispatch on width, as the padded path already does.
-                        _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt_idx].unsqueeze(0)
-                        _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt_idx].unsqueeze(0)
-                        if _pack_h.shape[-1] == lm_head.shape[1]:
-                            _fp32_bind(_need_entropy)
-                            if _pack_defer:
-                                # trusted shape, so no verify reads these values: the loss scores them
-                                _fused_pack = (_pack_h[0], _pack_tid[0])
-                                _pack_sel = _pack_h.new_zeros(_pack_tid.shape[1], dtype = torch.float32)
-                                _pack_ent = _pack_sel
-                            elif _need_entropy:
-                                _pack_sel, _pack_ent = _hidden_logps_and_entropies(_pack_h, _pack_tid, _pack_chunks)
-                                _pack_sel, _pack_ent = _pack_sel[0], _pack_ent[0]
+                    _pack_tgts, _pack_sels, _pack_ents, _fused_pack = [], [], [], ([] if _pack_defer else None)
+                    _pack_in_packed = True
+                    for _b_lo, _b_hi in _pack_bins:
+                        _pack_bin_T = sum(_pack_lengths_cpu[_b_lo:_b_hi])
+                        if _pack_bin_T == 0:
+                            continue
+                        _pack_nz_idx = grpo_nonzero_static(_pack_keep[_b_lo:_b_hi], _pack_bin_T)     # [T, 2] = (row, col)
+                        if _b_lo:
+                            _pack_nz_idx = _pack_nz_idx + torch.tensor(
+                                [_b_lo, 0], dtype = _pack_nz_idx.dtype, device = _pack_nz_idx.device,
+                            )
+                        _pack_flat_ids = input_ids[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
+                        _pack_psl = grpo_host_lengths_to_device(
+                            [_n for _n in _pack_lengths_cpu[_b_lo:_b_hi] if _n > 0], input_ids.device,
+                        )
+                        # reset 0-based position_ids per segment
+                        _pack_pos = (_pack_csum - 1)[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
+                        _pack_chunks = max(1, (_b_hi - _b_lo) * multiplier)
+                        _pack_within = _pack_nz_idx[1:, 0] == _pack_nz_idx[:-1, 0]     # [T-1]
+                        _pack_ctgt = (_pack_nz_idx[1:, 1] >= _pack_cstart[_pack_nz_idx[1:, 0]]) & _pack_within
+                        _pack_ctgt_idx = grpo_nonzero_static(_pack_ctgt, sum(_pack_ntgt_cpu[_b_lo:_b_hi])).squeeze(1)
+                        _fused_bin = None
+                        with autocaster:
+                            # use_cache=False: a KV cache silently disables varlen packing
+                            _pack_hidden = unwrapped_model(
+                                input_ids = _pack_flat_ids,
+                                position_ids = _pack_pos,
+                                packed_seq_lengths = _pack_psl,
+                                use_cache = False,
+                            ).logits
+                            _refresh_lm_head()
+                            # `.logits` carries hidden states only when the forward is the
+                            # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
+                            # otherwise it is real [T, vocab] logits and the lm_head matmul
+                            # dies. Dispatch on width, as the padded path already does.
+                            _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt_idx].unsqueeze(0)
+                            _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt_idx].unsqueeze(0)
+                            if _pack_h.shape[-1] == lm_head.shape[1]:
+                                _fp32_bind(_need_entropy)
+                                if _pack_defer:
+                                    # trusted shape, so no verify reads these values: the loss scores them
+                                    _fused_bin = (_pack_h[0], _pack_tid[0])
+                                    _pack_sel = _pack_h.new_zeros(_pack_tid.shape[1], dtype = torch.float32)
+                                    _pack_ent = _pack_sel
+                                elif _need_entropy:
+                                    _pack_sel, _pack_ent = _hidden_logps_and_entropies(_pack_h, _pack_tid, _pack_chunks)
+                                    _pack_sel, _pack_ent = _pack_sel[0], _pack_ent[0]
+                                else:
+                                    _pack_sel = chunked_hidden_states_selective_log_softmax(
+                                        _pack_h, lm_head, _pack_tid, _pack_chunks,
+                                        logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                        lm_head_bias = lm_head_bias,
+                                    )[0]
                             else:
-                                _pack_sel = chunked_hidden_states_selective_log_softmax(
-                                    _pack_h, lm_head, _pack_tid, _pack_chunks,
-                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                                    lm_head_bias = lm_head_bias,
+                                # Raw logits: the forward already applied scale/softcap.
+                                _pack_sel = chunked_selective_log_softmax(
+                                    _pack_h, _pack_tid,
+                                    temperature = temperature, chunks = _pack_chunks,
                                 )[0]
-                        else:
-                            # Raw logits: the forward already applied scale/softcap.
-                            _pack_sel = chunked_selective_log_softmax(
-                                _pack_h, _pack_tid,
-                                temperature = temperature, chunks = _pack_chunks,
-                            )[0]
-                            if _need_entropy:
-                                _pack_ent = _raw_logits_entropies(_pack_h)[0]
-                    # GPT-OSS offload race guard (matches the padded loop)
-                    device_synchronize()
-                    # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
-                    _pack_tgt = (_pack_nz_idx[1:, 0] * _pack_L + _pack_nz_idx[1:, 1])[_pack_ctgt_idx]
-                    if _fused_pack is not None:
-                        _fused_pack = _fused_pack + (_fused_slots(_pack_tgt // _pack_L, _pack_tgt % _pack_L, _pack_L),)
+                                if _need_entropy:
+                                    _pack_ent = _raw_logits_entropies(_pack_h)[0]
+                        # GPT-OSS offload race guard (matches the padded loop)
+                        device_synchronize()
+                        # each completion logprob's (row, col), so [:, -_pack_W:] matches padded
+                        _pack_tgt = (_pack_nz_idx[1:, 0] * _pack_L + _pack_nz_idx[1:, 1])[_pack_ctgt_idx]
+                        if _fused_bin is not None:
+                            _fused_pack.append(_fused_bin + (_fused_slots(_pack_tgt // _pack_L, _pack_tgt % _pack_L, _pack_L),))
+                        _pack_tgts.append(_pack_tgt)
+                        _pack_sels.append(_pack_sel.to(torch.float32))
+                        if _need_entropy:
+                            _pack_ents.append(_pack_ent.to(torch.float32))
+                        _pack_hidden = _pack_h = None
+                    # scatter every bin's log-probs into the padded [rows, L] layout in one op
+                    _pack_tgt = _pack_tgts[0] if len(_pack_tgts) == 1 else torch.cat(_pack_tgts)
                     _pack_result = torch.zeros(
                         total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
-                    ).index_put((_pack_tgt,), _pack_sel.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                    ).index_put(
+                        (_pack_tgt,), _pack_sels[0] if len(_pack_sels) == 1 else torch.cat(_pack_sels),
+                    ).view(total_rows, _pack_L)[:, -_pack_W:]
                     if _need_entropy:
                         _pack_entropies = torch.zeros(
                             total_rows * _pack_L, dtype = torch.float32, device = input_ids.device,
-                        ).index_put((_pack_tgt,), _pack_ent.to(torch.float32)).view(total_rows, _pack_L)[:, -_pack_W:]
+                        ).index_put(
+                            (_pack_tgt,), _pack_ents[0] if len(_pack_ents) == 1 else torch.cat(_pack_ents),
+                        ).view(total_rows, _pack_L)[:, -_pack_W:]
+                    _pack_tgts = _pack_sels = _pack_ents = None
                     _pack_in_packed = False
                     # trust decision: re-verify when T or the longest segment grows past what was verified
                     # (a LongRoPE cache switch can change the result)
@@ -5342,7 +5398,7 @@ def grpo_accumulated_loss(
                             _pack_cm = _pack_cm * _pack_vsel
                         _pack_diff = float(((_pack_result.detach() - _pack_ref).abs() * _pack_cm).max())
                         if UNSLOTH_ENABLE_LOGGING:
-                            print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} maxseg={_pack_maxseg} rows={len(_pack_vrows)}/{total_rows} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
+                            print(f"[Unsloth] GRPO seq-packing (grad) verify: T={_pack_T} bins={len(_pack_bins)} maxseg={_pack_maxseg} rows={len(_pack_vrows)}/{total_rows} packed-vs-perrow max|d|={_pack_diff:.4f}", flush = True)
                         # floor ~0.25 through different kernels; cross-sample contamination is >= 2.4
                         if _pack_diff < 7e-1:
                             unwrapped_model._unsloth_seq_packing_grad_ok = True
@@ -5789,7 +5845,7 @@ def grpo_accumulated_loss(
         elif _pg_use and _pg_result is not None:
             _fused_items = [_fused_pg] if _fused_pg is not None else []
         else:
-            _fused_items = [_fused_pack] if _fused_pack is not None else []
+            _fused_items = list(_fused_pack) if _fused_pack else []
         _fused_pad = _fused_pack = _fused_pg = None
 
         def _score_deferred(items, need_entropy):
