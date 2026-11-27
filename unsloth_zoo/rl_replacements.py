@@ -5081,6 +5081,8 @@ def grpo_accumulated_loss(
         _pg_engage = _pg_engage and pad_eos_rows is None
         # Same for real prompt tokens that share the pad id (prompt_real_mask).
         _pg_engage = _pg_engage and prompt_real_mask is None
+        # Score centering gathers its heads in the packed or padded forward; PrefixGrouper's would skip them.
+        _pg_engage = _pg_engage and _sc_ids is None
 
         # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
         # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
@@ -5186,9 +5188,9 @@ def grpo_accumulated_loss(
         # result, and it fixes the padded path's left-pad RoPE error. Loss/gradients flow through it. Self-
         # verified against the per-row forward (shape/RoPE-aware, re-checked as T grows); falls back if a
         # backend ignores packed_seq_lengths. lm_head runs on completion positions only.
-        if _sc_ids is not None:
-            # Score centering gathers its head log-probs in the padded loop below.
-            _pg_skip_pack = True
+        _sc_pack_head = None
+        if _sc_ids is not None and pixel_values is None and _sc_ids.shape[1] != logits_to_keep + max_left_pad:
+            _pg_skip_pack = True  # heads not in the [rows, W] loss window: the padded loop gathers them
         new_logprobs = None
         _pack_result = None
         _pack_use = False
@@ -5274,6 +5276,7 @@ def grpo_accumulated_loss(
                         and _pack_maxseg <= int(getattr(unwrapped_model, "_unsloth_seq_packing_grad_verified_seg", 0))
                     )
                     _pack_tgts, _pack_sels, _pack_ents, _fused_pack = [], [], [], ([] if _pack_defer else None)
+                    _sc_pack_parts = []
                     _pack_in_packed = True
                     for _b_lo, _b_hi in _pack_bins:
                         _pack_bin_T = sum(_pack_lengths_cpu[_b_lo:_b_hi])
@@ -5334,6 +5337,19 @@ def grpo_accumulated_loss(
                                 )[0]
                                 if _need_entropy:
                                     _pack_ent = _raw_logits_entropies(_pack_h)[0]
+                            if _sc_ids is not None:
+                                # The centering head at the same packed rows, at the padded loop's rows per chunk.
+                                from unsloth_zoo.score_centering import grpo_topk_head_logprobs as _sc_head_logprobs
+                                _sc_r = _pack_nz_idx[1:, 0][_pack_ctgt_idx]
+                                _sc_c = _pack_nz_idx[1:, 1][_pack_ctgt_idx] - (_pack_L - _pack_W)
+                                _sc_ids = _sc_ids.to(_sc_r.device)
+                                _sc_n = sum(_pack_ntgt_cpu[_b_lo:_b_hi])
+                                _sc_pack_parts.append((_sc_r, _sc_c, _sc_head_logprobs(
+                                    _pack_h, lm_head, _sc_ids[_sc_r, _sc_c].unsqueeze(0),
+                                    max(1, -(-_sc_n * multiplier // max(1, _pack_W))),
+                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                    lm_head_bias = lm_head_bias,
+                                )[0]))
                         # GPT-OSS offload race guard (matches the padded loop)
                         device_synchronize()
                         # each completion logprob's (row, col), so [:, -_pack_W:] matches padded
@@ -5359,6 +5375,17 @@ def grpo_accumulated_loss(
                             (_pack_tgt,), _pack_ents[0] if len(_pack_ents) == 1 else torch.cat(_pack_ents),
                         ).view(total_rows, _pack_L)[:, -_pack_W:]
                     _pack_tgts = _pack_sels = _pack_ents = None
+                    if _sc_pack_parts:
+                        _sc_r = torch.cat([_x[0] for _x in _sc_pack_parts])
+                        _sc_c = torch.cat([_x[1] for _x in _sc_pack_parts])
+                        _sc_ph = torch.cat([_x[2] for _x in _sc_pack_parts])
+                        _sc_pack_head = _sc_ph.new_zeros((total_rows, _pack_W, _sc_ph.shape[-1])).index_put(
+                            (_sc_r, _sc_c), _sc_ph,
+                        )
+                        _sc_pack_cov = torch.zeros(
+                            (total_rows, _pack_W), dtype = torch.bool, device = _sc_r.device,
+                        ).index_put((_sc_r, _sc_c), torch.ones_like(_sc_r, dtype = torch.bool))
+                    _sc_pack_parts = _sc_r = _sc_c = _sc_ph = None
                     _pack_in_packed = False
                     # trust decision: re-verify when T or the longest segment grows past what was verified
                     # (a LongRoPE cache switch can change the result)
@@ -5454,6 +5481,7 @@ def grpo_accumulated_loss(
                 _pack_hidden = _pack_h = None
                 _pack_sel = _pack_ent = None
                 _pack_tgts = _pack_sels = _pack_ents = None
+                _sc_pack_parts = _sc_pack_head = _sc_ph = _sc_pack_cov = None
                 _fused_pack = None
                 _pack_result = None
                 _pack_use = False
@@ -5602,6 +5630,10 @@ def grpo_accumulated_loss(
             zipped_inputs = []
         elif _pack_use and _pack_result is not None:
             new_logprobs = _pack_result          # verified -> skip the loop
+            if _sc_pack_head is not None:
+                _sc_head_list.append(_sc_pack_head)
+                # A position the packed rows did not score has no trainer head: leave it out of the term.
+                _sc_ids = _sc_ids.masked_fill(~_sc_pack_cov.unsqueeze(-1), -1)
             if _need_entropy:
                 all_entropies_list = [_pack_entropies]
             zipped_inputs = []
@@ -5609,6 +5641,7 @@ def grpo_accumulated_loss(
             # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
             # neither co-resides with it; same for a declined PrefixGrouper layout
             _pack_hidden = _pack_sel = _pack_result = None
+            _sc_pack_head = _sc_pack_cov = None
             _pg_layout = None
             _pack_ent = _pack_entropies = None
             _fused_pack = None
