@@ -374,7 +374,7 @@ def test_record_lookup_align_roundtrip():
 
 
 def _trl1_sampled_logprobs(outputs):
-    """TRL >= 1.x vllm_generation.extract_logprobs + grpo_trainer: sort each position by rank, keep entry 0."""
+    """Mirrors TRL >= 1.x extract_logprobs: rank-sort, keep entry 0."""
     rows = []
     for o in outputs:
         for c in o.outputs:
@@ -401,15 +401,14 @@ def test_wrapped_generate_returns_the_requested_logprobs(asked):
     params = types.SimpleNamespace(logprobs = asked)
     got = llm.generate(["a", "b"], sampling_params = params)
     assert seen["logprobs"] == (k if asked is None or asked < k else asked)
-    assert params.logprobs == asked  # a reused SamplingParams asks for its own value on the next call
+    assert params.logprobs == asked
     assert sc.score_centering_stats()["recorded"] == 2
-    # The head was recorded before the cut.
     head_ids, _ = sc._lookup(sc._make_key([1, 2, 3] + completion, None), None)
     assert head_ids[0].tolist() == truth[0][0][1]
     if asked is None:
         assert all(c.logprobs is None for o in got for c in o.outputs)
         return
-    if asked == 0:  # what TRL asks for: entry 0 after the rank sort is the sampled token again
+    if asked == 0:
         sampled = [[float(pos[0][tok].logprob) for pos, tok in zip(t, o.outputs[0].token_ids)]
                    for t, o in zip(truth, got)]
         assert _trl1_sampled_logprobs(got) == sampled

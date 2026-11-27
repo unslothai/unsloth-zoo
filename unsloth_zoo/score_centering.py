@@ -300,8 +300,7 @@ def record_rollout_topk(request_outputs, k):
 
 
 def _raise_logprobs(params, k):
-    """TRL asks for logprobs=0 (the sampled token); a larger request is left alone. Returns what each
-    params object asked for before, in order (False for an object without a logprobs field)."""
+    """Raise logprobs to k; returns each params' prior value (False = no logprobs field)."""
     items = params if isinstance(params, (list, tuple)) else [params]
     asked = []
     for p in items:
@@ -323,9 +322,7 @@ def _lower_logprobs(params, asked, k):
 
 
 def _as_requested(completion, asked):
-    """Cut a completion's per-token logprobs back to what the caller asked vLLM for: the sampled token, plus
-    ranks 1..asked (None = no logprobs). TRL >= 1.x sorts each position by rank and reads entry 0 as the sampled
-    token's logprob, which is the top-1 token once the head is in the dict."""
+    """Keep only the sampled token plus ranks <= asked: TRL >= 1.x reads rank-sorted entry 0 as the sampled logprob."""
     positions = getattr(completion, "logprobs", None)
     if positions is None:
         return
@@ -349,8 +346,6 @@ def _as_requested(completion, asked):
 
 
 def _restore_requested(outputs_list, asked, k):
-    """Apply _as_requested to every completion, matching params to outputs (one params object for all, or
-    one per prompt). Returns completions cut."""
     asked = [a for a in asked if a is not False]
     if not asked:
         return 0
@@ -360,7 +355,7 @@ def _restore_requested(outputs_list, asked, k):
     for i, request_output in enumerate(outputs_list):
         want = asked[0] if len(asked) == 1 else asked[i]
         if want is not None and want >= k:
-            continue  # the caller's own request covered the head: left as vLLM returned it
+            continue
         for completion in getattr(request_output, "outputs", None) or []:
             _as_requested(completion, want)
             done += 1
@@ -400,7 +395,6 @@ def wrap_vllm_generate_topk(llm, k):
         try:
             outputs = generate(*args, **kwargs)
         finally:
-            # The raise lasts one call: a caller that reuses its SamplingParams asks for its own value again.
             if params is not None:
                 _lower_logprobs(params, asked, k)
         outputs_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
