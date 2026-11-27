@@ -432,7 +432,7 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
     if not ce_all:
         return zero + 0.0 * sum(p.sum() for p in drafter.parameters() if p.requires_grad), {"n_tokens": 0}
     ce, l1, correct = torch.cat(ce_all), torch.cat(l1_all), torch.cat(correct_all)
-    den = weight.sum() + 1e-6 if normalizer is None else normalizer.to(weight).clamp_min(1e-6)
+    den = weight.sum() + 1e-6
     ce_loss = (ce * weight).sum() / den
     loss = ce_alpha * ce_loss
     stats = {"n_tokens": int(ce.numel()), "ce_loss": float(ce_loss.detach())}
@@ -448,6 +448,9 @@ def dspark_loss(drafter, out, teacher_hidden = None, ce_alpha = 0.1, l1_alpha = 
             conf_loss = (F.binary_cross_entropy_with_logits(conf, accept, reduction = "none") * weight).sum() / den
             loss = loss + confidence_alpha * conf_loss
             stats["confidence_loss"] = float(conf_loss.detach())
+    if normalizer is not None:
+        # Logged terms stay this batch's means; the loss becomes its share of the window's weighted mean.
+        loss = loss * (den / normalizer.to(den).clamp_min(1e-6))
     bs = out["hidden"].shape[2]
     per_slot = torch.zeros(bs, device = slot.device).index_add_(0, slot, correct)
     count = torch.zeros(bs, device = slot.device).index_add_(0, slot, torch.ones_like(correct))
@@ -511,9 +514,12 @@ class UnslothDSparkTrainer(Trainer):
         batch_samples, _ = super().get_batch_samples(epoch_iterator, num_batches, *args, **kwargs)
         drafter = self.accelerator.unwrap_model(self.model)
         total = None
-        for x in batch_samples:
+        for i, x in enumerate(batch_samples):
             loss_mask = _loss_mask(x)
-            anchors, keep = sample_anchor_positions(loss_mask, int(self.args.dspark_num_anchors))
+            # Seeded by step, not the global RNG: Trainer restores a checkpoint's RNG state only after this call.
+            gen = torch.Generator(device = loss_mask.device)
+            gen.manual_seed(hash((self.args.seed, self.state.global_step, self.args.process_index, i)) & (2**63 - 1))
+            anchors, keep = sample_anchor_positions(loss_mask, int(self.args.dspark_num_anchors), gen)
             _, eval_mask = _eval_slots(anchors, keep, loss_mask, drafter.block_size)
             slot = torch.arange(drafter.block_size, device = eval_mask.device).expand_as(eval_mask)
             weight = (_slot_weights(slot, self.args.dspark_decay_gamma) * eval_mask).sum()

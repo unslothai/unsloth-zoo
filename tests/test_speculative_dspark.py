@@ -335,6 +335,9 @@ def test_trainer_evaluates_and_resumes(tmp_path):
                                    eval_dataset = rows, data_collator = MTPDataCollator(pad_token_id = 0))
     resumed.train(resume_from_checkpoint = str(tmp_path / "checkpoint-2"))
     assert resumed.state.global_step == 4
+    # Anchors are drawn before Trainer restores the checkpoint RNG state, so they must not depend on it.
+    straight = trainer.model.state_dict()
+    assert all(torch.equal(v, straight[k]) for k, v in resumed.model.state_dict().items())
 
 
 def test_default_ddp_reduces_the_loss_only_heads(tmp_path):
