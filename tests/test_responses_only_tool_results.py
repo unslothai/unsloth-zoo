@@ -78,7 +78,8 @@ def test_tool_results_are_not_trained(family):
         f"{turn}user\nQ{end}\n{turn}model\nCALL1{opener}RESULT1{closer}{opener}RESULT2{closer}"
         f"ANSWER{end}\n"
     )
-    assert _trained(family, text) == f"CALL1{opener}{opener}ANSWER{end}\n"
+    # Only the first opener is generated (it stops generation); the second result's opener is the tool's.
+    assert _trained(family, text) == f"CALL1{opener}ANSWER{end}\n"
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -106,13 +107,14 @@ def test_cached_tokenizer_tool_conversation(repo, opener):
     transformers = pytest.importorskip("transformers")
     try:
         tokenizer = transformers.AutoTokenizer.from_pretrained(repo)
-    except Exception as e:  # offline runner
+    except Exception as e:  # offline runner without the cached tokenizer: the fake-tokenizer tests above still run
         pytest.skip(f"cannot load {repo}: {e}")
     call = {"type": "function", "function": {"name": "multiply", "arguments": {"a": 77, "b": 88}}}
     messages = [
         {"role": "user", "content": "USERQ"},
-        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "assistant", "content": "", "tool_calls": [call, call]},
         {"role": "tool", "name": "multiply", "content": "TOOLOUT_9137"},
+        {"role": "tool", "name": "multiply", "content": "TOOLOUT_4421"},
         {"role": "assistant", "content": "FINALANS_5521"},
     ]
     tools = [{"type": "function", "function": {
@@ -126,3 +128,4 @@ def test_cached_tokenizer_tool_conversation(repo, opener):
     trained = tokenizer.decode([t for t, label in zip(input_ids, labels) if label != -100])
     assert "call:multiply" in trained and opener in trained and "FINALANS_5521" in trained, trained
     assert "TOOLOUT" not in trained and "USERQ" not in trained, trained
+    assert trained.count(opener) == 1, trained
