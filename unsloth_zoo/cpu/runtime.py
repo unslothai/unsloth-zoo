@@ -519,7 +519,8 @@ def _cpu_family_model():
     return (int(found.group(1)), int(found.group(2))) if found else None
 
 
-# Zen 4 models of family 25 (Genoa / Raphael / Phoenix / Bergamo / Siena): their siblings slowed decode by 4-13%.
+# Zen 4 models of family 25 (Genoa / Raphael / Phoenix / Bergamo / Siena): kept at the training count like Zen 5
+# (family 26, EPYC 9V45), whose siblings slowed decode by 4-13%; Zen 4 itself was not measured.
 _ZEN4_MODELS = (range(0x10, 0x20), range(0x60, 0x80), range(0xA0, 0xB0))
 
 
@@ -556,8 +557,8 @@ def rollout_threads():
     Training uses one thread per physical core (SMT siblings made SFT and GRPO 13-20% slower). Decoding is batched
     GEMVs that stream every weight per token, and on AMD Zen 3 without native bf16 (EPYC 7763) the siblings help it:
     2-core x 2-SMT EPYC 7763 runners decoded Qwen3-0.6B GRPO rollouts about 35% faster on 4 threads with training
-    left at 2 (step -19 to -21% on Windows, -10% on Linux), while Zen 4 (EPYC 9V45) was 4-13% slower and Intel was
-    not measured, so only Zen 3 widens. UNSLOTH_CPU_ROLLOUT_THREADS=N sets the count for every host, 0 keeps the training count."""
+    left at 2 (step -19 to -21% on Windows, -10% on Linux), while Zen 5 (EPYC 9V45) was 4-13% slower and Intel and
+    Zen 4 were not measured, so only Zen 3 widens. UNSLOTH_CPU_ROLLOUT_THREADS=N sets the count for every host, 0 keeps the training count."""
     import torch
     explicit = os.environ.get("UNSLOTH_CPU_ROLLOUT_THREADS", "").strip().lower()
     current = torch.get_num_threads()
