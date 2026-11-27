@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
 import collections
+import contextlib
 import os
 import types
 import torch
@@ -75,14 +76,17 @@ LAST_DECLINE = {"reason": None}
 
 
 def _grouped_mm_supported() -> bool:
-    """Cached probe: reuse unsloth's check, else a local tiny torch._grouped_mm call."""
+    """Cached probe: reuse unsloth's check, else a local tiny torch._grouped_mm call. An out-of-memory probe is no
+    verdict: this call keeps the loop and the next one probes again."""
     global _GROUPED_MM_SUPPORTED
     if _GROUPED_MM_SUPPORTED is not None:
         return _GROUPED_MM_SUPPORTED
     ok = False
     try:
-        from .moe_utils import _check_torch_grouped_mm_supported
-        ok = bool(_check_torch_grouped_mm_supported())
+        from . import moe_utils
+        ok = bool(moe_utils._check_torch_grouped_mm_supported())
+        if not ok and moe_utils._TORCH_GROUPED_MM_SUPPORTED is None:
+            return False  # moe_utils recorded no verdict (out of memory): do not latch it here either
     except Exception:
         try:
             if torch.cuda.is_available():
@@ -96,7 +100,10 @@ def _grouped_mm_supported() -> bool:
                 w = torch.ones((1, 8, 8), device=dev, dtype=torch.bfloat16)
                 torch._grouped_mm(x, w, offs=torch.tensor([1], device=dev, dtype=torch.int32))
                 ok = True
-        except Exception:
+        except Exception as exc:
+            oom = getattr(torch, "OutOfMemoryError", None)
+            if (isinstance(oom, type) and isinstance(exc, oom)) or "out of memory" in str(exc).lower():
+                return False
             ok = False
     _GROUPED_MM_SUPPORTED = ok
     return ok
@@ -111,6 +118,12 @@ try:
     from .moe_utils import _triton_grouped_mm, _triton_grouped_mm_wanted
 except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
+
+try:
+    from .moe_utils import _count_grouped_mm_sync
+except Exception:
+    def _count_grouped_mm_sync(*args, **kwargs):
+        return None
 
 try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
@@ -166,6 +179,7 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     x = x.contiguous()
     if not _view_weight_ok(w):
         w = w.contiguous()
+    _count_grouped_mm_sync("torch_fallback", x, w, offs.shape[0])
     try:
         return torch._grouped_mm(x, w, offs=offs)
     except RuntimeError as e:
@@ -555,11 +569,39 @@ def _stacked_state_dict_pre_hook(module, prefix, keep_vars):
     module.__dict__["_unsloth_keep_vars"] = keep_vars
 
 
+_PACKED_CLONES = None  # id(stack) -> (stack, detached clone), only inside packed_stacked_state_dict()
+# Host stacks keep per-expert clones: a fresh multi-MB host allocation per stack measured 2.6x slower.
+_UNPACKED_DEVICE_TYPES = ("cpu",)
+
+
+@contextlib.contextmanager
+def packed_stacked_state_dict():
+    """Stacked expert weights come out as views of one detached clone per stack, not a clone per expert. The views
+    share storage, which safetensors refuses: only for the in-memory vLLM handoff."""
+    global _PACKED_CLONES
+    outer = _PACKED_CLONES
+    _PACKED_CLONES = {} if outer is None else outer
+    try:
+        yield
+    finally:
+        _PACKED_CLONES = outer
+
+
 def _stacked_state_dict_hook(module, destination, prefix, local_metadata):
     # Per-expert key and shape as PEFT saves them; the stack key never leaves the model.
     destination.pop(prefix + _STACK_NAME, None)
-    w = module.weight
-    destination[prefix + "weight"] = w if module.__dict__.pop("_unsloth_keep_vars", False) else w.detach().clone()
+    if module.__dict__.pop("_unsloth_keep_vars", False):
+        destination[prefix + "weight"] = module.weight
+        return
+    clones = _PACKED_CLONES
+    stack = getattr(module._unsloth_stack_owner, _STACK_NAME)
+    if clones is None or stack.device.type in _UNPACKED_DEVICE_TYPES:
+        destination[prefix + "weight"] = stack[module._unsloth_stack_index].detach().clone()
+        return
+    entry = clones.get(id(stack))
+    if entry is None or entry[0] is not stack:
+        entry = clones[id(stack)] = (stack, stack.detach().clone())
+    destination[prefix + "weight"] = entry[1][module._unsloth_stack_index]
 
 
 def _stacked_load_pre_hook(module, state_dict, prefix, local_metadata, strict,

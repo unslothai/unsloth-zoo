@@ -254,7 +254,7 @@ def test_packed_forward_scores_the_kept_eos(monkeypatch):
         "chunked_hidden_states_selective_log_softmax": _rl.chunked_hidden_states_selective_log_softmax,
         "chunked_selective_log_softmax": _rl.chunked_selective_log_softmax,
         "_refresh_lm_head": lambda: None, "_fp32_bind": lambda entropy = False: None, "lm_head_bias": None,
-        "_fused_route": False, "_fused_pack": None, "_pg_layout": None,
+        "_fused_route": False, "_fused_pack": None, "_pg_layout": None, "_sc_ids": None,
         "create_completion_attention_mask": _rl.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None, "UNSLOTH_ENABLE_LOGGING": False,
         "trainer": trainer, "unwrapped_model": model, "lm_head": lm_head,

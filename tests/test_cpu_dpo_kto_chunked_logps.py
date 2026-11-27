@@ -19,11 +19,14 @@ forwards. TRL 1.x has neither forward (its fused LM head is already chunked on C
 
 import dataclasses
 import os
+import sys
 
 import pytest
 import torch
 
-TINY = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _tiny_qwen3 import tiny_snapshot  # noqa: E402
+
 
 
 def _trl_cls(kind):
@@ -51,11 +54,8 @@ def _trainer(tmp_path, kind, dtype = torch.float32, bf16 = False, lora = True, *
     from unsloth_zoo.cpu import loader
     from unsloth_zoo.cpu.trainer import install_cpu_training_defaults
     install_cpu_training_defaults()
-    try:
-        model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = not lora,
-                                                               load_in_4bit = False)
-    except OSError as error:  # offline without the tiny model cached
-        pytest.skip(f"{TINY} unavailable: {error}")
+    model, tokenizer = loader.FastCPUModel.from_pretrained(tiny_snapshot(), dtype = dtype, full_finetuning = not lora,
+                                                           load_in_4bit = False)
     assert getattr(model, "_unsloth_cpu_chunked_ce", False)
     if lora:  # frozen lm_head; the reference forward runs with the adapters disabled
         model = loader.FastCPUModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"])

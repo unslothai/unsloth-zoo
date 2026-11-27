@@ -311,8 +311,39 @@ def _restore_selected_moe_backend():
         module._SELECTED_MOE_BACKEND = before
 
 
-# UNSLOTH_COMPILE_DISABLE also governs fused losses and maybe_compile since PR/issue 1866; tests
-# using usefixtures('compile_enabled') clear it and re-enable frozen flags.
+_PATCH_UTILS = "unsloth_zoo.temporary_patches.utils"
+# Per-step state: a checkpointed compiled forward + backward with no optimizer step after it (most model tests) leaves
+# the packed marker set and its labels compiled-ok / pending eager, as it should mid-step. Nothing ends that step in a
+# test, so on the same xdist worker a later eager-fallback test saw a live compiled pack (_give_up re-raised instead of
+# falling back) or applied the previous test's pending latches.
+_STEP_MARKERS = ("_PACKED_COMPILED_IN_CHECKPOINT", "_RAISED_INSIDE_CHECKPOINT")
+_STEP_LABEL_SETS = ("_COMPILED_OK_LABELS", "_PENDING_EAGER_LABELS")
+
+
+def _end_the_step():
+    module = sys.modules.get(_PATCH_UTILS)
+    if module is None:
+        return
+    for name in _STEP_MARKERS:
+        if hasattr(module, name):
+            setattr(module, name, False)
+    for name in _STEP_LABEL_SETS:
+        labels = getattr(module, name, None)
+        if isinstance(labels, set):
+            labels.clear()
+
+
+@_pytest.fixture(autouse = True)
+def _each_test_starts_a_new_step():
+    """Each test starts at a step boundary, as apply_pending_eager_fallbacks() leaves it, and ends its own step."""
+    _end_the_step()
+    yield
+    _end_the_step()
+
+
+# UNSLOTH_COMPILE_DISABLE only stops torch.compile, but since PR/issue 1866 fused losses and maybe_compile honour it
+# too; compile-path tests opt in via pytest.mark.usefixtures('compile_enabled'), which clears it and re-enables frozen
+# flags in every loaded module for the test.
 _COMPILE_SWITCH_FLAGS = {
     "UNSLOTH_COMPILE_DISABLE": False,
     "UNSLOTH_COMPILE_DISABLE_PARTIAL": False,
@@ -325,6 +356,16 @@ _COMPILE_SWITCH_MODULES = (
     "unsloth_zoo.fused_losses.cross_entropy_loss",
     "unsloth_zoo.fused_losses.chunked_logprob",
 )
+
+
+@_pytest.fixture
+def triton_moe_on_cpu(monkeypatch):
+    """Let forward_triton_grouped_gemm take its Triton branch with CPU tensors. Tests that fake the grouped-GEMM kernels
+    (or stop at the autotune step) check that branch's own logic on CPU CI; without this the device gate (#2864) sends
+    CPU tensors to the eager loop and they test something else, or nothing."""
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    monkeypatch.setattr(moe_utils, "_triton_moe_tensors_on_gpu", lambda module, hidden_states: True)
 
 
 @_pytest.fixture

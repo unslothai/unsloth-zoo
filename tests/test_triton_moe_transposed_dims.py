@@ -5,6 +5,8 @@ import torch.nn as nn
 
 from unsloth_zoo.temporary_patches import moe_utils
 
+pytestmark = pytest.mark.usefixtures("triton_moe_on_cpu")
+
 
 class _Stop(Exception):
     pass

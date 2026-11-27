@@ -161,8 +161,8 @@ def save_attention_offload():
 
 
 # Automatic mode: compute capability -> the shortest query length where Colab measured it faster
-# than the A/A noise (Qwen3-4B LoRA): T4 and A100 from 8K, L4 from 16K (noisy and +1.6% at 8K).
-_AUTO_MIN_SEQ = {(7, 5): 8192, (8, 0): 8192, (8, 9): 16384}
+# than the A/A noise (Qwen3-4B LoRA): T4, A100 and sm120 from 8K, L4 from 16K (noisy and +1.6% at 8K).
+_AUTO_MIN_SEQ = {(7, 5): 8192, (8, 0): 8192, (8, 9): 16384, (12, 0): 8192}
 # ROCm gcnArchName -> same; gfx1151 measured on AMD CI (-5.6% to -14.2%/step). Others off until measured.
 _AUTO_MIN_SEQ_ROCM = {"gfx1151": 8192}
 _AUTO_ACTIVE = [False]

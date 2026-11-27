@@ -68,6 +68,8 @@ _PIN_RESERVE_MIN_BYTES = 4 << 30
 _PIN_RESERVE_FRACTION = 0.15
 # Copy, stall and compute timings for stats(); UNSLOTH_OFFLOAD_STATS=0 skips the timing events.
 _TIMING = os.environ.get("UNSLOTH_OFFLOAD_STATS", "1") != "0"
+# Backward leaves the first prefetch_depth swapped blocks on the card for the next forward (0 = release them).
+_KEEP_BOTTOM = os.environ.get("UNSLOTH_OFFLOAD_KEEP_FIRST", "1") != "0"
 # Lossless bf16 compression of the host copies (fewer PCIe bytes per fetch, decoded on the card); opt in with 1.
 _COMPRESS_ENV = "UNSLOTH_BLOCK_SWAP_COMPRESS"
 # prefetch_depth = "auto": deepest pool it grows to, and the steps it watches before settling.
@@ -83,6 +85,15 @@ _WORKSPACE_FRACTION = 0.05
 
 def _compress_requested():
     return os.environ.get(_COMPRESS_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Disk-tier blocks are stored with the lossless bf16 codec unless this is 0: the disk is ~17x slower than the bus,
+# so a quarter fewer bytes read is a quarter off a disk-bound step, and the card decodes far faster than either.
+_DISK_COMPRESS_ENV = "UNSLOTH_OFFLOAD_DISK_COMPRESS"
+
+
+def _disk_compress_requested():
+    return os.environ.get(_DISK_COMPRESS_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 _CODEC = []
@@ -133,6 +144,13 @@ def _disk():
                 mod = None
         _DISK.append(mod if mod is not None else _NoDiskTier)
     return _DISK[0]
+
+
+def _consume_cuda_error():
+    """Clear this thread's pending CUDA / HIP error (block_swap_disk.consume_cuda_error). Never raises."""
+    fn = getattr(_disk(), "consume_cuda_error", None)
+    if fn is not None:
+        fn()
 
 
 def _has_disk_ref(p):
@@ -273,6 +291,14 @@ def _end_host_session():
     _publish_host_pending(0)
 
 
+def _size_text(nbytes):
+    """GiB with one decimal, or MiB / KiB below 0.1 GiB, so a small cap does not read as 0.0 GiB."""
+    for unit, scale in (("GiB", 2**30), ("MiB", 2**20)):
+        if nbytes >= scale // 10:
+            return f"{nbytes / scale:.1f} {unit}"
+    return f"{nbytes / 2**10:.1f} KiB"
+
+
 def _check_host_fit(sizes, on_host = 0, slack = 0):
     """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
     freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
@@ -291,6 +317,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
         avail = free - others + on_host
     limit = _disk().host_limit_bytes()
+    capped = limit is not None and limit < avail
     if limit is not None:
         avail = min(avail, limit)
     # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
@@ -305,6 +332,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
             return None
         others = _others_host_pending(own)
         avail = free - (others or 0) + on_host
+        capped = limit is not None and limit < avail
         if limit is not None:
             avail = min(avail, limit)
     if need <= avail:
@@ -316,9 +344,19 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         if used + size > avail:
             break
         used, fit = used + size, fit + 1
-    raise ValueError(
+    asked = (
         f"Unsloth: offload_layers asked for {len(sizes)} layers in host RAM, which needs "
-        f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
+        f"{_size_text(need)}, but "
+    )
+    if capped:
+        # The cap, not free RAM, is what ran out: naming the system reserve would send the user after the wrong knob.
+        raise ValueError(
+            asked + f"UNSLOTH_OFFLOAD_HOST_LIMIT caps the offloaded layers at {_size_text(avail)}. "
+            f"At most {fit} layers would fit; raise UNSLOTH_OFFLOAD_HOST_LIMIT, lower offload_layers, "
+            "or enable the disk tier."
+        )
+    raise ValueError(
+        asked + f"only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
         f"{_host_reserve(total) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
         "lower offload_layers or free host RAM."
     )
@@ -346,6 +384,8 @@ class _Registered:
         # cudaHostRegisterPortable: pinned for every device's context, since blocks may fetch onto several cards.
         rc = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), nbytes, 1)
         if int(rc) != 0:
+            # The refusal stays this thread's pending error; left there, the next kernel launch raises it.
+            _consume_cuda_error()
             raise RuntimeError(f"cudaHostRegister failed: {rc}")
         self.ptr = buf.data_ptr()
 
@@ -353,7 +393,8 @@ class _Registered:
         # Before the buffer can be freed: a freed range left registered would pin whatever lands there next.
         if self.ptr is not None:
             try:
-                torch.cuda.cudart().cudaHostUnregister(self.ptr)
+                if int(torch.cuda.cudart().cudaHostUnregister(self.ptr)) != 0:
+                    _consume_cuda_error()
             except Exception:
                 pass
             self.ptr = None
@@ -542,7 +583,8 @@ class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
                  "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
                  "t_copy", "copy_open", "copy_pending", "marks", "mark_open", "codec", "decoders",
-                 "disk", "disk_store", "disk_runs", "disk_state", "disk_ready", "disk_futs", "stage", "tier")
+                 "disk", "disk_store", "disk_runs", "disk_state", "disk_ready", "disk_futs", "stage", "tier",
+                 "fences")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -583,6 +625,7 @@ class _Block:
         self.sig = tuple((tuple(p.shape), p.dtype, d, off) for p, d, off in zip(self.params, self.devices, self.layout))
         self.disk, self.disk_store, self.disk_runs, self.disk_state = None, None, (), 0
         self.disk_ready, self.disk_futs, self.stage, self.tier = {}, None, None, None
+        self.fences = None
         refs = [_disk().disk_ref(p) if getattr(p, "_unsloth_disk", None) is not None else None for p in self.params]
         if any(r is not None for r in refs):
             if not all(r is not None for r in refs):
@@ -615,6 +658,59 @@ class _Block:
     def nbytes(self):
         return sum(self.sizes.values())
 
+    def encode_disk(self, encode_device):
+        """Rewrite a raw spilled region (spilled at load) encoded, in place: the encoded region is never longer."""
+        if not self.disk_compressible() or self.disk is None or self.compressed():
+            return False
+        # The raw region read back plus its encoding (up to MAX_RATIO of it) are live together: only with that
+        # much host RAM free beyond the reserve, else the block stays raw.
+        try:
+            if _host_free()[1] < 2 * self.nbytes():
+                return False
+        except Exception:
+            return False
+        with _no_inference_mode():
+            raw, owner = _disk().read_bytes(self.disk_store, self.disk["base"], self.nbytes())
+        try:
+            return self._store_encoded(raw, encode_device, self.disk_store, self.disk["base"])
+        finally:
+            del raw, owner
+
+    def _store_encoded(self, raw, encode_device, store, at):
+        """Encode the raw region and write it (appended, or over the raw region at `at`). False = keep raw."""
+        codec = _codec()
+        d = next(iter(self.sizes))
+        # A fresh spill encodes over `raw` itself (each chunk is read before its shorter encoding is written), so
+        # host RAM holds one region; a rewrite keeps `raw` intact to put back if the write fails.
+        out = raw if at is None else None
+        try:
+            with _no_inference_mode():
+                enc = codec.encode_region(raw, device = encode_device, out = out)
+        except torch.cuda.OutOfMemoryError:
+            enc = None
+        if enc is None:
+            return False
+        parts, c = enc
+        pieces = [(t, off) for off, t in parts]
+        if out is not None:
+            pieces.insert(0, (out[:c.words * 3 // 2], 0))
+        try:
+            base = store.write_region(pieces, c.nbytes, at = at)
+        except BaseException:
+            if at is not None:
+                # The raw bytes may be half overwritten: put them back before giving up.
+                store.write_region([(raw, 0)], raw.numel(), at = at)
+            raise
+        mod = _disk()
+        if at is None:
+            refs = [mod.DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype)
+                    for p, off in zip(self.params, self.layout)]
+            self.disk = {"refs": refs, "base": base}
+            self.disk_store = store
+        self.codec[d] = c
+        self.disk_runs = ((base, mod._round_up(c.nbytes), 0),)
+        return True
+
     def pack(self, regions):
         """Copy the weights into host `regions` {device: uint8 view}; host[i] become views into them."""
         self.host_buf = regions
@@ -627,18 +723,34 @@ class _Block:
     def compressible(self):
         return self.disk is None and bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
 
-    def spill(self):
-        """Write the weights to the spill file and serve the block from disk."""
+    def spill(self, encode_device = None):
+        """Write the weights to the spill file and serve the block from disk; encoded when `encode_device` is
+        given and the codec takes the region."""
         mod = _disk()
         store = mod._shared_spill(self.nbytes())
+        if encode_device is not None and self.disk_compressible():
+            # Outside inference mode: the encoder writes its output over this scratch.
+            with _no_inference_mode(), torch.no_grad():
+                raw = torch.zeros(self.nbytes(), dtype = torch.uint8)
+                for p, off in zip(self.params, self.layout):
+                    raw[off:off + p.data.nbytes].view(p.dtype).view(p.shape).copy_(p.data)
+            if self._store_encoded(raw, encode_device, store, None):
+                return
+            del raw
         base = store.write_region([(p.data, off) for p, off in zip(self.params, self.layout)], self.nbytes())
         self.set_disk([mod.DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype)
                        for p, off in zip(self.params, self.layout)])
 
+    def disk_compressible(self):
+        return len(self.sizes) == 1 and bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
+
     def disk_views(self, target = "cpu"):
         """The block's weights read back from disk, on `target`."""
         mod = _disk()
-        buf, owner = mod.read_bytes(self.disk_store, self.disk["base"], self.nbytes())
+        c = next((c for c in self.codec.values() if c is not None), None) if self.codec else None
+        buf, owner = mod.read_bytes(self.disk_store, self.disk["base"], c.nbytes if c is not None else self.nbytes())
+        if c is not None:
+            buf = _codec().decode_region_cpu(c, buf)
         out = []
         for shape, dt, _, off in self.sig:
             n = torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()
@@ -760,17 +872,16 @@ class _Block:
                 if self.t_copy is not None:
                     self.t_copy[d].record(stream)
                 c = self.codec.get(d)
+                # The slot may still be written by a compressed block's decode that was stolen before compute
+                # waited for it (an interrupted step): order this fetch after it.
+                _wait_fence(self, bufs[d], stream)
                 if c is None:
-                    dec = (self.decoders or {}).get(d)
-                    if dec is not None:
-                        # The slot may still be written by a compressed block's decode that was stolen before
-                        # compute waited for it (an interrupted step): order this copy after it.
-                        stream.wait_stream(dec.stream)
                     bufs[d].copy_(self.host_buf[d], non_blocking = True)
                     event.record(stream)
             if c is not None:
                 # Compressed bytes over the bus, decoded into the slot on the card's decode stream.
                 self.decoders[d].fetch(c, self.host_buf[d], bufs[d], stream, event)
+                _set_fence(self, bufs[d], event)
         self.copy_open = self.t_copy is not None
         for p, v in zip(self.params, views):
             p.data = v
@@ -805,6 +916,22 @@ class _Block:
             self.tier.complete(self)
         for d, event in self.events.items():
             torch.cuda.current_stream(d).wait_event(event)
+
+
+def _wait_fence(block, buf, stream):
+    """Order `stream` after the last decode into slot buffer `buf` that a released block left behind."""
+    fences = getattr(block, "fences", None)
+    ev = fences.pop(buf.data_ptr(), None) if fences else None
+    if ev is not None:
+        stream.wait_event(ev)
+
+
+def _set_fence(block, buf, event):
+    """A decode into slot buffer `buf` was just submitted (it completes at `event`, on a codec stream): the next
+    fetch into that buffer waits for it, whichever block holds the slot by then."""
+    fences = getattr(block, "fences", None)
+    if fences is not None:
+        fences[buf.data_ptr()] = event
 
 
 def _to_device(obj, device):
@@ -869,8 +996,10 @@ class BlockSwap:
     _hwm_base = {}
     _peak_devs = ()
     _to_spill = frozenset()
+    _spill_hold = None
     _disk_tier = None
     _disk_seen = {}
+    _disk_decoders = {}
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
@@ -941,7 +1070,7 @@ class BlockSwap:
             # One canonical key: params report cuda:N, so a bare "cuda" would split peaks and homes in two.
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
-        self._disk_tier, self._to_spill, self._disk_seen = None, set(), {}
+        self._disk_tier, self._to_spill, self._disk_seen, self._disk_decoders = None, set(), {}, {}
         # Every card a block's frozen weights land on gets slots, not only its home card.
         self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
                                   and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
@@ -1064,9 +1193,18 @@ class BlockSwap:
 
             if self._staging_bytes():
                 self._disk_tier = _disk().DiskTier(self._staging_bytes() // 2, slots = 2)
+                self._disk_decoders = self._disk_compress_check()
             self._pack()
+            if self._disk_decoders and not any(b.compressed() and b.disk is not None for b in self.blocks):
+                self._disk_decoders = {}
             if self._compress:
                 self._build_decoders()
+            # A slot can be reused while the last decode into it is still running (an interrupted step steals or
+            # resets a prefetched block): each decode submitted into a slot leaves its event there, and the next
+            # fetch into that slot waits for it, whichever block or codec stream it came from.
+            fences = {}
+            for b in self.blocks:
+                b.fences = fences
             # What sits in host RAM: compressed regions are smaller than host_bytes() (the raw size).
             total = sum(b.wire_bytes() for b in self.blocks) if self._compress else self.ram_bytes()
             if self._disk_tier is not None:
@@ -1146,7 +1284,12 @@ class BlockSwap:
                 used += b.nbytes()
         if not spill:
             return False
-        mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
+        spread = _disk_placement(movable, len(spill), self.depth)
+        if spread is not None and sum(self.blocks[k].nbytes() for k in movable if k not in spread) \
+                + sum(b.nbytes() for k, b in enumerate(self.blocks) if b.disk is None and k not in movable) <= budget:
+            spill = spread
+        # Held until remove(): the shared file is weakly referenced, and the blocks only take it as they spill.
+        self._spill_hold = mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
         self._to_spill = spill
         return True
 
@@ -1155,11 +1298,14 @@ class BlockSwap:
         if not disk:
             return
         nbytes = sum(b.nbytes() for b in disk)
+        stored = sum(n for b in disk for _, n, _ in b.disk_runs)
         store = disk[0].disk_store
+        packed = (f", stored losslessly compressed as {stored / 2**30:.2f} GiB" if any(b.compressed() for b in disk)
+                  else "")
         print(f"Unsloth: offload_layers serves {len(disk)} of {len(self.blocks)} swapped layers "
-              f"({nbytes / 2**30:.2f} GiB) from disk at {store.directory}, since GPU and host RAM cannot hold them "
-              f"({self.ram_bytes() / 2**30:.2f} GiB stay in host RAM). Each forward and each backward reads them "
-              f"again, about {2 * nbytes / 2**30:.2f} GiB from disk per micro-batch, so steps are disk bound: use a "
+              f"({nbytes / 2**30:.2f} GiB{packed}) from disk at {store.directory}, since GPU and host RAM cannot hold "
+              f"them ({self.ram_bytes() / 2**30:.2f} GiB stay in host RAM). Each forward and each backward reads them "
+              f"again, about {2 * stored / 2**30:.2f} GiB from disk per micro-batch, so steps are disk bound: use a "
               f"larger batch with fewer gradient accumulation steps. {_disk()._ENV}=0 refuses instead.")
 
     def _compress_check(self):
@@ -1223,6 +1369,54 @@ class BlockSwap:
                 return False
         return True
 
+    def _disk_compress_check(self):
+        """{card: DeviceDecoder} for the disk tier's bf16 blocks, or {} (codec off, no Triton decode, no room)."""
+        if not _disk_compress_requested():
+            return {}
+        codec = _codec()
+        if codec is None:
+            return {}
+        largest = {}
+        for k, b in enumerate(self.blocks):
+            if self._on_disk(k) and b.disk_compressible():
+                d = torch.device(next(iter(b.sizes)))
+                if d.type == "cuda":
+                    largest[d] = max(largest.get(d, 0), b.nbytes())
+        # The slot pool must still fit beside the decode buffers (counting what packing frees on that card), else
+        # the disk tier stays raw rather than failing the pool allocation later.
+        per_sig = {}
+        for b in self.blocks:
+            per_sig.setdefault(b.sig, [0, b.sizes])[0] += 1
+        for d, n in largest.items():
+            words = n // 2
+            dec_bytes = codec._RING * (min(codec.CHUNK, words) * 3 // 2) + 2 * codec.max_aux_nbytes(n)
+            slots = sum(min(self.depth + 1, k) * sizes.get(d, 0) for k, sizes in per_sig.values())
+            reclaim = sum(p.data.nbytes for b in self.blocks for p in b.params
+                          if p.data.device.type == "cuda" and torch.device(p.data.device) == d)
+            try:
+                free = torch.cuda.mem_get_info(d)[0] + torch.cuda.memory_reserved(d) - torch.cuda.memory_allocated(d)
+            except Exception:
+                free = None
+            if free is not None and free + reclaim < slots + dec_bytes:
+                print("Unsloth: offload_layers stores disk layers raw (no GPU room for the decode buffers next to "
+                      "the slot pool).")
+                return {}
+        out = {}
+        try:
+            with _no_inference_mode():
+                for d, n in largest.items():
+                    ok, triton_on, why = codec.self_check(d)
+                    if not (ok and triton_on):
+                        # The torch decode is exact but slower than a fast disk; keep those blocks raw.
+                        print(f"Unsloth: offload_layers stores disk layers raw ({why or 'no Triton decode'}).")
+                        return {}
+                    words = n // 2
+                    out[d] = codec.DeviceDecoder(d, min(codec.CHUNK, words) * 3 // 2, codec.max_aux_nbytes(n),
+                                                 use_triton = True)
+        except torch.cuda.OutOfMemoryError:
+            return {}
+        return out
+
     def _release_decoders(self):
         """Drop every decoder's GPU buffers (callers drained the decode streams first)."""
         self._decoders = {}
@@ -1231,16 +1425,18 @@ class BlockSwap:
                 b.decoders = None
 
     def _build_decoders(self):
-        used = {d for b in self.blocks for d, c in b.codec.items() if c is not None}
+        # Host-tier blocks only: disk-tier blocks keep the decoders sized for them (_disk_decoders).
+        host = [b for b in self.blocks if b.disk is None]
+        used = {d for b in host for d, c in b.codec.items() if c is not None}
         self._decoders = {d: dec for d, dec in self._decoders.items() if d in used}
         if not self._decoders:
             self._compress = False
-        for b in self.blocks:
+        for b in host:
             b.decoders = self._decoders
-        raw = sum(b.nbytes() for b in self.blocks if b.compressed())
+        raw = sum(b.nbytes() for b in host if b.compressed())
         if raw:
-            stored = sum(b.wire_bytes() for b in self.blocks if b.compressed())
-            n = sum(b.compressed() for b in self.blocks)
+            stored = sum(b.wire_bytes() for b in host if b.compressed())
+            n = sum(b.compressed() for b in host)
             print(f"Unsloth: offload_layers stores {n} of {len(self.blocks)} swapped layers compressed (lossless), "
                   f"{stored / 2**30:.2f} of {raw / 2**30:.2f} GiB ({100 * stored / raw:.0f}%), so fetches copy fewer bytes.")
 
@@ -1328,24 +1524,58 @@ class BlockSwap:
         """Packing step of a disk-tier block: spill it unless spilled at load, then release it."""
         if not self._on_disk(k):
             return False
+        dec = self._disk_decoders.get(torch.device(next(iter(b.sizes)))) if self._disk_decoders and b.sizes else None
         if b.disk is None:
-            b.spill()
+            b.spill(encode_device = dec.device if dec is not None else None)
+        elif dec is not None:
+            b.encode_disk(dec.device)
+        if b.compressed():
+            b.decoders = self._disk_decoders
         b.tier = self._disk_tier
         self._release(b)
         self._publish_packed(k)
         return True
 
     def _release(self, block):
+        held = self.__dict__.get("_held")
+        if held and id(block) in held:
+            # Layer-major gradient accumulation runs every micro-batch through this block before letting it go.
+            held[id(block)] = True
+            return
         freed = block.evict()
         if freed is not None:
             self.free[block.sig].append(freed)
 
+    def hold(self, idx):
+        """Keep decoder layer `idx` on the card across its calls until `unhold(idx)` (layer-major gradient
+        accumulation: one fetch serves every micro-batch). A no-op for a layer that is not swapped."""
+        i = self.pos.get(idx, -1)
+        if 0 <= i < len(self.blocks):
+            self.__dict__.setdefault("_held", {}).setdefault(id(self.blocks[i]), False)
+
+    def unhold(self, idx):
+        """Stop holding layer `idx`; a release requested while it was held happens now."""
+        i = self.pos.get(idx, -1)
+        held = self.__dict__.get("_held")
+        if not held or not 0 <= i < len(self.blocks):
+            return
+        b = self.blocks[i]
+        if held.pop(id(b), False):
+            self._release(b)
+
+    def _keep(self, block):
+        """Backward is done with the block, but it stays on the card for the next forward."""
+        block.pending = False
+
     def _acquire(self, block, steal):
         free = self.free[block.sig]
+        held = self.__dict__.get("_held") or ()
         if not free and steal:
             # Only after an interrupted step, since prefetches never steal (could evict the running block); a pending
             # block's slot is still read by backward, so reuse corrupts gradients silently.
             for b in self.blocks:
+                if id(b) in held:
+                    continue
                 if b is not block and b.sig == block.sig and b.resident and b.slot is not None and not b.pending:
                     self._release(b)
                     break
@@ -1421,6 +1651,8 @@ class BlockSwap:
             return inner(run, *args, **kw)
 
         run_in_checkpoint._unsloth_block_swap = self
+        # Identity marker (functools.wraps copies attributes, not this self-reference's target).
+        run_in_checkpoint._unsloth_block_swap_wrapper = run_in_checkpoint
         run_in_checkpoint.__wrapped__ = inner
         if hasattr(inner, "_unsloth_replay_checkpoint"):   # routing replay then sees it as wrapped, not rewrapping
             run_in_checkpoint._unsloth_replay_checkpoint = inner._unsloth_replay_checkpoint
@@ -1520,16 +1752,19 @@ class BlockSwap:
         def hook(grad):
             if self._auto and not self._settled:
                 self._note_block_peak(self.blocks[i])
+            # The first `depth` blocks are the next forward's first fetches (_end_step arms them into the same
+            # pool): keep them instead of copying the same bytes in again.
+            release = self._keep if _KEEP_BOTTOM and i < getattr(self, "depth", 0) else self._release
             # Reentrant checkpoint: the input grad can land before a token-id-only branch (Qwen4Exp n-gram keys)
             # reads its frozen weights, so release only once the inner backward is done.
             task = _graph_task_id()
             if grad is not None and task != -1 and self._forward_task[i] not in (-1, task):
                 try:
-                    torch.autograd.Variable._execution_engine.queue_callback(lambda: self._release(self.blocks[i]))
+                    torch.autograd.Variable._execution_engine.queue_callback(lambda: release(self.blocks[i]))
                 except RuntimeError:
-                    self._release(self.blocks[i])
+                    release(self.blocks[i])
             else:
-                self._release(self.blocks[i])
+                release(self.blocks[i])
             # Queue here only when the output's grad hook did not; else a checkpoint replay ends the
             # step twice.
             if i == 0 and not self._step_queued:
@@ -1547,7 +1782,20 @@ class BlockSwap:
     def _clear_step_queued(self):
         self._step_queued = False
 
+    @contextmanager
+    def layer_major_window(self):
+        """A layer-major window splits one step's backward into several autograd graphs: the step ends once,
+        when the caller calls _end_step after the window, not at each graph's end."""
+        self._layer_major_active = True
+        try:
+            yield
+        finally:
+            self._layer_major_active = False
+
     def _end_step(self):
+        if self.__dict__.get("_layer_major_active", False):
+            self._step_queued = False
+            return
         # Backward is done: a wait sample whose forward hook never ran (a recompute that stopped early) is complete.
         for b in self.blocks:
             if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
@@ -1628,11 +1876,13 @@ class BlockSwap:
                 self._arm(forward = True)
 
     def reset(self):
+        self.__dict__.pop("_held", None)
         for b in self.blocks:
             self._release(b)
         self._arm(forward = True)
 
     def remove(self):
+        self.__dict__.pop("_held", None)
         for h in self.handles:
             h.remove()
         self.handles = []
@@ -1651,7 +1901,8 @@ class BlockSwap:
         if tier is not None:
             tier.drain()
         # Drain every copy / decode stream before any slot, staging buffer or host arena can be freed.
-        for dev in list(self.streams) + [dec.stream.device for dec in (getattr(self, "_decoders", {}) or {}).values()]:
+        decs = list((getattr(self, "_decoders", {}) or {}).values()) + list((getattr(self, "_disk_decoders", {}) or {}).values())
+        for dev in list(self.streams) + [dec.stream.device for dec in decs]:
             try:
                 torch.cuda.synchronize(dev)
             except Exception:
@@ -1702,10 +1953,13 @@ class BlockSwap:
         # Callers holding this object (the fast decode loop) must see a no-op, not an empty pool.
         self.blocks = []
         self._decoders = {}
+        self._disk_decoders = {}
         self._chunks = []
         if tier is not None:
             tier.close()
             self._disk_tier = None
+        # The spill file closes (its disk space comes back) once no other model still reads from it.
+        self._spill_hold = None
         # A removed controller must not keep the model's layers (and their restored GPU weights) alive.
         self._reserve_layers, self._reserve_owner = (), None
         for dev in self.streams:
@@ -1939,8 +2193,13 @@ class BlockSwap:
             transient += reserve.get(_cuda_index(dv), 0)
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
-        for s in want:
-            self.free[s].append(self._new_slot(s))
+        try:
+            slots = [(s, self._new_slot(s)) for s in want]
+        except torch.cuda.OutOfMemoryError:
+            # Optional: a deeper lookahead that does not fit keeps the current depth (and the step's results).
+            return False
+        for s, slot in slots:
+            self.free[s].append(slot)
         return True
 
     def _shrink_pool(self):
@@ -2140,11 +2399,45 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
     indices, left = _auto_swap_indices(layers, reserve_bytes, prefetch_depth, free_bytes)
     if not tiers:
         return indices, left
-    return indices, left, _disk_tier_indices(layers, indices, host_free_bytes)
+    return indices, left, _disk_tier_indices(layers, indices, host_free_bytes, _resolved_depth(prefetch_depth))
 
 
-def _disk_tier_indices(layers, indices, host_free_bytes = None):
-    """The swapped `indices` past what host RAM holds, as BlockSwap's install splits them."""
+_DISK_PLACEMENT_ENV = "UNSLOTH_OFFLOAD_DISK_PLACEMENT"
+
+
+def _disk_placement(movable, n_disk, depth):
+    """Which of `movable` (swapped block positions, sweep order) to serve from disk, `n_disk` of them; None keeps
+    the tail (UNSLOTH_OFFLOAD_DISK_PLACEMENT=tail).
+
+    Disk blocks go first where a fetch is skipped: the last `depth` blocks stay on the card from forward to
+    backward, and the first `depth` from backward to the next forward. The rest are spread evenly between the
+    host RAM blocks, so a read is always in flight while RAM blocks compute, instead of the disk idling through a
+    run of RAM blocks and then stalling through a run of disk blocks."""
+    if os.environ.get(_DISK_PLACEMENT_ENV, "spread").strip().lower() == "tail":
+        return None
+    m = list(movable)
+    n_disk = min(n_disk, len(m))
+    if n_disk <= 0:
+        return set()
+    ends = []
+    depth = max(0, int(depth))
+    for j in range(depth):
+        ends.append(len(m) - 1 - j)
+        if _KEEP_BOTTOM:
+            ends.append(j)
+    pick = []
+    for j in ends:
+        if len(pick) < n_disk and 0 <= j < len(m) and j not in pick:
+            pick.append(j)
+    rest = [j for j in range(len(m)) if j not in pick]
+    left = n_disk - len(pick)
+    if left > 0:
+        pick += [rest[(2 * t + 1) * len(rest) // (2 * left)] for t in range(left)]
+    return {m[j] for j in pick}
+
+
+def _disk_tier_indices(layers, indices, host_free_bytes = None, prefetch_depth = 2):
+    """The swapped `indices` host RAM cannot hold, as BlockSwap's install picks them."""
     if not indices:
         return []
     sizes = [sum(p.nbytes for _, p in _swappable(layers[i])) for i in indices]
@@ -2166,6 +2459,9 @@ def _disk_tier_indices(layers, indices, host_free_bytes = None):
             out.append(i)
         else:
             used += n
+    spread = _disk_placement(range(len(indices)), len(out), prefetch_depth) if out else None
+    if spread is not None and sum(n for j, n in enumerate(sizes) if j not in spread) <= budget:
+        return [indices[j] for j in sorted(spread)]
     return out
 
 

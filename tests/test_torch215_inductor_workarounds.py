@@ -61,6 +61,19 @@ def test_mix_order_reduction_off_only_where_buggy():
         assert "triton.mix_order_reduction" not in torch_compile_options
 
 
+def test_mix_order_reduction_off_on_every_thread():
+    import threading
+    import torch._inductor.config as config
+    import unsloth_zoo.temporary_patches.common  # noqa: F401
+    if not _has_mix_order() or not (2, 10) <= _minor() < (2, 15):
+        pytest.skip("mix-order reduction is left on here")
+    seen = []
+    thread = threading.Thread(target = lambda: seen.append(config.triton.mix_order_reduction))
+    thread.start()
+    thread.join()
+    assert seen == [False]
+
+
 def test_compiled_cuda_dropout_never_uses_rand4x():
     import unsloth_zoo  # noqa: F401  (applies the workaround at import)
     try:
