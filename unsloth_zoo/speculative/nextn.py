@@ -538,7 +538,7 @@ def _init_unset(head, std):
 def load_nextn_state_dict(source, config, revision = None):
     """Read only MTP tensors of a NextN family checkpoint; returns (state_dict with canonical names, per-expert layout as in checkpoint, info)."""
     from safetensors import safe_open
-    from ..safetensors_pread import pread_backend_kwargs
+    from unsloth_zoo.safetensors_pread import pread_backend_kwargs
     from .mtp import _weight_map
 
     family = mtp_family_for_config(config)
