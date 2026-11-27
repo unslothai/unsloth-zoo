@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Validates quant_type as a bare [a-z0-9_]+ token before it reaches the shell=True command line; shell metacharacters
-are rejected, not interpolated (ALLOWED_QUANTS, IMATRIX_QUANTS, MLX quant_map fit)."""
+"""quant_type must be a bare [a-z0-9_]+ token; shell metacharacters are rejected (shell=True)."""
 
 from __future__ import annotations
 

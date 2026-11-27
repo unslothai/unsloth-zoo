@@ -37,7 +37,6 @@ def test_inherited_mask_keeps_one_visible_gpu_by_default(mask, expected):
 
 
 def test_unset_mask_keeps_gpu_0_by_default():
-    # As before: no inherited mask still pins one card, not every GPU.
     assert _env({"PATH": "/usr/bin"})["CUDA_VISIBLE_DEVICES"] == "0"
 
 

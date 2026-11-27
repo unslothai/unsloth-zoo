@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression tests for the Gemma3 UNSLOTH_FORCE_FLOAT32 boundary dtype: activations follow the float projection
-weight dtype (fp32 full finetune), fp16 fallback for uint8 4bit blobs and unchanged for fp16 LoRA; behavioural, on
-real transformers modules."""
+"""UNSLOTH_FORCE_FLOAT32 boundary follows weight dtype; fp16 for uint8 4bit blobs and LoRA."""
 
 from __future__ import annotations
 
@@ -124,7 +122,6 @@ def test_forced_float32_mlp_runs_float16_activation_into_float32_projections(for
     assert out.dtype == torch.float32
     assert out.shape == (2, 3, HIDDEN_SIZE)
     assert torch.isfinite(out).all()
-    # Every Linear must have been handed its own weight dtype, not a bare float16.
     assert gate_seen == [torch.float32]
     assert up_seen == [torch.float32]
     assert down_seen == [torch.float32]
@@ -153,7 +150,6 @@ def test_forced_float32_mlp_float16_weights_are_bitwise_identical_to_pre_fix(for
 
     assert out.dtype == torch.float16
     assert expected.dtype == torch.float16
-    # Bitwise, via the raw fp16 bit patterns rather than float comparison.
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
     assert gate_seen[0] == torch.float16
     assert down_seen[0] == torch.float16
@@ -329,7 +325,6 @@ def test_to_boundary_dtype_casts_to_the_weight_dtype_and_is_identity_when_it_mat
     float32_activation = torch.randn(2, 3, dtype = torch.float32)
     float16_activation = torch.randn(2, 3, dtype = torch.float16)
 
-    # Matching dtype: same tensor object back, no copy.
     assert _to_boundary_dtype(float32_activation, torch.float32) is float32_activation
     assert _to_boundary_dtype(float16_activation, torch.float16) is float16_activation
 
@@ -342,8 +337,7 @@ def test_to_boundary_dtype_casts_to_the_weight_dtype_and_is_identity_when_it_mat
 
 
 class _FakeLinear4bit(torch.nn.Module):
-    """Stand-in for bitsandbytes Linear4bit: its uint8 weight blob gives _linear_boundary_dtype no answer, and forward
-    returns the caller's input dtype, changing QLoRA dtypes."""
+    """Linear4bit stand-in: uint8 blob, no answer; forward returns input dtype (changes QLoRA)."""
 
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -364,8 +358,7 @@ pass
 
 @requires_gemma3
 def test_forced_float32_mlp_downcasts_to_float16_when_4bit_weights_cannot_answer(forced_float32_patches):
-    """4bit QLoRA has no floating-point projection weight, so the boundary dtype is None; the forced output must still
-    fall back to float16 or down_proj gets float32."""
+    """4bit QLoRA: boundary dtype None; forced output still falls back to fp16, not fp32."""
     torch.manual_seed(0)
     mlp = gemma3.Gemma3MLP(_text_config()).to(torch.float16)
     _quantize_projections(mlp, ("gate_proj", "up_proj", "down_proj"))
@@ -445,8 +438,7 @@ _QUANT_STORAGE_DTYPES = [torch.uint8, torch.bfloat16, torch.float16, torch.float
 @pytest.mark.parametrize("storage_dtype", _QUANT_STORAGE_DTYPES,
                          ids = lambda d: str(d).split(".")[-1])
 def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_dtype):
-    """bnb_4bit_quant_storage is not the compute dtype: FSDP-QLoRA users set it to bfloat16 while weights stay packed
-    4bit, so a quantized weight must never answer the boundary dtype."""
+    """Quantized weights never answer; bnb_4bit_quant_storage is not the compute dtype."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     quantized = _Projections(**{
         name: _Projections(weight = _QuantizedWeight(
@@ -468,8 +460,7 @@ def test_a_quantized_weight_never_answers_whatever_its_storage_dtype_is(storage_
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32],
                          ids = lambda d: str(d).split(".")[-1])
 def test_an_unquantized_weight_still_answers_and_the_skip_is_not_blanket(weight_dtype):
-    """Quantized weights are skipped by quant_state, not dtype: an unquantized bfloat16 weight must still answer, or
-    float32 full finetunes hit the mat1/mat2 dtype crash."""
+    """Skip quantized by quant_state, not dtype; unquantized bf16 must answer, or fp32 crashes."""
     names = ("q_proj", "k_proj", "v_proj", "o_proj")
     module = _Projections(**{
         name: torch.nn.Linear(4, 4, bias = False, dtype = weight_dtype) for name in names

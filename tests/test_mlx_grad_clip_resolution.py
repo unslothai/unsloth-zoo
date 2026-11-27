@@ -79,10 +79,8 @@ def test_fields_accept_explicit_positive():
 
 # Each row: knobs passed in -> (max_grad_norm, max_grad_value, max_grad_leaf_norm, mode).
 @pytest.mark.parametrize("kwargs, expected", [
-    # Default (all None) is the cheap per-leaf clip at 1.0.
     pytest.param(dict(max_grad_norm=0.0), (0.0, 0.0, 1.0, "leaf_norm"), id="default_uses_cheap_leaf_norm"),
     pytest.param(dict(max_grad_norm=1.0), (1.0, 0.0, 0.0, "global_norm"), id="user_max_grad_norm_wins_over_default"),
-    # Explicit 0.0 disables the cheap default.
     pytest.param(dict(raw_mgv=0.0, max_grad_norm=0.0), (0.0, 0.0, 0.0, "none"), id="explicit_zero_disables_cheap_default"),
     pytest.param(dict(raw_mgv=0.0, max_grad_norm=1.0), (1.0, 0.0, 0.0, "global_norm"), id="explicit_zero_lets_max_grad_norm_through"),
     # An explicit positive max_grad_value wins over everything (historical contract).

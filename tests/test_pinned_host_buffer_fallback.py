@@ -288,8 +288,7 @@ def test_pageable_buffers_are_not_copied_with_a_non_blocking_claim(monkeypatch):
     assert seen["non_blocking"] is False
 
 
-# The hot-path copies read a cached pinned flag instead of asking the driver; that is only safe while it matches its
-# buffer, so no slot may claim pinned while pageable.
+# Hot-path copies trust a cached pinned flag, so no slot may claim pinned while pageable.
 
 def _assert_flags_match_reality(where):
     for i, buffer in enumerate(gc.CPU_BUFFERS):
@@ -400,8 +399,7 @@ def test_mid_run_fallback_to_pageable_flips_the_cached_flag(monkeypatch):
 
 @requires_cuda
 def test_the_hot_path_asks_the_driver_nothing_once_the_buffers_are_warm():
-    """is_pinned() is a cudaPointerGetAttributes driver query, so the hot path must ask nothing once buffers are warm;
-    it runs twice per checkpointed layer per micro batch."""
+    """Warm buffers must not call is_pinned(), a cudaPointerGetAttributes query run per layer."""
     dtype = torch.float16
     gc.initialize_unsloth_gradient_checkpointing(dtype = dtype)
     block = torch.nn.Linear(1024, 1024, device = "cuda", dtype = dtype)

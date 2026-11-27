@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A merge that fails after a resized (vocab grown) tensor was staged must not keep that tensor alive,
-and must not leak it into the next merge of a different model in the same process."""
+"""A failed merge must release a staged resized tensor and not leak it into later merges."""
 
 from __future__ import annotations
 

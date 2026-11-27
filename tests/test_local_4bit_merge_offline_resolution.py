@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A 4bit merge of a local 4bit base must not depend on the Hub: merged_4bit and forced_merged_4bit never read base
-weights, so a Hub outage falls back to local; nf4/fp4 under merged_16bit must keep raising, since it writes nothing
-and a fallback would be a silent no-op."""
+"""Local 4bit merges must not need the Hub: merged_4bit and forced_merged_4bit never read base
+weights, so outages fall back; nf4/fp4 under merged_16bit must raise (fallback = silent no-op)."""
 
 import ast
 import inspect
@@ -196,8 +195,7 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
             and save_method == "merged_16bit"
         )
 
-    # Whitespace-normalised fragments, not one exact line (an exact match failed on a reflow); pins which inputs the
-    # sink reads and that the walk uses the right gate; end-to-end tests cover the sink.
+    # Whitespace-normalised (exact line match broke on reflow); pins the sink inputs and gate.
     normalised = " ".join(inspect.getsource(saving_utils.merge_and_overwrite_lora).split())
     for fragment in (
         "base_model_is_quantized and",
@@ -233,14 +231,12 @@ def test_the_fallback_can_never_reach_the_silent_no_op(monkeypatch, tmp_path):
             assert not hits_the_silent_no_op(is_quantized, quant_type, save_method), (
                 f"{label} + {save_method} fell back into the silent no-op"
             )
-    # 4 quant types x 6 save methods: fp8 resolves for the two 4bit merges and merged_16bit, which applies its companion
-    # scales; the three 4bit types resolve only for the 4bit merges.
+    # fp8 resolves for 4bit merges and merged_16bit; three 4bit types only for 4bit merges.
     assert (resolved, raised) == (3 + 3 * 2, 3 + 3 * 4), (resolved, raised)
 
 
 def test_every_merge_call_site_passes_the_save_method():
-    """Every merge call site must forward the save method, since omitting it traps whoever widens the fallback; asserted
-    as a property, not a count, so a third resolution is fine."""
+    """Every merge call site must forward save_method, or the fallback traps whoever widens it."""
     tree = ast.parse(inspect.getsource(saving_utils.merge_and_overwrite_lora).lstrip())
     calls = [
         node for node in ast.walk(tree)
@@ -273,8 +269,7 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_4bit_copy(
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
     monkeypatch.setattr(
         saving_utils, "check_model_quantization_status",
-        # The local copy is checked by absolute path and the Hub by the name as given, which tells the two calls apart;
-        # the Hub-side call passes local_ok = False (absorbed by **kwargs) when the name is also a directory.
+        # Absolute path = local copy; **kwargs absorbs local_ok = False for dir-named repos.
         lambda name, token = None, **kwargs: (True, "nf4") if os.path.isabs(str(name)) else (False, None),
     )
 

@@ -43,7 +43,6 @@ def test_live_tree_passes():
     )
 
 
-# --- the lint actually catches things ----------------------------------------
 
 @pytest.mark.parametrize("body, description", [
     ('exec(f"import {x}")', "f-string"),
@@ -73,7 +72,6 @@ def test_non_interpolated_calls_are_not_flagged(body, tmp_path):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
 
 
-# --- the allowlist has to stay honest ----------------------------------------
 
 def test_every_allowlist_entry_has_a_justification():
     # An empty allowlist is legitimate: it means no interpolated dynamic execution is left in the repo.

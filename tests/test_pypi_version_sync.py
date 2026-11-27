@@ -6,8 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Checks __version__ on main is >= the latest PyPI release so a rewind cannot ship a smaller version; networked,
-skipped if PyPI is unreachable (CI allowlists pypi.org:443)."""
+"""Main's __version__ must be >= latest PyPI release; skipped if pypi.org:443 is unreachable."""
 
 from __future__ import annotations
 

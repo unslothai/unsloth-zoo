@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""messages and prompt/completion datasets render one chat template call per batch, with the same token ids,
-masks, row order and errors as one call per row. CPU-only."""
+"""Batched chat template calls match per-row token ids, masks, row order and errors; CPU-only."""
 
 import json
 from types import SimpleNamespace

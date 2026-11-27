@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the Host and Origin checks of the DiffusionGemma shim (no credential; loopback is no boundary against cross-site
-POST or DNS rebinding) and its generation ceiling that stops one caller holding the single-sequence decoder lock;
-in-process, no socket"""
+"""Pins the shim's Host and Origin checks (no credential; loopback is no boundary against cross-site
+POST or DNS rebinding) and generation ceiling bounding decoder-lock hold; in-process."""
 
 from __future__ import annotations
 
@@ -63,7 +62,6 @@ def client(monkeypatch):
         yield test_client
 
 
-# --- A browser page the user visits is not the local user ---
 
 def test_a_cross_site_origin_is_refused(client):
     """The CORS-simple POST: text/plain needs no preflight, so nothing else stops it."""
@@ -99,7 +97,6 @@ def test_a_rebound_hostname_is_refused(client):
     assert client.calls == []
 
 
-# --- An ordinary local client keeps working ---
 
 def test_an_unparseable_host_is_refused_not_a_500(client):
     """An unparseable Host must be refused with 403: an uncaught urlsplit error would be a 500, and such a host is the one least worth trusting."""
@@ -159,7 +156,6 @@ def test_a_published_listener_still_answers_its_own_name(client, monkeypatch):
     assert response.status_code == 200, response.text
 
 
-# --- One caller cannot take the decoder for as long as it likes ---
 
 def test_max_tokens_is_clamped(client):
     """max_tokens is clamped because _max_blocks sizes the generation and the request holds the process-wide lock for all of it."""
@@ -185,7 +181,6 @@ def test_the_ceiling_is_configurable(client, monkeypatch):
     assert shim._max_blocks({"max_tokens": 10 ** 9}) == (CEILING, True)
 
 
-# --- A reply this server cut short does not report a natural stop ---
 
 def test_a_capped_generation_reports_length(client):
     """A capped generation must report finish_reason length, or a truncated answer looks complete and clients skip the continuation they run on other servers."""

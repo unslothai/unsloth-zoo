@@ -31,8 +31,7 @@ _spec.loader.exec_module(probe)
 
 @pytest.mark.parametrize("var", ["UNSLOTH_ALLOW_CPU", "UNSLOTH_IS_PRESENT"])
 def test_importing_the_probe_does_not_rewrite_the_environment(monkeypatch, var):
-    """Probe import must not set env vars: conftest sets UNSLOTH_ALLOW_CPU and unsloth/__init__.py sets
-    UNSLOTH_IS_PRESENT; os.environ.setdefault writes through to the real process env, so clear them and re-execute"""
+    """Import must not set UNSLOTH_ALLOW_CPU or UNSLOTH_IS_PRESENT; setdefault writes through."""
     monkeypatch.delenv(var, raising=False)
     _spec.loader.exec_module(importlib.util.module_from_spec(_spec))
     assert var not in os.environ

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers 4.x SDPA is_causal is a SymBool under dynamic shapes; SDPA takes only a bool, so the
-compiler rewrites it to the conditional form Llama uses."""
+"""transformers 4.x: SymBool is_causal in dynamic shapes; SDPA takes a bool, so it's rewritten."""
 import textwrap
 
 import torch

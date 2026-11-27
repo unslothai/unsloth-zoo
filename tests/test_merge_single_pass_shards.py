@@ -137,7 +137,6 @@ def test_shards_are_written_once_and_match_the_copy_path(tmp_path, monkeypatch, 
     assert any(not torch.equal(merged[k], base_tensors[k]) for k in merged if "q_proj" in k)
     assert not [f for f in os.listdir(single) if f.startswith(".unsloth-")]
     if source == "cache":
-        # The cache blobs are read, never written.
         for blob in (tmp_path / "hub" / "models--fake--repo" / "blobs").iterdir():
             assert os.stat(blob).st_mode & 0o222 == 0
 

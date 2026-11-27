@@ -2,8 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Offload buffers past the pinned cap (free host RAM per local rank) go pageable instead of raising; CPU only,
-torch.empty is spied so pinned requests are recorded, not performed."""
+"""Buffers past the pinned cap go pageable, not raise; CPU only, torch.empty is spied."""
 import types
 
 import pytest
@@ -143,7 +142,6 @@ def test_released_blocks_stay_charged_and_are_reused(monkeypatch, gc_module):
     assert gc_module._reserve_pinned(3000)          # 4096 block
     gc_module._release_pinned(3000)
     assert gc_module.GC_PINNED_BYTES == 4096
-    # Another size class cannot pile on top of the cached block past the cap.
     assert not gc_module._reserve_pinned(7000)      # 4096 cached + 8192 > 10000
     # The same size class takes the cached block back without a new charge.
     assert gc_module._reserve_pinned(4000)
@@ -185,7 +183,6 @@ def test_cached_block_taken_by_another_user_is_not_reused_past_the_cap(monkeypat
     free["bytes"] = 0
     # A new 4096 block would make 8192 pinned, past the 6000 cap.
     assert not gc_module._reserve_pinned(4096)
-    # Still reusable when the allocator really holds it free.
     gc_module._release_pinned(4096)
     free["bytes"] = 4096
     assert gc_module._reserve_pinned(4096)
@@ -276,8 +273,7 @@ def test_baseline_is_taken_once_host_stats_appear(monkeypatch, gc_module):
 
 
 def test_cap_flushes_our_released_blocks_before_going_pageable(monkeypatch, gc_module):
-    # A grown slot's old block counts against the cap until torch frees it; at the cap these dead blocks go back to the
-    # OS once, so a bigger block can still pin.
+    # Dead old blocks count against the cap; at the cap they are returned to the OS once.
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
     monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.setattr(gc_module, "_synchronize_used_devices", lambda: None)
@@ -294,8 +290,7 @@ def test_cap_flushes_our_released_blocks_before_going_pageable(monkeypatch, gc_m
 
 
 def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_module):
-    # Our released 4096 block was taken by another pinned user (a DataLoader), so the flush cannot free it and an 8192
-    # request still does not fit under a 10000 cap.
+    # Another pinned user (a DataLoader) took our released 4096 block; flush cannot free it.
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", str(10000 / (1 << 30)))
     monkeypatch.setattr(gc_module, "DEVICE_TYPE", "cuda", raising = False)
     monkeypatch.setattr(gc_module, "_synchronize_used_devices", lambda: None)
@@ -309,14 +304,12 @@ def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_mod
     gc_module._release_pinned(3000)                 # cached, then reused by another pinned user
     assert not gc_module._reserve_pinned(7000)
     assert emptied == [True]
-    # Once the allocator really frees it, the same request fits.
     held["bytes"] = 0
     assert gc_module._reserve_pinned(7000)
 
 
-# torch 2.13+ host allocator settings: above pinned_max_round_threshold_mb (or
-# pinned_max_cached_size_mb) a pinned block is the exact request, and above
-# pinned_max_cached_size_mb a freed block goes back to the OS instead of the cache.
+# torch 2.13+: above pinned_max_round_threshold_mb (or pinned_max_cached_size_mb) a pinned block is
+# the exact request; above pinned_max_cached_size_mb a freed block goes to the OS, not the cache.
 MIB = 1 << 20
 
 
@@ -391,8 +384,7 @@ def test_release_uses_the_block_charged_at_allocation(monkeypatch, host_alloc_co
 
 
 def test_concurrent_releases_keep_the_cap_bookkeeping_consistent(gc_module, monkeypatch):
-    # Split-model backward releases on autograd worker threads; the read-modify-write over the cap
-    # globals must not lose updates (a lost update leaks charged bytes and offload goes pageable early).
+    # Autograd threads release concurrently; a lost cap-counter update leaks charged bytes.
     import sys, threading
     MIB = 1 << 20
     old = sys.getswitchinterval()
@@ -439,8 +431,7 @@ def _auto_cap(monkeypatch, cap_bytes):
 
 
 def test_freed_baseline_pin_cannot_hide_our_cached_blocks(gc_module, counted):
-    # A user-set cap bounds every pinned byte the allocator holds: with a 6 MiB foreign pin, one of our
-    # 4 MiB blocks released (cached) and the foreign block back to the OS, nothing pins past 10 MiB.
+    # A user cap bounds pinned bytes, including a 6 MiB foreign pin; nothing pins past 10 MiB.
     fake = counted("pinned_max_cached_size_mb:4", cap_bytes = 10 * MIB)
     foreign = fake.allocate(6 * MIB)
     live = [(n, pin(gc_module, fake, n)) for n in (3 * MIB, 3 * MIB)]
@@ -482,8 +473,7 @@ def test_auto_cap_is_not_reduced_by_foreign_pins_present_when_computed(monkeypat
 
 
 def test_concurrent_reservations_cannot_spend_the_same_headroom(monkeypatch, gc_module, counted):
-    # Cap 11 MiB, 3 MiB of ours live, 5 MiB pinned by another user since the baseline. A reserves 2 MiB and
-    # stalls before torch pins it; B's 3 MiB must not pass the cap check on the stale count (13 MiB).
+    # Reservations racing: A stalls before pinning 2 MiB, so B must not reuse the stale count.
     import threading
     fake = counted("pinned_max_round_threshold_mb:1", cap_bytes = 11 * MIB)
     live = gc_module._new_host_buffer(3 * MIB, torch.uint8)

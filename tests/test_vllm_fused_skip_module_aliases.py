@@ -14,15 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Merged 4bit exports must carry skip-module names vLLM can match (unslothai/unsloth issues 1886, 464): vLLM fuses
-leaves and is_layer_skipped_bnb only matches dotted ancestors, so a dense layer gets quantized and fails a shape
-assert."""
+"""Merged 4bit exports need vLLM-matchable skip names (unslothai/unsloth issues 1886, 464)."""
 
 import pytest
 
-# Identity fallback fires only when the module imports but the symbol is absent; a bare except ImportError would turn a
-# torch-less runner into 21 failures that look like a missing fix (macos-15), so import first and skip the file on
-# failure.
+# Bare except ImportError would fail 21 tests on torch-less runners; import first and skip the file.
 try:
     import unsloth_zoo.saving_utils as _saving_utils
 except ImportError as _e:
@@ -40,8 +36,7 @@ add_vllm_fused_skip_module_aliases = getattr(
 
 
 def is_layer_skipped_bnb(prefix, llm_int8_skip_modules):
-    """Verbatim copy of vllm/model_executor/layers/quantization/bitsandbytes.py::is_layer_skipped_bnb (identical in vllm
-    0.11.2 and 0.29.0), so the test pins it without importing vLLM."""
+    """Verbatim copy of vLLM bitsandbytes.py is_layer_skipped_bnb; same in 0.11.2 and 0.29.0."""
     components = prefix.split(".")
     substr_check = any(m in components for m in llm_int8_skip_modules)
     set_components = set(".".join(components[: i + 1]) for i in range(len(components)))
@@ -64,7 +59,6 @@ MERGED_LEAF_SKIP_MODULES = [
     "lm_head",
 ]
 
-# The modules vLLM actually builds for those layers.
 VLLM_FUSED_PREFIXES = [
     "model.layers.0.self_attn.qkv_proj",
     "model.layers.0.mlp.gate_up_proj",
@@ -152,9 +146,7 @@ def test_idempotent():
     assert add_vllm_fused_skip_module_aliases(once) == once
 
 
-# Second mechanism (Transformers >= 4.52 multimodal nesting, verified on GPU):
-# unsloth/Qwen3-VL-4B-Instruct-unsloth-bnb-4bit writes model.language_model.layers.0.mlp, but vLLM 0.11.2 builds
-# language_model.model.layers.0.mlp.down_proj and dies on a uint8 vs bfloat16 shape.
+# Transformers >= 4.52 nesting: the Qwen3-VL bnb-4bit export mismatches vLLM 0.11.2 module names.
 
 vllm_compatible_skip_modules = getattr(
     _saving_utils, "vllm_compatible_skip_modules", add_vllm_fused_skip_module_aliases,
@@ -206,8 +198,7 @@ def test_combined_is_additive_and_idempotent():
 
 
 def test_merge_path_actually_writes_the_vllm_compatible_names():
-    """Reverting only the wiring leaves other tests green, so this guards against a silent drop; it asserts on the
-    writer's source since a full merge needs a GPU model."""
+    """Source-asserts (full merge needs a GPU); reverting only the wiring is otherwise silent."""
     import inspect
     from unsloth_zoo import saving_utils
 
@@ -244,12 +235,9 @@ def test_namespace_alias_never_emits_a_bare_namespace_root():
             assert not name.endswith("."), f"bare namespace root {name!r} from {entry!r}"
 
 
-# Other half of the contract: an alias can also make Transformers skip more, since matching is by prefix and suffix, so
-# an alias that is a suffix of a real Linear keeps it 16-bit on reload; the trees below are real nn.Linear names
-# enumerated on the meta device.
+# Aliases can widen the skip by prefix/suffix; an alias suffix can keep a real Linear 16-bit.
 
 MODULE_TREES = {
-    # text only
     "qwen2": [
         f"model.layers.{i}.{rest}"
         for i in range(4)
@@ -315,9 +303,8 @@ def _skip_lists(tree):
 
 
 def _should_convert_module():
-    """Uses transformers' own should_convert_module or skips where this release lacks it: transformers 4.57.6 ships
-    quantizers.quantizers_utils without it, so importorskip on the module alone fails on the attribute instead of
-    skipping."""
+    """Uses transformers should_convert_module or skips where the release lacks it (absent in
+    4.57.6); importorskip on the module alone fails on the attribute instead of skipping."""
     utils = pytest.importorskip(
         "transformers.quantizers.quantizers_utils",
         reason = "needs a transformers exposing should_convert_module",
@@ -393,8 +380,7 @@ def test_the_widening_probe_can_actually_detect_widening():
 
 
 def test_transformers_5x_skip_matcher_matches_the_stock_transformers_clauses():
-    """Compared against the clauses written out literally, not the live should_convert_module, since patching_utils
-    replaces that at import time and the result would depend on import order."""
+    """Uses literal clauses; patching_utils replaces live should_convert_module at import time."""
     import random
     import re as _re
 
@@ -435,8 +421,7 @@ def test_guard_is_inert_when_no_module_names_are_given():
 # A checkpoint is written by one transformers and loaded by another; 4.x and 5.x match differently and neither is a subset of the other.
 
 def test_transformers_4x_skip_matcher_matches_the_literal_4_57_expression():
-    """Pinned to the literal skip clause in transformers 4.57.6 integrations/bitsandbytes.py:167-172: a key followed by
-    a dot occurs in the name, or the key equals the name."""
+    """Pins the 4.57.6 bitsandbytes.py:167-172 skip clause: key+'.' in name, or key == name."""
     import random
 
     from unsloth_zoo.saving_utils import _transformers_4x_skip_matcher
@@ -465,8 +450,7 @@ def test_transformers_4x_skip_matcher_matches_the_literal_4_57_expression():
 
 
 def test_guard_covers_the_4x_only_widening_vector():
-    """A parent-form alias reaches the tower under transformers 4.x but not 5.x, so a guard tested only against the
-    installed matcher waves it through; reachable by saving on 5.x and reloading on 4.57.6."""
+    """Parent-form alias reaches the tower on transformers 4.x only (save 5.x, reload 4.57.6)."""
     from unsloth_zoo.saving_utils import (
         _transformers_4x_skip_matcher, _transformers_5x_skip_matcher,
         vllm_compatible_skip_modules,

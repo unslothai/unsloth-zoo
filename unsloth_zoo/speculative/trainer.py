@@ -179,6 +179,8 @@ class UnslothMTPTrainer(Trainer):
         super().__init__(model = model, args = args, **kwargs)
         # compute_loss normalizes by num_items_in_batch itself, so the Trainer must not also divide by GA.
         self.model_accepts_loss_kwargs = True
+        # Set after init (unsloth's Trainer.__init__ wrapper clears it): without it GA averages microbatch means.
+        self.model._unsloth_num_items_labels = "shifted"
         self._mtp_log = []
 
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):

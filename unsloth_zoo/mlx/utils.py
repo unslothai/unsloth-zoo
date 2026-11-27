@@ -618,7 +618,7 @@ def _as_array_mask(q, k, mask):
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
 
 
-# mlx 0.32.4 fused SDPA VJP keeps tiles in input dtype; fp32 wins only at 2047+ queries and D64/128.
+# mlx 0.32.5 fused SDPA VJP keeps its P and dS tiles in input dtype; fp32 wins only at 2047+ queries and D64/128.
 _FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
 _FP32_CAUSAL_MIN_QUERIES = 2047
 
@@ -707,11 +707,11 @@ def _set_mlx_windowed_attention(enabled: bool) -> None:
             setattr(module, attr, original)
 
 
-def _train_qmm_call(native, routes):
+def _train_qmm_call(native):
     from . import matmul
 
     def call(self, x):
-        routed = matmul.call_train_qmm_route(self, x, routes) if mlx_training_patches_active() else None
+        routed = matmul.call_dense_train_qmm(self, x) if mlx_training_patches_active() else None
         if routed is None:
             return native(self, x)
         return routed + self["bias"] if "bias" in self else routed
@@ -727,9 +727,8 @@ def _set_mlx_train_qmm(enabled: bool) -> None:
     # A __call__ someone else rebound keeps its behaviour: only mlx's own method takes the route.
     if enabled and original is None and getattr(current, "__module__", "").startswith("mlx.nn."):
         from . import matmul
-        routes = matmul.available_train_qmm_routes()
-        if routes:
-            nn.QuantizedLinear.__call__ = _train_qmm_call(current, routes)
+        if matmul.dense_train_qmm_available():
+            nn.QuantizedLinear.__call__ = _train_qmm_call(current)
     elif not enabled and original is not None:
         nn.QuantizedLinear.__call__ = original
 
@@ -1025,14 +1024,13 @@ def apply_gather_qmm_nax_guard() -> bool:
 
 
 _MLX_GELU_APPROX_FINITE_GRAD = None
-_MLX_GELU_APPROX_STOCK = None
 
 
 def _gelu_approx_finite_grad(x):
-    # Stock fp16 grad is NaN for |x| >= ~148 (3x**2 overflows, meets sech^2 = 0). tanh is exactly +-1 past |x| = 10,
-    # so the clip keeps the forward bit-identical (u - v == 0). Other dtypes cannot overflow: stock graph, zero cost.
+    # Before mlx 0.32.5 fp16 grads are NaN for |x| >= ~148 (4906 is this clipped body). Other dtypes stay plain:
+    # the clipped graph trips shapeless compile's stale-shape bug when first traced inside a gradient.
     if x.dtype != mx.float16:
-        return _MLX_GELU_APPROX_STOCK(x)
+        return 0.5 * x * (1 + mx.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)))
     t = mx.clip(x, -10, 10)
     u = 1 + mx.tanh(math.sqrt(2 / math.pi) * (t + 0.044715 * t**3))
     v = mx.stop_gradient(u)
@@ -1041,10 +1039,9 @@ def _gelu_approx_finite_grad(x):
 
 def apply_gelu_approx_finite_grad() -> bool:
     """Idempotent. Must run before a model is first traced: mx.compile'd callers keep the function they traced."""
-    global _MLX_GELU_APPROX_FINITE_GRAD, _MLX_GELU_APPROX_STOCK
+    global _MLX_GELU_APPROX_FINITE_GRAD
     activations = importlib.import_module("mlx.nn.layers.activations")
     if _MLX_GELU_APPROX_FINITE_GRAD is None:
-        _MLX_GELU_APPROX_STOCK = activations.gelu_approx
         _MLX_GELU_APPROX_FINITE_GRAD = mx.compile(_gelu_approx_finite_grad, shapeless=True)
     if nn.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD and activations.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD:
         return False
@@ -2861,13 +2858,6 @@ def _masked_correct(logits, targets, mask):
     return hits.astype(mx.float32).sum()
 
 
-def _row_contiguous_cross_entropy(logits, targets, **kwargs):
-    # mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686). A flatten round
-    # trip copies sequence- or vocab-sliced logits and is free for row-contiguous ones; mx.contiguous would also copy a
-    # row-contiguous slice out of its larger buffer.
-    return nn.losses.cross_entropy(logits.reshape(-1).reshape(logits.shape), targets, **kwargs)
-
-
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Standard cross-entropy over full LM-head logits, used when use_cce=False; returns (model, batch, lengths,
     labels=None) -> (loss, ntoks); with label_smoothing=0 the labels=None branch is byte-identical to
@@ -3486,7 +3476,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = _row_contiguous_cross_entropy(logits, safe_targets) * mask
+        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         if return_correct:

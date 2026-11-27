@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Standby's patched CuMemAllocator.sleep must take both call shapes: vLLM <= 0.33 calls sleep(offload_tags) and
-vLLM >= 0.34 (CuMemBackend.suspend) calls sleep(offload_tags, discardable). On 0.34 AllocationData also carries
-is_asleep, which vLLM's own discard/_trim/free paths read, so the patch must keep it in sync."""
+"""vLLM <= 0.33: sleep(offload_tags); >= 0.34: sleep(offload_tags, discardable), also sync is_asleep."""
 
 import dataclasses
 import sys
@@ -128,12 +126,10 @@ def test_is_asleep_tracked_and_no_double_release(vllm_utils, monkeypatch):
     alloc.sleep(("weights", "runtime", "cudagraph"), set())
     assert [d.is_asleep for d in alloc.pointer_to_data.values()] == [False, True, True, True]
     del calls[:]
-    # A second sleep must not release handles that are already released.
     alloc.sleep(("weights", "runtime", "cudagraph"), set())
     assert [c for c in calls if c[0] == "unmap"] == []
     alloc.wake_up()
     assert [d.is_asleep for d in alloc.pointer_to_data.values()] == [False] * 4
     del calls[:]
-    # A second wake_up must not map still-mapped handles again.
     alloc.wake_up()
     assert calls == []

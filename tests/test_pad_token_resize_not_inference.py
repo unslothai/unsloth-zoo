@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pad-token embedding rows must be trainable tensors, not inference tensors: patch_tokenizer runs under
-torch.inference_mode, and a resize there broke eager training and torch.compile (Moonshine)."""
+"""Pad rows must be trainable: a resize under inference_mode broke training and torch.compile."""
 
 import pytest
 

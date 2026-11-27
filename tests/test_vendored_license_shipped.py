@@ -8,8 +8,7 @@ _VENDORED = os.path.join(_REPO_ROOT, "unsloth_zoo", "_vendored")
 
 
 def _load_licenses_module():
-    # Load by file path to avoid importing unsloth_zoo (it pulls in the patching machinery); setuptools packages.find
-    # ships every .py under _vendored, so the module reaches the wheel.
+    # Load by path to avoid importing unsloth_zoo; packages.find ships all _vendored .py files.
     path = os.path.join(_VENDORED, "_licenses.py")
     spec = importlib.util.spec_from_file_location("unsloth_zoo_vendored_licenses", path)
     mod = importlib.util.module_from_spec(spec)

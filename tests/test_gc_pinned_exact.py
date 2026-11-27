@@ -2,9 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Exact-size pinned blocks for gradient checkpointing offload: the gate that sets
-pinned_max_round_threshold_mb (CUDA, torch 2.14+, no user pinned knob, kill switch), the growth
-granularity, and the counted accounting. CPU only: torch's setter and allocator are stubbed."""
+"""Exact-size pinned GC-offload blocks; the gate sets pinned_max_round_threshold_mb (CUDA, torch
+2.14+, no user pinned knob, kill switch); CPU tests stub torch's setter and allocator."""
 import os
 import subprocess
 import sys

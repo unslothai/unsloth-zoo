@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only with an existing labels column: labels arrive as plain lists under
-datasets.map(batched=True), so calling .tolist() on them unconditionally raised AttributeError; CPU-only, stub
-tokenizer."""
+"""With labels column, batched map gives lists; unconditional .tolist() raised AttributeError."""
 
 import pytest
 import torch
@@ -28,7 +26,6 @@ from unsloth_zoo.dataset_utils import train_on_responses_only
 INSTRUCTION_PART = "<|user|>"
 RESPONSE_PART = "<|assistant|>"
 
-# Token ids: 1 = <|user|>, 2 = <|assistant|>, everything else is content.
 USER_ID, ASSISTANT_ID = 1, 2
 ROW = [USER_ID, 10, 11, ASSISTANT_ID, 20, 21]
 
@@ -124,9 +121,8 @@ def test_no_labels_column_still_masks_from_input_ids():
 
 
 def test_an_explicit_one_maps_in_process(monkeypatch):
-    """num_proc=1 means no multiprocessing and must map to None: datasets >= 4.1 pools any count >= 1, so forwarding 1
-    built a Pool(1) on splits over _MIN_ROWS_FOR_MULTIPROC; UNSLOTH_DATASET_NUM_PROC=0 kept forking; 3.x ran 1
-    in-process."""
+    """num_proc=1 maps to None: datasets >= 4.1 pools any count >= 1, forwarding 1 made Pool(1)
+    above _MIN_ROWS_FOR_MULTIPROC; UNSLOTH_DATASET_NUM_PROC=0 kept forking; 3.x ran in-process."""
     import types
 
     # Over the 5,000-row threshold: below it the per-split guard already returns None for an auto request, so only rows above it test this.

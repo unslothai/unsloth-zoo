@@ -4714,6 +4714,7 @@ def grpo_accumulated_loss(
         # of every completion token, looked up by content in TRL's [prompt | completion] layout.
         _sc_ids = _sc_logps = None
         _sc_head_list = []
+        _sc_k = 0
         if kwargs.get("loss_type", "grpo") == "reinforce" and getattr(trainer, "use_vllm", False):
             from unsloth_zoo.rl_replacements import grpo_score_centering_k as _sc_enabled_k
             _sc_k = _sc_enabled_k(trainer, kwargs, _rollout_logps_as_old, bool(_support_kwargs))
@@ -4722,6 +4723,10 @@ def grpo_accumulated_loss(
                 _sc_ids, _sc_logps, _sc_matched = _sc_lookup(
                     input_ids, logits_to_keep, _sc_k, trainer.processing_class.pad_token_id,
                 )
+        if not _sc_k and os.environ.get("UNSLOTH_GRPO_SCORE_CENTERING", "0").strip().lower() not in ("", "0", "false", "off", "no"):
+            # Centering is off for this loss: stop the generate wrapper recording heads nobody reads.
+            from unsloth_zoo.score_centering import pause_score_centering_record as _sc_pause
+            _sc_pause()
 
         # The text path rebuilds completion_mask from token ids, which would undo TRL's
         # mask_truncated_completions row zeroing; keep TRL's rows and reapply them before the loss.

@@ -68,7 +68,6 @@ def test_auto_gradient_checkpointing(monkeypatch, choice, ram, env, expect_off):
     assert bool(result) is expect_off
     assert args.gradient_checkpointing is (not expect_off)
     assert model.is_gradient_checkpointing is (not expect_off)
-    # Idempotent: a second trainer on the same model / args changes nothing more.
     trainer._auto_cpu_gradient_checkpointing(model, args)
     assert args.gradient_checkpointing is (not expect_off)
 
@@ -216,8 +215,7 @@ def test_auto_gradient_checkpointing_counts_sdpa_dropout_scores(monkeypatch, dro
 
 
 def test_available_ram_honours_a_cgroup_v1_container_limit(monkeypatch, tmp_path):
-    """A cgroup v1 container (Docker on RHEL 8 / Amazon Linux 2) sees the host's MemAvailable in /proc/meminfo: the
-    16-bit and no-checkpointing decisions must use the container's own limit, or a model that fits the host OOMs."""
+    """cgroup v1 sees host MemAvailable: use the container limit, or a host-fitting model OOMs."""
     import types
     import psutil
     import unsloth_zoo.hf_xet_tuning as xet
@@ -265,9 +263,8 @@ def _stored_dtypes(model):
 
 
 def test_default_frozen_bf16_is_for_training_only():
-    """Frozen bf16 storage upcasts every projection per call, which made decode ~26% slower on CPUs without native
-    bf16. The default is kept for training only: generate() / for_inference upcast the frozen weights to fp32 once
-    (outputs unchanged), for_training / get_peft_model store them in bf16 again, bit for bit."""
+    """Frozen bf16 is train-only: upcasts slow decode without native bf16; generate()/for_inference
+    upcast once to fp32 (same outputs); for_training, get_peft_model restore bf16 exactly."""
     from unsloth_zoo.cpu import loader
     model, reference = _tiny_bf16_llama("training")
     original = {k: v.clone() for k, v in model.state_dict().items() if v.dtype == torch.bfloat16}

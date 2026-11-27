@@ -45,7 +45,6 @@ def test_compressed_config_reads_follow_the_commit(monkeypatch, tmp_path):
     assert S._compressed_packed_format("org/repo", None, commit) == "mxfp4-pack-quantized"
     # An explicit revision in the name still wins over the pinned commit.
     assert S._compressed_packed_format("org/repo@dev", None, commit) == "mxfp4-pack-quantized"
-    # No commit: unchanged, the default branch.
     assert S._compressed_packed_format("org/repo", None) == "mxfp4-pack-quantized"
     assert asked == [commit, "dev", None]
 
@@ -64,7 +63,6 @@ def test_base_config_read_follows_the_commit(monkeypatch):
     commit = "d" * 40
     assert S._read_export_base_config("org/repo", None, model, commit = commit) == "config"
     assert calls[-1]["revision"] == commit and calls[-1]["trust_remote_code"] is False
-    # Without a commit the call is exactly the old one.
     assert S._read_export_base_config("org/repo", None, model) == "config"
     assert "revision" not in calls[-1]
 

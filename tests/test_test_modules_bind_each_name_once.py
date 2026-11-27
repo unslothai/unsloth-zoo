@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""No test module may bind a top-level name twice: a later binding silently shadows the earlier one.
-Two PRs added a `_SHRUNK_VLM_STACKS` table to test_mlx_training_e2e_metal.py with different tuple
-shapes; Metal-only tests reading the first failed only on nightly Mac; this check needs no Metal."""
+"""Test modules bind each top-level name once; a duplicate _SHRUNK_VLM_STACKS silently shadows."""
 
 import ast
 import collections

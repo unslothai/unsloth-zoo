@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision towers looping `for i, blk in enumerate(self.blocks):` (Qwen3-VL, Qwen3-Omni) need the requires-grad hook: fed
-by a frozen patch embedding, reentrant-checkpointed blocks get no gradient."""
+"""Enumerate-loop vision towers need the hook: frozen patch input starves reentrant blocks."""
 
 import pytest
 import torch

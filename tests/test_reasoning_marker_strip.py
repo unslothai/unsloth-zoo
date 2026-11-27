@@ -3,14 +3,12 @@ when generation-only, never unmasking user content; skips (not fails) if no offl
 unavailable, so pytest never reaches the network or breaks collection."""
 import pytest
 
-# unsloth_zoo/__init__.py raises ImportError without the separate `unsloth` package, so it is imported lazily in
-# _setup(), not at module scope, to allow the skip.
+# unsloth_zoo/__init__.py needs `unsloth`, so import lazily in _setup() to allow the skip.
 
 
 def _tokenizer():
     from transformers import AutoTokenizer
-    # local_files_only keeps this hermetic: an uncached tokenizer raises at once instead of downloading or timing out,
-    # so the loop falls through to the next or a skip.
+    # local_files_only: uncached tokenizer raises at once instead of downloading or timing out.
     for repo in ("hf-internal-testing/llama-tokenizer", "Qwen/Qwen2.5-0.5B-Instruct"):
         try:
             tok = AutoTokenizer.from_pretrained(repo, local_files_only=True)
@@ -34,8 +32,7 @@ def _setup():
     return tok, get_chat_template_parts, train_on_responses_only
 
 
-# History turns carry an empty <think></think> while the final turn keeps real reasoning; the generation prompt also
-# emits the empty tag (Qwen3-Thinking / Nemotron Nano shape).
+# History: empty <think></think>; final turn keeps reasoning; generation prompt emits it too.
 PAIRED = (
     "{%- for m in messages %}"
     "{%- if m['role'] == 'user' %}{{ '<|im_start|>user\n' + m['content'] + '<|im_end|>\n' }}"

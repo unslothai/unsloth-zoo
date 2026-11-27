@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Kimi delta attention chunk fallback (glm5_next, kimi_linear) must stay eager: compiled, its loop took 25+ min of AOT
-compile on the GLM-5.3-Flash first checkpoint replay; decode-only recurrent stays compiled (eager is 2x slower per
-token)."""
+"""Kimi delta attention chunk fallback (glm5_next, kimi_linear) must stay eager: compiled, its loop
+makes AOT compile very slow; decode-only recurrent stays compiled."""
 
 import importlib.util
 import json

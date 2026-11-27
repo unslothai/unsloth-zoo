@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Mask builders must never be compiled fullgraph: flex_attention_mask branches on fast_all(attention_mask), which fails
-as Data-dependent branching; matching literal create_causal_mask(**mask_kwargs) broke when a kwarg was added, so a
-call-shaped detector is pinned."""
+"""Mask builders never compile fullgraph; flex_attention_mask's fast_all is data-dependent."""
 
 import inspect
 
@@ -85,8 +83,7 @@ def test_vision_mask_builders_are_not_compiled(model):
 
 
 def test_a_defined_vision_mask_builder_is_always_resolved():
-    """Skipping is legitimate only when no modeling file defines a builder; a builder renamed elsewhere would also skip
-    and guard nothing, so the modeling source is checked directly."""
+    """Skip only if no modeling file defines one; a renamed one would skip and guard nothing."""
     defines = []
     for model in _VISION_MASK_MODELS:
         try:
@@ -112,8 +109,7 @@ def test_a_defined_vision_mask_builder_is_always_resolved():
 
 
 def test_a_mask_builder_really_is_uncapturable_fullgraph():
-    """Runs eager first so a drifted harness fails loudly; a fullgraph raise then requires the compiler exclusion, while
-    success just means upstream became traceable."""
+    """Eager first catches drift; fullgraph raise needs the exclusion; success means traceable."""
     torch = pytest.importorskip("torch")
     gemma3 = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
     builder = getattr(gemma3, "create_masks_for_vision_model", None)
@@ -214,8 +210,7 @@ def test_ordinary_lifted_functions_still_compile(name):
 
 
 def test_disable_compile_functions_outranks_the_mask_rule():
-    """@torch.compiler.disable also blocks inlining into a compiled caller, so a mask call inside a
-    DISABLE_COMPILE_FUNCTIONS name must not downgrade to 'emit bare'; nothing listed builds masks today."""
+    """DISABLE_COMPILE_FUNCTIONS mask callers must not emit bare (disable blocks inlining)."""
     source = inspect.getsource(compiler_module)
 
     # Loop B: skipped for a listed name, so the disable branch below is still reached.

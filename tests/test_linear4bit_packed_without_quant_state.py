@@ -28,8 +28,7 @@ from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
 
 
 class _FakeLinear4bit(torch.nn.Module):
-    """Fake Linear4bit as left by a load that dropped quant_state; both feature counts are always set, since leaving
-    them off fires the guard via an unreachable default."""
+    """Fake Linear4bit with quant_state dropped; set both feature counts, else the guard fires."""
 
     def __init__(self, weight, bias = None, out_features = 5120, in_features = 5120):
         super().__init__()
@@ -48,8 +47,7 @@ def _packed_weight(n_bytes = 8192):
 
 
 def _real_bitsandbytes():
-    """Real bitsandbytes or skip: importorskip is not enough, as zoo installs `stubs/bitsandbytes_stub.py` under that
-    name, with no-op attributes the patch cannot patch."""
+    """importorskip is not enough: zoo's stub bitsandbytes has unpatchable no-op attributes."""
     bitsandbytes = pytest.importorskip("bitsandbytes")
     from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
     if not real_bitsandbytes_available():
@@ -63,8 +61,7 @@ def _patched_forward():
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     forward = bitsandbytes.nn.modules.Linear4bit.forward
     forward = getattr(forward, "__wrapped__", forward)
-    # patch_function can decline by returning False, which this patch discards; without this assert a test would
-    # silently exercise upstream bitsandbytes and pass.
+    # patch_function returning False is discarded; the assert stops tests passing on upstream.
     assert forward.__module__ == "unsloth_zoo.temporary_patches.bitsandbytes"
     return forward
 
@@ -87,8 +84,7 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     monkeypatch.setattr(
         bnb_patch, "_transformers_drops_prequantized_quant_state", lambda: True
     )
-    # Forces the no-repair case so the result cannot depend on whether another test installed the runtime repair; that
-    # branch is tested in tests/test_composite_conversion_rescope.py.
+    # Forces the no-repair case so another test's runtime repair cannot change the result.
     monkeypatch.setattr(
         bnb_patch, "_composite_renaming_repair_installed", lambda: False
     )
@@ -98,8 +94,7 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     # Regeneration advice stays conditional on trying a supported transformers first, since a checkpoint with genuinely absent sidecars reaches the same branch.
     assert "before regenerating anything" in message
     assert "does need rebuilding" in message
-    # 4.57.6 ships no qwen3_5, so it would swap the shape error for an unrecognised-architecture one; assert on the
-    # advice since a bare `not in message` also matches the version.
+    # Check advice only: a bare `not in message` matches the version; 4.57.6 lacks qwen3_5.
     _, _, advice = message.partition("fixed by PR #45567 in 5.6.0.")
     assert advice, "the advice section moved; this assertion no longer reads it"
     assert "4.57" not in advice
@@ -207,8 +202,7 @@ def test_packed_blob_whose_rows_equal_out_features_is_still_caught(in_features, 
 
 
 def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
-    """A real unquantized Linear4bit with in_features == 1 has a (out_features, 1) weight, so the guard must also
-    compare out_features or it would raise on a working model."""
+    """Unquantized one-input Linear4bit: (out_features, 1) weight; guard must check out_features."""
     bnb = _real_bitsandbytes()
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     module = bnb.nn.Linear4bit(1, 16)

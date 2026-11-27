@@ -117,7 +117,6 @@ def _router_class(family):
         and issubclass(obj, nn.Linear) and obj.__module__ == modeling.__name__
     )
     if not found:
-        # No nn.Linear router means the automatic search never saw one here.
         pytest.skip(f"no nn.Linear router class in modeling_{family}")
     return modeling, found[0][1]
 

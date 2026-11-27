@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference under torchrun: decisions that change which collectives a rank enters must match on all ranks, since
-external_launcher puts every rank's engine in the job's process group; else ranks sit in different collectives until
-the group timeout; CPU only, gloo."""
+"""Decisions that alter a rank's collectives must match on every rank, since engines share one group."""
 
 import json
 import os

@@ -1204,6 +1204,19 @@ def _is_scanned_member(name: str) -> bool:
 _SCANNED_SUFFIXES = (".pth", ".py", ".js", ".mjs", ".cjs", ".ts", ".sh", ".bash")
 
 
+def _decode_member(name: str, data: bytes) -> str:
+    """Decode a member the way its consumer will: Python honours a PEP 263 coding
+    cookie, so a `# coding: utf-7` file read as UTF-8 would hide every pattern."""
+    if name.lower().endswith(".py"):
+        import tokenize
+        try:
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
+            return data.decode(encoding, errors = "replace")
+        except Exception:
+            pass  # Python would refuse to compile it too; fall through to UTF-8
+    return data.decode("utf-8", errors = "replace")
+
+
 def _scan_incomplete(incomplete, path: Path, reason: str) -> None:
     print(f"  [WARN] {path.name}: {reason}", file = sys.stderr)
     if incomplete is not None:
@@ -1271,7 +1284,7 @@ def iter_archive_files(archive_path: str, incomplete: list | None = None):
                     )
                     continue
                 total += len(data)
-                yield info.filename, data.decode("utf-8", errors = "replace")
+                yield info.filename, _decode_member(info.filename, data)
 
     elif path.name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
         total = 0
@@ -1349,7 +1362,7 @@ def iter_archive_files(archive_path: str, incomplete: list | None = None):
                     )
                     continue
                 total += len(data)
-                yield member.name, data.decode("utf-8", errors = "replace")
+                yield member.name, _decode_member(member.name, data)
     else:
         print(f"  [WARN] Unknown archive format: {path.name}", file = sys.stderr)
 

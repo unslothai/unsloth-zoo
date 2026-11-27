@@ -1,10 +1,6 @@
-"""Marker token cores drop the bare SentencePiece dummy-prefix piece a standalone tokenization starts with.
-
-transformers 5 SentencePiece tokenizers tokenize Zephyr's "\\n<|assistant|>\\n" on its own as "▁", "<0x0A>", "<", ...
-Mid-text, after the previous turn, the marker has no leading "▁", so a core that keeps it matches nothing and
-train_on_responses_only either refuses to auto-detect or trains on no tokens. The stub below reproduces that shape
-without a downloaded tokenizer, so this runs offline (tests/test_zephyr_marker_context.py needs a cached one).
-"""
+"""Marker cores drop the bare SentencePiece dummy-prefix piece: transformers 5 emits a leading ▁ for
+standalone text, but mid-text the marker lacks it, so keeping it matches nothing
+(train_on_responses_only refuses to auto-detect or trains on no tokens); the stub runs offline."""
 
 import pytest
 
@@ -20,10 +16,9 @@ class _Encoding(dict):
 
 
 class _DummyPrefixTokenizer:
-    """One piece per character; standalone text that starts with "\\n" gets a lone dummy-prefix piece first.
-
-    "<CHAT>" is an added token, and ">" followed by "\\" merges into one piece (aya-vision-32b's ">" + "\\sigma").
-    """
+    """One piece per character, except the added <CHAT> token and '>' merging with a following
+    backslash (aya-vision-32b); standalone text starting with a newline gets a lone dummy-prefix
+    piece first."""
 
     ADDED = "<CHAT>"
     MERGE = ">\\"
@@ -80,8 +75,7 @@ def test_a_lone_piece_is_kept():
 
 
 def test_a_mergeable_suffix_is_still_trimmed_after_the_prefix_is_dropped():
-    """The edge probes are normalized like the marker, so "\\n<CHAT>>" still drops its ">" (it merges with a "\\"
-    that starts the answer) instead of keeping a core no answer can match."""
+    """>' merging into the answer's backslash must be trimmed, or the core matches no answer."""
     tok = _DummyPrefixTokenizer()
     core, _, right = dataset_utils._find_common_token_ids("\n<CHAT>>", tok, True)
     assert tok.convert_ids_to_tokens(core) == ["\n", "<CHAT>"]

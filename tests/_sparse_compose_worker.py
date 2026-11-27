@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks skip and flex patches compose per install order, one process per order; each family is
-checked alone, its failure reported for that family only, env restored."""
+"""Skip and flex patches compose per install order (one process each); families checked alone."""
 
 import os
 import sys

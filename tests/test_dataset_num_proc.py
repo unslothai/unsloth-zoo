@@ -54,8 +54,7 @@ def dnp(monkeypatch):
     try:
         from unsloth_zoo import hf_xet_tuning
     except Exception:
-        # unsloth_zoo/__init__ can raise 'Please install Unsloth' after importing hf_xet_tuning, but the submodule stays
-        # cached in sys.modules, which the policy reaches.
+        # __init__ can raise after importing hf_xet_tuning, which stays cached in sys.modules.
         hf_xet_tuning = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if hf_xet_tuning is not None:
         for name, neutral in (
@@ -104,6 +103,64 @@ def test_fork_start_method_honours_explicit_value(monkeypatch, dnp):
     assert dnp.get_dataset_num_proc(6) == 6
 
 
+# ---------- live offload_layers veto ----------
+
+
+def _fake_block_swap(monkeypatch, active):
+    import types
+    fake = types.ModuleType("unsloth_zoo.block_swap")
+    if isinstance(active, BaseException):
+        def probe():
+            raise active
+    else:
+        def probe():
+            return active
+    fake.offload_active = probe
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.block_swap", fake)
+
+
+@pytest.mark.parametrize("desired", [None, 6])
+def test_live_offload_keeps_map_in_process(monkeypatch, dnp, desired):
+    # A page-locked host tier is copied into each forked worker at fork time: 6 workers stalled map at 0 rows.
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_cpus(monkeypatch, dnp, 12)
+    _fake_block_swap(monkeypatch, True)
+    assert dnp.get_dataset_num_proc(desired) is None
+    # The config layer too: a 1 there would still be a Pool(1) fork in TRL's other trainers.
+    assert dnp.get_dataset_num_proc(desired, serial_as_none = False) is None
+
+
+def test_live_offload_veto_warns_once_for_an_explicit_count(monkeypatch, dnp, capsys):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _fake_block_swap(monkeypatch, True)
+    dnp.get_dataset_num_proc(6)
+    dnp.get_dataset_num_proc(6)
+    out = capsys.readouterr().out
+    assert out.count("offload_layers holds model layers page-locked") == 1
+
+
+@pytest.mark.parametrize("raw, expected", [("6", 6), ("0", None)])
+def test_env_override_beats_live_offload_veto(monkeypatch, dnp, raw, expected):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _fake_block_swap(monkeypatch, True)
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, raw)
+    assert dnp.get_dataset_num_proc(None) == expected
+
+
+@pytest.mark.parametrize("active", [False, RuntimeError("probe failed")])
+def test_no_live_offload_keeps_workers(monkeypatch, dnp, active):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_cpus(monkeypatch, dnp, 12)
+    _fake_block_swap(monkeypatch, active)
+    assert dnp.get_dataset_num_proc(6) == 6
+
+
+def test_block_swap_not_loaded_keeps_workers(monkeypatch, dnp):
+    _force_start_method(monkeypatch, dnp, "fork")
+    monkeypatch.delitem(sys.modules, "unsloth_zoo.block_swap", raising = False)
+    assert dnp.get_dataset_num_proc(6) == 6
+
+
 # ---------- the 1 -> None normalisation ----------
 
 
@@ -139,9 +196,8 @@ def test_config_layer_never_returns_none_while_forking_is_available(monkeypatch,
 @pytest.mark.parametrize("method", ["spawn", "forkserver", None])
 @pytest.mark.parametrize("desired", [None, 1, 16])
 def test_config_layer_is_none_not_one_on_a_non_fork_start_method(monkeypatch, dnp, method, desired):
-    """Config sentinel 1 reached unpatched TRL map sites (DPO, KTO, CPO, ORPO, Reward, PRM; SFT is rewritten) and built
-    a spawn Pool(1) that re-imports __main__ (issues 3211 and 3397); None is safe where forking is unavailable, since
-    auto-sizers also veto non-fork methods."""
+    """Sentinel 1 reached unpatched TRL map sites and built a spawn Pool(1) that re-imports __main__
+    (issues 3211 and 3397); None is safe as auto-sizers also veto non-fork methods."""
     _force_start_method(monkeypatch, dnp, method)
     assert dnp.get_dataset_num_proc(desired, serial_as_none = False) is None
 
@@ -359,8 +415,7 @@ def test_start_method_probe_prefers_the_real_default_over_list_order(monkeypatch
 
 
 def test_macos_stays_in_process_even_though_multiprocess_forks(monkeypatch, dnp, capsys):
-    """The probe reports fork on macOS but policy still refuses it: CPython moved macOS to spawn in 3.8 (bpo-33725)
-    because forking can crash, and this parent holds Torch and a threaded BLAS."""
+    """macOS spawn since CPython 3.8 (bpo-33725): fork can crash with Torch and threaded BLAS."""
     _force_start_method(monkeypatch, dnp, "fork")
     # Pin memory so the contrast is about policy, not the runner's free RAM.
     monkeypatch.setattr(dnp, "_affordable_workers", lambda: 1000)
@@ -506,8 +561,7 @@ def test_the_advice_matches_what_the_resolver_actually_returns(dnp, monkeypatch)
 
 
 def test_probe_rejects_a_start_method_the_host_does_not_offer(monkeypatch, dnp):
-    """The probe must reject a start method the host does not offer: on Windows the private default context said fork
-    while only spawn was offered (issues 3211 and 3397)."""
+    """Reject start methods not offered; Windows' default said fork (issues 3211 and 3397)."""
     import sys as _sys
     import types
 
@@ -532,8 +586,7 @@ def test_probe_rejects_a_start_method_the_host_does_not_offer(monkeypatch, dnp):
 
 
 def test_the_module_imports_nothing_but_the_standard_library():
-    """Imports only the standard library; psutil and multiprocess stay inside functions behind try/except so a host
-    without them degrades to a conservative answer instead of failing to import"""
+    """Stdlib-only at import; psutil and multiprocess are optional, so their absence degrades."""
     tree = ast.parse(MODULE_PATH.read_text(encoding = "utf-8"))
     top_level = []
     for node in tree.body:
@@ -548,9 +601,8 @@ def test_the_module_imports_nothing_but_the_standard_library():
 
 
 def test_it_is_reachable_as_unsloth_zoo_dataset_num_proc():
-    """unsloth/models/rl.py bakes this dotted import into generated trainers, so a rename breaks cached code; run in a
-    subprocess with UNSLOTH_ZOO_DISABLE_GPU_INIT=1 because the package __init__ refuses to load without unsloth
-    installed; skipping would retire the canary on CPU CI"""
+    """unsloth/models/rl.py bakes this import into generated trainers; use a subprocess with
+    UNSLOTH_ZOO_DISABLE_GPU_INIT=1 (__init__ needs unsloth); skipping would retire the canary."""
     import os
     import subprocess
 
@@ -691,8 +743,7 @@ def _force_stdlib_start_method(monkeypatch, dnp, method):
 
 
 def test_serial_is_one_when_the_two_modules_disagree(monkeypatch, dnp, capsys):
-    """None to train_on_responses_only means auto-size, which asks stdlib multiprocessing; where that says fork and
-    multiprocess says spawn it picks cpu_count + 4 workers on spawn (issues 3211 and 3397)."""
+    """Stdlib fork vs multiprocess spawn picks cpu_count + 4 workers (issues 3211 and 3397)."""
     _force_start_method(monkeypatch, dnp, "spawn")
     _force_stdlib_start_method(monkeypatch, dnp, "fork")
 
@@ -810,8 +861,7 @@ def _old_zoo(monkeypatch, memory_limit = None):
 
 
 def test_the_unaided_reader_subtracts_usage_too(monkeypatch, dnp, tmp_path):
-    """cgroup_memory_limit() alone reports an 8GB cgroup holding 6GB as 8GB free, so an older Zoo must still subtract
-    usage or map() children get OOM-killed (issue 2693)."""
+    """Limit alone counts usage as free: subtract it or map() children OOM-killed (issue 2693)."""
     _old_zoo(monkeypatch, memory_limit = 8 * 1024**3)
     leaf = tmp_path / "kubepods" / "podabc"
     leaf.mkdir(parents = True)
@@ -934,8 +984,7 @@ def test_no_unsloth_zoo_still_reads_the_cgroup(monkeypatch, dnp, tmp_path):
 
 
 def test_env_forced_serial_is_in_process_on_a_small_split(monkeypatch, dnp):
-    """With UNSLOTH_DATASET_NUM_PROC=0 the config sentinel 1 must become None, since returning 1 bypasses the
-    small-split guard and builds Pool(1) on datasets >= 4.1."""
+    """UNSLOTH_DATASET_NUM_PROC=0 must give None, not 1: 1 bypasses the small-split guard."""
     _force_start_method(monkeypatch, dnp, "fork")
     _force_stdlib_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "0")
@@ -969,8 +1018,7 @@ def test_an_explicit_count_the_host_can_afford_is_untouched_by_the_row_guard(mon
 
 
 def test_the_fixture_really_neutralises_the_zoo_readers(dnp):
-    """Patch the hf_xet_tuning entry in sys.modules, since unsloth_zoo/__init__ can raise after importing it; a clean
-    import leaves the real /sys/fs/cgroup readers live."""
+    """Patch hf_xet_tuning in sys.modules: unsloth_zoo/__init__ may raise after importing it."""
     module = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if module is None:
         pytest.skip("unsloth_zoo.hf_xet_tuning is not reachable here")
@@ -1012,8 +1060,7 @@ def test_standardize_data_formats_routes_through_the_policy(monkeypatch):
 def test_the_helper_backed_reader_pairs_v1_limits_with_their_own_usage(
     monkeypatch, dnp, tmp_path
 ):
-    """Pins the v1 branch of the helper-backed reader, a fallback the zoo never takes but the unaided reader mirrors; a
-    leaf's usage read against a slice's limit over-subscribes."""
+    """v1 limits pair with their own usage; a leaf's usage vs a slice limit over-subscribes."""
     slice_dir = tmp_path / "slurm"
     leaf = slice_dir / "job_1"
     leaf.mkdir(parents = True)

@@ -146,7 +146,6 @@ def test_mtp_teacher_follows_the_unmerged_adapter(loss_type):
     base_loss, _ = run(_target())
     assert torch.allclose(loss, ref_loss, atol = 1e-4)
     assert stats[0][1:] == ref_stats[0][1:]
-    # The adapter matters for this target: the bare base head gives a different objective.
     assert not torch.allclose(loss, base_loss, atol = 1e-3)
 
 

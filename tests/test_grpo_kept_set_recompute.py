@@ -129,7 +129,6 @@ def test_softcap_and_excluded_ids_match_float64_oracle(temperature, top_k, top_p
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("triton_sampler", [False, True])
 def test_matches_the_plain_helper_support_branch(temperature, top_k, top_p, min_p, dtype, triton_sampler):
-    # Same kept set and tie rules as the old support branch: forward equal, gradients equal to rounding.
     hidden, head, index, _ = _inputs(dtype = dtype, seed = 5)
     h1 = hidden.clone().requires_grad_(True)
     w1 = head.clone().requires_grad_(True)

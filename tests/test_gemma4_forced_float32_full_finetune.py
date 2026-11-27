@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma-4 norms follow the projections dtype when no autocast (a hard float16 cast broke lm_head);
-a float32 model matches vanilla; fp16 autocast and eval still run; env UNSLOTH_FORCE_FLOAT32."""
+"""Norms: projection dtype w/o autocast (hard fp16 cast broke lm_head); UNSLOTH_FORCE_FLOAT32."""
 
 import json
 import os
@@ -234,8 +233,7 @@ print(json.dumps({"after": str(getattr(p._GEMMA4_BOUNDARY, "dtype", None))}))
 
 
 def test_gemma4_boundary_does_not_leak_past_its_scope(tmp_path):
-    # Failing before: a stale float32 boundary made the multimodal embedder norm return float32 into its fp16
-    # projector ("expected m1 and m2 to have the same dtype, but got: float != c10::Half").
+    # Failing before: a stale float32 boundary fed float32 to fp16 projector (dtype mismatch).
     import pytest
 
     try:

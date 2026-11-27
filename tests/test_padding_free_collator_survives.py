@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Collator swap must keep padding-free batches: replacing the instance dropped Unsloth's torch_call wrapper that adds
-packed_seq_lengths while args.padding_free stayed True; tests the real TRL collator, since a mock would assert
-nothing about flattening or labels."""
+"""Collator swap must keep padding-free batches: dropping Unsloth's torch_call wrapper (adds
+packed_seq_lengths) broke it while args.padding_free stayed True; uses the real TRL collator."""
 
 import inspect
 import re

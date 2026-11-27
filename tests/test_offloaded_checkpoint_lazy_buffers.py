@@ -2,9 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Offload staging buffers and side streams are created per device on first use, since allocating on every GPU at init
-made each torchrun rank open a CUDA context (and buffers) on every card; CPU tests spy device_count, torch.empty and
-the stream/event constructors to simulate 4 GPUs."""
+"""Offload buffers and streams are created per device on first use, not on every GPU at init."""
 import pytest
 import torch
 

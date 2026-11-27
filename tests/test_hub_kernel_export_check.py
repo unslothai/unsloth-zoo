@@ -68,7 +68,6 @@ def test_patch_applies_only_where_dynamo_folds_is_exporting():
     assert applied == (folded and isinstance(getattr(torch.compiler, "_is_exporting_flag", None), bool))
     swapped = getattr(hub_kernels.is_torchdynamo_exporting, patch_module._MARK, False)
     assert swapped == applied
-    # Idempotent.
     assert patch_module.patch_hub_kernel_export_check() == applied
     assert getattr(hub_kernels.is_torchdynamo_exporting, patch_module._MARK, False) == applied
 

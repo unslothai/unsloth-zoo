@@ -34,6 +34,7 @@ from unsloth_zoo.fused_losses.stable_softmax import target_logprob, target_grad
 from typing import Optional
 
 from unsloth_zoo.rocm_build import is_rocm_torch
+from unsloth_zoo.utils import _is_out_of_memory
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, torch_compile_options
 
 
@@ -221,9 +222,10 @@ def _run(name, fn, *args):
             torch._dynamo.maybe_mark_dynamic(x, 0)
     try:
         return compiled(*args)
-    except torch.OutOfMemoryError:
-        raise
-    except Exception:
+    except Exception as error:
+        # Out of memory (also one an Inductor compile error wraps) is not a compile failure: never latch eager.
+        if _is_out_of_memory(error):
+            raise
         _eager.add(name)
         return fn(*args)
 

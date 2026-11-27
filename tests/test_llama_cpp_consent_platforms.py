@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Install consent: EOF with no terminal (implied consent) must never outrank UNSLOTH_AUTO_INSTALL=0; covers sys.stdin
-None under pythonw.exe and Windows env case; simulated, real Windows/macOS in staging CI."""
+"""Implied EOF consent never outranks UNSLOTH_AUTO_INSTALL=0; stdin None cases are simulated."""
 
 from __future__ import annotations
 
@@ -354,7 +353,6 @@ def test_ebadf_from_a_closed_stdout_is_not_consent(recorder, monkeypatch):
         builtins, "input",
         lambda prompt = "": (_ for _ in ()).throw(OSError(errno.EBADF, "Bad file descriptor")),
     )
-    # A live stdin: not closed, not a tty, and with a real descriptor behind it.
     monkeypatch.setattr(
         llama_cpp.sys, "stdin",
         types.SimpleNamespace(isatty = lambda: False, closed = False, fileno = lambda: 0),

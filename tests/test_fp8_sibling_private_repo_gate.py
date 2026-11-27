@@ -32,8 +32,7 @@ SERVICE_TOKEN  = "SERVICE_TOKEN"
 
 
 def _gated_repo_error(message):
-    """GatedRepoError under both signatures: hf_hub 1.x needs a required keyword response that it reads .headers and
-    .request from; 0.x defaults it to None; project allows >=0.34.0."""
+    """hf_hub 1.x needs response= (.headers, .request); 0.x defaults None. We support >=0.34.0."""
     response = SimpleNamespace(headers = {}, request = None)
     try:
         return GatedRepoError(message, response = response)
@@ -47,8 +46,7 @@ def _repo_not_found(path):
 
 
 def _hub(monkeypatch, tmp_path, *, anonymous_head, listed = True):
-    """Fake unsloth/GLM-5.2: anonymous_head None means public, else the HEAD error; downloads always succeed, even
-    anonymously, mimicking the hf_hub_download cache fallback, so only the HEAD decides."""
+    """anonymous_head None = public, else HEAD error; downloads succeed anon (cache fallback)."""
     seen = SimpleNamespace(list_tokens = [], download_tokens = [], head_tokens = [])
 
     def fake_ls(self, path, detail = True, **kwargs):

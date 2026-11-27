@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression for PR 826: with convert_moe_packed_tensors_cpu absent, stock transformers' self-transposing base plus
-saving_utils' own transpose double-transposes mxfp4 exports; both import orders must match."""
+"""PR 826: exports double-transpose w/o convert_moe_packed_tensors_cpu; import orders match."""
 import os
 import subprocess
 import sys

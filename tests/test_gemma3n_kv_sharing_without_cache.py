@@ -82,7 +82,6 @@ def test_the_patch_makes_an_uncached_forward_match_the_cached_one(pristine):
     assert modeling.Gemma3nTextAttention.forward is not pristine
     cached, uncached = _losses(_tiny_model())
     torch.testing.assert_close(uncached, cached)
-    # A second pass leaves the patched forward alone.
     patched = modeling.Gemma3nTextAttention.forward
     zoo_gemma3n.patch_Gemma3nTextAttention_kv_sharing()
     assert modeling.Gemma3nTextAttention.forward is patched

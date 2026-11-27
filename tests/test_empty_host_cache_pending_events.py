@@ -2,8 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""_empty_host_cache must still flush it: after a pinned offload slot goes pageable on growth, its old block stays in
-torch's host cache, counted active by host_memory_stats() until the non_blocking copy event is processed."""
+"""_empty_host_cache must flush a pinned block that stays counted active until its copy event."""
 import pytest
 import torch
 
@@ -70,8 +69,7 @@ def test_pageable_fallback_frees_block_last_used_by_async_copy(gc_module, monkey
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA pinned memory")
 def test_flush_waits_for_a_copy_still_in_flight(gc_module):
-    # A released block whose non_blocking copy is still in flight stays queued in torch's host cache; the flush must not
-    # drop its bookkeeping while the allocator still holds it.
+    # Flush must not drop bookkeeping while a non_blocking copy is still in flight.
     torch.cuda.synchronize()
     torch._C._host_emptyCache()
     base = torch.cuda.host_memory_stats()["allocated_bytes.current"]

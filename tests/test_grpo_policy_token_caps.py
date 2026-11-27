@@ -295,9 +295,8 @@ def _collective(monkeypatch, fsdp2 = True):
 @pytest.mark.parametrize("fsdp2", [True, False], ids = ["fsdp2", "zero3"])
 @pytest.mark.parametrize("prefix_grouper", [True, False], ids = ["pg", "packing"])
 def test_rank_local_forwards_are_off_when_forwards_are_collective(monkeypatch, fsdp2, prefix_grouper):
-    """Sharded FSDP2 / ZeRO-3 forwards all-gather: a rank whose batch packs or groups would run a different number
-    of forwards than one that runs the chunked loop, and the collectives hang. The forward count must equal the
-    split count, whatever the batch looks like."""
+    """Sharded FSDP2 / ZeRO-3 forwards all-gather: a rank that packs or groups runs a different
+    forward count, so collectives hang; forward count must equal the split count for any batch."""
     if prefix_grouper:
         _prefix_grouper(monkeypatch)
     else:

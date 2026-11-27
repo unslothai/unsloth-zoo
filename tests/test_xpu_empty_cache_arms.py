@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""On XPU, smart gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu,
-not torch.cuda (a no-op there); CPU only, both empty_cache calls counted."""
+"""Checkpointing and patch_model_and_tokenizer free XPU cache via torch.xpu, not torch.cuda."""
 
 from __future__ import annotations
 
@@ -81,8 +80,7 @@ def _helper(gc):
 
 
 class _FakeGC:
-    """`script` items: an int or None is what a pass that runs returns; "skip" returns 0 without collecting
-    (another thread's collection is in progress), leaving the full-collection stats unchanged."""
+    """Int or None: a pass ran; `skip`: another thread was collecting, so it returned 0."""
 
     def __init__(self, script, callbacks = ()):
         self.script = iter(script)
@@ -144,8 +142,7 @@ def test_patch_model_and_tokenizer_keeps_every_pass_when_gc_callbacks_are_regist
 
 
 def test_patch_model_and_tokenizer_keeps_collecting_while_another_thread_collects():
-    # Real gc. Thread A is inside a collection, blocked in a finalizer, when the release starts: the first
-    # gc.collect() returns 0 without collecting. Stopping there would leave our garbage behind.
+    # Thread A is inside a collection, so the first pass returns 0; we must keep collecting.
     started, release = threading.Event(), threading.Event()
 
     class Slow:

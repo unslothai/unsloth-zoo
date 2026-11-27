@@ -31,9 +31,8 @@ import torch
 if not hasattr(torch, "float8_e4m3fn"):
     pytest.skip("float8_e4m3fn unavailable", allow_module_level=True)
 
-# unsloth_zoo and transformers import bitsandbytes at import time (a 4bit path FP8 tests never reach); stub it only when
-# absent so CPU-only envs run, with a valid __spec__ so find_spec returns a spec instead of raising, then reports
-# unavailable via missing dist metadata.
+# unsloth_zoo and transformers import bitsandbytes at import time; stub it only when absent with a
+# valid __spec__ (find_spec must not raise), so CPU-only runs work and it reports unavailable.
 try:
     import bitsandbytes  # noqa: F401
 except Exception:
@@ -338,16 +337,14 @@ def test_fp8_dense_scale_in_sibling_shard_weight_first(tmp_path):
 
 
 def test_fp8_dense_scale_in_sibling_shard_scale_first(tmp_path):
-    """Scale in shard 1, weight in shard 2, processed scale-first: the order-independent cleanup must still drop the
-    orphaned scale; per-shard processing alone cannot."""
+    """Scale in sibling shard, processed first: only an order-independent cleanup drops it."""
     s1 = tmp_path / "model-00001-of-00002.safetensors"
     s2 = tmp_path / "model-00002-of-00002.safetensors"
     _run_cross_shard_merge(tmp_path, weight_in=s2, scale_in=s1, process_order=(s1.name, s2.name))
 
 
 def test_fp8_post_pass_preserves_unrelated_scale(tmp_path):
-    """Cleanup must drop FP8 companion scales but keep an unrelated *_scale buffer whose base weight was never FP8;
-    anchoring on a post-rewrite name heuristic would delete it, as every weight is 16bit by then."""
+    """Keep unrelated *_scale (base not FP8); name rules would drop it: all weights are 16bit."""
     from unsloth_zoo.saving_utils import (
         _merge_and_overwrite_lora_fp8, _drop_resolved_fp8_scales_after_rewrite,
         _collect_fp8_weight_keys,
@@ -481,8 +478,7 @@ def test_fp8_dense_block_scale_partial_block(tmp_path):
 
 
 def test_fp8_dense_path_refuses_moe_expert_lora(tmp_path):
-    """The dense FP8 rewrite cannot fuse per-expert adapters so refuses MoE-expert LoRA; the dispatcher routes those to
-    the in-place quant-aware path (test_moe_merge_legacy_mixtral_cpu)."""
+    """Dense FP8 can't fuse per-expert LoRA adapters; dispatcher routes MoE experts in-place."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora_fp8
 
     W_fp8, scale = _fp8_quant_channel(torch.randn(32, 48) * 0.1)
@@ -627,7 +623,6 @@ def test_strip_fp8_suffix():
     assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct-FP8-Block") == "unsloth/Llama-3.1-8B-Instruct"
     assert _strip_fp8_suffix("org/Model-FP8-Static") == "org/Model"
     assert _strip_fp8_suffix("org/model-fp8") == "org/model"
-    # No marker -> None (do not touch 16bit names).
     assert _strip_fp8_suffix("unsloth/GLM-5.2") is None
     assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct") is None
 
@@ -646,7 +641,6 @@ def test_resolve_fp8_16bit_sibling_local(tmp_path):
     assert got is not None and str(got).endswith("GLM-5.2") and "FP8" not in str(got)
     # No sibling on disk -> None (fall back to FP8 dequant).
     assert _resolve_fp8_16bit_sibling(str(tmp_path / "Nonexistent-FP8")) is None
-    # Plain 16bit name (no FP8 marker) -> None (nothing to resolve).
     assert _resolve_fp8_16bit_sibling(str(tmp_path / "GLM-5.2")) is None
 
 

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The media guard must connect to the address it checked, so a DNS rebind between check and fetch cannot reach internal
-hosts; tests run offline over loopback with a stubbed resolver."""
+"""Media guard connects to the address it checked, so a DNS rebind cannot reach internal hosts."""
 
 from __future__ import annotations
 
@@ -95,8 +94,7 @@ def server():
 
 @pytest.fixture
 def resolver(monkeypatch):
-    """Scripted resolver that answers the same name differently per lookup: public address for the guard, loopback for
-    the connection, like an attacker-controlled zone."""
+    """Resolver answers per lookup: public address for the guard, loopback for the connection."""
     real = socket.getaddrinfo
     scripted = {}
     failing_first = set()
@@ -184,8 +182,7 @@ def test_rebinding_to_loopback_after_the_check_is_refused(server, resolver, conn
 
 
 def test_without_pinning_the_same_setup_does_reach_loopback(server, resolver, connects, monkeypatch):
-    """Differential: validation without pinning, letting the connection re-resolve the name, is the pre-fix behaviour:
-    same resolver, loopback server, returns its bytes."""
+    """Without pinning, the connection re-resolves and reaches loopback: the pre-fix behaviour."""
     real_check = vision_utils._check_fetchable_url
 
     def validate_only(url):
@@ -361,8 +358,7 @@ def server_tls(tmp_path):
     ))
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    # PROTOCOL_TLS_SERVER already negotiates 1.2 or 1.3, but the context still permits 1.0 and 1.1 (flagged by CodeQL
-    # py/insecure-protocol), so the TLSv1_2 floor is explicit.
+    # Explicit TLSv1_2 floor: the context still permits 1.0/1.1 (CodeQL py/insecure-protocol).
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(certificate_path), str(key_path))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
@@ -431,7 +427,6 @@ def test_a_missing_or_foreign_pin_is_refused_rather_than_resolved_again():
     with pytest.raises(ValueError, match="nothing pins"):
         pinned_class("images.invalid")._new_conn()
 
-    # A host that is not the one checked, a proxy hop for instance
     token = vision_utils._PINNED_ADDRESSES.set((("example.invalid",), (PUBLIC_IP,)))
     try:
         with pytest.raises(ValueError, match="checked host was"):

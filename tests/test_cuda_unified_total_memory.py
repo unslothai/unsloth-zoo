@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Tests cuda_total_memory on unified-memory NVIDIA hosts: props.total_memory may be the dedicated carve-out, so only a
-LARGER driver total is adopted; discrete cards must not change."""
+"""Unified NVIDIA: props' carve-out total yields to a larger driver total; discrete unchanged."""
 
 from __future__ import annotations
 
@@ -64,8 +63,7 @@ class TestIntegratedDetection:
         assert integrated_device.cuda_props_are_integrated(props) is True
 
     def test_hip_is_excluded_by_name(self, monkeypatch):
-        # clr left the integrated field unassigned before ROCm 6.2, and the ROCm total has its own handling, so this
-        # probe must never reach an AMD part, flag set or not.
+        # Never probe AMD, flag set or not: clr left integrated field unset before ROCm 6.2.
         monkeypatch.setattr(pytest.importorskip("torch").version, "hip", "6.4.0", raising = False)
         assert integrated_device.cuda_props_are_integrated(_Props(8 * GIB, 1)) is False
 
@@ -142,7 +140,6 @@ class TestDiscreteIsUntouched:
         assert calls == []
 
     def test_hip_never_calls_mem_get_info(self, monkeypatch):
-        # The ROCm path keeps whatever it did before, untouched by this probe.
         calls = _install(monkeypatch, _Props(96 * GIB, 1), driver_total = None, hip = "6.4.0")
         assert integrated_device.cuda_total_memory(0) == 96 * GIB
         assert calls == []
@@ -170,8 +167,7 @@ class TestUnreadableDevice:
 
 
 class TestFlexAttentionCallSite:
-    """The kernel-option probe must keep raising for an undescribed device: cuda_total_memory's 0 would read as 16GB or
-    less and leave flex attention enabled; the shipped expression is evaluated."""
+    """Must raise for an undescribed device: a 0 total would leave flex attention enabled."""
 
     @staticmethod
     def _vram_expression():

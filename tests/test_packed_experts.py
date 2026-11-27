@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-"""NVFP4 / MXFP8 packed routed-expert stacks: decode, RTN quantizers, grouped forward + dX bitwise vs the dense
-dequantized stack, the MoE route, and the param's device / copy / pickle contract."""
+"""NVFP4/MXFP8 packed expert stacks: decode, RTN, forward and dX bitwise vs dense dequantized."""
 
 import copy
 import pickle
@@ -69,9 +68,8 @@ def _random_mxfp8(E, N, K, seed = 0, device = "cpu"):
 
 
 def _same_decode(out, want):
-    """bf16 / fp32: bitwise. fp16: bitwise on every non-zero and zero exactly where the reference is zero, sign of
-    zero aside: on gfx1151 (ROCm, Linux and Windows) the fused decode kernels store -0.0 as +0.0 in fp16 only (the
-    multiply and the fp16 conversion fuse into one mixed-precision op); every other fp16 value is bitwise."""
+    """bf16/fp32 bitwise; fp16 bitwise with zeros where the reference is zero, sign of zero aside on
+    gfx1151 (ROCm): fused kernels store -0.0 as +0.0 (multiply and fp16 conversion fuse)."""
     want = want.contiguous()
     if out.dtype == torch.float16:
         nz = want != 0

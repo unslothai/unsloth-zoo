@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""GRPO log-softmax chunk loop uses `chunks` row ranges, not torch.chunk: a list length cannot be symbolic, so Dynamo
-recompiled per torch.chunk count as T changed; now flat in T."""
+"""Row-range chunks, not torch.chunk (list length can't be symbolic); graph count flat in T."""
 import os
 import subprocess
 import sys

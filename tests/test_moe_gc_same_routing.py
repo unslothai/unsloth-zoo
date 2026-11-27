@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unsloth gradient checkpointing: the backward replay of an MoE block must route tokens to the experts the first
-(no-grad) pass picked. Under block compile the two passes run different compiled graphs whose rounding can move a
-router input across a top-k boundary; the toy router below flips its choice in grad mode to model that."""
+"""Replay must match the no-grad pass's experts; compile rounding can flip top-k in grad mode."""
 
 import os
 
@@ -167,8 +165,7 @@ def test_mismatched_entry_falls_back():
 
 
 def test_dense_weights_straight_through():
-    """GPT-OSS hands dense [T, E] scores: values from the first pass; the gradient goes through the replay's scores
-    only for a token whose replay picked the same expert set."""
+    """Dense [T, E] scores take first-pass values; gradient flows only for same-set tokens."""
     idx0 = torch.tensor([[0, 1], [2, 3]])
     w0 = torch.tensor([[0.6, 0.4, 0.0, 0.0], [0.0, 0.0, 0.7, 0.3]])
     idx1 = torch.tensor([[0, 2], [3, 2]])  # token 0 changed set, token 1 same set in another order
@@ -202,8 +199,7 @@ def _softmax_topk_renorm(logits, k, index = None):
 
 
 def test_same_set_gradient_matches_the_fixed_expert_oracle_fp64():
-    """Same expert set in another slot order: the blended weights' router gradient equals the oracle that
-    renormalizes the replay's probabilities over the first pass's ids."""
+    """Same set, other slot order: router grad matches oracle renormalized over first-pass ids."""
     torch.manual_seed(0)
     logits = torch.randn(5, 6, dtype = torch.float64)
     idx0, w0 = _softmax_topk_renorm(logits, 3)
@@ -218,8 +214,7 @@ def test_same_set_gradient_matches_the_fixed_expert_oracle_fp64():
 
 
 def test_changed_set_sends_no_gradient_to_a_replay_only_expert_fp64():
-    """Review repro: forward picks experts [0, 1], a 2e-7 nudge makes the replay pick [0, 2]. The replay's weights are
-    normalized over expert 2, which the loss never used, so no router gradient may come from them."""
+    """A 2e-7 nudge makes replay pick expert 2, unused by the loss: no router gradient from it."""
     logits = torch.tensor([[1.0, 0.5, 0.5 - 1e-7]], dtype = torch.float64)
     idx0, w0 = _softmax_topk_renorm(logits, 2)
     assert idx0.tolist() == [[0, 1]]
@@ -233,8 +228,7 @@ def test_changed_set_sends_no_gradient_to_a_replay_only_expert_fp64():
 
 
 def test_constant_expert_outputs_give_zero_input_gradient_fp64():
-    """Review oracle: every expert outputs 1, so the routed mixture is identically 1 and its gradient through the
-    routing must be 0 whatever the replay picks."""
+    """All experts output 1: routing gradient must be 0 whatever the replay picks."""
     torch.manual_seed(0)
     x = torch.randn(64, H, dtype = torch.float64)
     router = torch.randn(H, E, dtype = torch.float64)
@@ -276,8 +270,7 @@ def test_compiled_replay_reuses_first_pass_routing(backend):
 
 
 def test_probe_forward_inside_trial_does_not_store():
-    """Block compile's grad-mode trial runs inside the first pass, and the LoRA stash probe inside it runs a no_grad
-    throwaway forward: a suspended frame keeps that routing (the grad graph's) out of the replay."""
+    """A suspended frame keeps the no_grad LoRA probe run inside the grad trial out of replay."""
     torch.manual_seed(0)
     x = torch.randn(T, H)
     layer = ToyMoE(0)

@@ -47,14 +47,12 @@ def test_decision_matrix_patch_and_version():
 
 
 def test_unparseable_version_defaults_to_modern_stock():
-    # None / garbage version must not crash; assume modern stock (self-transposes).
     assert _mxfp4_base_returns_transposed(None, None) is True
     assert _mxfp4_base_returns_transposed(None, "not-a-version") is True
 
 
 def test_all_conventions_produce_identical_gpt_oss_layout():
-    """The export weight must match the GPT-OSS layout whichever convert_moe_packed_tensors convention made the raw
-    dequant; ground truth is stock >= 4.56.0's out.transpose(1, 2).contiguous()."""
+    """Export layout matches stock >= 4.56.0 out.transpose(1, 2) for all conventions."""
     torch.manual_seed(0)
     E, D, N = 4, 6, 8  # [experts, rows, cols] of the un-transposed dequant `out`
     out = torch.randn(E, D, N)
@@ -72,13 +70,11 @@ def test_all_conventions_produce_identical_gpt_oss_layout():
 
 
 def test_old_cpu_only_keying_would_corrupt_stock_4_55():
-    """Guards the fixed bug: base_returns_transposed == (_cpu is None) treated stock 4.55.x as self-transposing,
-    skipping the external transpose and giving an un-transposed layout."""
+    """Keying base_returns_transposed on _cpu is None skipped the transpose for stock 4.55.x."""
     torch.manual_seed(0)
     out = torch.randn(4, 6, 8)
     ground_truth = out.transpose(1, 2).contiguous()
 
-    # Old logic: _cpu absent -> assume self-transposed -> no external transpose.
     old_base_returns_transposed = (None is None)  # i.e. _cpu is None -> True (buggy)
     old_W = out.contiguous() if old_base_returns_transposed else out.transpose(1, 2).contiguous()
     assert not torch.equal(old_W, ground_truth)  # confirms the old path corrupted 4.55.x

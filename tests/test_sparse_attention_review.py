@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression tests for the sparse attention review findings (unsloth-zoo #2509): dispatch latches, input
-validation, the no-sink form, empty / -inf rows, layouts, the Qwen4Exp patch guards. CUDA tests skip on CPU."""
+"""Sparse attention review regressions (unsloth-zoo #2509); CUDA tests skip on CPU."""
 
 import os
 import subprocess
@@ -103,7 +102,6 @@ def test_no_triton_never_imports_the_kernel_module(monkeypatch, clean_dispatch):
     assert sa.sparse_gqa_attn(query, key, key, idx[..., :3], 0.3, backend = "torch").shape == (1, 9, 4, 8)
 
 
-# 6: the window entry validates its operands like sparse_attn.
 @pytest.mark.parametrize("bad", ["window_width", "compressed_width", "short_sink", "index_rows"])
 def test_window_entry_validates_operands(bad):
     q, kv, sink, idx = _cpu_inputs()
@@ -120,7 +118,6 @@ def test_window_entry_validates_operands(bad):
         sa.sparse_attn_window(q, win, kv, idx, sink, 0.25, 4, backend = "torch")
 
 
-# 35: windows must be positive.
 @pytest.mark.parametrize("window", [0, -3])
 def test_window_must_be_positive(window):
     q, kv, sink, idx = _cpu_inputs()
@@ -149,7 +146,6 @@ def test_gather_gets_a_single_shared_kv_head(monkeypatch):
     assert out.is_contiguous()   # 58
 
 
-# 15-18: the no-sink form (attn_sink None) through _check, the reference (incl. recompute) and the gather adapter.
 def test_no_sink_form(monkeypatch, clean_dispatch):
     q, kv, _, idx = _cpu_inputs()
     no_sink = torch.full((2,), float("-inf"))
@@ -165,7 +161,6 @@ def test_no_sink_form(monkeypatch, clean_dispatch):
     assert torch.isneginf(seen["sink"]).all()
 
 
-# 33 / 34: an empty selection stays connected to every input (zero gradients, not an error).
 @pytest.mark.parametrize("fn", ["public", "reference"])
 def test_empty_selection_is_connected_to_every_input(fn, clean_dispatch):
     q, kv, sink, _ = _cpu_inputs()
@@ -178,7 +173,6 @@ def test_empty_selection_is_connected_to_every_input(fn, clean_dispatch):
     assert not d_kv.any() and not d_sink.isnan().any()
 
 
-# 10 / 48: GQA validates the index rows and the head grouping before folding.
 def test_gqa_validation(clean_dispatch):
     query, key = torch.randn(1, 4, 9, 8), torch.randn(1, 2, 9, 8)
     with pytest.raises(ValueError):
@@ -188,7 +182,6 @@ def test_gqa_validation(clean_dispatch):
                            backend = "torch")
 
 
-# 11 / 12: unsupported mask types and ranks decline instead of crashing; per-head masks too.
 @pytest.mark.parametrize("mask", ["none", "2d", "3d", "per_head"])
 def test_geometry_and_selector_decline_unsupported_masks(mask):
     s = 12
@@ -209,12 +202,10 @@ def test_interval_rows_check_the_interior():
     assert sa._contiguous_rows(torch.tril(torch.ones(1, s, s, dtype = torch.bool))) is not None
 
 
-# 20: the shared-memory helper answers 0 off CUDA.
 def test_shared_memory_off_cuda():
     assert sa._shared_memory(torch.device("cpu")) == 0
 
 
-# 26: the environment can force hd512 for the window form only.
 def test_env_backend_parser_accepts_hd512_for_windows(monkeypatch):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "hd512")
     assert sa._forced_backend(window = True) == "hd512"
@@ -246,7 +237,6 @@ def test_flex_with_sink_gated_below_the_verified_torch(monkeypatch, clean_dispat
     assert sa._flex_sink_ok(q, kv, sink)
 
 
-# 32: an untimed tuner selection launches once on a cold key (the selection's launch is the call's launch).
 def test_tuner_launches_once_on_a_cold_untimed_call(monkeypatch):
     pytest.importorskip("triton")
     tune = pytest.importorskip("unsloth_zoo._vendored.attn_gym._backends.triton.tune")
@@ -351,7 +341,6 @@ def test_fast_path_probe_shapes(monkeypatch):
     assert seen == [((1, 4, 40, 32), (1, 2, 40, 32))]
 
 
-# 47: an attention subclass defined in another module still finds transformers' RoPE.
 @qwen_only
 def test_subclass_finds_rope(monkeypatch):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
@@ -363,9 +352,7 @@ def test_subclass_finds_rope(monkeypatch):
     assert zq._qwen4_exp_sparse_attention(attention, hidden, pe, mask, None, {}) is not None
 
 
-# 23 / 24: bf16 projections with fp32 RoPE tables (4-bit / mixed precision): both the sparse path and the reference
-# fallback (short sequences) align Q / K / V dtypes after RoPE, so the fused kernels / SDPA see one dtype; a compiled
-# step runs. On CUDA, SDPA rejects mixed dtypes and the sparse kernels need bf16 Q / K, so the base fails there.
+# bf16 Q/K/V with fp32 RoPE: dtypes align after RoPE; CUDA SDPA rejects mixed, sparse needs bf16 Q/K
 @qwen_only
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("seq", [12, 40], ids = ["reference_fallback", "sparse"])
@@ -404,7 +391,6 @@ def test_post_rope_dtype_alignment(monkeypatch, seq, device):
 
 
 # ------------------------------------------------------------------------------------------------- CUDA kernels
-# 4 / 5: a strided sink view gives the same result as its contiguous copy.
 @cuda_only
 @pytest.mark.parametrize("form", ["index", "window"])
 def test_strided_sink(form):
@@ -424,7 +410,6 @@ def test_strided_sink(form):
     torch.testing.assert_close(got, want, rtol = 0, atol = 0)
 
 
-# 19: the native support predicate checks the KV geometry.
 @cuda_only
 def test_native_support_checks_kv_geometry():
     from unsloth_zoo import sparse_mqa_kernel as mk
@@ -447,7 +432,6 @@ def test_gqa_index_batch_rejected_before_the_kernel(clean_dispatch):
                            backend = "triton")
 
 
-# 9: flex sink scaling on empty rows and disabled (-inf) sink heads gives finite gradients.
 @cuda_only
 def test_flex_sink_scaling_empty_rows_finite(clean_dispatch):
     if torch.cuda.get_device_capability()[0] < 8:
@@ -463,7 +447,6 @@ def test_flex_sink_scaling_empty_rows_finite(clean_dispatch):
     assert not out[0, :5].any()
 
 
-# 21 / 22 / 27 / 28: hd512 ops on empty inputs, and on empty intervals with a disabled sink (no NaN).
 @cuda_only
 def test_hd512_empty_inputs_and_neg_inf_rows():
     from unsloth_zoo import sparse_mqa_kernel as mk

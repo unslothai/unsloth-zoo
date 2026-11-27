@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Automatic saved attention budget: step 1's peak is below step 2's (AdamW moments come after
-activations are freed), so trusting it overcommitted step 2 past the card (full finetuning,
-trained embeddings / lm_head); the per-step floor lifts the expected peak until a step with
-moments is measured."""
+"""Saved-attention budget: step 1's peak misses AdamW moments, so trusting it overcommitted step 2
+past the card; a per-step floor lifts the expected peak until moments are measured."""
 import pathlib
 
 import pytest

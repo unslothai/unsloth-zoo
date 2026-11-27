@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Raw-logit entropies used only for the top_entropy_quantile mask carry no gradient (TRL uses no_grad), so they must
-not keep full-vocab fp32 tensors; with the entropy bonus on, the entropy keeps its graph."""
+"""Mask-only entropies (TRL no_grad) avoid full-vocab fp32; the entropy bonus keeps its graph."""
 import types
 
 import pytest

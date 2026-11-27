@@ -115,8 +115,7 @@ def test_the_flag_is_reset_per_call():
 
 
 def test_both_blocking_arms_also_set_the_flag():
-    """The sys.modules block and the engine arg must never disagree, or parent and worker choose different backends;
-    each block arm also sets _UNSLOTH_FLASHINFER_UNUSABLE."""
+    """sys.modules block and engine arg must agree; each block arm sets _UNSLOTH_FLASHINFER_UNUSABLE."""
     source = inspect.getsource(vllm_utils.load_vllm)
     blocks = source.count("_block_flashinfer_import()")
     flags = source.count("_UNSLOTH_FLASHINFER_UNUSABLE = True")
@@ -147,8 +146,7 @@ def test_installed_vllm_accepts_the_argument_or_the_filter_drops_it():
     [((7, 0), False), ((7, 5), False), ((8, 0), True), ((9, 0), True), ((10, 0), True)],
 )
 def test_flash_attn_is_only_pinned_from_ampere_up(monkeypatch, capability, expected):
-    """FLASH_ATTN needs compute capability 8.0+, and an explicit backend is a hard requirement, so pinning it on V100 or
-    T4 makes a working XFORMERS run fail at startup."""
+    """FLASH_ATTN needs SM 8.0+; pinning it on V100 or T4 breaks a working XFORMERS run."""
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: capability)
@@ -232,8 +230,7 @@ def test_the_unblock_is_the_first_thing_delete_vllm_does():
 
 
 def _load_vllm_failure_arm():
-    """The except BaseException arm of the try that wraps load_vllm's whole engine build. Inner retry loops have their
-    own except BaseException arms, so the first one in the text is not necessarily this one."""
+    """except BaseException covers load_vllm's whole engine build; inner retry loops have their own arms."""
     source = textwrap.dedent(inspect.getsource(vllm_utils.load_vllm))
     fn = ast.parse(source).body[0]
     arms = [
@@ -268,8 +265,7 @@ def test_return_args_does_not_leave_flashinfer_blocked():
 # ------------------------------------------------- MLA models need an MLA backend
 
 def test_an_mla_config_is_not_pinned_to_flash_attn(monkeypatch):
-    """Under MLA, platforms/cuda.py's priority list holds only MLA backends and validate_configuration rejects an
-    is_mla() mismatch, so a pinned FLASH_ATTN on DeepSeek-V2/V3 fails startup."""
+    """Under MLA only MLA backends apply; pinned FLASH_ATTN fails startup for DeepSeek-V2/V3."""
     monkeypatch.delenv("VLLM_MLA_DISABLE", raising = False)
     deepseek = types.SimpleNamespace(kv_lora_rank = 512)
     assert vllm_utils._config_uses_mla(deepseek) is True
@@ -314,8 +310,7 @@ def test_the_pin_is_gated_on_both_the_device_and_the_config():
 
 
 def test_an_mla_model_gets_an_mla_backend_not_nothing(monkeypatch):
-    """The engine arg is the only exclusion that survives into a spawned EngineCore; dropping it for MLA lets the worker
-    re-probe FlashInfer and pick FLASHINFER_MLA, reintroducing the missing-nvcc failure."""
+    """Only the engine arg survives spawn; dropping it for MLA lets FLASHINFER_MLA come back."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:")
     window = source[marker:marker + 500]
@@ -373,7 +368,6 @@ def test_a_second_failed_load_keeps_a_live_engine_s_block(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
     vllm_utils._block_flashinfer_import()
     monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_UNUSABLE", True, raising = False)
-    # One engine is alive and owns the block.
     monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_BLOCK_OWNERS", 1, raising = False)
 
     window = _load_vllm_failure_arm()
@@ -396,7 +390,6 @@ def test_a_successful_load_takes_ownership():
     assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1" in source, (
         "a successful engine never registers its dependence on the block"
     )
-    # Only when something was actually blocked.
     take = source.index("_UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1")
     assert "if _UNSLOTH_FLASHINFER_UNUSABLE:" in source[take - 200:take]
 

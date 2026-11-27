@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD=1 must reach the recompute projector too, else new logps (recompute) and old/ref logps
-(plain) differ by 16-bit head rounding on identical weights."""
+"""UNSLOTH_VLLM_FP32_LM_HEAD=1 must reach recompute, else logps differ by 16-bit head rounding."""
 
 import inspect
 import math
@@ -82,7 +81,6 @@ def test_recompute_fp32_head_matches_plain_fp32_head(bias, temperature):
         )
     assert (logps.double() - ref_logps).abs().max().item() < 1e-4
     assert (entropy.double() - ref_entropy).abs().max().item() < 1e-4
-    # new logps (recompute) and old / ref logps (plain) agree on identical weights.
     assert (logps - plain).abs().max().item() < 1e-5
 
 

@@ -69,8 +69,7 @@ def test_get_peft_model_records_the_choice():
 
 
 def test_use_gradient_checkpointing_false_also_clears_activation_checkpointing(monkeypatch, tmp_path):
-    """transformers >= 5.24 enables checkpointing from activation_checkpointing (gradient_checkpointing is its alias):
-    clearing only the alias left recomputation on in every training step."""
+    """transformers >= 5.24 reads activation_checkpointing; clearing only the alias left it on."""
     from transformers import TrainingArguments
     from unsloth_zoo.cpu import trainer
     monkeypatch.setattr(trainer, "available_ram", lambda: 0, raising = False)

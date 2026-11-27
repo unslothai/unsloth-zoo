@@ -353,6 +353,21 @@ def get_quant_type(config):
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+def _is_out_of_memory(error):
+    """True for a device or host out-of-memory error, also when a compile error carries it (inner_exception /
+    __cause__). An out-of-memory capability probe says nothing about the capability: record no verdict."""
+    oom = getattr(torch, "OutOfMemoryError", None)
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, MemoryError) or (isinstance(oom, type) and isinstance(error, oom)):
+            return True
+        if "out of memory" in str(error).lower():
+            return True
+        error = getattr(error, "inner_exception", None) or error.__cause__
+    return False
+
+
 def is_activation_checkpointing(model, default = False):
     """Whether activation (gradient) checkpointing is on for ``model``, read quietly.
 

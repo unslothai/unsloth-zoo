@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tokenizing an in-memory Dataset (from_dict / from_list) writes the result to a temp Arrow
-file, so it is memory-mapped instead of held in anonymous RAM; the rows are the same. CPU-only."""
+"""In-memory Dataset tokenizing writes a temp Arrow file: memory-mapped, same rows; CPU-only."""
 
 import os
 from types import SimpleNamespace

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests that merge_and_unload also slices the oversized expert-stack re-quantize, since a single bitsandbytes call
-aborts at csrc/ops.cu line 74; the cap is lowered and every call recorded."""
+"""Slices expert re-quantize in merge_and_unload; bitsandbytes aborts at csrc/ops.cu line 74."""
 
 from __future__ import annotations
 

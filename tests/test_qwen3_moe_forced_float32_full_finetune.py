@@ -139,7 +139,6 @@ print(json.dumps(errors))
 
 
 def test_float16_and_float32_models_in_two_threads_keep_their_own_norm_dtype(tmp_path):
-    # Failing before: the boundary dtype was one process-wide value, so a float32 model running between an fp16
-    # model's last layer and its final norm made that norm return float32 to the fp16 lm_head ("float != Half").
+    # Boundary dtype was process-wide, so an interleaved float32 model broke fp16 lm_head.
     got = _run(INTERLEAVED, str(tmp_path), zoo = True)
     assert got == {"half_dtype": "torch.float16"}, got

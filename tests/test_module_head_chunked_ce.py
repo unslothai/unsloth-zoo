@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A live PEFT adapter on lm_head is scored through the head's own forward. That forward now runs per chunk of
-labelled rows with each chunk's gradients taken in forward, so the full logits never exist: loss and every
-gradient must match the all-rows path (UNSLOTH_CHUNKED_MODULE_HEAD=0) (CPU, float64)."""
+"""Chunked lm_head forward for live PEFT adapters: full logits never exist, and loss and grads must
+match the all-rows path (UNSLOTH_CHUNKED_MODULE_HEAD=0), on CPU float64."""
 
 import copy
 
@@ -222,8 +221,7 @@ def _fp16_case(monkeypatch, chunked, scaling = None):
 
 
 def test_fp16_without_a_grad_scaler_keeps_the_all_rows_forward(monkeypatch):
-    # Flip: chunked, the upstream factor reached the float16 per-chunk gradients only after they were rounded
-    # (bias error 0.15 against 0.007 all rows); without a loss scale the head now keeps the all-rows forward.
+    # No loss scale: fp16 keeps all-rows, since chunked grads round before the upstream factor.
     want, _ = _fp16_case(monkeypatch, chunked = False)
     got, engaged = _fp16_case(monkeypatch, chunked = True)
     torch.testing.assert_close(got, want, rtol = 1e-3, atol = 0)

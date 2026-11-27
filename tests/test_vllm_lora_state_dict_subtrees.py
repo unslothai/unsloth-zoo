@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_lora_state_dict must equal the LoRA slice of model.state_dict() without running the base layers'
-_save_to_state_dict (a bitsandbytes Linear4bit packs its QuantState there, with a GPU sync)."""
+"""_lora_state_dict: LoRA slice of state_dict() minus base _save_to_state_dict (bnb GPU sync)."""
 import pytest
 import torch
 import torch.nn as nn

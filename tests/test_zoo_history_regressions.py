@@ -15,8 +15,7 @@ import importlib
 import pytest
 
 
-# A missing comma in temporary_patches/utils.py __all__ silently concatenates literals (raise_errorUnpack), so names
-# fail under `from ... import *` with no syntax error; commit 2e36f32, issue 617.
+# A missing comma in __all__ concatenates literals silently, breaking `import *` (issue 617).
 
 
 def test_temporary_patches_utils_all_entries_are_valid_attributes():
@@ -37,8 +36,7 @@ def test_temporary_patches_utils_all_entries_are_valid_attributes():
 
 
 def test_temporary_patches_utils_no_concatenated_all_entries():
-    """No `__all__` entry may be two jammed names like `raise_errorUnpack`: flagged only when a name has both an
-    underscore and a lowercase-to-uppercase transition; pure ALL_CAPS like `KWARGS_TYPE` is not flagged."""
+    """Flags jammed names (`raise_errorUnpack`), not pure ALL_CAPS (`KWARGS_TYPE`)."""
     from unsloth_zoo.temporary_patches import utils
     import re
 
@@ -72,15 +70,10 @@ def test_temporary_patches_utils_known_public_names_present():
         )
 
 
-# higher_precision_softmax must be idempotent: a second run appended a duplicate .to(x.dtype).to(x.dtype) since the
-# rewritten lookahead was missing; it may re-run mid-training (e.g. checkpoint reload), so emitted source must not
-# drift; commit f98dbbc, PR 631.
+# higher_precision_softmax re-runs must not append a duplicate .to(x.dtype) cast (PR 631).
 
 
 def test_higher_precision_softmax_idempotent():
-    """`higher_precision_softmax(higher_precision_softmax(src))` must
-    equal `higher_precision_softmax(src)`.
-    """
     from unsloth_zoo.compiler import higher_precision_softmax
 
     # Sample source pulled from the docstring of the function itself.
@@ -117,8 +110,7 @@ def test_higher_precision_softmax_does_not_double_cast():
     )
 
 
-# device_synchronize and device_empty_cache must not raise on partial torch backends, e.g. torch.xpu present but
-# torch.xpu.synchronize raising (e08c1df, 35dc451).
+# device_synchronize/device_empty_cache must not raise on partial backends (xpu sync raises).
 
 
 def test_device_synchronize_tolerates_partial_backend():
@@ -143,8 +135,7 @@ def test_device_type_module_has_expected_helpers():
     )
 
 
-# RL_REPLACEMENTS is rebuilt per definition, so a missing `RL_REPLACEMENTS[name] = fn` after the GRPO refactor fails
-# silently; pins public-API keys (commits 466334c, 9829ade, 035f...); test_rl_replacements_cpu.py covers IO.
+# Missing `RL_REPLACEMENTS[name] = fn` after the GRPO refactor fails silently; pins API keys.
 
 
 def test_rl_replacements_registration_survived_grpo_refactor():
@@ -164,8 +155,7 @@ def test_rl_replacements_registration_survived_grpo_refactor():
     )
 
 
-# With config._attn_implementation == 'flex_attention' inference passes a BlockMask into eager attention, crashing on +=
-# with TypeError; AST guards on wrap.return_attention_mask and patch_GptOssModel; PR 690, latent since commit ef819214.
+# BlockMask from flex_attention reaches eager attention, crashing with TypeError on +=; PR 690.
 
 
 def test_gpt_oss_wrap_has_flex_attention_inference_guard():
@@ -204,8 +194,7 @@ def test_gpt_oss_wrap_has_flex_attention_inference_guard():
 
 
 def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
-    """Patched GptOssModel.forward needs its own _attn_implementation == 'flex_attention' guard, independent of wrap's,
-    so removing the forward-level swap fails this test."""
+    """Patched forward needs its own _attn_implementation == 'flex_attention' guard, not wrap's"""
     import ast
     import inspect
     from unsloth_zoo.temporary_patches import gpt_oss as _M
@@ -233,9 +222,7 @@ def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
     )
 
 
-# transformers 5.x KV cache pre-allocation can exceed the causal mask width (k=161 vs 128), so attn_weights +=
-# attention_mask raises RuntimeError on dim 3; _align_kv_to_mask trims to the shorter length and must run in both eager
-# forwards; PR 691.
+# 5.x KV pre-alloc exceeds the mask: both eager forwards must call _align_kv_to_mask (PR 691).
 
 
 def test_gpt_oss_eager_attention_aligns_kv_to_mask():
@@ -277,8 +264,7 @@ def test_gpt_oss_eager_attention_aligns_kv_to_mask():
     )
 
 
-# Patched GptOssModel.forward hard-coded 4.x mask kwargs (input_embeds, cache_position) and broke on 5.x (renamed
-# inputs_embeds, dropped cache_position); PR 690 added inspect-driven kwarg filtering for both.
+# Hard-coded 4.x mask kwargs broke when 5.x renamed/dropped them; PR 690 filters via inspect.
 
 
 def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
@@ -299,9 +285,7 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
     )
 
 
-# patch_compiling_bitsandbytes used exec plus eval, which raised NameError under PEP 667 (Python 3.13+) with
-# bitsandbytes < 0.46.0; now importlib (source 710, issue 311). Tests stub bitsandbytes and peft in sys.modules, so no
-# GPU is needed.
+# Exec+eval raised NameError on Python 3.13+ (PEP 667) with bitsandbytes < 0.46.0; issue 311.
 
 
 def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
@@ -348,7 +332,6 @@ def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
         ]:
             monkeypatch.setitem(sys.modules, name, mod)
     else:
-        # A peft package whose submodules cannot be imported: no __path__.
         peft = types.ModuleType("peft")
         monkeypatch.setitem(sys.modules, "peft", peft)
         for name in ["peft.tuners", "peft.tuners.lora", "peft.tuners.lora.bnb"]:
@@ -358,8 +341,7 @@ def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
 
 
 def test_patch_compiling_bitsandbytes_old_bnb_wraps_without_nameerror(monkeypatch):
-    """Guards issue 311: with bitsandbytes < 0.46.0 the patch must not raise NameError from exec/eval namespace loss on
-    Python 3.13+ and must dynamo-disable every forward on both target modules."""
+    """Issue 311: no NameError on Python 3.13+ with bnb < 0.46.0; forwards dynamo-disabled."""
     from unsloth_zoo.patching_utils import patch_compiling_bitsandbytes
 
     bnb_modules, peft_leaf = _install_fake_bnb_and_peft(monkeypatch, "0.45.5")
@@ -415,8 +397,7 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
     )
 
 
-# Gemma-4 E-series KV sharing under use_cache=False and gradient checkpointing (transformers issue 45242); these lock
-# the zoo fix in and check its invariants on CPU.
+# Gemma-4 E-series KV sharing: use_cache=False plus checkpointing (transformers issue 45242).
 def test_gemma4_kv_shared_patches_registered():
     """Both patch functions stay registered AND wire the carrier (not bare return stubs)."""
     import inspect
@@ -614,7 +595,6 @@ def test_gemma4_pristine_checkpoint_recovered_via_set_once_capture(monkeypatch):
 
     real = _ckpt.checkpoint  # genuine torch fn in the test process (no shim installed)
 
-    # Force the "late import" path: no import-captured pristine available.
     monkeypatch.setattr(g4, "_PRISTINE_TORCH_CHECKPOINT", None, raising=False)
     monkeypatch.delattr(_ckpt, "_unsloth_pristine_checkpoint", raising=False)
 
@@ -704,9 +684,8 @@ def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
     assert getattr(m_eval, "_unsloth_gemma4_carrier_outstanding", False) is False
 
 
-# Gpt-oss bnb-4bit <-> 16bit compiled-cache switch: a stale BnB module re-installs the BnB router ('weights not
-# initialized'); patch_gpt_oss_bnb4bit_auto must restore stock classes and invalidate on non-bnb4bit loads, and drop
-# stale stock modules when switching into bnb.
+# Stale BnB module re-installs the BnB router; patch_gpt_oss_bnb4bit_auto must restore stock
+# classes, invalidate on non-bnb4bit loads, and drop stale stock modules when switching into bnb.
 
 
 def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path, monkeypatch):

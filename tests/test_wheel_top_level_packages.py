@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Wheel ships only unsloth_zoo and unsloth_zoo_downloads at top level; auto-discovery shipped top-level tests and
-scripts, names shared with other wheels, so an uninstall could delete their files; the Hub helpers import
-unsloth_zoo_downloads without unsloth_zoo's package init."""
+"""Only unsloth_zoo and unsloth_zoo_downloads top-level; else uninstall may delete other wheel files."""
 import os
 import sys
 

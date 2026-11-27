@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""requires_grad_for_gradient_checkpointing drops older requires-grad hooks but must keep with_kwargs = True
-registration; re-registering Unsloth's inputs_embeds pre-hook without it makes the next forward raise TypeError
-(Qwen3-VL / Qwen3.5 vision towers)."""
+"""Keeps with_kwargs=True on re-registered hooks, else Qwen3-VL/Qwen3.5 raise TypeError."""
 
 import torch
 
@@ -67,7 +65,6 @@ def test_kept_kwargs_pre_hook_still_gets_kwargs():
 
     model.visual.register_forward_pre_hook(make_inputs_embeds_require_grads, with_kwargs = True)
     requires_grad_for_gradient_checkpointing(model)
-    # The tower got the fallback pre-hook, and the existing kwargs hook was re-registered.
     names = [getattr(h, "__name__", "") for h in model.visual._forward_pre_hooks.values()]
     assert "requires_grad_pre_hook" in names, names
     model(hidden_states = torch.randn(2, 4))

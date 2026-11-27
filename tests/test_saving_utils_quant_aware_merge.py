@@ -113,7 +113,6 @@ def test_fp8_weight_writes_data_and_scale():
     )
     assert ok is True
 
-    # Two writes: the scale companion first (extra_writes), then the data.
     assert len(mm.writes) == 2
     keys = [w[0] for w in mm.writes]
     assert keys == [

@@ -144,8 +144,7 @@ def _mask(dataset):
 
 @pytest.mark.parametrize("fmt", [None, "numpy", "torch"])
 def test_masked_split_matches_the_row_by_row_scan(monkeypatch, fmt, capsys):
-    # The two runs' logs are compared, so the worker count must not depend on free RAM read at each call: a dip
-    # between them adds "not enough free memory ... tokenizing in-process" to only one log. In-process here.
+    # Worker count must not read free RAM per call, or a dip warns in only one compared log.
     monkeypatch.setenv(dataset_num_proc.NUM_PROC_ENV_VAR, "0")
     dataset = Dataset.from_dict({"input_ids": _token_rows(4000, 5)})
     if fmt is not None: dataset = dataset.with_format(fmt)

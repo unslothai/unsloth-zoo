@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A fused MoE expert stack quantized in place (bare Params4bit) dequantizes to quant_state.dtype, like a Linear4bit
-weight. A pre-quantized checkpoint stores the dtype it was made in (unsloth/Inkling-2-Mini-unsloth-bnb-4bit:
-bfloat16), so on a float16 GPU its experts dequantized in bfloat16: on Kaggle 2x T4, 36.5 s per step against 25.4 s
-for the quantize-on-load path, 1.2 GB more memory per card and different losses. patch_model_and_tokenizer now
-gives bare stacks the compute dtype, as it does for Linear4bit; forced float32 keeps them as loaded."""
+"""Bare Params4bit expert stacks dequantize to quant_state.dtype; patch_model_and_tokenizer uses the
+compute dtype like Linear4bit (pre-quantized bf16 checkpoints on fp16 GPUs gave bf16 experts:
+slower, more memory, different losses); forced float32 keeps loaded dtype."""
 
 import pytest
 import torch

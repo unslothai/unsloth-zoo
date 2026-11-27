@@ -73,7 +73,6 @@ def test_repeated_patch_wraps_capture_once(monkeypatch, version):
         collects.clear()
         result = runner().capture_model()
         assert result in ("captured", "captured_v0")
-        # gc.collect is suppressed while the original capture runs, and restored after.
         assert captures and captures[0] is not gc.collect
         assert gc.collect.__name__ == "collect"
         # Main ran this once per patch_vllm() call: 4 here.

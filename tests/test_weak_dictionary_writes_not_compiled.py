@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dynamo must not compile weakref.__setitem__: its exhausted recompile budget (1030 compiles vs limit 1024) on
-gemma-4-E2B-it T4 broke activation checkpoint; skipping the four marked code objects lets the run complete (Kaggle
-danielhanchen/unsloth-t4-ci-e29ca7f0)."""
+"""Dynamo must not compile weakref.__setitem__: exhausted recompile budget broke activation checkpoint."""
 
 import sys
 from pathlib import Path
@@ -48,8 +46,7 @@ def test_every_weak_dictionary_writer_is_marked():
 
 
 def test_the_marked_frames_are_never_compiled():
-    """No Dynamo cache entry for the four marked frames via the accessor; weaker than it looks, since interception
-    depends on how frames are reached; the invariant holds either way."""
+    """No Dynamo cache entry for the marked frames via the accessor; weaker than it looks."""
     import weakref
     from torch._dynamo.eval_frame import _debug_get_cache_entry_list
 

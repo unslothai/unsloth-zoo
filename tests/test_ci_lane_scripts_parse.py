@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""Concurrent CI lanes must parse as whole shell with every pytest file present: a double-backslash continuation
-silently left twenty files out of the run; bash -n plus a file-count check guard it."""
+"""A double-backslash continuation dropped twenty files; bash -n and a file count guard it."""
 
 from __future__ import annotations
 

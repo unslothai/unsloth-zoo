@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Prompt/completion rows in sft_prepare_dataset cut to max_length like TRL: truncation_mode picks the side and
-max_length=None is no limit (it used to raise TypeError); CPU-only, offline."""
+"""Prompt/completion rows cut like TRL (truncation_mode picks side); max_length=None: no limit."""
 
 import pytest
 from datasets import Dataset

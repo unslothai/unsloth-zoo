@@ -42,8 +42,7 @@ PIXELS = torch.randn(int(GRID.prod(-1).sum()), P, generator = torch.Generator().
 
 
 class _VLM(torch.nn.Module):
-    """Images enter at their IMG slots through a trainable projector; a causal running mean carries them into the
-    completion, so every completion log-prob depends on its own row's images and on no other row's."""
+    """Images enter at IMG slots via a projector; a causal running mean keeps rows independent."""
 
     def __init__(self, dtype = torch.float32):
         super().__init__()
