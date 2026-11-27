@@ -302,25 +302,31 @@ def _decode(b, j, jh, m, tab, TYPE: tl.constexpr):
 @triton.jit
 def _tile3(P, rows, blk0, rmask, row_bytes, nblk, tab,
            TYPE: tl.constexpr, QK: tl.constexpr, BS: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr):
-    """Decoded float32 tile (rows, NB blocks, QK // G8, G8) of a packed matrix starting at block ``blk0``, G8 = 8
-    values per group (1 for one-value blocks). Block fields load once per (row, block), group fields once per 8
-    values, and index math runs on the in-block index only. SPLIT=False keeps one value per group (the reshape
-    into a dot operand is cheaper; group fields then load per value)."""
-    G8: tl.constexpr = 8 if (QK >= 8 and SPLIT) else 1
+    """Decoded float32 tile (rows, NB blocks, G groups, QK // G values) of a packed matrix starting at block
+    ``blk0``. SPLIT: 8-value groups, so group fields load once per 8 values; else one group of the whole block on
+    the last axis (cheaper to reshape into a dot operand; group fields then load per value). Block fields load once
+    per (row, block); index math runs on the in-block index only."""
+    G: tl.constexpr = QK // 8 if (QK >= 8 and SPLIT) else 1  # groups per block
+    W: tl.constexpr = QK // G  # values per group, on the last (contiguous) axis
     blk = blk0 + tl.arange(0, NB)
     b = P + rows.to(tl.int64)[:, None, None, None] * row_bytes + (blk * BS)[None, :, None, None]
     m = rmask[:, None, None, None] & (blk < nblk)[None, :, None, None]
-    jh = (tl.arange(0, QK // G8) * G8)[None, None, :, None]
-    j = jh + tl.arange(0, G8)[None, None, None, :]
+    if G > 1:
+        jh = (tl.arange(0, G) * W)[None, None, :, None]
+        j = jh + tl.arange(0, W)[None, None, None, :]
+    else:
+        j = tl.arange(0, W)[None, None, None, :]
+        jh = j
     return _decode(b, j, jh, m, tab, TYPE)
 
 
 @triton.jit
 def _cols(blk0, QK: tl.constexpr, NB: tl.constexpr, SPLIT: tl.constexpr):
-    """Column index of every value of a ``_tile3`` tile, shape (1, NB, QK // G8, G8)."""
-    G8: tl.constexpr = 8 if (QK >= 8 and SPLIT) else 1
-    jh = (tl.arange(0, QK // G8) * G8)[None, None, :, None]
-    return (blk0 + tl.arange(0, NB))[None, :, None, None] * QK + jh + tl.arange(0, G8)[None, None, None, :]
+    """Column index of every value of a ``_tile3`` tile, shape (1, NB, G, QK // G)."""
+    G: tl.constexpr = QK // 8 if (QK >= 8 and SPLIT) else 1
+    W: tl.constexpr = QK // G
+    jh = (tl.arange(0, G) * W)[None, None, :, None]
+    return (blk0 + tl.arange(0, NB))[None, :, None, None] * QK + jh + tl.arange(0, W)[None, None, None, :]
 
 
 @triton.jit
@@ -349,8 +355,8 @@ def gemv_kernel(
     rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     rmask = rows < N
     nblk = K // QK
-    G8: tl.constexpr = 8 if (QK >= 8 and SPLIT) else 1
-    acc = tl.zeros((BLOCK_N, NB, QK // G8, G8), dtype = tl.float32)
+    G: tl.constexpr = QK // 8 if (QK >= 8 and SPLIT) else 1
+    acc = tl.zeros((BLOCK_N, NB, G, QK // G), dtype = tl.float32)
     for blk0 in range(0, nblk, NB):
         cols = _cols(blk0, QK, NB, SPLIT)
         x = tl.load(X + cols, mask = cols < K, other = 0.0).to(tl.float32)
