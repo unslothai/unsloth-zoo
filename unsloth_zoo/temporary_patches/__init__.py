@@ -73,6 +73,7 @@ from .fp8_uncontained_weights import *
 from .fp8_partial_block_dequant import *
 from .flex_attention_bwd import *
 from .inductor_stride_guard import *
+from .inductor_nonowning_inplace import *
 from .remote_code_vlm import *
 # Eager-fallback hook unsloth calls when backward dies inside activation checkpointing; imported by name since utils
 # exports names this package never re-exports.
