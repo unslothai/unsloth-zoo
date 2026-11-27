@@ -585,6 +585,10 @@ def _restartable(layer):
     layer.__class__ = sub
 
 
+class _GraphToken:
+    """Pinned on an autograd node's metadata: its weak reference dies with that graph."""
+
+
 def _fall_back_to_eager_on_compile_error(layers):
     """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
     patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
@@ -599,11 +603,11 @@ def _fall_back_to_eager_on_compile_error(layers):
     # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
     # compiled (an eagerly retried one must recompute eagerly).
     pending = {}
-    # id(layer) -> [weak reference to the input, backpropagated] of forwards rerun eagerly after an out-of-memory
-    # compiled call. While any is alive the layer runs eagerly, as after a compile failure, and a recomputation that
-    # matches no queued compiled forward replays eagerly too, so checkpoints never mix modes. An entry ends with its
-    # input, or when a later forward reuses that input after the entry's backward ran (the next step); then the layer
-    # compiles again.
+    # id(layer) -> weak references to tokens pinned on the autograd graph (grad_fn.metadata) of forwards rerun eagerly
+    # after an out-of-memory compiled call: a token lives exactly as long as that forward's graph, so as long as its
+    # checkpoint can still recompute (retain_graph included). While any lives the layer runs eagerly, as after a
+    # compile failure, and a recomputation that matches no queued compiled forward replays eagerly too, so checkpoints
+    # never mix modes; once every such graph is freed the layer compiles again.
     eager_window = {}
 
     def first_tensor(args, kwargs = None):
@@ -628,15 +632,8 @@ def _fall_back_to_eager_on_compile_error(layers):
     def window_open(key):
         entries = eager_window.get(key)
         if entries:
-            entries[:] = [entry for entry in entries if entry[0]() is not None]
+            entries[:] = [ref for ref in entries if ref() is not None]
         return bool(entries)
-
-    def retire(key, args, kwargs):
-        # A forward on an input whose eager retry has already been backpropagated starts a new step.
-        x = first_tensor(args, kwargs)
-        entries = eager_window.get(key)
-        if entries and x is not None:
-            entries[:] = [entry for entry in entries if not (entry[1] and entry[0]() is x)]
 
     def take(key, args, kwargs = None):
         entries = pending.get(key)
@@ -671,16 +668,14 @@ def _fall_back_to_eager_on_compile_error(layers):
 
     def eager_once(key, layer, args, kwargs):
         out = layer._call_impl(*args, **kwargs)
-        x = first_tensor(args, kwargs)
-        if not _in_backward() and checkpointed(layer) and x is not None:
-            entries = [entry for entry in eager_window.get(key, ()) if entry[0]() is not None]
-            if not any(entry[0]() is x for entry in entries):  # one entry per input
-                entry = [weakref.ref(x), False]
-                y = first_tensor((out,))
-                if y is not None and y.requires_grad:
-                    y.register_hook(lambda grad, entry = entry: entry.__setitem__(1, True))
-                entries.append(entry)
-            eager_window[key] = entries
+        y = first_tensor((out,))
+        node = getattr(y, "grad_fn", None)
+        metadata = getattr(node, "metadata", None)
+        if not _in_backward() and checkpointed(layer) and isinstance(metadata, dict):
+            token = _GraphToken()
+            metadata.setdefault("_unsloth_eager_retry", []).append(token)
+            window_open(key)  # prune freed graphs
+            eager_window.setdefault(key, []).append(weakref.ref(token))
         return out
 
     def checkpointed(layer):
@@ -707,8 +702,6 @@ def _fall_back_to_eager_on_compile_error(layers):
                 # Not a queued compiled forward while eager retries are outstanding: every forward since ran eagerly,
                 # so this recomputation does too.
                 return _layer._call_impl(*args, **kwargs)
-            if not backward and eager_window.get(key):
-                retire(key, args, kwargs)
             if _layer.__dict__.pop("_unsloth_eager_once", False) or (not backward and window_open(key)):
                 return eager_once(key, _layer, args, kwargs)  # the restart after an out-of-memory compiled call
             if state["eager"] or _carries_cache(args, kwargs):

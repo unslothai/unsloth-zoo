@@ -347,3 +347,25 @@ def test_cpu_loader_reused_input_does_not_hold_the_eager_window_open(capsys):
         layer(x).square().sum().backward()
     assert len(calls) == 100  # one OOM call rerun eagerly, every later step compiled
     assert "training eagerly" not in capsys.readouterr().out
+
+
+def test_cpu_loader_retained_checkpoint_replays_eagerly_after_a_later_forward(capsys):
+    # A retained eager checkpoint, then another forward on the same input: the retained graph can still recompute, so
+    # the layer stays eager until it is freed, and its second backward replays eagerly.
+    import torch.utils.checkpoint as checkpoint
+    from unsloth_zoo.cpu import loader
+
+    torch.manual_seed(0)
+    block = _KeywordBlock()
+    calls = _oom_once_then(block)
+    loader._fall_back_to_eager_on_compile_error([block])
+    h = torch.randn(4, 8, requires_grad = True)
+    loss = checkpoint.checkpoint(block, h, use_reentrant = False).square().sum()
+    loss.backward(retain_graph = True)
+    checkpoint.checkpoint(block, h, use_reentrant = False).square().sum().backward()
+    loss.backward()
+    assert len(calls) == 1  # nothing compiled while the retained graph lived
+    del loss
+    checkpoint.checkpoint(block, h, use_reentrant = False).square().sum().backward()
+    assert len(calls) == 3  # freed: compiled again, forward and recompute
+    assert "training eagerly" not in capsys.readouterr().out
