@@ -355,15 +355,6 @@ def _kv_shared_layers(layers):
 _CKPT_SHIMS = ("unsloth_checkpoint", "unsloth_gradient_checkpoint", "unsloth_offloaded_gradient_checkpoint")
 
 
-def _saved_attention_armed():
-    saved = sys.modules.get("unsloth_zoo.saved_attention")
-    requested = getattr(saved, "save_attention_requested", None)
-    try:
-        return bool(requested()) if requested is not None else False
-    except Exception:
-        return True
-
-
 def _unsloth_checkpoint_function():
     """Unsloth's smart gradient checkpointing is patched in: torch's reentrant checkpoint and unsloth_checkpoint
     both run UnslothCheckpointFunction (offloaded inputs, MoE routing frames)."""
@@ -373,11 +364,12 @@ def _unsloth_checkpoint_function():
 @contextmanager
 def _unsloth_frames(layer, x, swapper = None):
     """Around the window's no-grad forward of a layer whose checkpoint is Unsloth's (a shim, or torch's reentrant
-    checkpoint once Unsloth's CheckpointFunction is patched in). Yields [refusal reason or None, routing frame]:
+    checkpoint once Unsloth's CheckpointFunction is patched in). Yields [refusal reason or None, routing frame,
+    (scope, saved-attention frame) or None]:
     standard training gives that checkpoint a MoE routing frame its recompute replays, and UnslothCheckpointFunction
     may store a float32 input in bfloat16 for its recompute. The window does neither, so an input stored that way
     is refused up front and a layer that records routing in the frame is refused after its forward."""
-    state = [None, None]
+    state = [None, None, None]
     gc = sys.modules.get("unsloth_zoo.gradient_checkpointing")
     fn = getattr(layer, "_gradient_checkpointing_func", None)
     for _ in range(4):
@@ -400,13 +392,23 @@ def _unsloth_frames(layer, x, swapper = None):
         state[0] = "Unsloth's checkpoint stores float32 layer inputs in bfloat16 for the recompute"
         yield state
         return
-    scope, new_frame = getattr(gc, "_checkpoint_routing_scope", None), getattr(gc, "_new_checkpoint_routing_frame", None)
-    frame = new_frame((x,)) if scope is not None and new_frame is not None else None
-    if frame is None:
-        yield state
-        return
-    state[1] = frame
-    with scope(frame, False):
+    with ExitStack() as stack:
+        scope, new_frame = getattr(gc, "_checkpoint_routing_scope", None), getattr(gc, "_new_checkpoint_routing_frame", None)
+        frame = new_frame((x,)) if scope is not None and new_frame is not None else None
+        if frame is not None:
+            state[1] = frame
+            stack.enter_context(scope(frame, False))
+        saved = sys.modules.get("unsloth_zoo.saved_attention")
+        new_attention = getattr(saved, "new_saved_attention_frame", None)
+        attention_scope = getattr(saved, "saved_attention_scope", None)
+        if not exact and new_attention is not None and attention_scope is not None:
+            # UnslothCheckpointFunction keeps the forward's attention outputs (UNSLOTH_GC_SAVE_ATTENTION, or its
+            # automatic mode at long sequences) for its recompute: the window keeps them the same way, one frame
+            # per layer and micro-batch, replayed by that recompute.
+            attention = new_attention((x,))
+            if attention is not None:
+                state[2] = (attention_scope, attention)
+                stack.enter_context(attention_scope(attention, False))
         yield state
 
 
@@ -415,8 +417,7 @@ def _checkpoint_mode(layer, swapper = None):
     function objects (identity, not names: functools.wraps copies those) are known: torch's checkpoint (current or
     the pristine one Unsloth keeps; what Unsloth's own layers carry), optionally a functools.partial binding nothing
     but use_reentrant, the checkpoint wrapper this block swap installed around it, and Unsloth's checkpoint shims
-    (reentrant; refused while saved-attention frames are armed, MoE routing checked per call). Anything else is
-    refused. no_grad_forward: standard training runs the
+    (reentrant; their MoE routing and saved-attention frames are handled per call). Anything else is refused. no_grad_forward: standard training runs the
     layer's forward without gradients (reentrant: use_reentrant True or unset, which torch resolves to True), so the
     window's no-grad forward and grad-mode recompute are exactly standard accumulation's, also where the two differ
     in the last bit (a compiled block's inference and training graphs)."""
@@ -436,10 +437,7 @@ def _checkpoint_mode(layer, swapper = None):
             continue
         if id(fn) in shim_fns:
             # Reentrant whatever use_reentrant says: a no-grad forward, then a grad-mode recompute from the kept
-            # (or offloaded and reloaded) input. Saved-attention frames hand the forward's attention to the
-            # recompute, which the window cannot; MoE routing frames are checked per call (_unsloth_frames).
-            if _saved_attention_armed():
-                return False, "Unsloth's checkpoint keeps saved-attention frames the window cannot replay"
+            # (or offloaded and reloaded) input. Their routing / saved-attention frames: _unsloth_frames.
             return True, None
         if _stock_checkpoint(fn):
             return reentrant is None or reentrant is True, None
@@ -510,6 +508,7 @@ class _Window:
         self.last_version = [None] * n
         self.h0 = [None] * n
         self.saved = [[None] * n for _ in range(self.L)]
+        self.attention = [[None] * n for _ in range(self.L)]   # (scope, saved-attention frame) per call
         # Every layer's output as the model sees it: a leaf, so a loss on intermediate hidden states (and the
         # loss part on the last one) leaves its gradient there for the backward.
         self.outs = [[None] * n for _ in range(self.L)]
@@ -627,6 +626,7 @@ class _Window:
             out = orig_call(layer, *args2, **kwargs2)
         if frames[1] is not None and frames[1].entries:
             self._abort("a decoder layer routes MoE experts under Unsloth's checkpoint, whose recompute replays it")
+        self.attention[l][m] = frames[2]
         out_h, rebuild = _split_output(out)
         if out_h is None:
             self._abort("a decoder layer output that is not the hidden states (or a tuple led by them)")
@@ -712,6 +712,7 @@ class _Window:
             try:
                 for m in range(self.n):
                     saved, self.saved[l][m] = self.saved[l][m], None
+                    attention, self.attention[l][m] = self.attention[l][m], None
                     leaf, self.outs[l][m] = self.outs[l][m], None
                     # The loss part's gradient on the last output, or a loss on an intermediate one.
                     extra = leaf.grad if leaf is not None else None
@@ -724,7 +725,8 @@ class _Window:
                     args2, kwargs2, where, ac, rng, metadata = saved
                     x = args2[0] if where == 0 else kwargs2[where]
                     x.requires_grad_(True)
-                    with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng):
+                    with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng), \
+                            (attention[0](attention[1], True) if attention is not None else nullcontext()):
                         out = orig_call(layer, *args2, **kwargs2)
                     out_h, _ = _split_output(out)
                     if out_h is None or not out_h.requires_grad or leaf is None or \
