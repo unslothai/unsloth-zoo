@@ -482,6 +482,106 @@ def _pin_omp_env(threads):
         os.environ["OMP_NUM_THREADS"] = str(max(1, int(threads)))
 
 
+@functools.cache
+def _cpu_vendor():
+    """Lower-cased CPU vendor string ("authenticamd", "genuineintel", ...; "" when unknown)."""
+    try:
+        with open("/proc/cpuinfo", "r", encoding = "utf-8", errors = "ignore") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                if key.strip().lower() == "vendor_id":
+                    return value.strip().lower()
+    except OSError:
+        pass
+    # Windows: "AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD".
+    return (platform.processor() or "").lower()
+
+
+@functools.cache
+def _cpu_family_model():
+    """(x86 family, model) from /proc/cpuinfo or the Windows processor string; None when unknown."""
+    family = model = None
+    try:
+        with open("/proc/cpuinfo", "r", encoding = "utf-8", errors = "ignore") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                key = key.strip().lower()
+                if key == "cpu family" and family is None:
+                    family = int(value)
+                elif key == "model" and model is None:
+                    model = int(value)
+                if family is not None and model is not None:
+                    return family, model
+    except (OSError, ValueError):
+        pass
+    import re
+    found = re.search(r"family\s+(\d+)\s+model\s+(\d+)", platform.processor() or "", re.I)
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+# Zen 4 models of family 25 (Genoa / Raphael / Phoenix / Bergamo / Siena): kept at the training count like Zen 5
+# (family 26, EPYC 9V45), whose siblings slowed decode by 4-13%; Zen 4 itself was not measured.
+_ZEN4_MODELS = (range(0x10, 0x20), range(0x60, 0x80), range(0xA0, 0xB0))
+
+
+def _zen3():
+    """Family 25 outside the Zen 4 models (Milan, Vermeer, Cezanne, Rembrandt): the class the decode SMT gain was
+    measured on. A cloud VM can hide a Zen 4 part's AVX-512 / bf16 (an EPYC 9V74 runner exposing only AVX2), so the
+    family / model decides, not the flags."""
+    fm = _cpu_family_model()
+    return fm is not None and fm[0] == 25 and not any(fm[1] in r for r in _ZEN4_MODELS)
+
+
+def _logical_cpus():
+    """Logical CPUs (SMT siblings counted) in the affinity mask, quota-capped on Linux; os.cpu_count() elsewhere."""
+    if sys.platform.startswith("linux"):
+        try:
+            cpus = len(_process_affinity())
+        except (AttributeError, OSError):
+            return None
+        try:
+            quota = _cgroup_cpu_limit()
+        except Exception:
+            quota = None
+        return max(1, min(cpus, quota) if quota else cpus)
+    return os.cpu_count()
+
+
+# Fitted counts a rollout may widen: the defaults, not a user's, a launcher's or a quota's.
+_ROLLOUT_WIDEN_REASONS = ("default", "physical cores")
+
+
+def rollout_threads():
+    """torch threads for CPU generate (decode, GRPO rollouts), or None to keep the training count.
+
+    Training uses one thread per physical core (SMT siblings made SFT and GRPO 13-20% slower). Decoding is batched
+    GEMVs that stream every weight per token, and on AMD Zen 3 without native bf16 (EPYC 7763) the siblings help it:
+    2-core x 2-SMT EPYC 7763 runners decoded Qwen3-0.6B GRPO rollouts about 35% faster on 4 threads with training
+    left at 2 (step -19 to -21% on Windows, -10% on Linux), while Zen 5 (EPYC 9V45) was 4-13% slower and Intel and
+    Zen 4 were not measured, so only Zen 3 widens. UNSLOTH_CPU_ROLLOUT_THREADS=N sets the count for every host, 0 keeps the training count."""
+    import torch
+    explicit = os.environ.get("UNSLOTH_CPU_ROLLOUT_THREADS", "").strip().lower()
+    current = torch.get_num_threads()
+    if explicit:
+        try:
+            target = int(explicit)
+        except ValueError:
+            return None
+        return target if target > 0 and target != current else None
+    fitted = _THREADS_FITTED
+    if fitted is None or fitted[1] not in _ROLLOUT_WIDEN_REASONS or fitted[0] != current or _local_world_size() > 1:
+        return None
+    if platform.machine().lower() not in ("x86_64", "amd64") or "authenticamd" not in _cpu_vendor() or not _zen3():
+        return None
+    if cpu_bf16_supported():
+        return None
+    logical = _logical_cpus()
+    if not logical:
+        return None
+    target = min(logical, 2 * current, _DEFAULT_THREAD_CAP)
+    return target if target > current else None
+
+
 _CGROUP_ROOT = "/sys/fs/cgroup"
 _PROC_SELF_CGROUP = "/proc/self/cgroup"
 
