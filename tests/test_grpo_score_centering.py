@@ -316,6 +316,49 @@ def test_topk_head_logprobs_matches_full_softmax(softcap, mult, div, temp):
     assert (out - torch.log_softmax(lz / temp, -1).gather(-1, ids)).abs().max().item() < 1e-12
 
 
+@pytest.mark.parametrize("chunks", [1, 4, 9])
+def test_topk_head_logprobs_skips_positions_without_a_head(chunks, monkeypatch):
+    gen = torch.Generator().manual_seed(11)
+    R, T, H, V, k = 4, 9, 16, 97, 5
+    h = torch.randn(R, T, H, generator = gen, dtype = D64, requires_grad = True)
+    W = torch.randn(V, H, generator = gen, dtype = D64, requires_grad = True)
+    ids = torch.randint(0, V, (R, T, k), generator = gen)
+    lengths = [9, 3, 0, 6]  # row 2 unmatched
+    for r, n in enumerate(lengths):
+        ids[r, n:] = -1
+    ids[3, 2, 3:] = -1  # a short head keeps its position
+    seen = []
+    real = sc._head_chunk_logps
+
+    def counting(x, *a, **kw):
+        seen.append(x.shape[0])
+        return real(x, *a, **kw)
+
+    monkeypatch.setattr(sc, "_head_chunk_logps", counting)
+    out = sc.grpo_topk_head_logprobs(h, W, ids, chunks, temperature = 0.8)
+    kept = (ids >= 0).any(-1)
+    assert sum(seen) == int(kept.sum()) == sum(lengths)
+    assert max(seen) <= -(-R * T // min(chunks, R * T))  # rows per chunk do not grow
+    ref = torch.log_softmax(torch.nn.functional.linear(h, W) / 0.8, -1).gather(-1, ids.clamp_min(0))
+    assert (out[kept] - ref[kept]).abs().max().item() < 1e-12
+    assert (out[~kept] == 0).all()
+    mask = ids >= 0
+    gw = torch.randn(R, T, k, generator = gen, dtype = D64)
+    g1 = torch.autograd.grad(torch.where(mask, out * gw, 0.0).sum(), [h, W])
+    g2 = torch.autograd.grad(torch.where(mask, ref * gw, 0.0).sum(), [h, W])
+    for a, b in zip(g1, g2):
+        assert (a - b).abs().max().item() < 1e-12
+    none = sc.grpo_topk_head_logprobs(h, W, torch.full_like(ids, -1), chunks)
+    assert none.shape == (R, T, k) and (none == 0).all() and none.requires_grad
+    # Raw logits are not gathered (that would copy the [rows, V] input outside the checkpoints).
+    seen.clear()
+    logits = torch.nn.functional.linear(h, W).detach().requires_grad_()
+    raw = sc.grpo_topk_head_logprobs(logits, W, ids, chunks)
+    assert sum(seen) == R * T
+    ref_raw = torch.log_softmax(logits, -1).gather(-1, ids.clamp_min(0))
+    assert (raw[kept] - ref_raw[kept]).abs().max().item() < 1e-12
+
+
 class _LP:
     def __init__(self, logprob, rank):
         self.logprob, self.rank = logprob, rank
