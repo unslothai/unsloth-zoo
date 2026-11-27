@@ -899,7 +899,7 @@ def test_lane_projections_serve_a_family_with_no_exact_verifier(qwen_4bit, monke
 
 @pytest.fixture(scope = "module")
 def inkling2():
-    """Random 4-bit looped Inkling 2: only a loop passes speculative_verify to its expert layers."""
+    """Random quantized looped Inkling 2: only a loop passes speculative_verify to its expert layers."""
     import mlx.nn as nn
     from mlx.utils import tree_map
     language = pytest.importorskip("mlx_vlm.models.inkling2.language", reason = "mlx-vlm < 0.8.1 has no Inkling 2")
@@ -913,7 +913,9 @@ def inkling2():
     lm.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
                        if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, lm.parameters()))
     lm.set_dtype(mx.bfloat16)
-    nn.quantize(lm, group_size = 32, bits = 4, class_predicate = lambda path, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0)
+    # As Inkling-2-Mini-oQ4e quantizes: NVFP4 experts (the grouped kernel takes no other 4-bit mode), 8-bit affine elsewhere.
+    nn.quantize(lm, class_predicate = lambda path, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0 and (
+        dict(group_size = 16, bits = 4, mode = "nvfp4") if "switch_mlp" in path else dict(group_size = 64, bits = 8, mode = "affine")))
     lm.eval()
     mx.eval(lm.parameters())
     return SimpleNamespace(language_model = lm), [[(7 * i + 3) % 40 + 2 for i in range(48)]]
