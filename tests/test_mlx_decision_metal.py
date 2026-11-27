@@ -94,8 +94,8 @@ class _Reference(torch.nn.Module):
         return logits.masked_fill(~marker_mask, -1e4)
 
 
-# A padded evaluation batch takes qmm, a lone record qmv, which mlx 0.32.4 sums in float32.
-_EVAL_REL = 3e-3
+# A padded evaluation batch takes qmm, a lone record qmv; mlx 0.32.5 runs 3-16 rows on qmv_mma (4787), measured 3.1e-3 off on M1.
+_EVAL_REL = 5e-3
 
 
 # 1 and 0 head layers exercise the trimmed last layer alone and the no-head gather.
