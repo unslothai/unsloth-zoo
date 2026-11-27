@@ -104,6 +104,64 @@ def test_fork_start_method_honours_explicit_value(monkeypatch, dnp):
     assert dnp.get_dataset_num_proc(6) == 6
 
 
+# ---------- live offload_layers veto ----------
+
+
+def _fake_block_swap(monkeypatch, active):
+    import types
+    fake = types.ModuleType("unsloth_zoo.block_swap")
+    if isinstance(active, BaseException):
+        def probe():
+            raise active
+    else:
+        def probe():
+            return active
+    fake.offload_active = probe
+    monkeypatch.setitem(sys.modules, "unsloth_zoo.block_swap", fake)
+
+
+@pytest.mark.parametrize("desired", [None, 6])
+def test_live_offload_keeps_map_in_process(monkeypatch, dnp, desired):
+    # A page-locked host tier is copied into each forked worker at fork time: 6 workers stalled map at 0 rows.
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_cpus(monkeypatch, dnp, 12)
+    _fake_block_swap(monkeypatch, True)
+    assert dnp.get_dataset_num_proc(desired) is None
+    # The config layer too: a 1 there would still be a Pool(1) fork in TRL's other trainers.
+    assert dnp.get_dataset_num_proc(desired, serial_as_none = False) is None
+
+
+def test_live_offload_veto_warns_once_for_an_explicit_count(monkeypatch, dnp, capsys):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _fake_block_swap(monkeypatch, True)
+    dnp.get_dataset_num_proc(6)
+    dnp.get_dataset_num_proc(6)
+    out = capsys.readouterr().out
+    assert out.count("offload_layers holds model layers page-locked") == 1
+
+
+@pytest.mark.parametrize("raw, expected", [("6", 6), ("0", None)])
+def test_env_override_beats_live_offload_veto(monkeypatch, dnp, raw, expected):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _fake_block_swap(monkeypatch, True)
+    monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, raw)
+    assert dnp.get_dataset_num_proc(None) == expected
+
+
+@pytest.mark.parametrize("active", [False, RuntimeError("probe failed")])
+def test_no_live_offload_keeps_workers(monkeypatch, dnp, active):
+    _force_start_method(monkeypatch, dnp, "fork")
+    _force_cpus(monkeypatch, dnp, 12)
+    _fake_block_swap(monkeypatch, active)
+    assert dnp.get_dataset_num_proc(6) == 6
+
+
+def test_block_swap_not_loaded_keeps_workers(monkeypatch, dnp):
+    _force_start_method(monkeypatch, dnp, "fork")
+    monkeypatch.delitem(sys.modules, "unsloth_zoo.block_swap", raising = False)
+    assert dnp.get_dataset_num_proc(6) == 6
+
+
 # ---------- the 1 -> None normalisation ----------
 
 
