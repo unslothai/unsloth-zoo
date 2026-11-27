@@ -43,7 +43,6 @@ __all__ = [
     "ENGAGED",
 ]
 
-# Caches converted so far (engagement proof for tests / benches).
 ENGAGED = [0]
 
 _DEVICES = ("cpu", "mps")
@@ -91,7 +90,7 @@ if _DynamicLayer is not None:
                 or key_states.dim() != 4
                 or value_states.dim() != 4
             ):
-                # First call (lazy init + prefill) and traced code take the stock path; the result is adopted next.
+                # Prefill and traced code take the stock path; its result is adopted next.
                 self._forget()
                 return super().update(key_states, value_states, *args, **kwargs)
             k_buf, v_buf, n = self._grow_buffers()
@@ -105,7 +104,7 @@ if _DynamicLayer is not None:
                 or k_buf.device != key_states.device
                 or v_buf.device != value_states.device
             ):
-                # Shapes, dtypes or devices torch.cat would broadcast / promote / reject: keep its exact semantics.
+                # Mismatches torch.cat would promote or reject: keep its semantics.
                 self._forget()
                 return super().update(key_states, value_states, *args, **kwargs)
             t = key_states.shape[-2]
@@ -237,7 +236,6 @@ def install(model):
     wrapped = _growable_prepare(func)
     if wrapped is None:
         return False
-    # Bound per instance (MethodType), so deepcopy rebinds it to the copy, like the generate wrapper.
-    # On the module generate() calls it on: a PeftModel forwards the attribute to the inner model.
+    # On the owner (a PeftModel forwards the attribute); MethodType so deepcopy rebinds it.
     owner._prepare_cache_for_generation = types.MethodType(wrapped, owner)
     return True
