@@ -1895,43 +1895,34 @@ def _load_mlx_lm_with_strict_fallback(
     return model, tokenizer
 
 
-# mlx-lm `_download`'s defaults; 0.31.3 keeps them inline rather than as DEFAULT_ALLOW_PATTERNS.
-_MLX_LM_DEFAULT_ALLOW_PATTERNS = [
-    "*.json", "model*.safetensors", "*.py", "tokenizer.model", "*.tiktoken",
-    "tiktoken.model", "*.txt", "*.jsonl", "*.jinja",
-]
-
-
-def _mlx_download(path_or_hf_repo, revision=None, allow_patterns=None):
-    """mlx-lm's `_download`, falling back to the local cache only when offline mode refuses it: huggingface_hub 1.x lists the remote tree for a pinned commit hash that has no cached tree listing, even offline."""
+def _mlx_download(path_or_hf_repo, revision=None, allow_patterns=None, download=None):
+    """mlx-lm's `_download` (or `download`), resolving the cached snapshot when offline mode refuses it: huggingface_hub
+    1.26 to 2.1.1 lists the remote tree for a pinned commit with no cached tree listing, even offline."""
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import LocalEntryNotFoundError, OfflineModeIsEnabled
-    import mlx_lm.utils as mlx_lm_utils
 
+    if download is None:
+        import mlx_lm.utils as mlx_lm_utils
+
+        download = mlx_lm_utils._download
     try:
-        return mlx_lm_utils._download(path_or_hf_repo, revision=revision, allow_patterns=allow_patterns)
+        return download(path_or_hf_repo, revision=revision, allow_patterns=allow_patterns)
     except OfflineModeIsEnabled:
         pass
     hint = "Download it once with network access, or disable offline mode (HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE)."
     where = f"'{path_or_hf_repo}' (revision {revision or 'main'})"
     try:
-        path = Path(snapshot_download(
-            path_or_hf_repo,
-            revision=revision,
-            allow_patterns=allow_patterns or _MLX_LM_DEFAULT_ALLOW_PATTERNS,
-            local_files_only=True,
-        ))
+        path = Path(snapshot_download(path_or_hf_repo, revision=revision, local_files_only=True))
     except LocalEntryNotFoundError as error:
         if type(error) is not LocalEntryNotFoundError:
-            raise  # e.g. IncompleteSnapshotError, whose message already names the missing files
+            raise
         missing_snapshot = LocalEntryNotFoundError(
             f"Unsloth: {where} is not in the Hugging Face cache and offline mode is enabled. {hint}"
         )
-        # from_pretrained re-raises only this; other misses may still load through another backend's patterns.
+        # from_pretrained re-raises only this: mlx-vlm would retry the repo id and hide it.
         missing_snapshot._unsloth_offline_cache_miss = True
         raise missing_snapshot from error
-    # Without a cached tree listing the Hub returns the folder unchecked. Named shards are required (a strict=False
-    # load would skip them silently); named metadata like tokenizer.model is optional.
+    # No tree listing, so the Hub cannot check the folder; a strict=False load would skip a missing named shard.
     missing = [
         pattern for pattern in allow_patterns or ()
         if pattern.endswith(".safetensors")
@@ -2336,7 +2327,11 @@ def _load_mlx_vlm_distributed(
 
     try:
         with _temporary_hf_token_env(hf_token):
-            resolved_path = str(get_model_path(model_name, revision=revision))
+            resolved_path = str(_mlx_download(
+                model_name,
+                revision=revision,
+                download=lambda repo, revision, allow_patterns: get_model_path(repo, revision=revision),
+            ))
             load_config = config_override_data or _read_json_file(
                 os.path.join(resolved_path, "config.json")
             )
@@ -9552,7 +9547,6 @@ class FastMLXModel:
                     )
                 original_local_path = local_path
         except Exception as error:
-            # mlx-vlm would retry the repo id and hide zoo's offline cache miss behind OfflineModeIsEnabled.
             if distributed_requested or getattr(error, "_unsloth_offline_cache_miss", False):
                 raise
             local_path = None

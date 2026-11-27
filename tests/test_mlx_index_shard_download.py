@@ -199,3 +199,30 @@ def test_offline_entry_shard_miss_still_reaches_the_backend_load(monkeypatch, tm
     monkeypatch.setattr(lm_utils, "load_model", load_model)
     with pytest.raises(Reached):
         FastMLXModel.from_pretrained("org/repo")
+
+
+def test_offline_distributed_vlm_resolves_the_cached_snapshot(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    from huggingface_hub import snapshot_download
+    import unsloth_zoo.mlx.loader as loader
+
+    commit, snap, _ = _offline_hub(monkeypatch, tmp_path)
+    _skip_unless_hub_refuses_pinned_lookup(commit)
+    seen = []
+
+    def sharded_load(path, **_):
+        seen.append(path)
+        return object(), object()
+
+    vlm_utils = types.ModuleType("mlx_vlm.utils")
+    # mlx-vlm's get_model_path is snapshot_download with its own patterns.
+    vlm_utils.get_model_path = lambda repo, revision=None: Path(snapshot_download(repo, revision=revision))
+    vlm_utils.sharded_load = sharded_load
+    monkeypatch.setitem(sys.modules, "mlx_vlm", types.ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", vlm_utils)
+    monkeypatch.setattr(loader, "_bind_mlx_vlm_processor_loader", lambda sharded, **_: sharded)
+    group = types.SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    loader._load_mlx_vlm_distributed("org/repo", "llama", tensor_group=group, revision=commit)
+    assert [str(path) for path in seen] == [str(snap)]
