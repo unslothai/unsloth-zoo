@@ -620,6 +620,12 @@ def _unpadded_lengths(mask) -> list[int] | None:
         return None
 
 
+def _embedded_columns(embeds, tokens: int) -> int:
+    """Columns one row's embedding fills: a splicing model (FastVLM) fills more than its ids."""
+    shape = getattr(embeds, "shape", None)
+    return int(shape[1]) if shape is not None and len(shape) > 1 else tokens
+
+
 # A vision batch takes media-free rows as prompt_token_ids, which earlier releases refused.
 VLM_TOKEN_ID_PROMPTS = True
 
@@ -3621,10 +3627,16 @@ class _VLMBatchAdapter:
                     row_sampler.bind_uids(uids)
                     row_sampler.bind_generator(generator)
                 counts = _unpadded_lengths(mask)
+                # Only a lone unpadded row owns the width: a model may strip and re-pad padded rows.
+                width = len(prompt_ids[0])
+                spliced = (
+                    _embedded_columns(gen_kwargs.get("inputs_embeds"), width) - width
+                    if len(prompt_ids) == 1 and (counts is None or counts[0] == width) else 0
+                )
                 yield from self._drive(
                     generator, uids, indices, row_sampler,
-                    prompt_token_count=len(token_ids[0]),
-                    prompt_token_counts=None if counts is None else [counts[source] for source in sources],
+                    prompt_token_count=len(token_ids[0]) + spliced,
+                    prompt_token_counts=None if counts is None else [counts[source] + spliced for source in sources],
                 )
         except BaseException as exc:
             active_error = exc
@@ -3890,7 +3902,9 @@ class _VLMBatchSession:
                     self.tokenizer, require_independent = True,
                 ),
                 scanner = _StopStringScanner(defaults.stop_strings),
-                prompt_token_count = len(token_ids[0]),
+                prompt_token_count = _embedded_columns(
+                    prompt_kwargs.get("inputs_embeds"), len(token_ids[0]),
+                ),
                 cached_token_count = 0 if prefill is None else prefill.prefix,
             )
         except BaseException as active_error:
@@ -4300,8 +4314,9 @@ class _SpeculativeBatchSession:
             cached_token_count = prefix,
         )
         # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
-        with self._embedded(len(pending.prompt) - prefix):
+        with self._embedded(len(pending.prompt) - prefix) as fed:
             admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults, model=adapter.model))
+        state.prompt_token_count = prefix + fed[0]
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         retire = getattr(request.prompt_cache_state, "retire", None)
         if not finished:
@@ -4362,18 +4377,20 @@ class _SpeculativeBatchSession:
 
     @contextmanager
     def _embedded(self, tokens: int):
-        """Note whether the prompt ``generate_step`` embeds has one column per token."""
+        """Yield ``[columns]`` the prompt ``generate_step`` embeds fills; note if one per token."""
         model = self.adapter.model
         embed, own = model.get_input_embeddings, vars(model).get("get_input_embeddings")
+        fed = [tokens]
 
         def counted(*args, **kwargs):
             out = embed(*args, **kwargs)
-            self._addressed = out.inputs_embeds.shape[1] == tokens
+            fed[0] = _embedded_columns(out.inputs_embeds, tokens)
+            self._addressed = fed[0] == tokens
             return out
 
         model.get_input_embeddings = counted
         try:
-            yield
+            yield fed
         finally:
             # An instance override that was already there (the audio merge patch) goes back.
             if own is None:
