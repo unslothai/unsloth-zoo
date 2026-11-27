@@ -371,7 +371,7 @@ def _unsloth_checkpoint_function():
 
 
 @contextmanager
-def _unsloth_frames(layer, x):
+def _unsloth_frames(layer, x, swapper = None):
     """Around the window's no-grad forward of a layer whose checkpoint is Unsloth's (a shim, or torch's reentrant
     checkpoint once Unsloth's CheckpointFunction is patched in). Yields [refusal reason or None, routing frame]:
     standard training gives that checkpoint a MoE routing frame its recompute replays, and UnslothCheckpointFunction
@@ -380,14 +380,23 @@ def _unsloth_frames(layer, x):
     state = [None, None]
     gc = sys.modules.get("unsloth_zoo.gradient_checkpointing")
     fn = getattr(layer, "_gradient_checkpointing_func", None)
-    while isinstance(fn, functools.partial):
-        fn = fn.func
+    for _ in range(4):
+        attrs = getattr(fn, "__dict__", None) or {}
+        if isinstance(fn, functools.partial):
+            fn = fn.func
+        elif swapper is not None and attrs.get("_unsloth_block_swap") is swapper and \
+                attrs.get("_unsloth_block_swap_wrapper") is fn:
+            fn = fn.__wrapped__   # block swap's own residency wrapper, as _checkpoint_mode resolves it
+        else:
+            break
     shim = gc is not None and any(fn is getattr(gc, name, None) for name in _CKPT_SHIMS)
     if gc is None or not (shim or _unsloth_checkpoint_function()):
         yield state
         return
     store = getattr(gc, "_offload_store_dtype", None)
-    if (not shim or fn is getattr(gc, "unsloth_checkpoint", None)) and store is not None and store(x) != x.dtype:
+    # Every path but unsloth_gradient_checkpoint (which keeps the input as is) runs UnslothCheckpointFunction.
+    exact = shim and fn is getattr(gc, "unsloth_gradient_checkpoint", None)
+    if not exact and store is not None and store(x) != x.dtype:
         state[0] = "Unsloth's checkpoint stores float32 layer inputs in bfloat16 for the recompute"
         yield state
         return
@@ -612,7 +621,7 @@ class _Window:
         if m == 0 and self.swapper is not None:
             self.swapper.hold(l)
             self.held.add(l)
-        with torch.no_grad(), _checkpointing_off(layer), _unsloth_frames(layer, x) as frames:
+        with torch.no_grad(), _checkpointing_off(layer), _unsloth_frames(layer, x, self.swapper) as frames:
             if frames[0] is not None:
                 self._abort(frames[0])
             out = orig_call(layer, *args2, **kwargs2)

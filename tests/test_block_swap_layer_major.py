@@ -974,6 +974,34 @@ def test_float32_inputs_stored_in_bfloat16_are_refused(monkeypatch):
     monkeypatch.setattr(gc, "_offload_store_dtype", lambda t: t.dtype)
     with lm._unsloth_frames(layer, x) as frames:
         assert frames[0] is None
+    # Unpatched: unsloth_offloaded_gradient_checkpoint still runs UnslothCheckpointFunction,
+    # unsloth_gradient_checkpoint keeps its input as is.
+    monkeypatch.undo()
+    monkeypatch.setattr(gc, "_offload_store_dtype", lambda t: torch.bfloat16)
+    for name, refused in (("unsloth_offloaded_gradient_checkpoint", True), ("unsloth_gradient_checkpoint", False)):
+        layer = _CkptToy(getattr(gc, name))
+        with lm._unsloth_frames(layer, x) as frames:
+            assert (frames[0] is not None) is refused, name
+
+
+def test_block_swap_wrapped_unsloth_checkpoint_gets_a_routing_frame():
+    """Block swap's residency wrapper around Unsloth's checkpoint (as BlockSwap._wrap_checkpoint installs it) is
+    resolved to the shim, so the window forward still runs in a routing frame."""
+    gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
+    swapper = object()
+    inner = gc.unsloth_gradient_checkpoint
+
+    def run_in_checkpoint(function, *args, **kw):
+        return inner(function, *args, **kw)
+    run_in_checkpoint._unsloth_block_swap = swapper
+    run_in_checkpoint._unsloth_block_swap_wrapper = run_in_checkpoint
+    run_in_checkpoint.__wrapped__ = inner
+    layer = _CkptToy(run_in_checkpoint)
+    x = torch.zeros(2, 4, requires_grad = True)
+    with lm._unsloth_frames(layer, x, swapper) as frames:
+        assert frames == [None, frames[1]] and frames[1] is not None
+    with lm._unsloth_frames(layer, x, object()) as frames:
+        assert frames == [None, None]
 
 
 def test_unsloth_gradient_checkpoint_engages_bitwise():
