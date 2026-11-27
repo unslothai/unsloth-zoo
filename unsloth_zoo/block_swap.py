@@ -291,6 +291,14 @@ def _end_host_session():
     _publish_host_pending(0)
 
 
+def _size_text(nbytes):
+    """GiB with one decimal, or MiB / KiB below 0.1 GiB, so a small cap does not read as 0.0 GiB."""
+    for unit, scale in (("GiB", 2**30), ("MiB", 2**20)):
+        if nbytes >= scale // 10:
+            return f"{nbytes / scale:.1f} {unit}"
+    return f"{nbytes / 2**10:.1f} KiB"
+
+
 def _check_host_fit(sizes, on_host = 0, slack = 0):
     """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
     freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
@@ -309,6 +317,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
         avail = free - others + on_host
     limit = _disk().host_limit_bytes()
+    capped = limit is not None and limit < avail
     if limit is not None:
         avail = min(avail, limit)
     # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
@@ -323,6 +332,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
             return None
         others = _others_host_pending(own)
         avail = free - (others or 0) + on_host
+        capped = limit is not None and limit < avail
         if limit is not None:
             avail = min(avail, limit)
     if need <= avail:
@@ -334,9 +344,19 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         if used + size > avail:
             break
         used, fit = used + size, fit + 1
-    raise ValueError(
+    asked = (
         f"Unsloth: offload_layers asked for {len(sizes)} layers in host RAM, which needs "
-        f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
+        f"{_size_text(need)}, but "
+    )
+    if capped:
+        # The cap, not free RAM, is what ran out: naming the system reserve would send the user after the wrong knob.
+        raise ValueError(
+            asked + f"UNSLOTH_OFFLOAD_HOST_LIMIT caps the offloaded layers at {_size_text(avail)}. "
+            f"At most {fit} layers would fit; raise UNSLOTH_OFFLOAD_HOST_LIMIT, lower offload_layers, "
+            "or enable the disk tier."
+        )
+    raise ValueError(
+        asked + f"only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
         f"{_host_reserve(total) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
         "lower offload_layers or free host RAM."
     )
