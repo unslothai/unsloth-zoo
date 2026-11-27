@@ -808,12 +808,28 @@ def _triton_too_old():
     return (major, minor) < (3, 1)
 
 
+def _triton_lowers_dot(capability, triton_version) -> bool:
+    """False on sm_100 / sm_120 below Triton 3.3: Triton 3.2 aborts the process lowering tl.dot there (an assert in
+    AccelerateMatmul, not an exception the probe could catch)."""
+    if tuple(capability)[0] < 10:
+        return True
+    try:
+        major, minor = (int(v) for v in str(triton_version).split(".")[:2])
+    except ValueError:
+        return False
+    return (major, minor) >= (3, 3)
+
+
 def mxfp4_grouped_mm_available(device = None) -> bool:
     """Whether the fused kernel compiles on ``device`` and matches dequantize + matmul on a probe."""
     if not _HAS_TRITON or not torch.cuda.is_available() or _triton_too_old():
         return False
     device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":
+        return False
+    if torch.version.hip is None and not _triton_lowers_dot(
+        torch.cuda.get_device_capability(device), triton.__version__,
+    ):
         return False
     key = str(device)
     if key in _AVAILABLE:
