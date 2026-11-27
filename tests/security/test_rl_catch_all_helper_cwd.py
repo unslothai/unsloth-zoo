@@ -22,9 +22,13 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 ZOO_ROOT = Path(__file__).resolve().parents[2]
 
 
+# The helper is started with pass_fds, which Windows does not support, so it never runs there.
+@pytest.mark.skipif(sys.platform == "win32", reason = "catch-all helper is POSIX-only")
 def test_helper_does_not_import_from_cwd(tmp_path):
     planted = tmp_path / "planted"
     planted.mkdir()
