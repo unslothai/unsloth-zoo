@@ -211,12 +211,14 @@ def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
     lead = x.shape[:-1]
     x2 = x.reshape(-1, inner)
     M = x2.shape[0]
-    if M > 0 and M <= _FUSED_MAX_ROWS and _fused_ok(x, ggml_type):
+    gemv = M == 1 and trans_b
+    # tl.dot rounds float32 inputs to tf32: float32 activations use the GEMV or dequantize + matmul only.
+    if M > 0 and M <= _FUSED_MAX_ROWS and _fused_ok(x, ggml_type) and (gemv or x.dtype != torch.float32):
         try:
             x2 = x2.contiguous()
             out = torch.empty((M, outer), dtype = x.dtype, device = x.device)
             with torch.cuda.device(x.device):
-                if M == 1 and trans_b:
+                if gemv:
                     _gemv_launch(x2, packed, ggml_type, out, bias, N, K)
                 else:
                     _mm_launch(x2, packed, ggml_type, out, bias, None, M, outer, inner, 1, N, trans_b, False)
@@ -305,7 +307,7 @@ def _grouped_impl(x, packed, ggml_type, shape, counts, trans_b):
     out = torch.empty((M, outer), dtype = x.dtype, device = x.device)
     if M == 0:
         return out
-    if _fused_ok(x, ggml_type):
+    if _fused_ok(x, ggml_type) and x.dtype != torch.float32:
         try:
             with torch.cuda.device(x.device):
                 return _mm_launch(x.contiguous(), packed, ggml_type, out, None, counts.to(torch.int32).contiguous(),

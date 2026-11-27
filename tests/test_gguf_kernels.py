@@ -266,3 +266,15 @@ def test_int64_offsets():
     dense = dequantize_gguf(small, T.Q8_0, (small.shape[0], K), torch.bfloat16)
     assert dense.numel() > (1 << 31)
     assert _bits_equal(dense[-3:].cpu(), dequantize_reference(small[-3:].cpu(), T.Q8_0, (3, K), torch.bfloat16)) == 0
+
+
+@cuda
+@pytest.mark.parametrize("M", [1, 5])
+def test_fp32_activations_keep_fp32_accuracy(M):
+    # tl.dot would round float32 inputs to tf32 (~1e-3 relative); float32 activations must keep float32 accuracy
+    packed = random_packed(T.Q6_K, 40, 512, special = False).cuda()
+    w = dequantize_reference(packed, T.Q6_K, (40, 512)).cuda()
+    x = torch.randn(M, 512, device = "cuda")
+    got = gguf_linear(x, packed, T.Q6_K, (40, 512))
+    ref = x.double() @ w.double().t()
+    assert ((got.double() - ref).norm() / ref.norm()).item() < 1e-5
