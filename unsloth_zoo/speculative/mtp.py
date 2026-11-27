@@ -123,7 +123,7 @@ def load_mtp_state_dict(source, revision = None, config = None):
     head-relative (fc.weight), others keep full names (info["prefix"] is empty); only shards holding the head are
     opened."""
     from safetensors import safe_open
-    from ..safetensors_pread import pread_backend_kwargs
+    from unsloth_zoo.safetensors_pread import pread_backend_kwargs
     text = _text_config(config) if config is not None else _source_text_config(source, revision)
     family = _nextn_family(text)
     if family is not None:
