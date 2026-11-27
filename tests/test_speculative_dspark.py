@@ -335,6 +335,9 @@ def test_trainer_evaluates_and_resumes(tmp_path):
                                    eval_dataset = rows, data_collator = MTPDataCollator(pad_token_id = 0))
     resumed.train(resume_from_checkpoint = str(tmp_path / "checkpoint-2"))
     assert resumed.state.global_step == 4
+    # Anchors are drawn before Trainer restores the checkpoint RNG state, so they must not depend on it.
+    straight = trainer.model.state_dict()
+    assert all(torch.equal(v, straight[k]) for k, v in resumed.model.state_dict().items())
 
 
 def test_default_ddp_reduces_the_loss_only_heads(tmp_path):
@@ -378,6 +381,40 @@ def test_data_parallel_scores_after_the_gather(tmp_path):
     loss = trainer.compute_loss(torch.nn.DataParallel(drafter), {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)})
     hook.remove()
     assert seen == [False] and torch.isfinite(loss)
+
+
+@pytest.mark.parametrize("unsloth_counter", [False, True])
+def test_gradient_accumulation_matches_one_big_batch(tmp_path, monkeypatch, unsloth_counter):
+    # Uneven supervised rows: averaging microbatch means would weight short rows' slots more than long ones'.
+    from transformers import Trainer
+
+    from unsloth_zoo.loss_utils import _unsloth_get_batch_samples
+    if unsloth_counter:
+        monkeypatch.setattr(Trainer, "get_batch_samples", _unsloth_get_batch_samples)
+    target = _target().double()
+    gen = torch.Generator().manual_seed(2)
+    rows = []
+    for n, prompt in ((6, 2), (20, 7), (9, 0), (31, 11)):
+        ids = torch.randint(0, VOCAB - 1, (n,), generator = gen).tolist()
+        rows.append({"input_ids": ids, "labels": [-100] * prompt + ids[prompt:]})
+    init = _drafter(target, num_draft_layers = 1, confidence_head = True).state_dict()
+    results = []
+    for bs, ga in ((4, 1), (1, 4)):
+        drafter = _drafter(target, num_draft_layers = 1, confidence_head = True)
+        drafter.load_state_dict(init)
+        # More anchors than positions: every supervised pair is an anchor, so both runs score the same blocks.
+        args = DSparkTrainingArguments(
+            output_dir = str(tmp_path / f"{bs}_{ga}"), per_device_train_batch_size = bs, gradient_accumulation_steps = ga,
+            max_steps = 1, optim = "sgd", learning_rate = 1.0, max_grad_norm = 0.0, save_strategy = "no",
+            report_to = "none", use_cpu = True, dspark_num_anchors = 64, seed = 0,
+        )
+        UnslothDSparkTrainer(model = drafter.train(), target_model = target, args = args, train_dataset = Dataset.from_list(rows),
+                             data_collator = MTPDataCollator(pad_token_id = 0)).train()
+        results.append(drafter.state_dict())
+    moved = [k for k in init if not torch.equal(init[k], results[0][k])]
+    assert moved
+    for k in moved:
+        assert torch.allclose(results[0][k], results[1][k], rtol = 1e-6, atol = 1e-8), k
 
 
 def test_layer_minus_one_is_the_embedding_output(tmp_path):
