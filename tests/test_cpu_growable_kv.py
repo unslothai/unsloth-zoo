@@ -20,8 +20,8 @@ import pytest
 import torch
 
 cache_utils = pytest.importorskip("transformers.cache_utils")
-if not hasattr(cache_utils, "DynamicLayer"):
-    pytest.skip("transformers before layered caches keeps the stock DynamicCache", allow_module_level = True)
+if not hasattr(cache_utils, "DynamicLayer") or not hasattr(cache_utils.DynamicLayer(), "is_initialized"):
+    pytest.skip("transformers before 4.57's layer API keeps the stock DynamicCache", allow_module_level = True)
 
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
@@ -91,7 +91,7 @@ def _kv_storage_pointers(model, monkeypatch, growable, steps):
 def test_cpu_generate_decode_does_not_reallocate_kv_every_token(monkeypatch):
     """The flip: stock DynamicLayer re-allocates (torch.cat) the whole K/V each decode step; the growable layer
     writes in place, so 20 decode steps inside one 256-slot chunk keep one buffer."""
-    monkeypatch.setenv("UNSLOTH_GROWABLE_KV_MIN", "256")
+    monkeypatch.setenv("UNSLOTH_CPU_KV_CHUNK", "256")
     model = _attach(_tiny())
     stock = _kv_storage_pointers(model, monkeypatch, growable = False, steps = 20)
     grown = _kv_storage_pointers(model, monkeypatch, growable = True, steps = 20)
@@ -104,7 +104,7 @@ def test_cpu_generate_decode_does_not_reallocate_kv_every_token(monkeypatch):
 @pytest.mark.parametrize("chunk", ["256", "4"])
 def test_greedy_tokens_and_scores_match_stock_with_left_padding(monkeypatch, chunk):
     from unsloth_zoo.cpu import kv_cache
-    monkeypatch.setenv("UNSLOTH_GROWABLE_KV_MIN", chunk)  # "4" regrows many times inside the run
+    monkeypatch.setenv("UNSLOTH_CPU_KV_CHUNK", chunk)  # "4" regrows many times inside the run
     model = _attach(_tiny())
     stock = _generate(model, monkeypatch, False, max_new_tokens = 30, min_new_tokens = 30, do_sample = False)
     engaged = kv_cache.ENGAGED[0]
@@ -236,14 +236,15 @@ def test_layer_matches_stock_through_cache_edits(monkeypatch):
     import inspect
     from transformers.cache_utils import DynamicLayer
     from unsloth_zoo.cpu.kv_cache import GrowableDynamicLayer
-    monkeypatch.setenv("UNSLOTH_GROWABLE_KV_MIN", "4")
+    monkeypatch.setenv("UNSLOTH_CPU_KV_CHUNK", "4")
     torch.manual_seed(0)
     stock, grown = DynamicLayer(), GrowableDynamicLayer()
     crop_by_count = "tokens_to_remove" in inspect.signature(DynamicLayer.crop).parameters
 
     def step(batch, t):
         k = torch.randn(batch, 2, t, 8); v = torch.randn(batch, 2, t, 4)
-        a = stock.update(k, v); b = grown.update(k.clone(), v.clone())
+        with torch.no_grad():
+            a = stock.update(k, v); b = grown.update(k.clone(), v.clone())
         for x, y in zip(a, b):
             assert torch.equal(x, y)
 
@@ -263,6 +264,26 @@ def test_layer_matches_stock_through_cache_edits(monkeypatch):
     for _ in range(6):
         step(4, 1)
     assert grown.get_seq_length() == stock.get_seq_length()
+    step(4, 0)  # a zero-token update after edits adopts without writing
+    stock.crop(-2 if crop_by_count else stock.get_seq_length() - 2); grown.crop(-2 if crop_by_count else grown.get_seq_length() - 2)
+    step(4, 0)
+    for _ in range(3):
+        step(4, 1)
+    # Grad recording takes the stock append, so K / V saved for backward are never written in place.
+    k = torch.randn(4, 2, 1, 8); v = torch.randn(4, 2, 1, 4)
+    held, _ = grown.update(k, v)
+    snapshot = held.clone()
+    grown.update(torch.randn(4, 2, 1, 8), torch.randn(4, 2, 1, 4))
+    assert torch.equal(held, snapshot) and grown._grow_kview is None
+
+
+def test_caller_empty_legacy_tuple_is_not_converted(monkeypatch):
+    import transformers
+    if int(transformers.__version__.split(".")[0]) >= 5:
+        pytest.skip("transformers 5 rejects tuple caches")
+    model = _attach(_tiny())
+    out = _generate(model, monkeypatch, True, max_new_tokens = 4, do_sample = False, past_key_values = ())
+    assert "GrowableDynamicLayer" not in _layer_names(out)
 
 
 def test_kill_switch_and_cuda_device_keep_stock_cache(monkeypatch):
