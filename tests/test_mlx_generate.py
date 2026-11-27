@@ -1992,8 +1992,8 @@ def test_a_vision_row_s_events_report_each_sampled_id_once(last, reason, kept):
 def _splicing_embeddings(spliced):
     """An embedding that, as FastVLM does, fills ``spliced`` more columns than its ids."""
     def embed(input_ids, *a, **k):
-        width = len(input_ids.tolist()[0]) + spliced
-        embeds = types.SimpleNamespace(shape = (1, width, 4))
+        rows = input_ids.tolist()
+        embeds = types.SimpleNamespace(shape = (len(rows), len(rows[0]) + spliced, 4))
         return types.SimpleNamespace(inputs_embeds = embeds, to_dict = lambda: {"inputs_embeds": embeds})
     return embed
 
@@ -2009,7 +2009,7 @@ def test_a_vision_row_charges_the_columns_its_media_was_spliced_into(spliced):
 
 
 @pytest.mark.parametrize("spliced", [0, 255])
-def test_a_prefill_chunk_of_one_row_charges_the_columns_its_media_was_spliced_into(spliced):
+def test_a_prefill_chunk_charges_the_columns_its_media_was_spliced_into(spliced):
     import numpy as np
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
 
@@ -2029,7 +2029,7 @@ def test_a_prefill_chunk_of_one_row_charges_the_columns_its_media_was_spliced_in
     adapter._wired_limit = contextlib.nullcontext
     adapter._chunked_prefill_kwargs = lambda **kw: {}
     adapter.model = types.SimpleNamespace(
-        config = types.SimpleNamespace(image_token_index = None), language_model = object(),
+        config = types.SimpleNamespace(image_token_index = 9), language_model = object(),
         get_input_embeddings = _splicing_embeddings(spliced))
     adapter.generator_type = lambda *a, **k: _vlm_stub(events = [[(0, 1, "stop")]])(*a[:2])
     assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")], [0])] == [3 + spliced]
@@ -2048,6 +2048,26 @@ def test_a_prefill_chunk_of_one_row_charges_the_columns_its_media_was_spliced_in
                   attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([3, 2])))
     events = adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])
     assert [event.result for event in events] == [3, 2]
+    inputs.update(input_ids = np.array([[0, 4, 5], [1, 2, 3]]),
+                  attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([2, 3])))
+    events = adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])
+    assert [event.result for event in events] == [2, 3]
+    # Unpadded rows holding as many placeholders each fill the embedded width; rows that differ keep their ids.
+    def pair(ids):
+        inputs.update(input_ids = np.array(ids), attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([3, 3])))
+        return [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])]
+
+    assert pair([[1, 9, 3], [4, 9, 5]]) == [3 + spliced] * 2
+    del inputs["attention_mask"]
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")] * 2, [0, 1])] == [3 + spliced] * 2
+    assert pair([[1, 9, 3], [4, 5, 6]]) == pair([[1, 2, 3], [4, 9, 6]]) == [3, 3]
+    # Prepared vision inputs group by layout, not values, so their rows may splice unevenly too.
+    prepared = [GenerationRequest(prompt_token_ids = ids, vision_inputs = {}) for ids in ((1, 9, 3), (4, 9, 5))]
+    assert [event.result for event in adapter._run_chunk(prepared, [0, 1])] == [3, 3]
+    adapter.model.config.image_token_index = None
+    assert pair([[1, 9, 3], [4, 9, 5]]) == [3, 3]
+    inputs.update(input_ids = np.array([[1, 9, 3]]), attention_mask = types.SimpleNamespace(sum = lambda axis: np.array([3])))
+    assert [event.result for event in adapter._run_chunk([GenerationRequest(prompt = "p")], [0])] == [3 + spliced]
 
 
 @pytest.mark.parametrize("spliced, prefix", [(0, 0), (255, 0), (0, 2)])

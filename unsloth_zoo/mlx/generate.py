@@ -3027,6 +3027,15 @@ def _media_token_ids(config) -> set[int]:
     return ids
 
 
+def _splices_alike(rows, config, prepared: bool) -> bool:
+    """Whether every row gains the same spliced columns: prompt-encoded rows with equal placeholder
+    counts. Prepared vision inputs group by layout only, so their image shapes may differ."""
+    if len(rows) == 1:
+        return True
+    media = _media_token_ids(config)
+    return not prepared and bool(media) and len({sum(token in media for token in row) for row in rows}) == 1
+
+
 _SINGLE_ROW_PREDICATE = "_is_single_row_batch_cache"
 _SINGLE_ROW_EXTRACT = "_extract_row_cache"
 _SINGLE_ROW_PARAMETERS = (
@@ -3627,11 +3636,14 @@ class _VLMBatchAdapter:
                     row_sampler.bind_uids(uids)
                     row_sampler.bind_generator(generator)
                 counts = _unpadded_lengths(mask)
-                # Only a lone unpadded row owns the width: a model may strip and re-pad padded rows.
+                # The width is each row's only with no padded row and equal placeholders: models may re-pad.
                 width = len(prompt_ids[0])
                 spliced = (
                     _embedded_columns(gen_kwargs.get("inputs_embeds"), width) - width
-                    if len(prompt_ids) == 1 and (counts is None or counts[0] == width) else 0
+                    if (counts is None or all(count == width for count in counts))
+                    and _splices_alike(
+                        prompt_ids, getattr(self.model, "config", None), chunk[0].prompt_token_ids is not None,
+                    ) else 0
                 )
                 yield from self._drive(
                     generator, uids, indices, row_sampler,
