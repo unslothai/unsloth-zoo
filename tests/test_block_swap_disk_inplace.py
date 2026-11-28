@@ -111,12 +111,16 @@ def test_match_finds_whole_stacked_and_partial_tensors(tmp_path):
 
 
 @_linux
-def test_region_reads_mapped_bytes_zero_holes_and_redirects_writes(tmp_path):
+@pytest.mark.parametrize("mode", ["auto", "buffered"])
+def test_region_reads_mapped_bytes_zero_holes_and_redirects_writes(tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_INPLACE", mode)
     torch.manual_seed(1)
     a = torch.randint(0, 255, (5000,), dtype = torch.uint8)
     b = torch.randn(1000, dtype = torch.bfloat16)
     _save(str(tmp_path / "ck"), {"a": a, "b": b})
     index = _disk.checkpoint_index(_Named(nn.ModuleList(), str(tmp_path / "ck")))
+    if mode == "buffered":
+        assert index.files[0].dfd is None
     pa, pb, pc = nn.Parameter(a.clone(), requires_grad = False), nn.Parameter(b.clone(), requires_grad = False), \
         nn.Parameter(torch.randn(300, dtype = torch.bfloat16), requires_grad = False)
     layout = [0, 8192, 12288]
@@ -384,3 +388,20 @@ def test_load_time_in_place_layers_stay_raw_when_the_spill_has_no_room_to_encode
     assert st["disk_inplace_bytes"] >= len(state.disk) * 256 * 256 * 2, st
     _equal(ref, _train(layers))
     sw.remove()
+
+
+@_linux
+def test_direct_reads_span_the_bounce_buffer_at_odd_offsets(tmp_path, monkeypatch):
+    monkeypatch.setattr(_disk, "_BOUNCE_BYTES", 8192)
+    monkeypatch.setattr(_disk, "_BOUNCE", __import__("threading").local())
+    big = torch.randint(0, 255, (100_003,), dtype = torch.uint8)
+    _save(str(tmp_path / "ck"), {"big": big})
+    index = _disk.checkpoint_index(_Named(nn.ModuleList(), str(tmp_path / "ck")))
+    f = index.files[0]
+    if f.dfd is None:
+        pytest.skip("this filesystem refuses O_DIRECT")
+    base = index.entries[0][1]
+    for off, n in ((0, 100_003), (1, 4095), (4093, 20_000), (99_000, 1003)):
+        out = torch.empty(n, dtype = torch.uint8)
+        f.read_into(base + off, out, drop = True)
+        assert torch.equal(out, big[off:off + n]), (off, n)

@@ -25,7 +25,7 @@ Only used where host RAM would otherwise refuse the offload; UNSLOTH_OFFLOAD_DIS
 Weights whose bytes are already in a safetensors file of the model's checkpoint (as loaded, not transformed) are not
 copied: CheckpointRegion serves them from the shard files in place, matched and verified byte for byte once when
 the layer goes to disk. Only weights the loader changed (a quantization, a fused or transposed tensor) are spilled.
-UNSLOTH_OFFLOAD_DISK_INPLACE=0 always spills.
+UNSLOTH_OFFLOAD_DISK_INPLACE=0 always spills; =buffered reads the shards without O_DIRECT.
 """
 
 import os
@@ -737,23 +737,72 @@ def _safetensors_entries(path):
     return out
 
 
+_BOUNCE_BYTES = 16 << 20
+_BOUNCE = threading.local()
+
+
+def _bounce():
+    """This reader thread's aligned host buffer for O_DIRECT reads of unaligned file ranges."""
+    buf = getattr(_BOUNCE, "buf", None)
+    if buf is None:
+        buf = _BOUNCE.buf = _aligned_empty(_BOUNCE_BYTES, pin = False)
+    return buf[1]
+
+
 class _CkptFile:
-    """One checkpoint shard, opened read only (buffered: tensors start at any byte, O_DIRECT needs 4 KiB)."""
-    __slots__ = ("path", "fd", "size", "__weakref__")
+    """One checkpoint shard, opened read only. Training reads go through O_DIRECT (aligned superset into a bounce
+    buffer, then the wanted bytes copied out), as the spill file does, so no page cache competes with the host
+    tier; buffered with the pages dropped behind each read where O_DIRECT is refused or only page cache anyway."""
+    __slots__ = ("path", "fd", "dfd", "size", "__weakref__")
 
     def __init__(self, path):
         self.path = path
         self.fd = os.open(path, os.O_RDONLY)
         self.size = os.fstat(self.fd).st_size
+        self.dfd = None
+        if os.environ.get(_INPLACE_ENV, "auto").strip().lower() != "buffered" and not _layered(path):
+            try:
+                self.dfd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            except (OSError, AttributeError):
+                self.dfd = None
+
+    def _pread_full(self, fd, offset, mv, need):
+        """Read until `need` bytes are in `mv` (fewer only at end of file). Returns the count."""
+        done = 0
+        while done < need:
+            got = os.preadv(fd, [mv[done:]], offset + done)
+            if got <= 0:
+                break
+            done += got
+        return done
+
+    def _read_direct(self, offset, dst):
+        n = dst.numel()
+        bounce = _bounce()
+        end = offset + n
+        pos = offset - offset % ALIGN
+        while pos < end:
+            span = min(bounce.numel(), _round_up(end) - pos)
+            got = self._pread_full(self.dfd, pos, memoryview(bounce.numpy())[:span], span)
+            lo, hi = max(pos, offset), min(pos + got, end)
+            if hi <= lo:
+                raise OSError(f"Unsloth: short read from the checkpoint file {self.path} at {pos}")
+            dst[lo - offset:hi - offset].copy_(bounce[lo - pos:hi - pos])
+            pos += span
 
     def read_into(self, offset, dst, drop = False):
-        mv = memoryview(dst.numpy())
-        n, done = dst.numel(), 0
-        while done < n:
-            got = os.preadv(self.fd, [mv[done:]], offset + done)
-            if got <= 0:
-                raise OSError(f"Unsloth: short read from the checkpoint file {self.path} at {offset + done}")
-            done += got
+        """Fill uint8 `dst` from `offset`. `drop` (training reads): O_DIRECT, or the read pages dropped after."""
+        n = dst.numel()
+        if drop and self.dfd is not None:
+            try:
+                return self._read_direct(offset, dst)
+            except OSError as e:
+                if getattr(e, "errno", None) != 22:  # EINVAL: O_DIRECT accepted at open, refused per read
+                    raise
+                fd, self.dfd = self.dfd, None
+                os.close(fd)
+        if self._pread_full(self.fd, offset, memoryview(dst.numpy()), n) < n:
+            raise OSError(f"Unsloth: short read from the checkpoint file {self.path} at {offset}")
         if drop:
             # Training reads every disk layer twice a step: keep the page cache for the host tier.
             try:
@@ -762,12 +811,14 @@ class _CkptFile:
                 pass
 
     def close(self, _close = os.close):
-        fd, self.fd = getattr(self, "fd", None), None
-        if fd is not None:
-            try:
-                _close(fd)
-            except OSError:
-                pass
+        for attr in ("fd", "dfd"):
+            fd = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if fd is not None:
+                try:
+                    _close(fd)
+                except OSError:
+                    pass
 
     def __del__(self):
         try:
@@ -781,7 +832,7 @@ class CheckpointIndex:
 
     def __init__(self, paths):
         self.files, self.entries = [], []
-        self.directory = os.path.dirname(os.path.realpath(paths[0])) if paths else None
+        self.directory = os.path.dirname(os.path.abspath(paths[0])) if paths else None
         for path in paths:
             try:
                 entries = _safetensors_entries(path)
