@@ -574,3 +574,20 @@ def test_grad_scaler_is_applied_before_the_fp16_gradient_is_saved():
     assert error(unscaled) > 0.5, "negative control: an unscaled fp16 gradient should underflow here"
     assert error(got) < 1e-2, f"scaled fp16 gradient relative error {error(got):.3e}"
     torch.testing.assert_close(got_loss, want_loss, rtol = 1e-2, atol = 0)
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_identical_student_and_teacher_give_exactly_zero(beta, dtype):
+    """Student == teacher (a fresh LoRA against its adapter-off base): loss and every gradient exactly 0.
+
+    log_softmax backward leaves p * (sum q - 1), ~1e-8, at p = q; Adam turns that into full-size steps."""
+    g = torch.Generator().manual_seed(11)
+    h = torch.randn(2, 7, 32, generator = g).to(dtype)
+    w = (torch.randn(5000, 32, generator = g) * 0.5).to(dtype)
+    hs, ws = h.clone().requires_grad_(True), w.clone().requires_grad_(True)
+    mask = torch.ones(2, 7)
+    loss = rr.distillation_chunked_jsd(hs, h, ws, w, mask, beta = beta, chunk_size = 8)[0]
+    loss.backward()
+    assert loss.item() == 0.0, loss.item()
+    assert torch.count_nonzero(hs.grad) == 0 and torch.count_nonzero(ws.grad) == 0
