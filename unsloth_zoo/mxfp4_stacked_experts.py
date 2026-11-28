@@ -231,29 +231,51 @@ def _masked_grouped_mm(inputs, weight, ends, first, out):
 def _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step, out_dim):
     """`_chunked_grouped_mm` without host offsets: each chunk's grouped GEMM runs over every row with the absolute
     expert ends as offsets (its first expert's group also takes the rows before the chunk, rows after its last
-    end are left out), and only the chunk's own rows are kept. Same chunk memory, more rows multiplied."""
+    end are left out), and only the chunk's own rows are kept. Same chunk memory, more rows multiplied. Outside a
+    real capture (a graph decode step's eager warm-up) a chunk that does not fit is halved and that size kept, as
+    the host path does; the capture then starts from the kept size."""
     E = param._original_shape[0]
     M = inputs.shape[0]
     if M == 0:
         return inputs.new_empty((0, out_dim))
+    device = inputs.device
+    capturing = _tracing_or_capturing(device)
     ends = torch.cumsum(counts, 0, dtype = torch.int32)
-    row = torch.arange(M, device = inputs.device, dtype = torch.int32)[:, None]
+    row = torch.arange(M, device = device, dtype = torch.int32)[:, None]
     out = inputs.new_zeros((M, out_dim))
-    for first in range(0, E, step):
+    first = 0
+    while first < E:
         last = min(E, first + step)
-        weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
-        if not _grouped_mm_capture_safe(inputs, weight):
-            out = _masked_grouped_mm(inputs, weight, ends, first, out)
-            del weight
+        weight = part = None
+        try:
+            weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
+            if not _grouped_mm_capture_safe(inputs, weight):
+                out = _masked_grouped_mm(inputs, weight, ends, first, out)
+            else:
+                part = _grouped_mm(inputs, weight, ends[first:last].contiguous())
+                if part.shape[0] < M:
+                    # The per-expert loop fallback returns rows only through the chunk's last end.
+                    part = torch.nn.functional.pad(part, (0, 0, 0, M - part.shape[0]))
+                lo = ends[first - 1] if first > 0 else ends.new_zeros(())
+                keep = (row >= lo) & (row < ends[last - 1])
+                out = torch.where(keep, part, out)
+        except torch.cuda.OutOfMemoryError:
+            if capturing:
+                raise
+            weight = part = None
+            failed = step * _expert_bytes(param, dtype)
+            if step == 1:
+                if not _fused_fallback_ok(inputs, param):
+                    raise
+                if device.type == "cuda":
+                    _CHUNK_BUDGET[device.index] = [0, _CHUNK_RETRY_CALLS, failed]
+                return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
+            step //= 2
+            if device.type == "cuda":
+                _CHUNK_BUDGET[device.index] = [step * _expert_bytes(param, dtype), _CHUNK_RETRY_CALLS, failed]
             continue
-        part = _grouped_mm(inputs, weight, ends[first:last].contiguous())
-        if part.shape[0] < M:
-            # The per-expert loop fallback returns rows only through the chunk's last end.
-            part = torch.nn.functional.pad(part, (0, 0, 0, M - part.shape[0]))
-        lo = ends[first - 1] if first > 0 else ends.new_zeros(())
-        keep = (row >= lo) & (row < ends[last - 1])
-        out = torch.where(keep, part, out)
         del weight, part
+        first = last
     return out
 
 

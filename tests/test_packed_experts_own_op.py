@@ -374,3 +374,40 @@ def test_low_precision_inputs_take_a_different_autocast_dtype(dtype, autocast_dt
     assert eager.dtype == out.dtype == autocast_dtype
     assert torch.equal(out, eager)
     torch.testing.assert_close(eager, _reference(x.to(autocast_dtype), param, counts, True))
+
+
+def test_graph_decode_warm_up_halves_a_chunk_that_does_not_fit(monkeypatch):
+    # Eager warm-up of a graph decode step: a chunk over free memory is halved and retried, as on the host path.
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+    x = torch.randn(9, 64)
+    eager = pe.packed_expert_grouped_linear(x, param, counts, True)
+    monkeypatch.setattr(mse, "_chunk_bytes", lambda: 2 * 32 * 64 * 4)  # two experts per chunk
+    real = mse._dequantize_chunk
+    sizes = []
+
+    def dequantize(param, start, end, *args):
+        sizes.append(end - start)
+        if end - start > 1:
+            raise torch.cuda.OutOfMemoryError("simulated: chunk does not fit")
+        return real(param, start, end, *args)
+
+    monkeypatch.setattr(mse, "_dequantize_chunk", dequantize)
+    with graph_generate(), graph_decode_step():
+        device = pe.packed_expert_grouped_linear(x, param, counts, True)
+    torch.testing.assert_close(device, eager)
+    assert sizes[0] == 2 and set(sizes[1:]) == {1}
+
+
+def test_an_oom_inside_a_real_capture_still_raises(monkeypatch):
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+    monkeypatch.setattr(mse, "_chunk_bytes", lambda: 2 * 32 * 64 * 4)
+    monkeypatch.setattr(mse, "_tracing_or_capturing", lambda device = None: True)
+
+    def dequantize(*args):
+        raise torch.cuda.OutOfMemoryError("simulated")
+
+    monkeypatch.setattr(mse, "_dequantize_chunk", dequantize)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        mse._chunked_grouped_mm_on_device(torch.randn(9, 64), param, counts, torch.float32, True, 2, 32)
