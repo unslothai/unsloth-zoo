@@ -30,6 +30,8 @@ import types
 import torch
 import torch.nn.functional as F
 
+from ..fused_losses.aux_loss import unsloth_ga_scale_aux_loss
+
 
 def _cpu_fp16_autocast():
     try:
@@ -820,6 +822,45 @@ def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **k
         from transformers.activations import ACT2FN
         out = ACT2FN[activation](out)
     return out.to(hidden_states.dtype)
+
+
+def patch_cpu_router_aux_ga(model):
+    """Weight the MoE router aux loss a stock transformers forward adds in full (router_aux_loss_coef x aux_loss)
+    by each micro-batch's token share, local / num_items_in_batch, as zoo's GPU forwards do
+    (fused_losses/aux_loss.py). Unweighted, every one of G accumulated micro-batches carried the whole term, so
+    gradient accumulation trained with G times the coefficient of one batch of the same rows. Per instance; only
+    forwards whose source adds exactly that term (zoo's own rewriter recognises it). Returns True when installed."""
+    if os.environ.get("UNSLOTH_CPU_ROUTER_AUX_GA", "1") == "0":
+        return False
+    from ..fused_losses.aux_loss import rewrite_aux_loss_ga
+    target = next((m for m in model.modules() if "router_aux_loss_coef" in vars(m)), None)
+    if target is None or vars(target).get("_unsloth_cpu_router_aux_ga", False):
+        return False
+    class_forward = type(target).forward
+    try:
+        source = inspect.getsource(inspect.unwrap(class_forward))
+    except (OSError, TypeError):
+        return False
+    if rewrite_aux_loss_ga(source) == source:
+        return False
+
+    def forward(self, *args, **kwargs):
+        out = class_forward(self, *args, **kwargs)
+        labels = kwargs.get("labels")
+        n_items = kwargs.get("num_items_in_batch")
+        aux = getattr(out, "aux_loss", None)
+        coef = getattr(self, "router_aux_loss_coef", None)
+        if getattr(out, "loss", None) is None or aux is None or labels is None or n_items is None or not coef:
+            return out
+        weighted = unsloth_ga_scale_aux_loss(aux, labels, kwargs.get("attention_mask"), kwargs, n_items, model = self)
+        out.loss = out.loss + (coef * (weighted - aux)).to(device = out.loss.device, dtype = out.loss.dtype)
+        return out
+
+    forward.__wrapped__ = class_forward
+    # A deepcopy (TRL reference models) rebinds the method to the copy.
+    target.forward = types.MethodType(forward, target)
+    target._unsloth_cpu_router_aux_ga = True
+    return True
 
 
 def patch_causal_conv1d_fallback(model):

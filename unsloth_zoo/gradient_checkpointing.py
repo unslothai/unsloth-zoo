@@ -34,6 +34,7 @@ from .saved_attention import (
     saved_attention_scope,
     save_attention_requested,
     patch_transformers_saved_attention,
+    release_saved_attention_host_pool,
 )
 # Re-exported; lives in integrated_device.py so the import-time allocator block avoids torch.
 from .integrated_device import (
@@ -1498,6 +1499,7 @@ def unpatch_unsloth_gradient_checkpointing():
         del torch.utils.checkpoint._old_checkpoint
     pass
     _restore_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
+    release_saved_attention_host_pool()
 pass
 
 
@@ -1508,6 +1510,7 @@ def unpatch_gradient_checkpointing():
         del torch.utils.checkpoint._old_checkpoint
     pass
     _restore_transformers_checkpoint(unsloth_gradient_checkpoint)
+    release_saved_attention_host_pool()
 pass
 
 
@@ -1898,6 +1901,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global BUFFER_EVENTS_B
     global NEXT_BUFFER_SLOT
     _release_pool_pinned()
+    release_saved_attention_host_pool()
     _reset_pinned_cap()
     CPU_BUFFERS = []
     CPU_INDEX = 0
@@ -2985,6 +2989,7 @@ pass
 
 def unpatch_unsloth_smart_gradient_checkpointing():
     # All Unsloth Zoo code licensed under LGPLv3
+    release_saved_attention_host_pool()
     if (torch.utils.checkpoint.CheckpointFunction.__name__ == "UnslothCheckpointFunction") and \
         hasattr(torch.utils.checkpoint, "_old_CheckpointFunction"):
 
@@ -3064,6 +3069,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
 
     # GPU_BUFFERS is the "initialized" sentinel. An empty CPU_BUFFERS is a valid initialized pool (every
     # device keeps its inputs), and its run state (first pass, last checkpoint index) still has to be reset.
+    release_saved_attention_host_pool()
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
         return
 

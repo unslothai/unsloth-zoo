@@ -60,6 +60,9 @@ _PASSTHROUGH = {T.F32: torch.float32, T.F16: torch.float16, T.BF16: torch.bfloat
 _SPLIT_MM = frozenset((T.IQ2_XXS, T.IQ3_XXS, T.IQ4_XS, T.Q3_K, T.Q6_K))
 # The GEMV and dequantize kernels index group fields per group for every format.
 _NO_SPLIT_GEMV = frozenset()
+# ROCm (gfx1151, Triton 3.6): the split-group GEMV gets Q4_1 wrong for one row of x (about 700x the error of
+# dequantize + matmul) while its flat layout and every other format match, so Q4_1 takes the flat GEMV there.
+_ROCM_FLAT_GEMV = frozenset((T.Q4_1,))
 # Rows of x up to which the fused tile kernel beats Triton dequantize + cuBLAS (dense weights), from A100 / L4 runs
 # at 17408 x 5120: on HBM datacenter parts (A100 / H100 / B200: sm80, sm90, sm100) dequantize + cuBLAS is cheap, so
 # 256-value formats leave the fused path above 8 rows and the rest above 16; elsewhere (T4 / L4 / consumer cards)
@@ -378,6 +381,15 @@ def _mm_launch_tile(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, tra
     return out
 
 
+def _gemv_split(ggml_type):
+    if ggml_type in _NO_SPLIT_GEMV:
+        return False
+    if ggml_type in _ROCM_FLAT_GEMV:
+        from unsloth_zoo.rocm_build import is_rocm_torch
+        return not is_rocm_torch(torch)
+    return True
+
+
 def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
     qk, bs = GGML_BLOCK[ggml_type]
     # 4 rows x 512 values per step: best or near-best for every format on A100 and L4 (interleaved sweep)
@@ -386,7 +398,7 @@ def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
     _tk.gemv_kernel[grid](
         x1, packed, out, x1 if bias is None else bias, _table(x1.device), N, K, ggml_row_bytes(ggml_type, K),
         TYPE = ggml_type, QK = qk, BS = bs, HAS_BIAS = bias is not None,
-        BLOCK_N = BLOCK_N, NB = NB, SPLIT = ggml_type not in _NO_SPLIT_GEMV, num_warps = 4,
+        BLOCK_N = BLOCK_N, NB = NB, SPLIT = _gemv_split(ggml_type), num_warps = 4,
         enable_fp_fusion = True,
     )
     return out
