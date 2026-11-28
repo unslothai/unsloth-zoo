@@ -44,7 +44,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Harden runner (egress block)
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
           egress-policy: block
           disable-sudo: true
@@ -96,7 +96,7 @@ jobs:
 
       - name: Trufflehog secret scan
         continue-on-error: true
-        uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb  # v3.99.8
+        uses: trufflesecurity/trufflehog@3bd2b5887eb0efb8fa18bfd1d296032924e4ffdc  # v3.99.9
         with:
           base: ${{ github.event.repository.default_branch }}
           head: HEAD
@@ -110,7 +110,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (egress block)
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
           egress-policy: block
           disable-sudo: true
@@ -185,7 +185,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (egress block)
-        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c  # v2.23.0
         with:
           egress-policy: block
           disable-sudo: true
