@@ -537,7 +537,10 @@ def _compiled_layers(layers):
     optimized = getattr(getattr(torch, "_dynamo", None), "OptimizedModule", None)
     for layer in layers:
         forward = getattr(type(layer), "forward", None)
-        if (getattr(forward, "__module__", "") or "").startswith("unsloth.models._block_compile"):
+        # By the code's file: the block compile wrapper copies the original forward's __module__ (functools.wraps).
+        code = getattr(forward, "__code__", None)
+        if (getattr(forward, "__module__", "") or "").startswith("unsloth.models._block_compile") or \
+                os.path.basename(getattr(code, "co_filename", "") or "") == "_block_compile.py":
             return True
         for m in layer.modules():
             if getattr(m, "_compiled_call_impl", None) is not None or (optimized is not None and isinstance(m, optimized)):
@@ -1324,6 +1327,13 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
         return None, "decoder layers share key / value states (KV sharing)"
     if _operator_modes_active():
         return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
+    if _compiled_layers(layers) and not all(_checkpoint_mode(layer, swapper)[0] for layer in layers):
+        # Standard training runs these layers' forward under grad mode (non-reentrant checkpointing, which Unsloth
+        # uses when the MoE router loss is on, or none): the window's no-grad forward would run another compiled
+        # graph (inference vs training), which can differ in the last bit; refused before any layer runs, so the
+        # compiled blocks see only standard calls.
+        return None, ("compiled decoder layers whose standard forward runs under grad mode (non-reentrant or no "
+                      "gradient checkpointing): the window's no-grad forward would run a different compiled graph")
     if _forward_swapping_capture() and _recorder_targets(model, layers) and _compiled_layers(layers):
         # The window keeps each micro-batch's capture wrapper per thread through a class-level forward, which
         # compiled decoder code cannot trace (Unsloth's block compile would fall back to eager, changing numerics).

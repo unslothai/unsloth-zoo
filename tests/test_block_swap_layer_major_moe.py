@@ -289,3 +289,17 @@ def test_forward_swapping_capture_in_compiled_layers_is_refused():
     results, why = lm.run_layer_major(_layers(model), fns, model = model)
     assert results is None and "compiled decoder layers" in why, why
     assert _grads(model) == {}
+
+
+@pytest.mark.parametrize("gc", ["non_reentrant", "none"])
+def test_compiled_layers_with_a_grad_mode_standard_forward_are_refused(gc, monkeypatch):
+    """A compiled decoder layer whose standard forward runs under grad mode: the window's no-grad forward would run
+    the inference graph instead of the training graph. Refused before any layer runs."""
+    monkeypatch.setattr(lm, "_forward_swapping_capture", lambda: False)
+    model = _model("qwen3_moe", gc)
+    _layers(model)[1].compile()
+    batches, items = _batches()
+    fns = [functools.partial(_step, model, b, items) for b in batches]
+    results, why = lm.run_layer_major(_layers(model), fns, model = model)
+    assert results is None and "runs under grad mode" in why, why
+    assert _grads(model) == {}
