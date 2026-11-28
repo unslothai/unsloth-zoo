@@ -809,25 +809,52 @@ if _HAS_TRITON:
         return 2.0 * z * (poly * z2 + 1.0)
 
     @triton.jit
-    def _fl_log_mix(delta, beta, onemb):
-        # log((1 - beta) + beta exp(delta)) = m - ls for delta = lt - ls; exactly 0 at delta = 0, where
-        # logaddexp(ls + log(1 - beta), lt + log(beta)) - ls is an ulp of |ls| off (a spurious gradient at p = q).
-        # onemb = 1 - beta from the host in fp64 (in fp32 1 - beta is 0 for beta within 6e-8 of 1).
-        x = tl.minimum(delta, 80.0)
-        e = x * (1.0 + x * (1.0 / 2.0 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0 + x * (
-            1.0 / 720.0 + x * (1.0 / 5040.0 + x * (1.0 / 40320.0))))))))
-        e = tl.where(tl.abs(x) < 0.25, e, tl.exp(x) - 1.0)
-        u = beta * e
-        # log1p(u) = 2 atanh(u / (2 + u)) on [-1/2, 1]; plain log past 1; the log-space sum where 1 + u loses
-        # the (1 - beta) share (u < -1/2) or exp overflows (delta > 80).
-        lp = tl.where(u <= 1.0, _fl_log1p_neg(-tl.maximum(u, -0.5)), tl.log(1.0 + u))
-        lse = _fl_logaddexp(tl.zeros_like(delta) + tl.log(onemb), delta + tl.log(beta))
-        return tl.where((delta <= 80.0) & (u >= -0.5), lp, lse)
+    def _fl_log1p_sel(y, arg):
+        # log1p(y): 2 atanh series on [-1/2, 1], else log(arg) (arg = 1 + y, or an exact sum when 1 + y < 1/2).
+        return tl.where((y >= -0.5) & (y <= 1.0), _fl_log1p_neg(-tl.minimum(tl.maximum(y, -0.5), 1.0)), tl.log(arg))
 
     @triton.jit
-    def _fl_logaddexp(a, b):
-        mx = tl.maximum(a, b)
-        return mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx))
+    def _fl_log_mix_pair(delta, beta, onemb):
+        # For delta = lt - ls: (m - ls, lt - m) of the mixture log-prob m = log((1 - beta) p + beta q), from one
+        # exp: m - ls = log1p(beta expm1(delta)), lt - m = -log1p((1 - beta) expm1(-delta)). Both are exactly 0 at
+        # delta = 0, where logaddexp(ls + log(1 - beta), lt + log(beta)) is an ulp of |ls| off ls (a spurious
+        # gradient at p = q). onemb = 1 - beta from the host in fp64 (fp32 1 - beta is 0 within 6e-8 of 1);
+        # where 1 + y < 1/2 the small share is kept by summing (1 - c) + c exp(+-delta) directly.
+        x = tl.minimum(tl.maximum(delta, -80.0), 80.0)
+        r = tl.exp(x)
+        em1 = x * (1.0 + x * (1.0 / 2.0 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0 + x * (
+            1.0 / 720.0 + x * (1.0 / 5040.0 + x * (1.0 / 40320.0))))))))
+        em1 = tl.where(tl.abs(x) < 0.25, em1, r - 1.0)
+        y = beta * em1
+        mix = _fl_log1p_sel(y, tl.where(y < -0.5, onemb + beta * r, 1.0 + y))
+        mix = tl.where(delta > 80.0, delta + tl.log(beta), mix)
+        rinv = 1.0 / r
+        y2 = -onemb * em1 * rinv
+        tmix = -_fl_log1p_sel(y2, tl.where(y2 < -0.5, beta + onemb * rinv, 1.0 + y2))
+        tmix = tl.where(delta < -80.0, delta - tl.log(onemb), tmix)
+        return mix, tmix
+
+    @triton.jit
+    def _fl_log1p_small(y, arg):
+        # log1p(y) as y - y^2 / 2 + y^3 / 3 below |y| 1e-3 (where 1 + y rounds it away), else log(arg).
+        return tl.where(tl.abs(y) < 1e-3, y * (1.0 + y * (-0.5 + y * (1.0 / 3.0))), tl.log(arg))
+
+    @triton.jit
+    def _fl_log_mix_fast(delta, beta, onemb):
+        # _fl_log_mix_pair for the per-element passes: no divisions or series logs (one exp and one log per
+        # term), still exactly 0 at delta = 0 and keeping the small share near beta 0 / 1.
+        x = tl.minimum(tl.maximum(delta, -80.0), 80.0)
+        r = tl.exp(x)
+        em1 = tl.where(tl.abs(x) < 0.0625, x * (1.0 + x * (0.5 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0))))),
+                       r - 1.0)
+        y = beta * em1
+        mix = _fl_log1p_small(y, tl.where(y < -0.5, onemb + beta * r, 1.0 + y))
+        mix = tl.where(delta > 80.0, delta + tl.log(beta), mix)
+        rinv = tl.exp(-x)
+        y2 = -onemb * em1 * rinv
+        tmix = -_fl_log1p_small(y2, tl.where(y2 < -0.5, beta + onemb * rinv, 1.0 + y2))
+        tmix = tl.where(delta < -80.0, delta - tl.log(onemb), tmix)
+        return mix, tmix
 
     @triton.jit
     def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta, onemb,
@@ -884,10 +911,12 @@ if _HAS_TRITON:
             tl.store(a + 3, sj - tj)
             tl.store(a + 4, ls_j - lt_j)
         else:
-            tl.store(a + 3, -_fl_log_mix(tj - sj, beta, onemb))
+            c_mix, _ = _fl_log_mix_pair(tj - sj, beta, onemb)
+            tl.store(a + 3, -c_mix)
             # ls_j - m_j and lt_j - m_j from the peak log-probs, each its own log-mix (exact at p = q).
-            tl.store(a + 4, tl.exp(lt_j) * -_fl_log_mix(ls_j - lt_j, onemb, beta))
-            tl.store(a + 5, -_fl_log_mix(lt_j - ls_j, beta, onemb))
+            mix_j, tmix_j = _fl_log_mix_pair(lt_j - ls_j, beta, onemb)
+            tl.store(a + 4, tl.exp(lt_j) * tmix_j)
+            tl.store(a + 5, -mix_j)
 
     @triton.jit
     def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, aux_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
@@ -918,8 +947,9 @@ if _HAS_TRITON:
             tl.store(o, tl.sum(tl.where(off, p * (ls - lt - tl.load(a + 3)), 0.0), 0))
         else:
             # lt - m = -log((1 - (1 - b)) + (1 - b) exp(ls - lt)): the mirrored log-mix, not (lt - ls) - (m - ls).
-            tl.store(o, tl.sum(tl.where(off, -q * _fl_log_mix(ls - lt, onemb, beta), 0.0), 0))
-            tl.store(o + 1, tl.sum(tl.where(off, p * (-_fl_log_mix(lt - ls, beta, onemb) - tl.load(a + 3)), 0.0), 0))
+            mix, tmix = _fl_log_mix_fast(lt - ls, beta, onemb)
+            tl.store(o, tl.sum(tl.where(off, q * tmix, 0.0), 0))
+            tl.store(o + 1, tl.sum(tl.where(off, p * (-mix - tl.load(a + 3)), 0.0), 0))
 
     @triton.jit
     def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, aux_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
@@ -940,7 +970,8 @@ if _HAS_TRITON:
         if MODE == 1:
             d = ls - lt
         else:
-            d = -_fl_log_mix(lt - ls, beta, onemb)
+            mix, _ = _fl_log_mix_fast(lt - ls, beta, onemb)
+            d = -mix
         # d shifted by c = d_j (collapse-safe d - sum p d); j's term is exactly 0, not this d_j - c (an ulp off).
         g = p * (tl.where(cols == tl.load(a + 2).to(tl.int32), 0.0, d - tl.load(a + 3)) - tl.load(rs_ptr + row))
         dz = g * (tl.load(coef_ptr) * (scale_g * inv_t)) * ds
