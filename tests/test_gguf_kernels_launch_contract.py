@@ -121,6 +121,9 @@ def test_old_triton_on_blackwell_keeps_tl_dot_off(monkeypatch):
     monkeypatch.setattr(gguf_ops, "_HAS_TRITON", True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: (12, 0))
     monkeypatch.setattr(torch.version, "hip", None)
+    # A ROCm wheel still reads as ROCm through its +rocm version tag: fake the CUDA card all the way.
+    from unsloth_zoo import rocm_build
+    monkeypatch.setattr(rocm_build, "is_rocm_torch", lambda torch_mod = None: False)
     for old, expected in ((True, False), (False, True)):
         monkeypatch.setattr(gguf_ops, "_OLD_TRITON", old)
         monkeypatch.setattr(gguf_ops, "_DOT_LOWERS", {}, raising = False)

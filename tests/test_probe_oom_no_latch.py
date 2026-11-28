@@ -85,6 +85,8 @@ def test_mxfp4_convert_probe_gives_no_verdict_on_oom(monkeypatch, error, verdict
     from unsloth_zoo import mxfp4_gemm as G
 
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    # A ROCm wheel still reads as ROCm through its +rocm version tag: fake the CUDA card all the way.
+    monkeypatch.setattr(G, "is_rocm_torch", lambda torch_mod = None: False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: (12, 0))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "device", lambda index: contextlib.nullcontext())
