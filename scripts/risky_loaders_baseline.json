@@ -138,9 +138,9 @@
       "file": "unsloth_zoo/llama_cpp.py",
       "rule": "unpinned-code-fetch",
       "sink": "git-clone-unpinned",
-      "digest": "a5ae4361307c747b",
+      "digest": "d9a237f62382d340",
       "count": 1,
-      "reason": "Known residual: install_llama_cpp source-builds from upstream llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
+      "reason": "Known residual: only when no unslothai/llama.cpp release resolves (the release path extracts a sha256-checked source tarball instead), install_llama_cpp clones the unslothai/llama.cpp fork's default branch; the same trust as installing its prebuilt, and pinning that fallback is a separate change."
     },
     {
       "file": "unsloth_zoo/mlx/compile.py",
@@ -282,9 +282,9 @@
       "file": "unsloth_zoo/mlx/utils.py",
       "rule": "unpinned-code-fetch",
       "sink": "git-clone-unpinned",
-      "digest": "a565552d9206c779",
+      "digest": "03caac85fc21fa13",
       "count": 1,
-      "reason": "Known residual: the macOS source build clones llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
+      "reason": "Known residual: only when no unslothai/llama.cpp release resolves (the release path extracts a sha256-checked source tarball instead), the macOS source build clones the unslothai/llama.cpp fork's default branch; the same trust as installing its prebuilt, and pinning that fallback is a separate change."
     },
     {
       "file": "unsloth_zoo/patching_utils.py",
