@@ -69,16 +69,28 @@ def _fake_trl(root, orpo_in_trainer):
         _write(os.path.join(root, "trl", "experimental", "utils", "__init__.py"), "")
 
 
+def _drop_trl_modules():
+    for name in [m for m in sys.modules if m == "trl" or m.startswith("trl.")]:
+        del sys.modules[name]
+
+
 @pytest.fixture
 def fake_trl(tmp_path, monkeypatch):
+    # The fake trl.* modules must not outlive the test: later tests import the installed TRL.
+    saved = {m: sys.modules[m] for m in list(sys.modules) if m == "trl" or m.startswith("trl.")}
+
     def make(orpo_in_trainer):
         root = str(tmp_path / ("stable" if orpo_in_trainer else "experimental"))
         _fake_trl(root, orpo_in_trainer)
-        for name in [m for m in sys.modules if m == "trl" or m.startswith("trl.")]:
-            monkeypatch.delitem(sys.modules, name)
+        _drop_trl_modules()
         monkeypatch.syspath_prepend(root)
         return root
-    return make
+
+    try:
+        yield make
+    finally:
+        _drop_trl_modules()
+        sys.modules.update(saved)
 
 
 @pytest.mark.parametrize("orpo_in_trainer", [False, True], ids = ["trl_experimental", "trl_trainer"])
