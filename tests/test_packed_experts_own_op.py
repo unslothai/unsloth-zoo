@@ -320,3 +320,20 @@ def test_float32_inputs_under_autocast_match_eager_when_compiled(backend):
     out.backward(g)
     assert x.grad.dtype == x2.grad.dtype == torch.float32
     assert torch.equal(x.grad, x2.grad)
+
+
+@pytest.mark.parametrize("multi_chunk", [False, True])
+@pytest.mark.parametrize("transpose_b", [True, False])
+def test_graph_decode_step_avoids_host_sync_grouped_gemm_fallbacks(monkeypatch, multi_chunk, transpose_b):
+    # On CPU (as for float32 CUDA rows) the zoo's grouped GEMM is the per-expert loop, which reads its offsets on
+    # the host: a capture must not reach it, with one chunk or several.
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+    x = torch.randn(9, 64 if transpose_b else 32)
+    eager = pe.packed_expert_grouped_linear(x, param, counts, transpose_b)
+    if multi_chunk:
+        monkeypatch.setattr(mse, "_chunk_bytes", lambda: 32 * 64 * 4)  # one expert per chunk
+    _no_tolist(monkeypatch)
+    with graph_generate(), graph_decode_step():
+        device = pe.packed_expert_grouped_linear(x, param, counts, transpose_b)
+    torch.testing.assert_close(device, eager)

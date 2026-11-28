@@ -138,6 +138,8 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
             ends_device = torch.cumsum(counts, 0, dtype = torch.int32)
             try:
                 weight = _dequantize_chunk(param, 0, E, dtype, transpose, counts)
+                if _no_host_sync(device) and not _grouped_mm_capture_safe(inputs, weight):
+                    return _masked_grouped_mm(inputs, weight, ends_device, 0, inputs.new_zeros((inputs.shape[0], out_dim)))
                 return _grouped_mm(inputs, weight, ends_device)
             except torch.cuda.OutOfMemoryError:
                 if not adaptive or E == 1:
@@ -196,6 +198,34 @@ def _no_host_sync(device):
     return in_graph_decode_step()
 
 
+def _grouped_mm_capture_safe(inputs, weight):
+    """Whether the zoo's grouped GEMM takes a backend that reads no offsets on the host for these operands: its
+    Triton kernel, or torch._grouped_mm on bf16 CUDA. Its other fallbacks (the per-expert loop) do."""
+    if not inputs.is_cuda:
+        return False
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_supported_on, _triton_grouped_mm_wanted
+        if _triton_grouped_mm_wanted(inputs, weight):
+            return True
+        return inputs.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and bool(
+            _grouped_mm_supported_on(inputs.device)
+        )
+    except Exception:
+        return False
+
+
+def _masked_grouped_mm(inputs, weight, ends, first, out):
+    """Experts first.. of `weight` (C, K, N) over every row, each kept on its own rows: offsets stay on the device.
+    `ends` are the absolute expert ends (int32, device); `out` holds the other experts' rows."""
+    row = torch.arange(inputs.shape[0], device = inputs.device, dtype = torch.int32)[:, None]
+    for i in range(weight.shape[0]):
+        e = first + i
+        lo = ends[e - 1] if e > 0 else ends.new_zeros(())
+        keep = (row >= lo) & (row < ends[e])
+        out = torch.where(keep, inputs @ weight[i].to(inputs.dtype), out)
+    return out
+
+
 def _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step, out_dim):
     """`_chunked_grouped_mm` without host offsets: each chunk's grouped GEMM runs over every row with the absolute
     expert ends as offsets (its first expert's group also takes the rows before the chunk, rows after its last
@@ -210,6 +240,10 @@ def _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step,
     for first in range(0, E, step):
         last = min(E, first + step)
         weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
+        if not _grouped_mm_capture_safe(inputs, weight):
+            out = _masked_grouped_mm(inputs, weight, ends, first, out)
+            del weight
+            continue
         part = _grouped_mm(inputs, weight, ends[first:last].contiguous())
         if part.shape[0] < M:
             # The per-expert loop fallback returns rows only through the chunk's last end.
