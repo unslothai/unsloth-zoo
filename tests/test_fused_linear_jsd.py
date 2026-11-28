@@ -354,6 +354,29 @@ def test_log_mix_matches_logaddexp(beta):
     assert fl._jsd_log_mix(torch.zeros(1, dtype = torch.float32), beta).item() == 0.0
 
 
+@pytest.mark.parametrize("beta", [1e-8, 1.0 - 1e-8])
+@pytest.mark.parametrize("path", ["body", "chunk", "triton"])
+def test_beta_near_endpoints_stays_finite(beta, path):
+    """Large |lt - ls| with beta within 1e-8 of 0 or 1: 1 + u underflows to 0 in log1p form; the sum stays finite."""
+    s = torch.tensor([[0.0, -25.0], [-25.0, 0.0]])
+    t = torch.tensor([[-25.0, 0.0], [0.0, -25.0]])
+    one = torch.tensor(1.0)
+    if path == "body":
+        row, dz = fl._jsd_body(s, t, one, beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    elif path == "chunk":
+        row, dz = fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(t, -1), beta, True)
+    else:
+        if not torch.cuda.is_available() or not fl._use_triton(torch.device("cuda")):
+            pytest.skip("Triton on CUDA")
+        row, dz = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    row, dz = row.cpu().double(), dz.cpu().double()
+    assert torch.isfinite(row).all() and torch.isfinite(dz).all(), (row, dz)
+    for i in range(2):
+        ref, gref = _exact_jsd(s[i], t[i], beta)
+        torch.testing.assert_close(row[i], ref, rtol = 1e-3, atol = 1e-12)
+        torch.testing.assert_close(dz[i], gref, rtol = 1e-3, atol = 1e-12)
+
+
 def test_fully_masked_is_finite_zero():
     hs, ws, _, ht, wt, _, labels = _case(3)
     h = hs.clone().requires_grad_(True)

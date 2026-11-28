@@ -809,19 +809,23 @@ if _HAS_TRITON:
         return 2.0 * z * (poly * z2 + 1.0)
 
     @triton.jit
-    def _fl_log_mix(delta, beta):
+    def _fl_log_mix(delta, beta, onemb):
         # log((1 - beta) + beta exp(delta)) = m - ls for delta = lt - ls; exactly 0 at delta = 0, where
         # logaddexp(ls + log(1 - beta), lt + log(beta)) - ls is an ulp of |ls| off (a spurious gradient at p = q).
         x = -tl.abs(delta)
         e = x * (1.0 + x * (1.0 / 2.0 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0 + x * (
             1.0 / 720.0 + x * (1.0 / 5040.0 + x * (1.0 / 40320.0))))))))
         e = tl.where(x > -0.25, e, tl.exp(x) - 1.0)
-        u = tl.where(delta > 0, 1.0 - beta, beta) * e
-        lg = tl.where(u >= -0.5, _fl_log1p_neg(tl.minimum(-u, 0.5)), tl.log(1.0 + u))
+        pos = delta > 0
+        # onemb = 1 - beta from the host in fp64: in fp32 1 - beta is 0 for beta within 6e-8 of 1.
+        c = tl.where(pos, onemb, beta)
+        u = c * e
+        # 1 + u = (1 - c) + c exp(x): the direct sum once u < -1/2, so beta near 0 or 1 keeps a finite log.
+        lg = tl.where(u >= -0.5, _fl_log1p_neg(tl.minimum(-u, 0.5)), tl.log(tl.where(pos, beta, onemb) + c * tl.exp(x)))
         return lg + tl.maximum(delta, 0.0)
 
     @triton.jit
-    def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta,
+    def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta, onemb,
                            s_scale, s_cap, t_scale, t_cap, inv_t, MODE: tl.constexpr, S_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, student scale
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK_NB: tl.constexpr):  # student cap, teacher scale / cap, vocab blocks pow2
         # Per row: confident x_j - lse rounds to 0 in fp32, so j's terms use log1p(-mass of the others).
@@ -875,15 +879,17 @@ if _HAS_TRITON:
             tl.store(a + 3, sj - tj)
             tl.store(a + 4, ls_j - lt_j)
         else:
-            tl.store(a + 3, -_fl_log_mix(tj - sj, beta))
+            tl.store(a + 3, -_fl_log_mix(tj - sj, beta, onemb))
             mix_o = p_o + beta * (q_o - p_o)
-            m_j = tl.where(mix_o < 0.5, _fl_log1p_neg(tl.minimum(mix_o, 0.5)), ls_j + _fl_log_mix(lt_j - ls_j, beta))
-            tl.store(a + 4, tl.exp(lt_j) * (lt_j - m_j))
-            tl.store(a + 5, ls_j - m_j)
+            # ls_j - m_j and lt_j - m_j, each from its own log-mix (no cancellation against a large |lt_j - ls_j|).
+            conf = mix_o < 0.5
+            m_c = _fl_log1p_neg(tl.minimum(mix_o, 0.5))
+            tl.store(a + 4, tl.exp(lt_j) * tl.where(conf, lt_j - m_c, -_fl_log_mix(ls_j - lt_j, onemb, beta)))
+            tl.store(a + 5, tl.where(conf, ls_j - m_c, -_fl_log_mix(lt_j - ls_j, beta, onemb)))
 
     @triton.jit
     def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, aux_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
-                           beta, s_scale, s_cap, t_scale, t_cap, inv_t,
+                           beta, onemb, s_scale, s_cap, t_scale, t_cap, inv_t,
                            MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, write dz, student scale
                            S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):  # student cap, teacher scale / cap, vocab cols
         # Sums without j (aux has j's terms). MODE 0: beta 0, sum q (lt - ls), dz = p - q. MODE 1: beta 1,
@@ -909,13 +915,13 @@ if _HAS_TRITON:
         elif MODE == 1:
             tl.store(o, tl.sum(tl.where(off, p * (ls - lt - tl.load(a + 3)), 0.0), 0))
         else:
-            mix = _fl_log_mix(lt - ls, beta)
-            tl.store(o, tl.sum(tl.where(off, q * ((lt - ls) - mix), 0.0), 0))
-            tl.store(o + 1, tl.sum(tl.where(off, p * (-mix - tl.load(a + 3)), 0.0), 0))
+            # lt - m = -log((1 - (1 - b)) + (1 - b) exp(ls - lt)): the mirrored log-mix, not (lt - ls) - (m - ls).
+            tl.store(o, tl.sum(tl.where(off, -q * _fl_log_mix(ls - lt, onemb, beta), 0.0), 0))
+            tl.store(o + 1, tl.sum(tl.where(off, p * (-_fl_log_mix(lt - ls, beta, onemb) - tl.load(a + 3)), 0.0), 0))
 
     @triton.jit
     def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, aux_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
-                          beta, s_scale, s_cap, t_scale, t_cap, inv_t,
+                          beta, onemb, s_scale, s_cap, t_scale, t_cap, inv_t,
                           MODE: tl.constexpr, S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, student / teacher scale, cap
                           T_CAP: tl.constexpr, BLOCK: tl.constexpr):  # teacher cap / vocab cols per block
         # dz = scale_g * p * (d - sum p d); MODE 1: d = ls - lt, MODE 2: d = ls - m, scale_g = 1 - beta.
@@ -932,7 +938,7 @@ if _HAS_TRITON:
         if MODE == 1:
             d = ls - lt
         else:
-            d = -_fl_log_mix(lt - ls, beta)
+            d = -_fl_log_mix(lt - ls, beta, onemb)
         # d shifted by c = d_j (collapse-safe d - sum p d); j's term is exactly 0, not this d_j - c (an ulp off).
         g = p * (tl.where(cols == tl.load(a + 2).to(tl.int32), 0.0, d - tl.load(a + 3)) - tl.load(rs_ptr + row))
         dz = g * (tl.load(coef_ptr) * (scale_g * inv_t)) * ds
@@ -2240,14 +2246,24 @@ def _jsd_log_mix(delta, beta):
 
     Exactly 0 at delta = 0: logaddexp(ls + log(1 - b), lt + log(b)) - ls is an ulp of |ls| off there, a spurious
     gradient at p = q that Adam turns into full-size steps (a LoRA student identical to its adapter-off teacher)."""
-    e = torch.expm1(-delta.abs())
-    return torch.log1p(torch.where(delta > 0, e * (1.0 - beta), e * beta)) + delta.clamp_min(0.0)
+    x = -delta.abs()
+    pos = delta > 0
+    u = torch.where(pos, torch.expm1(x) * (1.0 - beta), torch.expm1(x) * beta)
+    # 1 + u = (1 - c) + c exp(x) for the weight c of u: summed directly once u < -1/2, so beta near 0 or 1 stays finite.
+    lb, l1b = math.log(beta), math.log1p(-beta)
+    tail = torch.where(pos, torch.logaddexp(x + l1b, torch.full_like(x, lb)),
+                       torch.logaddexp(x + lb, torch.full_like(x, l1b)))
+    return torch.where(u >= -0.5, torch.log1p(u), tail) + delta.clamp_min(0.0)
 
 
 def _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta):
-    """log((1 - b) p_j + b q_j) of the top token, = log1p(-((1 - b) p_o + b q_o)) on a confident row."""
+    """(ls_j - m_j, lt_j - m_j) for the top token's m_j = log((1 - b) p_j + b q_j), = log1p(-((1 - b) p_o + b q_o))
+    on a confident row; otherwise each difference from its own log-mix."""
     mix_o = p_o + beta * (q_o - p_o)
-    return torch.where(mix_o < 0.5, torch.log1p(-mix_o), ls_j + _jsd_log_mix(lt_j - ls_j, beta))
+    conf = mix_o < 0.5
+    m_c = torch.log1p(-mix_o)
+    return (torch.where(conf, ls_j - m_c, -_jsd_log_mix(lt_j - ls_j, beta)),
+            torch.where(conf, lt_j - m_c, -_jsd_log_mix(ls_j - lt_j, 1.0 - beta)))
 
 
 def _jsd_peak_dz(ls_j, lt_j, p_o, q_o):
@@ -2296,14 +2312,11 @@ def _jsd_chunk(ls, lt, beta, want_grad):
         p.mul_(rs)
         return row, g.sub_(p)
     ls_j, lt_j = ls.gather(1, j), lt.gather(1, j)
-    # m = lt - ls, q = m_mix - ls (_jsd_log_mix, exactly 0 where p = q), in place: one extra transient buffer.
+    # m = lt - ls, q = m_mix - ls (_jsd_log_mix, exactly 0 where p = q); its transients are in _jsd_impl's n_buf.
     m = torch.sub(lt, ls)
-    pos = m > 0
-    q = torch.abs(m).neg_().expm1_()
-    w = pos.to(q.dtype).mul_(1.0 - 2.0 * beta).add_(beta)
-    q.mul_(w).log1p_().add_(torch.clamp(m, min = 0.0, out = w))
-    del pos, w
-    m.sub_(q)
+    q = _jsd_log_mix(m, beta)
+    # lt - m_mix from the mirrored log-mix, not m - q (which cancels against a large |lt - ls|).
+    m = _jsd_log_mix(m.neg_(), 1.0 - beta).neg_()
     q.neg_()
     lt.exp_()
     q_o = lt.scatter_(1, j, 0.0).sum(-1, keepdim = True)
@@ -2318,9 +2331,9 @@ def _jsd_chunk(ls, lt, beta, want_grad):
     g = torch.mul(p, q, out = m)
     rs = g.sum(-1, keepdim = True)
     ls_j, lt_j = _jsd_peak(ls_j, p_o), _jsd_peak(lt_j, q_o)
-    m_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
-    row_t = row_t + lt_j.exp() * (lt_j - m_j)
-    row = (beta * row_t + (1.0 - beta) * (rs + (ls_j - m_j))).squeeze(-1)
+    sm_j, tm_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
+    row_t = row_t + lt_j.exp() * tm_j
+    row = (beta * row_t + (1.0 - beta) * (rs + sm_j)).squeeze(-1)
     if not want_grad:
         return row, None
     p.mul_(rs)
@@ -2361,13 +2374,13 @@ def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: fl
         dz = g - p * rs
     else:
         delta = lt - ls
-        mix = _jsd_log_mix(delta, beta)
-        m_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
-        row_t = torch.where(top, 0.0, q * (delta - mix)).sum(-1, keepdim = True) + lt_j.exp() * (lt_j - m_j)
-        d = -mix
+        sm_j, tm_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
+        row_t = (torch.where(top, 0.0, q * -_jsd_log_mix(-delta, 1.0 - beta)).sum(-1, keepdim = True)
+                 + lt_j.exp() * tm_j)
+        d = -_jsd_log_mix(delta, beta)
         g = p * torch.where(top, 0.0, d - d.gather(1, j))
         rs = g.sum(-1, keepdim = True)
-        row = (beta * row_t + (1.0 - beta) * (rs + (ls_j - m_j))).squeeze(-1)
+        row = (beta * row_t + (1.0 - beta) * (rs + sm_j)).squeeze(-1)
         dz = (1.0 - beta) * (g - p * rs)
     if not want_grad:
         return row, None
@@ -2401,11 +2414,11 @@ def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap
     part = torch.empty((R, NB, 2), device = s.device, dtype = torch.float32)
     grid = (R, NB)
     _fl_jsd_stats_kernel[grid](s, t, s.stride(0), V, stats, NB, *sc, BLOCK = _JSD_BLOCK, **flags)
-    _fl_jsd_pre_kernel[(R,)](s, t, s.stride(0), stats, NB, aux, float(beta), *sc, MODE = mode,
+    _fl_jsd_pre_kernel[(R,)](s, t, s.stride(0), stats, NB, aux, float(beta), 1.0 - float(beta), *sc, MODE = mode,
                              BLOCK_NB = triton.next_power_of_2(NB), **flags)
     dz = torch.empty((R, V), device = s.device, dtype = grad_dtype) if want_grad else s.new_empty((1, 1))
     factor = factor.reshape(1).to(torch.float32)
-    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, aux, part, NB, dz, dz.stride(0), factor, float(beta),
+    _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, aux, part, NB, dz, dz.stride(0), factor, float(beta), 1.0 - float(beta),
                              *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, BLOCK = _JSD_BLOCK, **flags)
     if mode == 0:
         row = part[..., 0].sum(1) + aux[:, 4]
@@ -2419,7 +2432,8 @@ def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap
         return row, None
     if mode != 0:
         _fl_jsd_dz_kernel[grid](s, t, s.stride(0), V, aux, rs.contiguous(), dz, dz.stride(0), factor,
-                                1.0 if mode == 1 else 1.0 - beta, float(beta), *sc, MODE = mode,
+                                1.0 if mode == 1 else 1.0 - beta, float(beta), 1.0 - float(beta), *sc,
+                                MODE = mode,
                                 BLOCK = _JSD_BLOCK, **flags)
     return row, dz
 
@@ -2474,7 +2488,7 @@ def _jsd_impl(hidden, weight, bias, t_hidden, t_weight, t_bias, mask, divisor, s
         if sd == torch.float32:
             fused = _jsd_triton if _use_triton(device) else _jsd_compiled(device)
         # Compiled body: both logits + about 1.5 buffers (measured); eager four, five with softcapping.
-        n_buf = 4 if fused is not None else _JSD_BUFFERS + (s_cap != 0.0) + 2 * (0.0 < beta < 1.0)
+        n_buf = 4 if fused is not None else _JSD_BUFFERS + (s_cap != 0.0) + 4 * (0.0 < beta < 1.0)
         R = max(_jsd_rows(rows, n_keep, V, n_buf * sd.itemsize), 1)
         if fused is _jsd_triton and rows <= 0 and _JSD_TRITON_ROWS:
             # Triton keeps 2.5 [rows, vocab] fp32 buffers; rows as in the torch.func chunked JSD (2**26 logits, [64, 1024]).
