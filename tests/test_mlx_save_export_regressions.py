@@ -47,6 +47,14 @@ def _install_mlx_torch_shim():
     simulate_mlx_on_torch()
 
 
+@pytest.fixture(autouse=True)
+def _no_llama_cpp_release_lookup(monkeypatch):
+    # The macOS source build first asks for the fork release's source archive: no network here, so it clones.
+    import unsloth_zoo.llama_cpp as lcpp
+
+    monkeypatch.setattr(lcpp, "_source_build_release", lambda: None, raising=False)
+
+
 def test_vlm_config_save_uses_vlm_helper_and_preserves_quantization_config(
     monkeypatch,
     tmp_path,
@@ -2731,6 +2739,7 @@ def test_macos_helper_reclones_non_source_dir(monkeypatch, tmp_path):
     mutils._install_llama_cpp_macos(str(folder))
 
     assert any(list(c[:2]) == ["git", "clone"] for c in cmds), "expected a re-clone of the non-source dir"
+    assert [c[2] for c in cmds if list(c[:2]) == ["git", "clone"]] == ["https://github.com/unslothai/llama.cpp"]
     assert (folder / "CMakeLists.txt").is_file(), "folder should be a source tree after the re-clone"
 
 
