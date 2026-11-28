@@ -57,12 +57,16 @@ class Trainer:
     completion_only_loss = True
 
 
-def prepare(max_length, **overrides):
-    rows = [{"prompt": PROMPT + " ", "completion": COMPLETION}] * 2
-    dataset = sft_prepare_dataset(
-        Trainer(), Dataset.from_list(rows), Tokenizer(), Args(max_length, **overrides), False, None, "train",
+def run(rows, max_length, **overrides):
+    trainer = Trainer()
+    trainer.completion_only_loss = overrides.get("completion_only_loss", True)
+    return sft_prepare_dataset(
+        trainer, rows, Tokenizer(), Args(max_length, **overrides), False, None, "train",
     )
-    row = dataset[0]
+
+
+def prepare(max_length, **overrides):
+    row = run(Dataset.from_list([{"prompt": PROMPT + " ", "completion": COMPLETION}] * 2), max_length, **overrides)[0]
     # TRL >= 1.7 folds completion_mask into labels; older TRL keeps the column for its collator.
     keep = row["labels"] if "labels" in row else row["completion_mask"]
     trained = [t for t, k in zip(row["input_ids"], keep) if k not in (0, -100)]
@@ -86,6 +90,29 @@ def test_no_max_length_keeps_the_whole_row():
     ids, trained = prepare(None)
     assert ids == FULL
     assert trained == COMPLETION_IDS
+
+
+# At max_length 7 the long prompt fills the row, so no completion token survives keep_start.
+MIXED = [
+    {"prompt": "p1 p2 ", "completion": "c1 c2"},
+    {"prompt": PROMPT + " p1 ", "completion": COMPLETION},
+]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_rows_without_a_completion_token_are_dropped(streaming):
+    rows = Dataset.from_list(MIXED)
+    out = list(run(rows.to_iterable_dataset() if streaming else rows, 7))
+    assert [len(row["input_ids"]) for row in out] == [4]
+
+
+def test_full_sequence_loss_keeps_prompt_only_rows():
+    out = run(Dataset.from_list(MIXED), 7, completion_only_loss = False)
+    assert [len(row["input_ids"]) for row in out] == [4, 7]
+
+
+def test_split_with_no_row_left_is_empty():
+    assert len(run(Dataset.from_list(MIXED[1:]), 7)) == 0
 
 
 def test_unsloth_truncation_guard_anchor_is_kept():

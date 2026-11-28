@@ -3552,31 +3552,33 @@ def sft_prepare_dataset(
                     batched=_batch_map,
                     remove_columns=source_column_names, **_tokenize_map_kwargs,
                 )
-            if assistant_only_loss:
-                # Prompt-history assistant turns are no target while completion_mask applies.
-                pc_completion_only = getattr(self, "completion_only_loss", None)
-                if pc_completion_only is None:
-                    pc_completion_only = getattr(args, "completion_only_loss", None)
-                if pc_completion_only is None or pc_completion_only:
-                    if _batched_columns(dataset):
-                        dataset = dataset.filter(
-                            lambda assistant_masks, completion_mask: [
-                                any(a and c for a, c in zip(row_a, row_c))
-                                for row_a, row_c in zip(assistant_masks, completion_mask)
-                            ],
-                            batched = True, input_columns = ["assistant_masks", "completion_mask"],
-                        )
-                    else:
-                        dataset = dataset.filter(
-                            lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
-                        )
-                elif _batched_columns(dataset):
+            # Like TRL, drop rows left without a target: truncation can cut away the whole completion.
+            # Prompt-history assistant turns are no target while completion_mask applies.
+            pc_completion_only = getattr(self, "completion_only_loss", None)
+            if pc_completion_only is None:
+                pc_completion_only = getattr(args, "completion_only_loss", None)
+            pc_completion_only = pc_completion_only is None or pc_completion_only
+            if assistant_only_loss and pc_completion_only:
+                if _batched_columns(dataset):
                     dataset = dataset.filter(
-                        lambda assistant_masks: [any(row) for row in assistant_masks],
-                        batched = True, input_columns = ["assistant_masks"],
+                        lambda assistant_masks, completion_mask: [
+                            any(a and c for a, c in zip(row_a, row_c))
+                            for row_a, row_c in zip(assistant_masks, completion_mask)
+                        ],
+                        batched = True, input_columns = ["assistant_masks", "completion_mask"],
                     )
                 else:
-                    dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
+                    dataset = dataset.filter(
+                        lambda row: any(a and c for a, c in zip(row["assistant_masks"], row["completion_mask"]))
+                    )
+            elif assistant_only_loss or pc_completion_only:
+                target_mask = "assistant_masks" if assistant_only_loss else "completion_mask"
+                if _batched_columns(dataset):
+                    dataset = dataset.filter(
+                        lambda masks: [any(row) for row in masks], batched = True, input_columns = [target_mask],
+                    )
+                else:
+                    dataset = dataset.filter(lambda row: any(row[target_mask]))
         elif do_messages:
             truncate_messages = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0 and \
                 not locals().get("_unsloth_wrapped_packing", False)
@@ -3702,7 +3704,8 @@ def sft_prepare_dataset(
 
     # Imported here: this function's source is copied into the compiled trainer module.
     from unsloth_zoo.dataset_utils import trl_collator_applies_masks, trl_collator_ignores_labels
-    column_names = set(next(iter(dataset)).keys())
+    # The filters above can leave a split empty.
+    column_names = set(next(iter(dataset), {}).keys())
     if "labels" not in column_names and not trl_collator_applies_masks():
         completion_only_loss = getattr(self, "completion_only_loss", None)
         if completion_only_loss is None:
