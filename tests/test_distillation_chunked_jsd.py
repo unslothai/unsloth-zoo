@@ -591,3 +591,17 @@ def test_identical_student_and_teacher_give_exactly_zero(beta, dtype):
     loss.backward()
     assert loss.item() == 0.0, loss.item()
     assert torch.count_nonzero(hs.grad) == 0 and torch.count_nonzero(ws.grad) == 0
+
+
+def test_fp16_student_large_divisor_keeps_gradient():
+    """An fp16 student with num_items_in_batch = 2**25: the 1 / divisor weight must not underflow to zero."""
+    g = torch.Generator().manual_seed(2)
+    h = torch.randn(1, 4, 16, generator = g).to(torch.float16)
+    th = torch.randn(1, 4, 16, generator = g).to(torch.float16)
+    w = (torch.randn(300, 16, generator = g) * 0.5).to(torch.float16)
+    hs = h.clone().requires_grad_(True)
+    grads, (_, (loss, _)) = rr._distillation_jsd_grad_fn((0,))(
+        hs.reshape(4, 16), w, None, th.reshape(4, 16), w, None, torch.ones(4, dtype = torch.float16),
+        torch.tensor(float(2 ** 25)), 1.0, 0.0, 1.0, 0.0, 0.5, 1.0, torch.tensor(65536.0),
+    )
+    assert loss.item() > 0.0 and torch.count_nonzero(grads[0]) > 0

@@ -6324,8 +6324,10 @@ def _distillation_jsd_chunk(
     # the analytic dz through the temperature, softcapping and head via a linear surrogate.
     row, dz, per_token_entropy = _distillation_jsd_rows(student_logits.detach(), teacher_logits.detach(), beta)
     # The final chunk's tail holds positions packed out of the valid prefix.
+    # valid arrives in the student dtype: fp32 before dividing, or an fp16 1 / divisor underflows past 2**24 rows.
+    valid = valid.to(torch.float32)
     loss = (row * valid).sum() / divisor
-    weight = (dz * (valid / divisor).unsqueeze(-1)).detach()
+    weight = (dz * valid.unsqueeze(-1) / divisor).detach()
     surrogate = (weight * student_logits).sum()
     objective = loss.detach() + (surrogate - surrogate.detach())
     return objective * grad_scale, (loss, (per_token_entropy * valid).sum())
