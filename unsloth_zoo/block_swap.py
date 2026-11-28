@@ -153,6 +153,12 @@ def _consume_cuda_error():
         fn()
 
 
+def _reads_in_place(store):
+    """True for a disk-tier store that reads the checkpoint files in place (block_swap_disk.CheckpointRegion)."""
+    region = getattr(_disk(), "CheckpointRegion", None)
+    return region is not None and isinstance(store, region)
+
+
 def _has_disk_ref(p):
     """True for a weight spilled to disk at load whose placeholder BlockSwap has not taken over yet."""
     return getattr(p, "_unsloth_disk", None) is not None and _disk().disk_ref(p) is not None
@@ -698,6 +704,12 @@ class _Block:
                 return False
         except Exception:
             return False
+        if _reads_in_place(self.disk_store):
+            # Its encoding goes to the spill file: without room there the block stays raw, read in place.
+            try:
+                _disk()._shared_spill(self.nbytes())
+            except ValueError:
+                return False
         with _no_inference_mode():
             raw, owner = _disk().read_bytes(self.disk_store, self.disk["base"], self.nbytes())
         try:
@@ -726,7 +738,8 @@ class _Block:
         try:
             base = store.write_region(pieces, c.nbytes, at = at)
         except BaseException:
-            if at is not None:
+            # A region read in place maps a write only once it landed in the spill file: nothing to put back.
+            if at is not None and not _reads_in_place(store):
                 # The raw bytes may be half overwritten: put them back before giving up.
                 store.write_region([(raw, 0)], raw.numel(), at = at)
             raise
@@ -1370,8 +1383,7 @@ class BlockSwap:
         store = disk[0].disk_store
         packed = (f", stored losslessly compressed as {stored / 2**30:.2f} GiB" if any(b.compressed() for b in disk)
                   else "")
-        region = getattr(_disk(), "CheckpointRegion", None)
-        inplace = sum(b.disk_store.ckpt_bytes for b in disk if region is not None and isinstance(b.disk_store, region))
+        inplace = sum(b.disk_store.ckpt_bytes for b in disk if _reads_in_place(b.disk_store))
         if inplace:
             packed += f", {inplace / 2**30:.2f} GiB of it read in place from the checkpoint files (no copy)"
         print(f"Unsloth: offload_layers serves {len(disk)} of {len(self.blocks)} swapped layers "

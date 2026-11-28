@@ -41,6 +41,12 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 _disk = _mod._disk()
 BlockSwap = _mod.BlockSwap
+# The disk tier's codec (on by default): standalone, block_swap gets the copy loaded here.
+_cspec = importlib.util.spec_from_file_location(
+    "block_swap_codec_inplace_under_test", os.path.join(_HERE, "unsloth_zoo", "block_swap_codec.py"))
+_cmod = importlib.util.module_from_spec(_cspec)
+_cspec.loader.exec_module(_cmod)
+_mod._CODEC.append(_cmod)
 
 _linux = pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "the disk tier is Linux only")
 _cuda = pytest.mark.skipif(not torch.cuda.is_available() or not sys.platform.startswith("linux"),
@@ -253,7 +259,10 @@ def test_install_time_disk_layers_read_in_place_train_like_the_spill(monkeypatch
     sw = BlockSwap(layers, 9, prefetch_depth = 1, placement = "tail", model = _Named(layers, folder))
     st = sw.stats()
     assert st["disk_layers"] == 7, st
-    if compress == "0" or not any(b.compressed() for b in sw.blocks):
+    if compress == "1":
+        # bf16 blocks keep the codec (fewer bytes read per step): encoded into the spill file.
+        assert any(b.compressed() for b in sw.blocks if b.disk is not None), st
+    else:
         # Every disk layer's bytes come from the checkpoint files: nothing written.
         assert st["disk_inplace_bytes"] >= 7 * 256 * 256 * 2 and st["disk_spill_written"] == 0, st
         assert _disk.live_spill() is None, "no spill file should exist"
@@ -329,5 +338,49 @@ def test_prequantized_4bit_layers_read_in_place(monkeypatch, tmp_path):
     sw = BlockSwap(layers, 9, prefetch_depth = 1, placement = "tail", model = _Named(layers, folder))
     st = sw.stats()
     assert st["disk_layers"] == 8 and st["disk_inplace_bytes"] > 0 and st["disk_spill_written"] == 0, st
+    _equal(ref, _train(layers))
+    sw.remove()
+
+
+@_cuda
+def test_load_time_in_place_layers_stay_raw_when_the_spill_has_no_room_to_encode(monkeypatch, tmp_path):
+    """Disk compression on (the default): a layer read in place whose encoding has no spill room stays raw, read
+    from the checkpoint, instead of failing the install."""
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_COMPRESS", "1")
+    base = _stack()
+    folder = str(tmp_path / "ck")
+    _checkpoint(base, folder)
+    limit, per = _limit_for(base, 2)
+    ref = _train(copy.deepcopy(base))
+    real = _disk._shared_spill
+
+    def small_only(nbytes):
+        # Room for the 4 KiB norm tails, not for a layer's encoding.
+        if nbytes > 64 << 10:
+            raise ValueError("Unsloth: offload_layers needs more disk (test)")
+        return real(nbytes)
+
+    layers = copy.deepcopy(base)
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    state = _mod._HostLoad(9, "tail")
+    state.layers, state.indices = layers, _mod.swap_indices(len(layers), 9, "tail")
+    state.model_ref = (lambda m: (lambda: m))(_Named(layers, folder))
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(limit))
+    for i in state.indices:
+        state.evict(i)
+    assert state.disk
+    for name, p in layers.named_parameters():
+        p.requires_grad_("lora_" in name)
+    monkeypatch.setattr(_disk, "_shared_spill", small_only)
+    asked = []
+    encode = _mod._Block.encode_disk
+    monkeypatch.setattr(_mod._Block, "encode_disk", lambda self, d: asked.append(1) or encode(self, d))
+    sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    assert asked, "the disk codec was never engaged"
+    st = sw.stats()
+    disk = [b for b in sw.blocks if b.disk is not None]
+    assert disk and not any(b.compressed() for b in disk), st
+    assert st["disk_inplace_bytes"] >= len(state.disk) * 256 * 256 * 2, st
     _equal(ref, _train(layers))
     sw.remove()
