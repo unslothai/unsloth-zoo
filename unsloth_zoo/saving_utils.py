@@ -6321,6 +6321,10 @@ def merge_and_overwrite_lora(
         # re-upload it if the new key had to be added there.
         if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
             upload_items("model.safetensors.index.json")
+    elif save_method == "merged_16bit" and _has_trained_classifier(model):
+        # A head the base already holds is rewritten in place, but its labels and size still come from training.
+        _carry_over_trained_head_config(save_directory, model)
+        if push_to_hub: upload_items("config.json")
 
     # Select by adapter config, not requires_grad: an adapter reloaded frozen still has trained biases.
     peft_config = getattr(model, "peft_config", {})
@@ -8123,7 +8127,13 @@ pass
 _TRAINED_HEAD_CONFIG_FIELDS = ("id2label", "label2id", "problem_type")
 
 
-def _carry_over_trained_head_config(save_directory, model, model_class_name):
+def _has_trained_classifier(model):
+    return any(name.rsplit(".", 1)[-1] in ("score", "classifier") and hasattr(module, "modules_to_save")
+               for name, module in model.named_modules())
+pass
+
+
+def _carry_over_trained_head_config(save_directory, model, model_class_name = None):
     """Point the exported config at the head that was actually written.
 
     #1073 made the config come from the base checkpoint so it would describe the base's
@@ -8141,12 +8151,14 @@ def _carry_over_trained_head_config(save_directory, model, model_class_name):
                       f"({config_error}); the exported config may not match it.")
         return
 
-    data["architectures"] = [model_class_name]
+    if model_class_name: data["architectures"] = [model_class_name]
     for field in _TRAINED_HEAD_CONFIG_FIELDS:
         value = getattr(trained_config, field, None)
         if value is None: continue
         # JSON object keys are strings, and transformers reads id2label back through int().
-        if field == "id2label": value = {str(k) : v for k, v in value.items()}
+        if field == "id2label":
+            value = {str(k) : v for k, v in value.items()}
+            data.pop("num_labels", None)  # id2label sets the count
         data[field] = value
     config_path.write_text(json.dumps(data, indent = 2), encoding = "utf-8")
 pass

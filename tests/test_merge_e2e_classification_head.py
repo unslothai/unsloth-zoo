@@ -142,6 +142,41 @@ def test_any_label_count_round_trips(tmp_path, num_labels):
     assert reloaded.config.num_labels == num_labels
     assert torch.equal(reloaded.score.weight.detach().float(), head)
 
+@pytest.mark.parametrize("labels", [
+    {0: "spam", 1: "ham"},                 # relabelled: exported the base's names
+    {0: "spam", 1: "ham", 2: "other"},     # resized: the export did not load
+], ids=["relabelled", "resized"])
+def test_a_head_the_base_already_holds_exports_the_trained_labels(tmp_path, labels):
+    from transformers import AutoModelForSequenceClassification
+    from peft import LoraConfig, get_peft_model
+
+    H.set_offline_cpu_env()
+    if not H.family_available("llama"):
+        pytest.skip("llama unavailable")
+    base, out = str(tmp_path / "base"), str(tmp_path / "out")
+    config = H.make_spec("llama").config
+    config.id2label, config.label2id = {0: "neg", 1: "pos"}, {"neg": 0, "pos": 1}
+    torch.manual_seed(H.SEED)
+    AutoModelForSequenceClassification.from_config(config).save_pretrained(base)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        base, id2label=labels, label2id={v: k for k, v in labels.items()}, ignore_mismatched_sizes=True)
+    model.config._name_or_path = base
+    peft_model = get_peft_model(model, LoraConfig(r=4, target_modules=["q_proj"], task_type="SEQ_CLS"))
+    H.seed_lora(peft_model)
+    head = _distinct_head(len(labels), config.hidden_size)
+    with torch.no_grad():
+        for name, param in peft_model.named_parameters():
+            if name.endswith("score.modules_to_save.default.weight"):
+                param.copy_(head)
+
+    H.run_merge(peft_model, base, out, save_dtype=torch.float32)
+
+    data = _exported_config(out)
+    assert data["id2label"] == {str(k): v for k, v in labels.items()}
+    assert data["label2id"] == {v: k for k, v in labels.items()}
+    reloaded = AutoModelForSequenceClassification.from_pretrained(out, local_files_only=True)
+    assert torch.equal(reloaded.score.weight.detach().float(), head)
+
 
 def test_the_backbone_merge_is_unchanged_by_the_seeding(tmp_path):
     """Rewriting a shard to add the head must not disturb the tensors already in it."""
