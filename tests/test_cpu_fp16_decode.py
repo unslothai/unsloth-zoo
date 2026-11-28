@@ -156,6 +156,16 @@ def test_packs_follow_peft_merge_and_unmerge(no_bf16):
     assert (merged - before).abs().max() > 1e-3
     model.unmerge_adapter()
     torch.testing.assert_close(packed_out(), F.linear(x, lora.base_layer.weight.float()), rtol = 1e-5, atol = 1e-5)
+    # A full merge + unmerge between two rollouts: merged_adapters is back where it was, but bf16 rounding moved the
+    # weight, so the pack must be rebuilt from the current bits.
+    with torch.no_grad():
+        lora.base_layer.weight.add_(torch.randn_like(lora.base_layer.weight.float()).bfloat16())  # a new version
+    packed_out()
+    model.merge_adapter()
+    model.unmerge_adapter()
+    with torch.no_grad():
+        lora.base_layer.weight.data.mul_(1.5)  # a .data write: no new storage, no new version
+    torch.testing.assert_close(packed_out(), F.linear(x, lora.base_layer.weight.float()), rtol = 1e-5, atol = 1e-5)
 
 
 @needs_fbgemm

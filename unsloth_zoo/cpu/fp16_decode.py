@@ -65,6 +65,10 @@ _PROJECTIONS = frozenset((
 ))
 # module -> (weight key, [(first row, end row, packed), ...]); weak, so a deepcopy or a freed model carries no packs.
 _PACKS = weakref.WeakKeyDictionary()
+# adapter layer -> merge / unmerge calls seen. PEFT writes merged weights through .data (same storage and version), and
+# a bf16 merge + unmerge round trip need not restore the bits, so the count is part of the pack key.
+_MERGE_EVENTS = weakref.WeakKeyDictionary()
+_COUNTED = set()
 
 
 def _env():
@@ -167,19 +171,40 @@ def _candidates(model):
         if bias is not None and (bias.requires_grad or bias.dtype not in (torch.bfloat16, torch.float32)):
             continue
         seen.add(id(module))
-        found.append((module, is_head, owners.get(id(module))))
+        owner = owners.get(id(module))
+        if owner is not None:
+            _count_merges(type(owner))
+        found.append((module, is_head, owner))
     return found
 
 
+def _count_merges(owner_type):
+    """Wraps the adapter layer class's merge / unmerge (once) to count calls per layer."""
+    if owner_type in _COUNTED:
+        return
+    _COUNTED.add(owner_type)
+    for name in ("merge", "unmerge"):
+        original = getattr(owner_type, name, None)
+        if not callable(original) or getattr(original, "_unsloth_counts_merges", False):
+            continue
+
+        def counted(self, *args, _original = original, **kwargs):
+            _MERGE_EVENTS[self] = _MERGE_EVENTS.get(self, 0) + 1
+            return _original(self, *args, **kwargs)
+        functools.update_wrapper(counted, original)
+        counted._unsloth_counts_merges = True
+        setattr(owner_type, name, counted)
+
+
 def _key(module, owner):
-    """Storage, version and shape of the weight (and bias), plus the adapters PEFT merged into it: merge_adapter /
-    unmerge_adapter write through ``.data``, which moves neither the storage nor the version."""
+    """Storage, version and shape of the weight (and bias), plus the adapters PEFT merged into it and its merge /
+    unmerge count: those write through ``.data``, which moves neither the storage nor the version."""
     weight, bias = module.weight, module.bias
     key = (weight.data_ptr(), weight._version, weight.dtype, tuple(weight.shape))
     if bias is not None:
         key += (bias.data_ptr(), bias._version)
     if owner is not None:
-        key += (tuple(getattr(owner, "merged_adapters", ()) or ()),)
+        key += (tuple(getattr(owner, "merged_adapters", ()) or ()), _MERGE_EVENTS.get(owner, 0))
     return key
 
 
