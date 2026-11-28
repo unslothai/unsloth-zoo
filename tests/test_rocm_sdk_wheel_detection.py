@@ -167,6 +167,7 @@ _GUARDED = (
     "unsloth_zoo/fused_losses/chunked_logprob.py",
     "unsloth_zoo/fused_losses/fused_linear.py",
     "unsloth_zoo/fused_losses/preference_loss.py",
+    "unsloth_zoo/gguf_kernels/ops.py",
     "unsloth_zoo/gguf_kernels/triton_kernels.py",
     "unsloth_zoo/gpt_oss_decode_fused.py",
     "unsloth_zoo/merged_rollout_exact.py",

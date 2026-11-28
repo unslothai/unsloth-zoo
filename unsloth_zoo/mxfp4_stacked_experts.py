@@ -127,6 +127,9 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     while first < E:
         last = min(E, first + step)
         if ends is None and (first > 0 or last < E):
+            if _no_host_sync(device):
+                # A CUDA graph capture (or a decode step planned for one) cannot read the offsets on the host.
+                return _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step, out_dim)
             ends = torch.cumsum(counts, 0).tolist()   # several chunks slice rows: one host sync
         if ends is None:
             # One chunk covers every expert and every row: no host offsets needed.
@@ -135,6 +138,8 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
             ends_device = torch.cumsum(counts, 0, dtype = torch.int32)
             try:
                 weight = _dequantize_chunk(param, 0, E, dtype, transpose, counts)
+                if _no_host_sync(device) and not _grouped_mm_capture_safe(inputs, weight):
+                    return _masked_grouped_mm(inputs, weight, ends_device, 0, inputs.new_zeros((inputs.shape[0], out_dim)))
                 return _grouped_mm(inputs, weight, ends_device)
             except torch.cuda.OutOfMemoryError:
                 if not adaptive or E == 1:
@@ -179,6 +184,106 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
         del weight
         first = last
     return out if out is not None else inputs.new_empty((inputs.shape[0], out_dim))
+
+
+def _no_host_sync(device):
+    """Inside a CUDA graph capture, or a decode step Unsloth plans to capture (its eager warm-up must take the same
+    kernels for the first replay to validate bitwise)."""
+    if _tracing_or_capturing(device):
+        return True
+    try:
+        from unsloth_zoo.decode_graph_state import in_graph_decode_step
+    except Exception:
+        return False
+    return in_graph_decode_step()
+
+
+# Capture-safety verdicts taken outside a capture (a graph decode step's eager warm-up), reused inside it.
+_CAPTURE_SAFE = {}
+
+
+def _grouped_mm_capture_safe(inputs, weight):
+    """Whether the zoo's grouped GEMM reads no offsets on the host for these operands
+    (`moe_utils.grouped_mm_backend_reads_host_offsets`). Inside a real capture nothing is probed: the verdict of the
+    warm-up call of the same shapes, else False (the masked path)."""
+    if inputs.device.type != "cuda":
+        return False
+    key = (inputs.device.index, inputs.dtype, weight.dtype, tuple(inputs.shape), tuple(weight.shape),
+           tuple(weight.stride()))
+    if _tracing_or_capturing(inputs.device):
+        return _CAPTURE_SAFE.get(key, False)
+    try:
+        from unsloth_zoo.temporary_patches import moe_utils
+        safe = not moe_utils.grouped_mm_backend_reads_host_offsets(inputs, weight)
+    except Exception:
+        safe = False
+    if len(_CAPTURE_SAFE) > 4096:
+        _CAPTURE_SAFE.clear()
+    _CAPTURE_SAFE[key] = safe
+    return safe
+
+
+def _masked_grouped_mm(inputs, weight, ends, first, out):
+    """Experts first.. of `weight` (C, K, N) over every row, each kept on its own rows: offsets stay on the device.
+    `ends` are the absolute expert ends (int32, device); `out` holds the other experts' rows."""
+    row = torch.arange(inputs.shape[0], device = inputs.device, dtype = torch.int32)[:, None]
+    for i in range(weight.shape[0]):
+        e = first + i
+        lo = ends[e - 1] if e > 0 else ends.new_zeros(())
+        keep = (row >= lo) & (row < ends[e])
+        out = torch.where(keep, inputs @ weight[i].to(inputs.dtype), out)
+    return out
+
+
+def _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step, out_dim):
+    """`_chunked_grouped_mm` without host offsets: each chunk's grouped GEMM runs over every row with the absolute
+    expert ends as offsets (its first expert's group also takes the rows before the chunk, rows after its last
+    end are left out), and only the chunk's own rows are kept. Same chunk memory, more rows multiplied. Outside a
+    real capture (a graph decode step's eager warm-up) a chunk that does not fit is halved and that size kept, as
+    the host path does; the capture then starts from the kept size."""
+    E = param._original_shape[0]
+    M = inputs.shape[0]
+    if M == 0:
+        return inputs.new_empty((0, out_dim))
+    device = inputs.device
+    capturing = _tracing_or_capturing(device)
+    ends = torch.cumsum(counts, 0, dtype = torch.int32)
+    row = torch.arange(M, device = device, dtype = torch.int32)[:, None]
+    out = inputs.new_zeros((M, out_dim))
+    first = 0
+    while first < E:
+        last = min(E, first + step)
+        weight = part = None
+        try:
+            weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
+            if not _grouped_mm_capture_safe(inputs, weight):
+                out = _masked_grouped_mm(inputs, weight, ends, first, out)
+            else:
+                part = _grouped_mm(inputs, weight, ends[first:last].contiguous())
+                if part.shape[0] < M:
+                    # The per-expert loop fallback returns rows only through the chunk's last end.
+                    part = torch.nn.functional.pad(part, (0, 0, 0, M - part.shape[0]))
+                lo = ends[first - 1] if first > 0 else ends.new_zeros(())
+                keep = (row >= lo) & (row < ends[last - 1])
+                out = torch.where(keep, part, out)
+        except torch.cuda.OutOfMemoryError:
+            if capturing:
+                raise
+            weight = part = None
+            failed = step * _expert_bytes(param, dtype)
+            if step == 1:
+                if not _fused_fallback_ok(inputs, param):
+                    raise
+                if device.type == "cuda":
+                    _CHUNK_BUDGET[device.index] = [0, _CHUNK_RETRY_CALLS, failed]
+                return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
+            step //= 2
+            if device.type == "cuda":
+                _CHUNK_BUDGET[device.index] = [step * _expert_bytes(param, dtype), _CHUNK_RETRY_CALLS, failed]
+            continue
+        del weight, part
+        first = last
+    return out
 
 
 def _fused_fallback_ok(inputs, param):
