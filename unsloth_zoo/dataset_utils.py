@@ -1056,9 +1056,12 @@ def train_on_responses_only(
     boundary_first |= role_stop_ids
     inner_stop_ids = tuple(boundary_first | {Q_first})
 
-    # Mistral: the answer after a tool result follows [/TOOL_RESULTS] with no [/INST]; it runs to eos.
-    resume_id = token_ids.get("[/TOOL_RESULTS]")
-    resume_stop_ids = frozenset(inner_stop_ids) | {token_ids.get("[TOOL_RESULTS]")}
+    # Mistral and DeepSeek: the answer after a tool result follows the result's closer with no assistant
+    # marker; it runs to eos. DeepSeek R1 also closes each result inside "outputs end", so that one wins.
+    resume_ids = [token_ids[t] for t in
+        ("[/TOOL_RESULTS]", "<｜tool▁outputs▁end｜>", "<｜tool▁output▁end｜>") if t in token_ids]
+    resume_stop_ids = frozenset(inner_stop_ids) | {token_ids.get(t) for t in
+        ("[TOOL_RESULTS]", "<｜tool▁outputs▁begin｜>", "<｜tool▁output▁begin｜>", "<｜tool▁outputs▁end｜>")}
     # Harmony (gpt-oss): the auto-detected marker is the final channel, but a tool call
     # "<|start|>assistant to=functions.x ... <|call|>" is the model's output too.
     harmony_call = None
@@ -1267,7 +1270,8 @@ def train_on_responses_only(
                 j += 1
             pass
 
-            if resume_id is not None and resume_id in input_ids:
+            resume_id = next((i for i in resume_ids if i in input_ids), None)
+            if resume_id is not None:
                 for c in [i for i, t in enumerate(input_ids) if t == resume_id]:
                     j = c + 1
                     while j < n and input_ids[j] not in resume_stop_ids: j += 1

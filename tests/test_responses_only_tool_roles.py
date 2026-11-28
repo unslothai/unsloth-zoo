@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only around tool turns: GLM <|observation|>, Mistral [/TOOL_RESULTS], gpt-oss tool calls."""
+"""train_on_responses_only around tool turns: GLM <|observation|>, Mistral [/TOOL_RESULTS], gpt-oss tool calls, DeepSeek tool outputs."""
 
 import re
 
@@ -76,6 +76,27 @@ def test_mistral_answer_after_tool_results_is_trained(last_response_only, expect
     ) == expected
 
 
+DEEPSEEK = ("<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>", "<｜tool▁outputs▁begin｜>",
+    "<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>", "<｜tool▁outputs▁end｜>")
+
+
+@pytest.mark.parametrize("results", [
+    # R1: results inside an "outputs" wrapper, separated by a newline.
+    "<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>R1<｜tool▁output▁end｜>\n"
+    "<｜tool▁output▁begin｜>R2<｜tool▁output▁end｜><｜tool▁outputs▁end｜>",
+    # V3.1: one wrapper per result.
+    "<｜tool▁output▁begin｜>R1<｜tool▁output▁end｜><｜tool▁output▁begin｜>R2<｜tool▁output▁end｜>",
+], ids = ["r1", "v3.1"])
+@pytest.mark.parametrize("last_response_only", [False, True])
+def test_deepseek_answer_after_tool_results_is_trained(results, last_response_only):
+    user, assistant, eos = DEEPSEEK[:3]
+    text = f"{user}Q{assistant}CALL{eos}{results}ANSWER{eos}{user}Q2"
+    expected = f"ANSWER{eos}" if last_response_only else f"CALL{eos}ANSWER{eos}"
+    assert _trained(
+        DEEPSEEK, text, user, assistant, eos = eos, last_response_only = last_response_only,
+    ) == expected
+
+
 TOOLS = [{"type": "function", "function": {
     "name": "multiply", "description": "Multiply.",
     "parameters": {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}},
@@ -93,6 +114,8 @@ TOOL_CHAT = [
     ("unsloth/GLM-4.5-Air", "<arg_value>77</arg_value>"),
     ("unsloth/Mistral-Small-3.2-24B-Instruct-2506", '{"a": 77, "b": 88}'),
     ("unsloth/gpt-oss-20b", '{"a": 77, "b": 88}<|call|>'),
+    ("unsloth/DeepSeek-V3.1", '{"a": 77, "b": 88}'),
+    ("unsloth/DeepSeek-R1-0528", '{"a": 77, "b": 88}'),
 ])
 def test_cached_tokenizer_tool_conversation(repo, call_text):
     transformers = pytest.importorskip("transformers")
@@ -100,7 +123,11 @@ def test_cached_tokenizer_tool_conversation(repo, call_text):
         tokenizer = transformers.AutoTokenizer.from_pretrained(repo)
     except Exception as e:  # offline runner
         pytest.skip(f"cannot load {repo}: {e}")
-    text = tokenizer.apply_chat_template(TOOL_CHAT, tools = TOOLS, tokenize = False)
+    chat = TOOL_CHAT
+    if "DeepSeek" in repo:  # these templates concatenate the arguments as a JSON string
+        function = {"name": "multiply", "arguments": '{"a": 77, "b": 88}'}
+        chat = [TOOL_CHAT[0], TOOL_CHAT[1] | {"tool_calls": [CALL | {"function": function}]}, *TOOL_CHAT[2:]]
+    text = tokenizer.apply_chat_template(chat, tools = TOOLS, tokenize = False)
     input_ids = tokenizer(text, add_special_tokens = False).input_ids
     labels = train_on_responses_only(None, tokenizer = tokenizer, return_function = True)(
         {"input_ids": [input_ids]}
