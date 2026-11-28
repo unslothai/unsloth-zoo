@@ -851,7 +851,20 @@ class _Window:
             self.held.add(l)
         collectors = self._collectors(layer)
         before = [_record_counts(c) for c, _ in collectors]
-        with torch.no_grad(), _checkpointing_off(layer), _unsloth_frames(layer, x, self.swapper) as frames:
+        if no_grad_forward:
+            # Standard training runs this forward without gradients (reentrant checkpoint): so does the window.
+            forward = ExitStack()
+            forward.enter_context(torch.no_grad())
+            forward.enter_context(_checkpointing_off(layer))
+            frames = forward.enter_context(_unsloth_frames(layer, x, self.swapper))
+        else:
+            # Standard training runs it under grad mode (non-reentrant checkpoint, or none): the window runs the very
+            # same call, through the layer's own checkpoint, so compiled blocks run the same training graph; only the
+            # outputs are kept, detached (the checkpoint keeps no activations, its recompute never runs).
+            forward = ExitStack()
+            forward.enter_context(torch.enable_grad())
+            frames = [None, None, None, False]
+        with forward:
             if frames[0] is not None:
                 self._abort(frames[0])
             out = orig_call(layer, *args2, **kwargs2)
@@ -932,18 +945,26 @@ class _Window:
         def leafify(t):
             if id(t) in made:
                 return made[id(t)]
-            if t is x or t.requires_grad or not t.is_leaf:
+            if t is x or (t.requires_grad and t.is_leaf):
                 self._abort("a decoder layer recorded an auxiliary output that already needs gradients (it aliases "
-                            "an input, or a grad-mode run inside the layer call recorded it)")
-            made[id(t)] = t.requires_grad_(True)
-            return t
+                            "an input)")
+            # A grad-mode forward's output has a graph: a detached leaf replaces it where it was recorded.
+            made[id(t)] = t.requires_grad_(True) if t.is_leaf else t.detach().requires_grad_(True)
+            return made[id(t)]
 
         for ci, ((sink, recs), counts) in enumerate(zip(collectors, before)):
             recorders.append(recs)
             for key, now in _record_counts(sink).items():
-                for j, t in enumerate(tuple(sink[key])[counts.get(key, 0):now]):
+                start = counts.get(key, 0)
+                for j, t in enumerate(tuple(sink[key])[start:now]):
                     if grads and isinstance(t, torch.Tensor) and t.is_floating_point():
-                        records.append((ci, key, j, leafify(t)))
+                        leaf = leafify(t)
+                        if leaf is not t:
+                            if isinstance(sink[key], list):
+                                sink[key][start + j] = leaf
+                            else:   # transformers 4.x keeps tuples
+                                sink[key] = sink[key][:start + j] + (leaf,) + sink[key][start + j + 1:]
+                        records.append((ci, key, j, leaf))
         if extras:
             if shim:
                 self._abort("a decoder layer returns tensors besides the hidden states under Unsloth's checkpoint "
@@ -1350,13 +1371,6 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
     if _operator_modes_active():
         return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
     # As the micro-batches will run them (the trainer switches to train mode inside each training step).
-    if _compiled_layers(layers) and not all(_checkpoint_mode(layer, swapper, training = True)[0] for layer in layers):
-        # Standard training runs these layers' forward under grad mode (non-reentrant checkpointing, which Unsloth
-        # uses when the MoE router loss is on, or none): the window's no-grad forward would run another compiled
-        # graph (inference vs training), which can differ in the last bit; refused before any layer runs, so the
-        # compiled blocks see only standard calls.
-        return None, ("compiled decoder layers whose standard forward runs under grad mode (non-reentrant or no "
-                      "gradient checkpointing): the window's no-grad forward would run a different compiled graph")
     if _forward_swapping_capture() and _recorder_targets(model, layers) and _compiled_layers(layers):
         # The window keeps each micro-batch's capture wrapper per thread through a class-level forward, which
         # compiled decoder code cannot trace (Unsloth's block compile would fall back to eager, changing numerics).

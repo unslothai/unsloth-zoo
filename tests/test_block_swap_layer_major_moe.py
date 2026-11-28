@@ -292,17 +292,51 @@ def test_forward_swapping_capture_in_compiled_layers_is_refused():
 
 
 @pytest.mark.parametrize("gc", ["non_reentrant", "none"])
-def test_compiled_layers_with_a_grad_mode_standard_forward_are_refused(gc, monkeypatch):
-    """A compiled decoder layer whose standard forward runs under grad mode: the window's no-grad forward would run
-    the inference graph instead of the training graph. Refused before any layer runs."""
-    monkeypatch.setattr(lm, "_forward_swapping_capture", lambda: False)
-    model = _model("qwen3_moe", gc)
-    _layers(model)[1].compile()
-    batches, items = _batches()
-    fns = [functools.partial(_step, model, b, items) for b in batches]
-    results, why = lm.run_layer_major(_layers(model), fns, model = model)
-    assert results is None and "runs under grad mode" in why, why
-    assert _grads(model) == {}
+def test_compiled_layers_with_a_grad_mode_standard_forward_bitwise(gc):
+    """Compiled decoder layers whose standard forward runs under grad mode: the window runs that same call (through
+    the layer's own non-reentrant checkpoint), so the compiled training graph is the one standard training runs."""
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin, self.router = torch.nn.Linear(16, 16), torch.nn.Linear(16, 4)
+            self.gradient_checkpointing = gc != "none"
+            self._gradient_checkpointing_func = functools.partial(torch.utils.checkpoint.checkpoint,
+                                                                  use_reentrant = False)
+
+        def _inner(self, x):
+            weight = torch.softmax(self.router(x), -1).amax(-1, keepdim = True)
+            return torch.tanh(self.lin(x)) * weight
+
+        def forward(self, x):
+            if self.gradient_checkpointing and self.training:
+                return self._gradient_checkpointing_func(self._inner, x)
+            return self._inner(x)
+
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([Layer() for _ in range(3)])
+    for layer in layers:
+        layer.compile(backend = "aot_eager")
+    assert lm._compiled_layers(layers)
+
+    def fn(m):
+        x = torch.randn(2, 5, 16, generator = torch.Generator().manual_seed(m)).requires_grad_(True)
+        for layer in layers:
+            x = layer(x)
+        loss = x.square().sum()
+        loss.backward()
+        return loss.detach()
+
+    base_losses = [fn(m) for m in range(2)]
+    base = {n: p.grad.clone() for n, p in layers.named_parameters()}
+    for p in layers.parameters():
+        p.grad = None
+    lm.layer_major_stats(reset = True)
+    results, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], model = layers)
+    assert why is None, why
+    assert lm.layer_major_stats()["windows"] == 1
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, results))
+    for n, p in layers.named_parameters():
+        assert torch.equal(base[n], p.grad), n
 
 
 def test_per_call_router_recorder_hooks_bitwise():

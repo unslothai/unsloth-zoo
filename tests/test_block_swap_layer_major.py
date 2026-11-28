@@ -906,11 +906,17 @@ def test_out_of_memory_saving_existing_gradients_is_a_refusal(monkeypatch):
     assert all(torch.equal(p.grad, torch.ones_like(p)) for p in layers.parameters())
 
 
+class _Calls(_Toy):
+    """Computes something else in the window's recompute (the calling thread's backward) than in its forward
+    (the micro-batch workers)."""
+    def forward(self, x, **kwargs):
+        return self.out(torch.tanh(self.lin(x)), threading.current_thread() is threading.main_thread())
+
+
 def test_replay_output_mismatch_rolls_back():
-    class GradOnlyAux(_Toy):
-        def forward(self, x, **kwargs):
-            h = torch.tanh(self.lin(x))
-            return (h, h.sum()) if torch.is_grad_enabled() else h
+    class GradOnlyAux(_Calls):
+        def out(self, h, recompute):
+            return (h, h.sum()) if recompute else h
 
     layers = _toy_stack(GradOnlyAux)
     head = torch.nn.Parameter(torch.ones(16))
@@ -934,11 +940,11 @@ def test_recompile_limit_in_the_backward_rolls_back():
     if kind is None:
         pytest.skip("no recompile-limit exception in this torch")
 
-    class Limited(_Toy):
-        def forward(self, x, **kwargs):
-            if torch.is_grad_enabled():
+    class Limited(_Calls):
+        def out(self, h, recompute):
+            if recompute:
                 raise kind("simulated")
-            return torch.tanh(self.lin(x))
+            return h
 
     layers = _toy_stack(Limited)
 
@@ -1003,10 +1009,10 @@ def test_forward_input_keeps_requires_grad():
     """A reentrant checkpoint hands its no-grad forward an input that requires grad; compiled guards see the same."""
     seen = []
 
-    class Seen(_Toy):
-        def forward(self, x, **kwargs):
+    class Seen(_CkptToy):
+        def _inner(self, x, past_key_value = None):
             seen.append((torch.is_grad_enabled(), x.requires_grad))
-            return super().forward(x, **kwargs)
+            return super()._inner(x)
 
     layers = _toy_stack(Seen)
 
@@ -1324,12 +1330,11 @@ def test_loss_part_writing_a_decoder_weight_gradient_aborts():
 
 
 def test_recompute_with_other_values_rolls_back():
-    """A layer whose math depends on grad mode: same structure, other values, so the gradient is of another
-    function."""
-    class Flips(_Toy):
-        def forward(self, x, **kwargs):
-            h = torch.tanh(self.lin(x))
-            return h if torch.is_grad_enabled() else -h
+    """A layer whose recompute computes other values than its forward (same structure): the gradient would be of
+    another function."""
+    class Flips(_Calls):
+        def out(self, h, recompute):
+            return -h if recompute else h
 
     layers = _toy_stack(Flips)
 
@@ -1346,8 +1351,9 @@ def test_recompute_with_other_values_rolls_back():
 
 @pytest.mark.parametrize("reentrant", [True, None, False])
 def test_grad_mode_dependent_layers_under_a_checkpoint(reentrant):
-    """A reentrant checkpoint runs standard training's forward without gradients too: the window is then that
-    exact computation (no value check). Non-reentrant runs it under grad mode: the window must refuse."""
+    """A reentrant checkpoint runs standard training's forward without gradients: so does the window (no value
+    check). Non-reentrant runs it under grad mode: the window runs the same call through the layer's checkpoint, so
+    a layer whose math depends on grad mode is still bitwise."""
     class Ckpt(_Toy):
         def __init__(self):
             super().__init__()
@@ -1381,13 +1387,9 @@ def test_grad_mode_dependent_layers_under_a_checkpoint(reentrant):
         base = [fn(m) for m in range(2)]
         base_grads = [p.grad.clone() for p in layers.parameters()]
         losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
-    if reentrant is False:
-        assert losses is None and "changed the hidden states" in why
-        assert all(p.grad is None for p in layers.parameters())
-    else:
-        assert why is None
-        assert all(torch.equal(a, b) for a, b in zip(base, losses))
-        assert all(torch.equal(a, p.grad) for a, p in zip(base_grads, layers.parameters()))
+    assert why is None
+    assert all(torch.equal(a, b) for a, b in zip(base, losses))
+    assert all(torch.equal(a, p.grad) for a, p in zip(base_grads, layers.parameters()))
 
 
 def test_a_raising_window_restores_gradients_rng_and_swapper():
@@ -1826,9 +1828,9 @@ def test_a_targeted_backward_that_skips_the_last_output_is_refused():
 
 
 def test_replayed_output_metadata_must_match():
-    class Flagged(_Toy):
-        def forward(self, x, **kwargs):
-            return torch.tanh(self.lin(x)), torch.is_grad_enabled()
+    class Flagged(_Calls):
+        def out(self, h, recompute):
+            return h, recompute
 
     layers = _toy_stack(Flagged)
 
