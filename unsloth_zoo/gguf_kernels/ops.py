@@ -36,6 +36,7 @@ from .formats import GGML_BLOCK, GGMLType as T, TABLE_OFFSETS, ggml_packed_bytes
 from .reference import dequantize_reference
 
 __all__ = [
+    "COMPILE_TRACED_DEQUANTIZE",
     "dequantize_gguf",
     "gguf_linear",
     "gguf_linear_backward_input",
@@ -67,16 +68,21 @@ _HBM_ARCHS = frozenset(((8, 0), (9, 0), (10, 0)))
 _ROW_CAPS = {}
 
 
+@torch.compiler.assume_constant_result
+def _row_cap(index, big_blocks):
+    key = (index, big_blocks)
+    cap = _ROW_CAPS.get(key)
+    if cap is None:
+        hbm = torch.version.hip is None and torch.cuda.get_device_capability(index) in _HBM_ARCHS
+        cap = (8 if big_blocks else 16) if hbm else 128
+        _ROW_CAPS[key] = cap
+    return cap
+
+
 def _fused_max_rows(device, ggml_type):
     if _FUSED_MAX_ROWS is not None:
         return _FUSED_MAX_ROWS
-    big_blocks = GGML_BLOCK[ggml_type][0] >= 256
-    key = (device.index, big_blocks)
-    cap = _ROW_CAPS.get(key)
-    if cap is None:
-        hbm = torch.version.hip is None and torch.cuda.get_device_capability(device) in _HBM_ARCHS
-        cap = (8 if big_blocks else 16) if hbm else 128
-        _ROW_CAPS[key] = cap
+    cap = _row_cap(device.index or 0, GGML_BLOCK[ggml_type][0] >= 256)
     return min(cap, 16) if ggml_type == T.NVFP4 else cap
 
 
@@ -159,6 +165,102 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
     return out if native else out.to(dtype)
 
 
+# Under torch.compile the dequantize kernel is launched straight from the graph (Dynamo traces a user Triton
+# kernel, Inductor launches it from its wrapper): no Python custom op per use, which costs about as much host time as
+# the decode itself costs the GPU in a LoRA step, and the matmul after it stays an aten op Inductor plans.
+# Same kernel and launch arguments as _dequant_triton. Inductor keeps `enable_fp_fusion = False` on a user kernel it
+# launches from torch 2.14 (before, it re-emits the kernel with fp fusion on, so the decode would not be bitwise the
+# eager one): UNSLOTH_GGUF_TRACED unset / "auto" = on from 2.14, "1" on, "0" custom ops only.
+def _torch_at_least(major, minor):
+    try:
+        found = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return False
+    return found >= (major, minor)
+
+
+def _traced_setting():
+    value = os.environ.get("UNSLOTH_GGUF_TRACED", "auto").strip().lower()
+    if value in ("0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return _HAS_TRITON
+    return _HAS_TRITON and _torch_at_least(2, 14)
+
+
+_TRACED = _traced_setting()
+# Feature flag for callers: Unsloth picks these kernels by default only when it is set.
+COMPILE_TRACED_DEQUANTIZE = _TRACED
+
+
+def _tag_compile_caches():
+    """Inductor's FX graph cache keys a traced user kernel without its source: key compiled graphs on this kernel
+    file too, so a cached graph never launches an older decoder."""
+    try:
+        import hashlib
+        config = torch.compiler.config
+        if not hasattr(config, "cache_key_tag"):
+            return
+        with open(_tk.__file__, "rb") as f:
+            tag = "unsloth_zoo_gguf:" + hashlib.sha256(f.read()).hexdigest()[:16]
+        if tag not in (config.cache_key_tag or ""):
+            config.cache_key_tag = f"{config.cache_key_tag}|{tag}" if config.cache_key_tag else tag
+    except Exception:
+        pass
+
+
+if _TRACED:
+    _tag_compile_caches()
+_NATIVE_BF16 = {}
+
+
+@torch.compiler.assume_constant_result
+def _native_bf16(index):
+    native = _NATIVE_BF16.get(index)
+    if native is None:
+        native = _NATIVE_BF16[index] = torch.version.hip is not None or torch.cuda.get_device_capability(index)[0] >= 8
+    return native
+
+
+@torch.compiler.assume_constant_result
+def _cuda_table(index):
+    # The lookup table as a graph constant: built once at trace time, never inside the compiled graph.
+    return _table(torch.device("cuda", index))
+
+
+def _compiling():
+    try:
+        return torch.compiler.is_compiling()
+    except Exception:
+        return False
+
+
+def _traced_ok(packed, ggml_type, dtype):
+    """Whether this compiled graph launches the dequantize kernel itself."""
+    if not (_TRACED and _HAS_TRITON and packed.is_cuda and ggml_type not in _PASSTHROUGH and _compiling()):
+        return False
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32) or not _env_on("UNSLOTH_GGUF_TRITON"):
+        return False
+    return dtype != torch.bfloat16 or _native_bf16(packed.device.index or 0)
+
+
+def _dequant_traced(packed, ggml_type, shape, dtype):
+    qk, bs = GGML_BLOCK[ggml_type]
+    K = shape[-1]
+    row_bytes = ggml_row_bytes(ggml_type, K)
+    rows = packed.numel() // row_bytes
+    out = torch.empty(shape, dtype = dtype, device = packed.device)
+    NB = max(1, 256 // qk)
+    BLOCK_R = 16
+    grid = (-(-rows // BLOCK_R), -(-(K // qk) // NB))
+    _tk.dequantize_kernel[grid](
+        packed, out, _cuda_table(packed.device.index or 0), rows, K, row_bytes,
+        TYPE = ggml_type, QK = qk, BS = bs, BLOCK_R = BLOCK_R, NB = NB, SPLIT = True,
+        num_warps = 4, enable_fp_fusion = False,
+    )
+    return out
+
+
 def _dequantize_impl(packed, ggml_type, shape, dtype):
     if ggml_type in _PASSTHROUGH:
         out = dequantize_reference(packed, ggml_type, shape, dtype)
@@ -189,6 +291,8 @@ def dequantize_gguf(packed: torch.Tensor, ggml_type, shape, dtype = torch.bfloat
     ggml_type = ggml_type_id(ggml_type)
     shape = [int(s) for s in shape]
     _check(packed, ggml_type, shape)
+    if _traced_ok(packed, ggml_type, dtype):
+        return _dequant_traced(packed.contiguous(), ggml_type, shape, dtype)
     return _dequantize_op(packed, ggml_type, shape, dtype)
 
 
@@ -197,9 +301,9 @@ def _fused_ok(x, ggml_type):
         return False
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
-    if x.dtype == torch.bfloat16 and torch.version.hip is None:
+    if x.dtype == torch.bfloat16:
         # tl.dot needs native bf16 (sm80+); T4 runs fp16.
-        return torch.cuda.get_device_capability(x.device)[0] >= 8
+        return _native_bf16(x.device.index or 0)
     return True
 
 
@@ -279,6 +383,24 @@ def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
     return y
 
 
+def _traced_linear_ok(x, packed, ggml_type, bias, trans_b):
+    """Whether a compiled graph runs this linear as the traced dequantize + an aten matmul.
+
+    - Only without autograd through it: a differentiable call keeps the custom op, whose backward saves just the
+      packed bytes and decodes again (an aten matmul would keep the 16-bit weight alive until backward).
+    - A single row keeps the fused GEMV (decode). Sizes 0 and 1 are static under torch.compile, so this adds no guard.
+      Every other row count runs dequantize + matmul, the dense model's product; eager picks the fused tile kernel
+      for rows up to the row cap, within bf16 rounding of it."""
+    if not _traced_ok(packed, ggml_type, x.dtype):
+        return False
+    if torch.is_grad_enabled() and (x.requires_grad or (bias is not None and bias.requires_grad)):
+        return False
+    M = 1
+    for d in x.shape[:-1]:
+        M = M * d
+    return not (trans_b and M == 1 and _fused_ok(x, ggml_type))
+
+
 @torch.library.custom_op("unsloth_zoo::gguf_linear", mutates_args = ())
 def _linear_op(x: torch.Tensor, packed: torch.Tensor, ggml_type: int, shape: List[int], bias: Optional[torch.Tensor]) -> torch.Tensor:
     return _linear_impl(x, packed, ggml_type, tuple(shape), bias, True)
@@ -329,6 +451,9 @@ def gguf_linear(x: torch.Tensor, packed: torch.Tensor, ggml_type, shape, bias: O
     _check(packed, ggml_type, shape, ("x", x), ("bias", bias))
     if x.shape[-1] != shape[1]:
         raise ValueError(f"Unsloth: x has {x.shape[-1]} features, the GGUF weight expects {shape[1]}")
+    if _traced_linear_ok(x, packed, ggml_type, bias, True):
+        w = _dequant_traced(packed.contiguous(), ggml_type, shape, x.dtype)
+        return torch.nn.functional.linear(x, w, bias)
     return _linear_op(x, packed, ggml_type, shape, bias)
 
 
@@ -339,6 +464,8 @@ def gguf_linear_backward_input(grad_out: torch.Tensor, packed: torch.Tensor, ggm
     _check(packed, ggml_type, shape, ("grad_out", grad_out))
     if grad_out.shape[-1] != shape[0]:
         raise ValueError(f"Unsloth: grad_out has {grad_out.shape[-1]} features, the GGUF weight has {shape[0]} rows")
+    if _traced_linear_ok(grad_out, packed, ggml_type, None, False):
+        return grad_out @ _dequant_traced(packed.contiguous(), ggml_type, shape, grad_out.dtype)
     return _linear_bwd_op(grad_out, packed, ggml_type, shape)
 
 
