@@ -1629,12 +1629,18 @@ def _capture_wrapper(fn, sink, index):
 
 def _aux_wanted(aux, check):
     """[(where, leaf)] of a call's auxiliary leaves to recompute: those the loss part reached (all of them where the
-    recompute's values are checked)."""
+    recompute's values are checked), each leaf once (a recorded router output the layer also returns is one leaf,
+    whose .grad already holds both uses)."""
     if aux is None:
         return []
     out = [(("rec", ci, key, j), a) for ci, key, j, a in aux["records"]]
     out += [(("out", i), a) for i, a in aux["extras"]]
-    return [(w, a) for w, a in out if check or a.grad is not None]
+    seen, unique = set(), []
+    for w, a in out:
+        if id(a) not in seen and (check or a.grad is not None):
+            seen.add(id(a))
+            unique.append((w, a))
+    return unique
 
 
 def _recomputed_aux(out, sinks, where):
@@ -1816,6 +1822,9 @@ def _tied_trainable_io(model):
     return any(id(p) in trainable for p in head.parameters())
 
 
+# Most decoder buffer bytes a window copies for a rollback (rotary tables and expert biases are KBs).
+_BUFFER_SNAPSHOT_MAX = 256 * 2**20
+
 def _run_layer_major(layers, micro_fns, swapper, model, agreement, rng_plan = None, rng_trace = None):
     n = len(micro_fns)
     if n < 1 or not len(layers):
@@ -1869,12 +1878,30 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement, rng_plan = No
         outside = [(p, None if p.grad is None else p.grad.clone()) for p in params]
     except torch.OutOfMemoryError:
         return None, "out of memory while saving the gradients a window would have to restore"
+    # Decoder buffers: a forward that writes one (an expert bias or counter updated from the routed load) refuses
+    # the window, and the standard retry must start from the values it found.
+    decoder_buffers, seen_buf = [], set()
+    for layer in layers:
+        for b in layer.buffers():
+            if id(b) not in seen_buf:
+                seen_buf.add(id(b))
+                decoder_buffers.append(b)
+    if sum(b.numel() * b.element_size() for b in decoder_buffers) > _BUFFER_SNAPSHOT_MAX:
+        return None, f"over {_BUFFER_SNAPSHOT_MAX >> 20} MiB of decoder buffers to keep for a rollback"
+    try:
+        buffer_copies = [(b, b._version, b.detach().clone()) for b in decoder_buffers]
+    except torch.OutOfMemoryError:
+        return None, "out of memory while saving the decoder buffers a window would have to restore"
     rng = _all_rng_state()
     watched = [(p, p.grad, None if p.grad is None else p.grad._version) for p in decoder]
 
     def restore():
         for p, g in outside:
             p.grad = g
+        with torch.no_grad():
+            for b, version, copy in buffer_copies:
+                if b._version != version:
+                    b.copy_(copy)
         _set_all_rng_state(rng)   # draws made by the abandoned window (NEFTune noise, dropout) are not consumed
 
     def roll_back(reason):

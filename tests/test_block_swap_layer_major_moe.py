@@ -223,9 +223,12 @@ def test_a_buffer_written_in_the_forward_is_refused():
             x = layer(x)
         x.square().sum().backward()
 
+    before = [layer.bias.clone() for layer in layers]
     results, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], model = layers)
     assert results is None and "buffers" in why, why
     assert all(p.grad is None for p in layers.parameters())
+    # The standard retry starts from the values the window found, not from its micro-batches' updates.
+    assert all(torch.equal(layer.bias, b) for layer, b in zip(layers, before))
 
 
 def test_capture_hooks_installed_by_the_first_call_inside_a_window():
@@ -391,4 +394,43 @@ def test_per_call_router_recorder_hooks_bitwise():
     assert lm.layer_major_stats()["windows"] == 1
     assert all(torch.equal(a, b) for a, b in zip(base_losses, results))
     for n, p in stack.named_parameters():
+        assert torch.equal(base[n], p.grad), n
+
+
+def test_a_router_output_both_recorded_and_returned_is_backpropagated_once():
+    """The same router logits recorded by a per-call hook and returned by the layer are one leaf: its gradient (both
+    uses summed) goes through the recompute once, so the router gradient equals standard accumulation's."""
+    import threading
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_RouterLayer() for _ in range(3)])
+
+    def fn(m):
+        sink, me = [], threading.get_ident()
+
+        def record(module, args, output):
+            if threading.get_ident() == me:
+                sink.append(output)
+        record._unsloth_router_recorder = (me, sink)
+        handles = [layer.router.register_forward_hook(record) for layer in layers]
+        try:
+            x = torch.randn(2, 5, 16, generator = torch.Generator().manual_seed(m)).requires_grad_(True)
+            returned = []
+            for layer in layers:
+                x, logits = layer(x)
+                returned.append(logits)
+        finally:
+            for h in handles:
+                h.remove()
+        loss = x.square().sum() + 0.1 * sum(r.square().mean() for r in sink) + 0.1 * sum(r.sum() for r in returned)
+        loss.backward()
+        return loss.detach()
+
+    base_losses = [fn(m) for m in range(2)]
+    base = {n: p.grad.clone() for n, p in layers.named_parameters()}
+    for p in layers.parameters():
+        p.grad = None
+    results, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], model = layers)
+    assert why is None, why
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, results))
+    for n, p in layers.named_parameters():
         assert torch.equal(base[n], p.grad), n
