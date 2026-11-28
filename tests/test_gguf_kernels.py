@@ -493,9 +493,10 @@ assert tk.__file__.startswith(sys.argv[1]), tk.__file__
 calls = []
 real = ops._mm_launch
 def mm(*a, **k):
-    calls.append(a[6])
+    calls.append((a[6], a[11]))  # (M, trans_b)
     return real(*a, **k)
 ops._mm_launch = mm
+ops._FUSED_MAX_ROWS = 1 << 30  # HBM GPUs send big-block types past 8 rows to cuBLAS; keep every M on the fused path
 dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 N, K = 80, 512
 packed = random_packed(T.Q4_K, N, K, seed = 3, special = False).cuda()
@@ -513,7 +514,7 @@ for M in (1, 2, 5, 16, 11):
 dev = torch.cuda.current_device()
 caches = getattr(tk.mm_kernel, "device_caches", None)
 n = len(caches[dev][0]) if caches is not None else len(tk.mm_kernel.cache[dev])
-print("VARIANTS " + json.dumps({"variants": n, "mm_calls": len(calls), "err": err}))
+print("VARIANTS " + json.dumps({"variants": n, "calls": calls, "err": err}))
 """
 
 
@@ -529,7 +530,9 @@ def test_mm_kernel_one_variant_per_tile_across_token_counts():
     assert line is not None, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-4000:]}"
     got = json.loads(line[len("VARIANTS "):])
     print(got)
-    # 9 launches (M = 1 forward is the GEMV): one forward and one backward variant.
-    assert got["mm_calls"] == 9, got
-    assert got["variants"] <= 2, got
+    # Every launch is the same 16-row tile config per direction (M = 1 forward is the GEMV): M == 1, M % 16 == 0
+    # and the other M must share one variant per direction.
+    directions = {trans_b for _, trans_b in got["calls"]}
+    assert len(got["calls"]) == 9, got
+    assert got["variants"] <= len(directions) <= 2, got
     assert got["err"] < 2e-2, got
