@@ -5381,8 +5381,9 @@ pass
 
 def _patch_lora_base_layer_input_cast(source):
     # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
-    # Packed bases (`_unsloth_mxfp4_packed_linear`: MXFP4, GGUF) cast x themselves and decode a fresh 16-bit `weight`
-    # on every read: the class check comes first so neither the call nor Dynamo's guards on it ever read `weight`.
+    # Packed bases (`_unsloth_mxfp4_packed_linear`: MXFP4, GGUF) decode a fresh 16-bit `weight` on every read, and
+    # outside autocast they compute in x's dtype: x goes to their `compute_dtype` (the decoded weight's dtype) instead,
+    # and the class check comes first so neither the call nor Dynamo's guards on it ever read `weight`.
     _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
     _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
     if not _m:
@@ -5391,7 +5392,11 @@ def _patch_lora_base_layer_input_cast(source):
     return source.replace(
         _base_layer_call,
         f"if not torch.is_autocast_enabled() "
-        f"and not getattr(type(self.base_layer), '_unsloth_mxfp4_packed_linear', False) "
+        f"and getattr(type(self.base_layer), '_unsloth_mxfp4_packed_linear', False):\n"
+        f"{_ind}    if getattr(self.base_layer, 'compute_dtype', None) in (torch.float16, torch.bfloat16, torch.float32) "
+        f"and x.dtype != self.base_layer.compute_dtype:\n"
+        f"{_ind}        x = x.to(self.base_layer.compute_dtype)\n"
+        f"{_ind}elif not torch.is_autocast_enabled() "
         f"and hasattr(self.base_layer, 'weight') "
         f"and self.base_layer.weight is not None "
         f"and not hasattr(self.base_layer.weight, 'quant_state') "
