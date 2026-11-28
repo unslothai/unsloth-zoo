@@ -19743,9 +19743,12 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
 
     def _clone():
+        # Always unslothai/llama.cpp: the source of the release a prebuilt install would use, else its default branch.
+        from unsloth_zoo.llama_cpp import _install_fork_release_source, LLAMA_CPP_FORK_GIT_URL
+        if _install_fork_release_source(llama_cpp_folder) is not None: return
         print("Unsloth: Cloning llama.cpp...")
         subprocess.run(
-            ["git", "clone", "https://github.com/ggml-org/llama.cpp", llama_cpp_folder],
+            ["git", "clone", LLAMA_CPP_FORK_GIT_URL, llama_cpp_folder],
             check=True,
         )
 

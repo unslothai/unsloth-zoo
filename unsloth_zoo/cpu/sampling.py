@@ -75,9 +75,14 @@ def fast_multinomial_ok():
 def _wrap(original):
     @functools.wraps(original)
     def multinomial(input, num_samples, replacement = False, *, generator = None, out = None):
+        # Compiling first: a shape test ahead of it would add a guard (and break a marked dynamic range), and both
+        # branches call torch's multinomial there anyway. Exact int / bool arguments: anything else gets torch's error.
         if (
-            out is None
+            not torch.compiler.is_compiling()
+            and out is None
+            and type(num_samples) is int
             and num_samples == 1
+            and type(replacement) is bool
             and type(input) is torch.Tensor
             and input.device.type == "cpu"
             and input.dtype == torch.float32
@@ -86,7 +91,6 @@ def _wrap(original):
             and input.is_contiguous()
             and not input.requires_grad
             and _enabled()
-            and not torch.compiler.is_compiling()
             and fast_multinomial_ok()
         ):
             # torch's own checks, before any draw; a failing input goes to torch so the error is its own.

@@ -1356,16 +1356,21 @@ pass
 # cudaMalloc its segments again: about 0.5-0.7 s per step (L4 / A100, Qwen3-0.6B). When the training step measurably
 # fits in the memory left beside the mapped KV, keep vLLM awake instead. The first step always sleeps (it measures the
 # training step), every step re-checks the fit against its own rollout size, and a step that does not fit sleeps as
-# before. Numerics are unchanged: sleep only unmaps memory. UNSLOTH_VLLM_STANDBY_KEEP_AWAKE=0 always sleeps.
-_STANDBY_KEEP_AWAKE = {"kept_awake": 0, "slept": 0, "last": None, "announced": False}
+# before. Only the sleep that ends a rollout may be skipped: the engine's owner (a trainer, TRL's VLLMGeneration) calling
+# it from the same call that ran the generate. A skipped sleep still resets the prefix and encoder caches, as sleep does.
+# Under torch.distributed every rank keeps vLLM awake or none does. A CUDA out of memory error while vLLM was kept awake
+# turns keep-awake off for the rest of the process. Numerics are unchanged: sleep only unmaps memory.
+# UNSLOTH_VLLM_STANDBY_KEEP_AWAKE=0 always sleeps.
+_STANDBY_KEEP_AWAKE = {"kept_awake": 0, "slept": 0, "last": None, "announced": False, "disabled": None, "oom_mark": None}
 _STANDBY_KEEP_AWAKE_SAFETY = 1.2
 _STANDBY_KEEP_AWAKE_HISTORY = 16
 
 
 def standby_keep_awake_stats():
-    """Counters of the standby keep-awake decision: steps kept awake, steps slept, the last decision's inputs."""
+    """Counters of the standby keep-awake decision: steps kept awake, steps slept, the last decision's inputs, and why
+    keep-awake was turned off for this process (None while it is on)."""
     s = _STANDBY_KEEP_AWAKE
-    return {"kept_awake": s["kept_awake"], "slept": s["slept"], "last": s["last"]}
+    return {"kept_awake": s["kept_awake"], "slept": s["slept"], "last": s["last"], "disabled": s.get("disabled")}
 pass
 
 
@@ -1376,13 +1381,36 @@ pass
 
 
 def _standby_memory_point():
-    """(reserved, all-time reserved peak, allocated, free, device total) bytes on the current device. Free counts the
-    device's free memory plus torch's cached but unallocated blocks, which the next training step reuses first."""
+    """(reserved, all-time reserved peak, allocated) bytes on the current device, over every pool."""
     stats = torch.cuda.memory_stats()
-    free, total = torch.cuda.mem_get_info()
-    reserved = int(stats.get("reserved_bytes.all.current", 0))
-    allocated = int(stats.get("allocated_bytes.all.current", 0))
-    return reserved, int(stats.get("reserved_bytes.all.peak", 0)), allocated, int(free) + max(0, reserved - allocated), int(total)
+    return (int(stats.get("reserved_bytes.all.current", 0)), int(stats.get("reserved_bytes.all.peak", 0)),
+            int(stats.get("allocated_bytes.all.current", 0)))
+pass
+
+
+def _standby_pool_cache():
+    """(default pool, private pools) cached but unallocated bytes on the current device. Only the default pool's large
+    segments are cache the next training step allocates from; private pools (vLLM's cumem pool, the held cuBLAS
+    workspace pool, CUDA graph pools) and segments without a pool id are reserved memory training cannot reuse."""
+    device = torch.cuda.current_device()
+    default, private = 0, 0
+    for segment in torch.cuda.memory_snapshot():
+        if segment.get("device", device) != device: continue
+        total = int(segment.get("total_size", 0))
+        cached = max(0, total - int(segment.get("active_size", total)))
+        if tuple(segment.get("segment_pool_id", None) or (-1, -1)) == (0, 0):
+            if segment.get("segment_type", "large") != "small": default += cached
+        else:
+            private += cached
+    return default, private
+pass
+
+
+def _standby_pending(tokens, private_cached = None):
+    """The start point of the coming training step's measurement."""
+    _, peak, allocated = _standby_memory_point()
+    if private_cached is None: private_cached = _standby_pool_cache()[1]
+    return {"allocated": allocated, "peak": peak, "tokens": tokens, "private_cached": private_cached}
 pass
 
 
@@ -1390,7 +1418,7 @@ def _standby_state(llm):
     """Per-engine measurements: one engine's training steps say nothing about another's memory."""
     state = getattr(llm, "_unsloth_standby_keep_awake_state", None)
     if state is None:
-        state = {"measured": [], "pending": None, "rollout_tokens": 0}
+        state = {"measured": [], "pending": None, "rollout_tokens": 0, "rollout_caller": None, "depth": 0}
         try: llm._unsloth_standby_keep_awake_state = state
         except Exception: pass
     return state
@@ -1407,22 +1435,27 @@ def _standby_close_measurement(s):
     if pend is None: return
     s["pending"] = None
     if pend["tokens"] <= 0: return  # no rollout since that sleep (the trainer's first sleep at init): nothing trained
-    reserved, peak, _, _, _ = _standby_memory_point()
+    reserved, peak, _ = _standby_memory_point()
     high = max(reserved, peak) if peak > pend["peak"] else max(reserved, pend["peak"])
-    s["measured"].append((max(0, high - pend["allocated"]), pend["tokens"]))
+    # reserved also holds the private pools' cache, which is not the step's working set; only what stayed cached
+    # through the step is taken out, so a private cache that grew or shrank during it never shrinks the estimate
+    private = min(pend.get("private_cached", 0), _standby_pool_cache()[1])
+    s["measured"].append((max(0, high - pend["allocated"] - private), pend["tokens"]))
     del s["measured"][:-_STANDBY_KEEP_AWAKE_HISTORY]
 pass
 
 
-def _standby_fits(s, tokens):
-    """True when the coming training step, scaled to this rollout's padded size, fits in the device's free memory
-    with the safety factor and a margin, judged from this engine's training steps measured so far."""
+def _standby_fits(s, tokens, cache):
+    """True when the coming training step, scaled to this rollout's padded size, fits in the memory training can use
+    (device free memory plus the reusable default-pool `cache`) with the safety factor and a margin, judged from this
+    engine's training steps measured so far."""
     if not s["measured"]: return False, None
-    _, _, _, free, total = _standby_memory_point()
+    device_free, total = torch.cuda.mem_get_info()
+    free, total = int(device_free) + cache, int(total)
     need = _STANDBY_KEEP_AWAKE_SAFETY * max(g * max(1.0, tokens / t) for g, t in s["measured"])
     margin = max(1 << 30, int(0.05 * total))
-    info = {"need_gb": round(need / 1e9, 3), "free_gb": round(free / 1e9, 3), "margin_gb": round(margin / 1e9, 3),
-            "rollout_tokens": tokens}
+    info = {"need_gb": round(need / 1e9, 3), "free_gb": round(free / 1e9, 3), "cache_gb": round(cache / 1e9, 3),
+            "margin_gb": round(margin / 1e9, 3), "rollout_tokens": tokens}
     return need + margin <= free, info
 pass
 
@@ -1439,6 +1472,79 @@ def _standby_rollout_tokens(outputs):
 pass
 
 
+_STANDBY_OWNER_DEPTH = 16
+
+
+def _standby_owner_call(llm):
+    """(frame id, code) of the call driving this engine: the nearest calling frame that is a method of the object
+    owning the engine (self.llm is llm: TRL / Unsloth trainers, TRL's VLLMGeneration), looking past wrappers such as
+    Unsloth's generation hooks. None for anything else: a resume, a user's own generate or sleep, a callback. The
+    rollout's generate and its sleep run in that one live frame, so (id, code) cannot match a later call."""
+    frame = sys._getframe(1)
+    for _ in range(_STANDBY_OWNER_DEPTH):
+        if frame is None or frame.f_code.co_name == "<module>": return None
+        code = frame.f_code
+        try:
+            # a method's own self, not one a closure (a lambda, a nested hook) captured
+            owner = frame.f_locals.get("self", None) if "self" in code.co_varnames[:code.co_argcount] else None
+            if owner is not None and owner is not llm and getattr(owner, "llm", None) is llm:
+                return id(frame), code
+        except Exception:
+            pass
+        frame = frame.f_back
+    return None
+pass
+
+
+def _standby_oom_count():
+    return int(torch.cuda.memory_stats().get("num_ooms", 0))
+pass
+
+
+def _standby_check_oom(stats):
+    """Turn keep-awake off for this process when the allocator ran out of memory while vLLM was kept awake (the mark
+    is set by a kept-awake decision and cleared by a real sleep)."""
+    mark = stats.get("oom_mark")
+    if mark is None or stats.get("disabled"): return
+    try: ooms = _standby_oom_count()
+    except Exception: return
+    if ooms > mark:
+        stats["disabled"] = "out of memory while vLLM was kept awake"
+        print("Unsloth: Standby saw a CUDA out of memory error while vLLM was kept awake between steps, so vLLM "
+              "now sleeps after every rollout for the rest of this run.")
+pass
+
+
+def _standby_world_agrees(fits):
+    """Every rank keeps vLLM awake or none does. Each rank reaches this at the same rollout-ending sleep."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1: return fits, None
+    backend = str(dist.get_backend()).lower()
+    device = torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else torch.device("cpu")
+    flag = torch.tensor([1 if fits else 0], dtype = torch.int32, device = device)
+    dist.all_reduce(flag, op = dist.ReduceOp.MIN)
+    return bool(int(flag.item())), dist.get_world_size()
+pass
+
+
+def _standby_skip_resets(llm):
+    """What a level >= 1 sleep resets besides unmapping: the prefix cache (vLLM) and the encoder cache (Unsloth's
+    sleep wrapper), so a kept-awake step never reuses KV or vision embeddings computed before the weights changed.
+    False when the prefix cache could not be reset: then vLLM really sleeps."""
+    engine = getattr(llm, "llm_engine", llm)
+    fn = getattr(engine, "reset_encoder_cache", None)
+    if fn is not None:
+        try: fn()
+        except Exception: return False
+    fn = getattr(llm, "reset_prefix_cache", None)
+    if fn is None: return False
+    try: result = fn()
+    except Exception: return False
+    # vLLM 0.11.x drops the scheduler's bool (None); a reset only fails while requests run, and none do here
+    return result is None or bool(result)
+pass
+
+
 def patch_vllm_standby_keep_awake():
     """Wrap vllm.LLM sleep / wake_up / generate / chat (outermost) with the standby keep-awake decision."""
     LLM = getattr(vllm, "LLM", None)
@@ -1450,9 +1556,19 @@ def patch_vllm_standby_keep_awake():
     def _counting(original):
         @functools.wraps(original)
         def call(self, *args, **kwargs):
-            outputs = original(self, *args, **kwargs)
-            try: _standby_state(self)["rollout_tokens"] += _standby_rollout_tokens(outputs)
-            except Exception: pass
+            s = _standby_state(self)
+            outermost = s.get("depth", 0) == 0
+            if outermost:
+                try: s["rollout_caller"] = _standby_owner_call(self)
+                except Exception: s["rollout_caller"] = None
+            s["depth"] = s.get("depth", 0) + 1
+            try:
+                outputs = original(self, *args, **kwargs)
+            finally:
+                s["depth"] -= 1
+            if outermost:
+                try: s["rollout_tokens"] += _standby_rollout_tokens(outputs)
+                except Exception: pass
             return outputs
         return call
 
@@ -1461,28 +1577,45 @@ def patch_vllm_standby_keep_awake():
         level = kwargs.get("level", args[0] if args else 1)
         try: level = int(level)
         except Exception: level = 1
+        _standby_check_oom(stats)
         if level < 1:
             # level 0 only pauses scheduling: always honour it, and let its wake_up reach vLLM to resume
             self._unsloth_standby_awake = False
             return _orig_sleep(self, *args, **kwargs)
-        # Only the sleep that ends a rollout may be skipped. With no rollout since the last wake (the trainer's first
-        # sleep, a resume, a user freeing the GPU) vLLM always sleeps.
+        # Only the sleep that ends a rollout may be skipped: the owner's call that ran the generate. The trainer's
+        # first sleep, a resume, a user freeing the GPU, a callback: vLLM always sleeps.
         s = _standby_state(self)
         tokens, s["rollout_tokens"] = s["rollout_tokens"], 0
-        enabled = tokens > 0 and _standby_keep_awake_enabled()
-        fits = False
+        caller, s["rollout_caller"] = s.get("rollout_caller"), None
+        rollout_end = caller is not None
+        if rollout_end:
+            try: rollout_end = caller == _standby_owner_call(self)
+            except Exception: rollout_end = False
+        # Identical on every rank (env, device, call site), so every rank takes part in the agreement below.
+        enabled = rollout_end and _standby_keep_awake_enabled()
+        fits, info = False, None
         s["pending"] = None
         if enabled:
             try:
                 _standby_close_measurement(s)
-                fits, info = _standby_fits(s, tokens)
-                _, peak, allocated, _, _ = _standby_memory_point()
-                s["pending"] = {"allocated": allocated, "peak": peak, "tokens": tokens}
+                cache, private = _standby_pool_cache()
+                if tokens > 0 and not stats.get("disabled"):
+                    fits, info = _standby_fits(s, tokens, cache)
+                s["pending"] = _standby_pending(tokens, private)
             except Exception as e:
                 fits, info = False, {"error": repr(e)}
+            if fits and not _standby_skip_resets(self):
+                fits, info = False, dict(info or {}, error = "prefix cache reset failed")
+            try:
+                fits, world = _standby_world_agrees(fits)
+                if world is not None: info = dict(info or {}, world_size = world)
+            except Exception as e:
+                fits, info = False, dict(info or {}, error = repr(e))
             stats["last"] = dict(info or {}, kept_awake = bool(fits))
         if fits:
             stats["kept_awake"] += 1
+            try: stats["oom_mark"] = _standby_oom_count()
+            except Exception: stats["oom_mark"] = None
             self._unsloth_standby_awake = True
             if not stats["announced"]:
                 stats["announced"] = True
@@ -1492,12 +1625,12 @@ def patch_vllm_standby_keep_awake():
             return None
         if enabled: stats["slept"] += 1
         self._unsloth_standby_awake = False
+        stats["oom_mark"] = None
         result = _orig_sleep(self, *args, **kwargs)
         if s["pending"] is not None:
             # Measure the training step from after the sleep released the KV and emptied the cache.
             try:
-                _, peak, allocated, _, _ = _standby_memory_point()
-                s["pending"].update(allocated = allocated, peak = peak)
+                s["pending"] = _standby_pending(s["pending"]["tokens"])
             except Exception:
                 s["pending"] = None
         return result

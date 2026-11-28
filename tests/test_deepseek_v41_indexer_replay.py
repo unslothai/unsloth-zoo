@@ -173,3 +173,22 @@ def test_no_frame_outside_checkpointing(impl):
     with torch.no_grad():
         model(input_ids = ids, use_cache = False)
     assert sum(stats.values()) == 0
+
+
+def test_replay_reaches_an_indexer_class_a_compiled_cache_installed(impl, monkeypatch, one_thread):
+    """unsloth_compile_transformers replaces the modeling module's DeepseekV41Indexer with its compiled copy after the
+    patch ran, keeping the (already patched) decoder layer; the post_compile run of the patch wraps the new class."""
+    from unsloth_zoo.temporary_patches.deepseek_v41 import patch_deepseek_v41_gradient_checkpointing
+
+    original = impl.modeling.DeepseekV41Indexer
+    unwrapped = getattr(original.forward, "_unsloth_original", original.forward)
+    # A new class with the stock (unwrapped) forward, like the compiled cache's copy of it.
+    compiled = type("DeepseekV41Indexer", (original,), {"forward": unwrapped})
+    monkeypatch.setattr(impl.modeling, "DeepseekV41Indexer", compiled)
+    patch_deepseek_v41_gradient_checkpointing()  # the post_compile phase
+    assert getattr(compiled.forward, "_unsloth_selection_replay", False)
+
+    model = _tiny_model(impl)
+    assert {type(m) for m in _indexers(model)} == {compiled}
+    _, _, fwd_on, bwd_on = _step(model, _ids(), True)
+    assert (fwd_on, bwd_on) == (len(_indexers(model)), 0)

@@ -92,6 +92,8 @@ def patch_inductor_nonowning_inplace():
     if original is None or not hasattr(ir, "NonOwningLayout"):
         return False
     if getattr(original, _FLAG, False):
+        # TORCHINDUCTOR_FX_COMPILE_MODE may be set after import: a later call (compile_cpu_layers) still guards it.
+        _guard_subprocess_compiles()
         return True
     if os.environ.get("UNSLOTH_INDUCTOR_NONOWNING_GUARD", "1") == "0":
         return False

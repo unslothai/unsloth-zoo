@@ -184,3 +184,35 @@ def test_cpu_model_attach_installs_once_and_generate_samples_match(monkeypatch):
         assert n == 0 and torch.equal(fast, stock)
     finally:
         torch.multinomial = saved
+
+
+def test_compiled_dynamic_sampling_adds_no_shape_guard():
+    """Under torch.compile the wrapper is torch's call: no guard on the fast path's size threshold, so a marked
+    dynamic range across it compiles once and lengths on both sides of it reuse one graph."""
+    import torch._dynamo
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    def sample(x):
+        return FAST(x, 1)
+
+    torch._dynamo.reset()
+    fn = torch.compile(sample, backend = backend, fullgraph = True, dynamic = True)
+    for n in (2048, 8192, 1024):
+        x = torch.softmax(torch.randn(n), -1)
+        torch._dynamo.mark_dynamic(x, 0, min = 2, max = 10000)
+        assert fn(x).shape == (1,)
+    assert len(graphs) == 1, len(graphs)
+    torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("args", [(1.0,), (1, "x"), (1, 1)])
+def test_wrong_argument_types_raise_torchs_error(args):
+    p = torch.softmax(torch.randn(8192), -1)
+    with pytest.raises((TypeError, RuntimeError)):
+        ORIGINAL(p, *args)
+    with pytest.raises((TypeError, RuntimeError)):
+        FAST(p, *args)

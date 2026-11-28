@@ -2308,6 +2308,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
         fork_repo = LLAMA_CPP_FORK_REPO
         resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
         if resolved is not None:
+            _PREBUILT_RESOLVED_RELEASE[os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()] = resolved
             fork_tag, fork_assets = resolved
             manifest = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_MANIFEST_ASSET)
             fork_checksums = _fetch_release_json_asset(fork_assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
@@ -2369,6 +2370,69 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
     except Exception as e:
         logger.warning("Unsloth: Prebuilt llama.cpp install failed (%s) - falling back to source build.", e)
         return None
+
+
+# The source build's last resort when no release source can be placed: the fork's default branch.
+LLAMA_CPP_FORK_GIT_URL = f"https://github.com/{LLAMA_CPP_FORK_REPO}"
+# UNSLOTH_LLAMA_TAG pin -> (tag, assets) of the release the prebuilt install resolved, so a source build that
+# follows a failed prebuilt compiles that same release.
+_PREBUILT_RESOLVED_RELEASE = {}
+
+
+def _source_build_release():
+    """(tag, assets) of the unslothai/llama.cpp release a source build compiles: the one the prebuilt install
+    resolved in this process, else resolved the same way now (UNSLOTH_LLAMA_TAG, else the latest). None when no
+    release resolves."""
+    pin = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
+    if pin in _PREBUILT_RESOLVED_RELEASE:
+        return _PREBUILT_RESOLVED_RELEASE[pin]
+    return _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
+
+
+def _install_fork_release_source(llama_cpp_folder):
+    """Place the unslothai/llama.cpp release's source tree at llama_cpp_folder for a source build. Returns the tag,
+    or None with nothing written.
+
+    The tree comes from the release's llama.cpp-source-<tag>.tar.gz, verified against the sha256 the release
+    publishes: the upstream base plus the merged pins that its prebuilt binaries and converter were built from. The
+    fork's git tags mark its scripts branch, not that merged tree, so a `git clone --branch <tag>` would compile
+    something else."""
+    if os.path.exists(llama_cpp_folder):
+        try:
+            if os.listdir(llama_cpp_folder): return None
+            os.rmdir(llama_cpp_folder)
+        except OSError:
+            return None
+    release = _source_build_release()
+    if release is None:
+        return None
+    tag, assets = release
+    try:
+        assets, checksums = _fork_release_source_assets(tag, assets)
+        expected_sha256 = _published_source_sha256(checksums, tag)
+        if not expected_sha256:
+            raise RuntimeError(f"the release publishes no sha256 for {_fork_source_asset_name(tag)}")
+        parent_dir = os.path.dirname(llama_cpp_folder) or "."
+        os.makedirs(parent_dir, exist_ok = True)
+        with tempfile.TemporaryDirectory(prefix = ".llama_cpp_source_", dir = parent_dir) as staging:
+            archive_path = os.path.join(staging, "source.tar.gz")
+            _download_archive(_converter_source_url(tag, assets), archive_path)
+            actual = _sha256_file(archive_path)
+            if actual != expected_sha256.strip().lower():
+                raise RuntimeError(f"sha256 mismatch for {_fork_source_asset_name(tag)}: "
+                                   f"expected {expected_sha256}, got {actual}")
+            extract_dir = os.path.join(staging, "extracted")
+            os.makedirs(extract_dir)
+            _extract_archive(archive_path, extract_dir)
+            root = _single_extracted_root(extract_dir)
+            if not all(os.path.isdir(os.path.join(root, d)) for d in ("src", "ggml", "common")):
+                raise RuntimeError(f"{_fork_source_asset_name(tag)} is not a llama.cpp source tree")
+            shutil.move(root, llama_cpp_folder)
+    except Exception as e:
+        logger.warning(f"Unsloth: Could not use the {LLAMA_CPP_FORK_REPO} {tag} source archive ({e}); "
+                       f"cloning {LLAMA_CPP_FORK_GIT_URL} instead.")
+        return None
+    return tag
 
 
 def _maybe_install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_output = False):
@@ -2526,13 +2590,19 @@ def install_llama_cpp(
         parent_dir = os.path.dirname(llama_cpp_folder)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
-        print("Unsloth: Cloning llama.cpp repository...")
-        # H2: Quote path to handle spaces in directory names
-        quoted_folder = shlex.quote(llama_cpp_folder) if not IS_WINDOWS else f'"{llama_cpp_folder}"'
-        try_execute_with_auto_install(
-            f"git clone https://github.com/ggml-org/llama.cpp {quoted_folder}",
-            **kwargs
-        )
+        # Always unslothai/llama.cpp: the source of the release a prebuilt install would use, else the fork's
+        # default branch.
+        source_tag = _install_fork_release_source(llama_cpp_folder)
+        if source_tag is not None:
+            print(f"Unsloth: Using the {LLAMA_CPP_FORK_REPO} {source_tag} source.")
+        else:
+            print(f"Unsloth: Cloning {LLAMA_CPP_FORK_REPO}...")
+            # H2: Quote path to handle spaces in directory names
+            quoted_folder = shlex.quote(llama_cpp_folder) if not IS_WINDOWS else f'"{llama_cpp_folder}"'
+            try_execute_with_auto_install(
+                f"git clone {LLAMA_CPP_FORK_GIT_URL} {quoted_folder}",
+                **kwargs
+            )
     pass
 
     pip = check_pip()
@@ -4252,9 +4322,10 @@ def _converter_is_trusted_local(script_path):
     export points it at the llama.cpp it has just installed, which is routing and
     not a judgement about the converter, so internal_scripts_dir_pin marks that
     case and it gets no exemption either. When no prebuilt is available install_llama_cpp falls
-    back to an unpinned `git clone` of upstream master, and
+    back to a source build of unslothai/llama.cpp (a release's source archive, or
+    an unpinned `git clone` of the fork's default branch), and
     _resolve_bundle_convert_script accepts that checkout on the strength of a
-    conversion/ package alone. A converter fetched automatically from upstream is
+    conversion/ package alone. A converter fetched automatically like that is
     not a converter the user pinned, so it gets no exemption.
 
     UNSLOTH_PREBUILT_INFO.json is NOT accepted, though it used to be. The marker
@@ -7996,14 +8067,21 @@ def check_linux_type():
 pass
 
 
+def _llama_cpp_chat_source_url():
+    """common/chat.cpp on unslothai/llama.cpp, at the installed prebuilt's release tag, else the fork's default
+    branch."""
+    repo, tag = _read_prebuilt_marker(LLAMA_CPP_DEFAULT_DIR)
+    ref = tag if repo == LLAMA_CPP_FORK_REPO and tag else "refs/heads/master"
+    return f"https://raw.githubusercontent.com/{LLAMA_CPP_FORK_REPO}/{ref}/common/chat.cpp"
+
+
 @lru_cache(1)
 def _check_llama_cpp_appended_system_message():
     # See https://github.com/ggml-org/llama.cpp/issues/18323
     # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
-    llama_cpp_chat_file = "https://raw.githubusercontent.com/ggml-org/llama.cpp/refs/heads/master/common/chat.cpp"
     llama_cpp_appended = '''Respond in JSON format, either with `tool_call` (a request to call tools) or with `response` reply to the user's request'''
     try:
-        check = requests.get(llama_cpp_chat_file, timeout = 5)
+        check = requests.get(_llama_cpp_chat_source_url(), timeout = 5)
         check.raise_for_status()
         if llama_cpp_appended in check.content.decode("utf-8"):
             logger.info("llama.cpp appends an extra system message for tools. You should consider this.")

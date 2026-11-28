@@ -376,6 +376,20 @@ def test_no_packs_when_they_do_not_fit_in_ram(no_bf16, monkeypatch):
     assert not checked  # the RAM check comes before any eligibility check allocates
 
 
+@needs_fbgemm
+def test_ram_check_counts_every_local_rank(no_bf16, monkeypatch):
+    from unsloth_zoo.cpu import runtime
+    model = _tiny_llama()
+    need = 2 * sum(m.weight.numel() for m, _, _ in no_bf16._candidates(model))
+    monkeypatch.setattr(runtime, "available_ram", lambda: int(need / no_bf16._RAM_SHARE) + 1)
+    monkeypatch.setattr(runtime, "_local_world_size", lambda: 2)
+    _generate(model)
+    assert not _packed(model)
+    monkeypatch.setattr(runtime, "_local_world_size", lambda: 1)
+    _generate(model)
+    assert len(_packed(model)) == 15
+
+
 def test_eligibility_check_in_row_blocks(monkeypatch):
     from unsloth_zoo.cpu import fp16_decode
     monkeypatch.setattr(fp16_decode, "_CHECK_ROWS", 3)

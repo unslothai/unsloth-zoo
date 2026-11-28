@@ -241,10 +241,11 @@ def _prepare(model):
         stale.append((module, is_head, key, owner))
     if stale:
         # RAM first: before any check or pack allocates, for every weight that would need one.
-        from .runtime import available_ram
+        from .runtime import _local_world_size, available_ram
         extra = 2 * sum(module.weight.numel() for module, _, _, _ in stale)
         available = available_ram()
-        if available is None or extra > _RAM_SHARE * available:
+        # Every training process on this host reads the same free RAM and builds its own packs.
+        if available is None or extra * _local_world_size() > _RAM_SHARE * available:
             return ready or None
     todo = []
     for entry in stale:

@@ -126,7 +126,8 @@ def test_corrupted_checkout_still_repaired(probes, tmp_path, monkeypatch):
     with open(os.path.join(folder, "convert_lora_to_gguf.py"), "w") as f:
         f.write("# stub\n")
     monkeypatch.setattr(llama_cpp, "_is_safe_to_delete", lambda p: True)
+    monkeypatch.setattr(llama_cpp, "_source_build_release", lambda: None)  # no release: clone the fork
     assert llama_cpp.install_llama_cpp(llama_cpp_folder = folder, just_clone_repo = True) == folder
     assert not os.path.exists(folder)  # wiped, then (mocked) re-cloned
     assert _kinds(probes) == ["check_build_requirements", "try_execute_with_auto_install", "check_pip", "try_execute"]
-    assert "git clone" in probes[1][1]
+    assert probes[1][1].startswith("git clone https://github.com/unslothai/llama.cpp ")

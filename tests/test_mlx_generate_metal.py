@@ -2610,6 +2610,23 @@ def test_vlm_cache_materialization_spaces_out_the_default_interval(monkeypatch, 
     assert generator._cache_eval_interval == upstream
 
 
+def _settled_active_memory():
+    """Active Metal memory once released buffers have been returned: Metal hands a finished command buffer's
+    inputs back from its completion handler, which can run just after `mx.eval` returns, so a single reading
+    can still count a buffer that is already free. A buffer something still holds never leaves the count."""
+    import time
+
+    mx.synchronize()
+    reading = mx.get_active_memory()
+    for _ in range(100):
+        time.sleep(0.01)
+        again = mx.get_active_memory()
+        if again == reading:
+            return reading
+        reading = again
+    return reading
+
+
 @metal_only
 def test_vlm_cache_materialization_reuses_cache_buffers(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
@@ -2631,12 +2648,13 @@ def test_vlm_cache_materialization_reuses_cache_buffers(monkeypatch):
     generator.next = advance
     materializer = _VLMCacheMaterializer(generator)
     try:
-        initial = mx.get_active_memory()
+        initial = _settled_active_memory()
         materializer.next()
         mx.eval(materializer.pending)
-        assert mx.get_active_memory() - initial < 1024 * 1024
+        # One 1024 x 1024 float32 state is 4 MiB: a copied cache buffer stays held by `pending` and shows here.
+        assert _settled_active_memory() - initial < 1024 * 1024
+        initial = _settled_active_memory()
         mx.reset_peak_memory()
-        initial = mx.get_active_memory()
         materializer.next()
         mx.eval(materializer.pending)
         assert mx.get_peak_memory() - initial < 1024 * 1024
