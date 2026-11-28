@@ -1293,6 +1293,9 @@ def test_gemma4_kv_sharing_is_refused(monkeypatch):
     losses, why = lm.run_layer_major(layers, fns, model = model)
     assert losses is None and "share key / value states" in why
     monkeypatch.setattr(lm, "_kv_shared_layers", lambda layers: False)
+    for fn in fns:   # standard steps first: a window does not compile (Unsloth's compiled Gemma 4 MLP)
+        fn()
+    model.zero_grad(set_to_none = True)
     losses, why = lm.run_layer_major(layers, fns, model = model)
     # Whichever the window meets first: the shared KV mapping read, a per-layer input feeding a trained weight, or
     # the hidden states sliced before the first KV-sharing layer.
@@ -1320,7 +1323,9 @@ def test_state_shared_through_a_mapping_aborts():
         x.sum().backward()
 
     losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(2)])
-    assert losses is None and "mapping" in why
+    # The window runs a grad-mode layer's forward under grad mode, so the shared tensor can also be refused as a
+    # second input that needs gradients.
+    assert losses is None and ("mapping" in why or "needs gradients" in why), why
     assert all(p.grad is None for p in layers.parameters())
 
 
@@ -2330,12 +2335,13 @@ def test_a_window_that_compiles_rolls_back_and_the_next_one_runs():
         losses = [fn(m) for m in range(3)]
         return losses, [p.grad.clone() for p in layers.parameters()]
 
-    base_losses, base_grads = standard()   # grad-mode graphs only
+    # First calls inside a window: its forwards compile the graphs, so it rolls back.
     rng = torch.get_rng_state()
     losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(3)])
     assert losses is None and why.startswith(lm.COMPILED_IN_WINDOW), why
     assert all(p.grad is None for p in layers.parameters())
     assert torch.equal(torch.get_rng_state(), rng)
+    base_losses, base_grads = standard()
     epoch = lm.compile_epoch()
     losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(3)])
     assert why is None, why

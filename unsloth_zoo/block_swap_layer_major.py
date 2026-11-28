@@ -361,11 +361,44 @@ def _thread_forwards(classes):
                 del cls.forward
 
 
+_NO_COMPILE_MESSAGE = "torch.compile stance is 'fail_on_recompile'"
+
+
 def _recompile_limit(error):
+    """A compile the window may not do (recompile limits, or a new graph under the window's no-compile stance):
+    the window rolls back and the caller's standard step compiles it."""
+    if isinstance(error, RuntimeError) and _NO_COMPILE_MESSAGE in str(error):
+        return True
     exc = sys.modules.get("torch._dynamo.exc")
     kinds = tuple(cls for name in ("FailOnRecompileLimitHit", "RecompileLimitExceeded", "CacheLimitExceeded")
                   if isinstance(cls := getattr(exc, name, None), type))
     return bool(kinds) and isinstance(error, kinds)
+
+
+def _first_line(error):
+    """The function a no-compile error names (file:line) and the first guard that failed, if any."""
+    text = str(error).strip()
+    if not text:
+        return type(error).__name__
+    lines = text.splitlines()
+    out = lines[0].split("stance is 'fail_on_recompile'. ")[-1][:300]
+    guards = [l.strip().lstrip("- ") for l in lines[1:] if l.strip().startswith("- ")]
+    return out + (f"; guard: {guards[0][:300]}" if guards else "")
+
+
+def _no_compiles():
+    """Dynamo may not compile inside a window: a new graph there would be built in the window's call order (and
+    stay cached after a rollback), so standard accumulation could later run other kernels than in a run without
+    windows. Under torch's 'fail_on_recompile' stance a cache miss raises instead of compiling (torch >= 2.6);
+    compile_epoch() is the backstop for compiles the stance does not cover (a lazily compiled backward)."""
+    compiler = getattr(torch, "compiler", None)
+    set_stance = getattr(compiler, "set_stance", None)
+    if set_stance is None or "torch._dynamo" not in sys.modules:
+        return nullcontext()
+    try:
+        return set_stance("fail_on_recompile")
+    except Exception:
+        return nullcontext()
 
 
 def _all_rng_state():
@@ -556,18 +589,26 @@ COMPILED_IN_WINDOW = "torch.compile built new graphs inside the window"
 
 def compile_epoch():
     """A value that changes whenever Dynamo / AOTAutograd / Inductor compiles something in this process (None when
-    torch._dynamo was never imported)."""
+    torch._dynamo was never imported): (counter name, count) pairs."""
     utils = sys.modules.get("torch._dynamo.utils")
     counters = getattr(utils, "counters", None)
     if counters is None:
         return None
     try:
         inductor = counters.get("inductor", {})
-        return (sum(counters.get("frames", {}).values()), counters.get("stats", {}).get("unique_graphs", 0),
-                sum(counters.get("aot_autograd", {}).values()),
-                sum(v for k, v in inductor.items() if str(k).startswith("fxgraph_cache")))
+        return (("frames", sum(counters.get("frames", {}).values())),
+                ("graphs", counters.get("stats", {}).get("unique_graphs", 0)),
+                ("aot_autograd", sum(counters.get("aot_autograd", {}).values())),
+                ("inductor_graphs", sum(v for k, v in inductor.items() if str(k).startswith("fxgraph_cache"))))
     except Exception:
-        return ("unknown",)
+        return (("unknown", 0),)
+
+
+def _epoch_change(before, after):
+    if before is None or after is None:
+        return "torch._dynamo imported"
+    b = dict(before)
+    return ", ".join(f"{k} +{v - b.get(k, 0)}" for k, v in after if v != b.get(k, 0))
 
 
 def _autocast_state():
@@ -766,7 +807,9 @@ class _SharedMappings:
         for k in keys:
             v = dict.__getitem__(copy, k)
             if k not in real or real[k] is not v:
-                real[k] = v
+                # A layer whose forward runs under grad mode writes graph-carrying tensors; no other layer may read
+                # them in a window (that aborts), so they are kept detached like every other window output.
+                real[k] = _detach_tensors(v)
                 written.add(k)
         return True
 
@@ -1231,7 +1274,8 @@ class _Window:
         with forward:
             if frames[0] is not None:
                 self._abort(frames[0])
-            out = orig_call(layer, *args2, **kwargs2)
+            with _no_compiles():
+                out = orig_call(layer, *args2, **kwargs2)
         if any(len(c) for c in empties):
             self._abort("a decoder layer wrote into a mapping or list passed to every layer (shared KV states)")
         if bad:
@@ -1931,7 +1975,7 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
                                               for p, g, v in watched):
                 w.abort_reason = "a loss part wrote a decoder layer weight's gradient (a regulariser on it)"
             if w.abort_reason is None and compile_epoch() != epoch:
-                w.abort_reason = f"{COMPILED_IN_WINDOW} (forward: a new micro-batch shape or grad mode)"
+                w.abort_reason = f"{COMPILED_IN_WINDOW} (forward: {_epoch_change(epoch, compile_epoch())})"
     finally:
         # The first-input hooks only watch the loss parts; a reused input tensor must not keep the window alive.
         for handle in w.input_hooks:
@@ -1949,6 +1993,8 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
             # After the forward vote, loss parts may have run collectives another rank is still in: a rollback
             # vote could pair with them, so raise as a standard step would.
             raise error
+        if error is not None and _NO_COMPILE_MESSAGE in str(error):
+            w.abort_reason = f"{COMPILED_IN_WINDOW} (forward: {_first_line(error)})"
         if error is not None:
             # Its traceback's frames hold the failed forward's tensors (and the window): free them now, before
             # the caller's standard step needs the memory.
@@ -1959,7 +2005,8 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
     # Standard accumulation leaves the generators where the last micro-batch ended (the recompute replays its own).
     rng_load(w.rng_end[-1])
     try:
-        w.backward(orig_calls)
+        with _no_compiles():
+            w.backward(orig_calls)
     except (torch.OutOfMemoryError, _ReplayAbort, Exception) as error:
         # The recompute builds a graph the no-grad forward did not: it can run out where the forward fit, or hit
         # a compiled block's recompile limit. Anything else is a real error.
@@ -1967,6 +2014,8 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
             raise
         reason = ("out of memory in the decoder backward" if isinstance(error, torch.OutOfMemoryError)
                   else str(error) if isinstance(error, _ReplayAbort)
+                  else f"{COMPILED_IN_WINDOW} (decoder backward: {_first_line(error)})"
+                  if _NO_COMPILE_MESSAGE in str(error)
                   else "torch.compile recompile limit in the decoder backward")
         traceback.clear_frames(error.__traceback__)
         del error
@@ -1975,7 +2024,7 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
     if compile_epoch() != epoch:
         # The decoder recompute compiled a graph standard accumulation would have compiled at another point.
         w.saved = w.outs = w.h0 = None
-        return roll_back(f"{COMPILED_IN_WINDOW} (decoder backward)")
+        return roll_back(f"{COMPILED_IN_WINDOW} (decoder backward: {_epoch_change(epoch, compile_epoch())})")
     if not agreement.vote(True):
         w.saved = w.outs = w.h0 = None
         return roll_back(_DISAGREE)
