@@ -58,6 +58,8 @@ _RAM_SHARE = 0.25
 # Output embeddings are packed in row blocks of this many vocabulary rows, in parallel.
 _HEAD_BLOCK = 16384
 _FP16_MAX = 65504.0
+# Rows per step of the eligibility check (bounded temporaries for large output embeddings).
+_CHECK_ROWS = 4096
 _PROJECTIONS = frozenset((
     "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj", "gate_proj", "up_proj", "down_proj", "gate_up_proj",
 ))
@@ -179,16 +181,22 @@ def _key(module, owner):
 
 
 def _packable(weight):
-    """fp16 holds the weight's values: bf16 numbers (bf16 storage, or fp32 upcast from a bf16 checkpoint) in range."""
+    """fp16 holds the weight's values: bf16 numbers (bf16 storage, or fp32 upcast from a bf16 checkpoint) in range.
+    Checked _CHECK_ROWS rows at a time, so the temporaries stay small next to the weight."""
     w = weight.detach()
-    if w.dtype == torch.float32 and not torch.equal(w.bfloat16().float(), w):
-        return False
-    return bool(w.abs().max() <= _FP16_MAX)
+    for start in range(0, w.shape[0], _CHECK_ROWS):
+        part = w[start:start + _CHECK_ROWS]
+        if part.dtype == torch.float32 and not torch.equal(part.bfloat16().float(), part):
+            return False
+        low, high = torch.aminmax(part)
+        if not bool(low >= -_FP16_MAX and high <= _FP16_MAX):  # NaN compares False
+            return False
+    return True
 
 
 def _prepare(model):
     """Packs for every eligible module (built in parallel where missing or stale), or None when they do not fit."""
-    todo, ready = [], []
+    stale, ready = [], []
     for module, is_head, owner in _candidates(model):
         key = _key(module, owner)
         cached = _PACKS.get(module, None)
@@ -197,14 +205,16 @@ def _prepare(model):
             continue
         if cached is not None:  # the weight changed (merged, reloaded, edited in place): pack it again
             del _PACKS[module]
-        if _packable(module.weight):
-            todo.append((module, is_head, key))
-    if todo:
+        stale.append((module, is_head, key))
+    if stale:
+        # RAM first: before any check or pack allocates, for every weight that would need one.
         from .runtime import available_ram
-        extra = 2 * sum(module.weight.numel() for module, _, _ in todo)
+        extra = 2 * sum(module.weight.numel() for module, _, _ in stale)
         available = available_ram()
         if available is None or extra > _RAM_SHARE * available:
             return ready or None
+    todo = [entry for entry in stale if _packable(entry[0].weight)]
+    if todo:
         jobs = []
         for module, is_head, _ in todo:
             if is_head and module.weight.shape[0] > _HEAD_BLOCK:

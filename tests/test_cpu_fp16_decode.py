@@ -258,9 +258,23 @@ def test_skips_trainable_out_of_range_and_non_bf16_weights(no_bf16):
 def test_no_packs_when_they_do_not_fit_in_ram(no_bf16, monkeypatch):
     from unsloth_zoo.cpu import runtime
     monkeypatch.setattr(runtime, "available_ram", lambda: 1024)
+    checked = []
+    monkeypatch.setattr(no_bf16, "_packable", lambda weight: checked.append(weight) or True)
     model = _tiny_llama()
     _generate(model)
     assert no_bf16.ENGAGED[0] == 0 and not _packed(model)
+    assert not checked  # the RAM check comes before any eligibility check allocates
+
+
+def test_eligibility_check_in_row_blocks(monkeypatch):
+    from unsloth_zoo.cpu import fp16_decode
+    monkeypatch.setattr(fp16_decode, "_CHECK_ROWS", 3)
+    w = torch.randn(10, 4).bfloat16().float()
+    assert fp16_decode._packable(w) and fp16_decode._packable(w.bfloat16())
+    for row, value in ((9, 1e-9), (8, 70000.0), (7, float("nan")), (0, -70000.0)):
+        bad = w.clone()
+        bad[row, 1] = value
+        assert not fp16_decode._packable(bad), (row, value)
 
 
 @needs_fbgemm
