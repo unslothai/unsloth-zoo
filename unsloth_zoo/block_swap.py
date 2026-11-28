@@ -767,7 +767,8 @@ class _Block:
 
     def spill(self, encode_device = None, index = None):
         """Write the weights to the spill file and serve the block from disk; encoded when `encode_device` is
-        given and the codec takes the region, else read in place from the checkpoint where `index` finds them."""
+        given and the codec takes the region, else raw. With `index`, read in place from the checkpoint instead
+        when the spill has no room (or UNSLOTH_OFFLOAD_DISK_INPLACE=1)."""
         mod = _disk()
         store = None
         if encode_device is not None and self.disk_compressible():
@@ -787,11 +788,19 @@ class _Block:
                 return
             del raw
         if index is not None:
-            region = mod.inplace_region(index, self.params, self.layout, self.nbytes())
-            if region is not None:
-                self.set_disk([mod.DiskRef(region, off, p.data.nbytes, p.data.shape, p.data.dtype)
-                               for p, off in zip(self.params, self.layout)])
-                return
+            store = None
+            if not getattr(mod, "inplace_always", lambda: False)():
+                # The raw spill where it fits; the checkpoint only when the spill has no room.
+                try:
+                    store = mod._shared_spill(self.nbytes())
+                except ValueError:
+                    store = None
+            if store is None:
+                region = mod.inplace_region(index, self.params, self.layout, self.nbytes())
+                if region is not None:
+                    self.set_disk([mod.DiskRef(region, off, p.data.nbytes, p.data.shape, p.data.dtype)
+                                   for p, off in zip(self.params, self.layout)])
+                    return
         store = mod._shared_spill(self.nbytes())
         base = store.write_region([(p.data, off) for p, off in zip(self.params, self.layout)], self.nbytes())
         self.set_disk([mod.DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype)
@@ -1367,10 +1376,15 @@ class BlockSwap:
         owner = getattr(self, "_owner", None)
         owner = owner() if owner is not None else None
         self._ckpt_index = index_of(owner) if index_of is not None and owner is not None else None
-        if self._ckpt_index is None:
+        always = self._ckpt_index is not None and getattr(mod, "inplace_always", lambda: False)()
+        if not always:
             # Held until remove(): the shared file is weakly referenced, and the blocks only take it as they spill.
-            # Read in place, a layer takes spill room only for weights the checkpoint does not hold as loaded.
-            self._spill_hold = mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
+            try:
+                self._spill_hold = mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
+            except ValueError:
+                # No disk room for a spill copy: read the layers in place from the checkpoint where it holds them.
+                if self._ckpt_index is None:
+                    raise
         self._to_spill = spill
         return True
 

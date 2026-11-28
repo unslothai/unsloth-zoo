@@ -259,7 +259,7 @@ def test_install_time_disk_layers_read_in_place_train_like_the_spill(monkeypatch
     _disk._SPILL[:] = []
 
     layers = copy.deepcopy(base)
-    monkeypatch.delenv("UNSLOTH_OFFLOAD_DISK_INPLACE")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_INPLACE", "1")
     sw = BlockSwap(layers, 9, prefetch_depth = 1, placement = "tail", model = _Named(layers, folder))
     st = sw.stats()
     assert st["disk_layers"] == 7, st
@@ -291,7 +291,7 @@ def test_load_time_spill_reads_in_place_and_trains_like_the_spill(monkeypatch, t
 
     def run(inplace):
         if inplace:
-            monkeypatch.delenv("UNSLOTH_OFFLOAD_DISK_INPLACE", raising = False)
+            monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_INPLACE", "1")
         else:
             monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_INPLACE", "0")
         _disk._SPILL[:] = []
@@ -337,7 +337,7 @@ def test_prequantized_4bit_layers_read_in_place(monkeypatch, tmp_path):
     ref = _train(ref_layers)
     sw0.remove()
     _disk._SPILL[:] = []
-    monkeypatch.delenv("UNSLOTH_OFFLOAD_DISK_INPLACE")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_INPLACE", "1")
     layers = copy.deepcopy(base)
     sw = BlockSwap(layers, 9, prefetch_depth = 1, placement = "tail", model = _Named(layers, folder))
     st = sw.stats()
@@ -351,6 +351,7 @@ def test_load_time_in_place_layers_stay_raw_when_the_spill_has_no_room_to_encode
     """Disk compression on (the default): a layer read in place whose encoding has no spill room stays raw, read
     from the checkpoint, instead of failing the install."""
     monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_COMPRESS", "1")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_INPLACE", "1")
     base = _stack()
     folder = str(tmp_path / "ck")
     _checkpoint(base, folder)
@@ -405,3 +406,43 @@ def test_direct_reads_span_the_bounce_buffer_at_odd_offsets(tmp_path, monkeypatc
         out = torch.empty(n, dtype = torch.uint8)
         f.read_into(base + off, out, drop = True)
         assert torch.equal(out, big[off:off + n]), (off, n)
+
+
+@_cuda
+def test_default_spills_where_the_disk_has_room_and_reads_in_place_when_it_is_short(monkeypatch, tmp_path):
+    """UNSLOTH_OFFLOAD_DISK_INPLACE unset: the spill copy while the spill directory holds it (its aligned reads
+    measured a little faster), the checkpoint in place when it cannot; both train like no offload."""
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_COMPRESS", "0")
+    base = _stack()
+    folder = str(tmp_path / "ck")
+    _checkpoint(base, folder)
+    limit, per = _limit_for(base, 2)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(limit))
+    ref = _train(copy.deepcopy(base))
+
+    roomy = copy.deepcopy(base)
+    sw = BlockSwap(roomy, 9, prefetch_depth = 1, placement = "tail", model = _Named(roomy, folder))
+    st = sw.stats()
+    assert st["disk_layers"] == 7 and st["disk_inplace_bytes"] == 0 and st["disk_spill_written"] >= 7 * per, st
+    _equal(ref, _train(roomy))
+    sw.remove()
+    _disk._SPILL[:] = []
+
+    real = _disk._shared_spill
+
+    def no_room(nbytes):
+        if nbytes > 64 << 10:
+            raise ValueError("Unsloth: offload_layers needs more disk (test)")
+        return real(nbytes)
+
+    monkeypatch.setattr(_disk, "_shared_spill", no_room)
+    short = copy.deepcopy(base)
+    sw = BlockSwap(short, 9, prefetch_depth = 1, placement = "tail", model = _Named(short, folder))
+    st = sw.stats()
+    assert st["disk_layers"] == 7 and st["disk_inplace_bytes"] >= 7 * 256 * 256 * 2, st
+    _equal(ref, _train(short))
+    sw.remove()
+    # Without a checkpoint to read from, a short disk still refuses as before.
+    _disk._SPILL[:] = []
+    with pytest.raises(ValueError, match = "more disk"):
+        BlockSwap(copy.deepcopy(base), 9, prefetch_depth = 1, placement = "tail")
