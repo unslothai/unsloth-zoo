@@ -19,6 +19,7 @@ after generate (also on error); eval-mode generate, autograd calls, long prefill
 are not bf16 values, other CPUs and UNSLOTH_CPU_FP16_DECODE=0 keep the stock path."""
 
 import platform
+import sys
 import types
 
 import pytest
@@ -31,8 +32,13 @@ def _fbgemm():
     return fp16_decode_available()
 
 
+_X86 = platform.machine().lower() in ("x86_64", "amd64")
+_LINUX_X86 = _X86 and sys.platform.startswith("linux")
+
+# FBGEMM's fp16 GEMM ships in Linux x86 torch builds; Windows wheels have only the oneDNN quantized engine, whose
+# prepack refuses fp16, so the packs (and these tests) cannot run there.
 needs_fbgemm = pytest.mark.skipif(
-    platform.machine().lower() not in ("x86_64", "amd64"), reason = "FBGEMM fp16 GEMM ships in x86 torch builds only",
+    not (_X86 and _fbgemm()), reason = "no FBGEMM fp16 GEMM in this torch build (x86 Linux wheels have it)",
 )
 
 
@@ -76,9 +82,19 @@ def _packed(model):
     return [m for m in model.modules() if _PACKS.get(m, (None, None))[1] is not None]
 
 
-@needs_fbgemm
-def test_fbgemm_fp16_gemm_available_on_x86():
+@pytest.mark.skipif(not _LINUX_X86, reason = "Linux x86 torch wheels ship FBGEMM")
+def test_fbgemm_fp16_gemm_available_on_linux_x86():
     assert _fbgemm()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason = "Windows torch wheels")
+def test_windows_without_an_fbgemm_engine_reports_unavailable():
+    """torch's Windows wheels list only oneDNN: the path must turn itself off rather than fail at prepack."""
+    from unsloth_zoo.cpu import fp16_decode
+    engines = set(torch.backends.quantized.supported_engines)
+    if engines & {"fbgemm", "x86"}:
+        pytest.skip(f"this Windows build has {sorted(engines)}")
+    assert fp16_decode._fbgemm_engine() is None and fp16_decode.fp16_decode_available() is False
 
 
 @needs_fbgemm
