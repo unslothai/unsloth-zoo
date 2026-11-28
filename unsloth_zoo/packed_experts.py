@@ -804,8 +804,8 @@ def _own_rebuild(key, codes, scales, glob, meta):
 
 
 def _autocast_dtype(inputs):
-    """The dtype autocast would run this call's matmuls in (float32 inputs only), else None."""
-    if inputs.dtype != torch.float32:
+    """The dtype autocast would run this call's matmuls in, when it differs from the inputs', else None."""
+    if inputs.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return None
     device_type = inputs.device.type
     try:
@@ -814,7 +814,7 @@ def _autocast_dtype(inputs):
         dtype = torch.get_autocast_dtype(device_type)
     except Exception:
         return None
-    return dtype if dtype != torch.float32 else None
+    return dtype if dtype != inputs.dtype and dtype != torch.float32 else None
 
 
 def _autocast_off(device_type):
@@ -904,7 +904,7 @@ def _own_grouped_linear(inputs, param, counts, transpose_b):
     autocast_dtype = None if op is None else _autocast_dtype(inputs)
     if autocast_dtype is not None:
         # What autocast does to the grouped GEMM's operands, done before the op so eager and compiled calls agree
-        # (a custom op's fake output keeps its input dtype; its backward casts dX back to float32).
+        # (a custom op's fake output keeps its input dtype; its backward casts dX back to the input dtype).
         inputs = inputs.to(autocast_dtype)
     meta = None if op is None or key is None else _own_op_meta(param)
     if meta is None:

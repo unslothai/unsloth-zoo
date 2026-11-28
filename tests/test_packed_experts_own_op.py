@@ -337,3 +337,40 @@ def test_graph_decode_step_avoids_host_sync_grouped_gemm_fallbacks(monkeypatch, 
     with graph_generate(), graph_decode_step():
         device = pe.packed_expert_grouped_linear(x, param, counts, transpose_b)
     torch.testing.assert_close(device, eager)
+
+
+def test_capture_safety_consults_the_native_grouped_mm_fallback(monkeypatch):
+    # bf16 on Ampere with the zoo's Triton kernel off: torch._grouped_mm exists but serves the call with its own
+    # host-synced loop, so a capture must take the masked path.
+    import types
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    monkeypatch.setattr(moe_utils, "_triton_grouped_mm_wanted", lambda inputs, weight: False)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", lambda device: True)
+    cuda = torch.device("cuda", 0)
+    inputs = types.SimpleNamespace(device = cuda, is_cuda = True, dtype = torch.bfloat16)
+    weight = types.SimpleNamespace(device = cuda, dtype = torch.bfloat16, shape = (8, 64, 32))
+    monkeypatch.setattr(moe_utils, "_torch_grouped_mm_takes_fallback", lambda *args: True)
+    assert not mse._grouped_mm_capture_safe(inputs, weight)
+    monkeypatch.setattr(moe_utils, "_torch_grouped_mm_takes_fallback", lambda *args: False)
+    assert mse._grouped_mm_capture_safe(inputs, weight)
+
+
+@needs_tracing
+@pytest.mark.parametrize("dtype,autocast_dtype", [(torch.float16, torch.bfloat16), (torch.bfloat16, torch.float16)])
+def test_low_precision_inputs_take_a_different_autocast_dtype(dtype, autocast_dtype):
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+
+    def f(x, counts):
+        return pe.packed_expert_grouped_linear(x, param, counts, True)
+
+    x = (torch.randn(9, 64) * 0.5).to(dtype)
+    torch._dynamo.reset()
+    compiled = torch.compile(f, backend = "aot_eager", fullgraph = True)
+    with torch.autocast("cpu", dtype = autocast_dtype):
+        eager = f(x, counts)
+        out = compiled(x, counts)
+    assert eager.dtype == out.dtype == autocast_dtype
+    assert torch.equal(out, eager)
+    torch.testing.assert_close(eager, _reference(x.to(autocast_dtype), param, counts, True))

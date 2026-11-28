@@ -200,16 +200,18 @@ def _no_host_sync(device):
 
 def _grouped_mm_capture_safe(inputs, weight):
     """Whether the zoo's grouped GEMM takes a backend that reads no offsets on the host for these operands: its
-    Triton kernel, or torch._grouped_mm on bf16 CUDA. Its other fallbacks (the per-expert loop) do."""
-    if not inputs.is_cuda:
+    Triton kernel, or torch._grouped_mm where PyTorch serves it with a real grouped kernel (not its own synced
+    per-expert loop, e.g. bf16 on Ampere). Its other fallbacks (the per-expert loop) do read them."""
+    if inputs.device.type != "cuda":
         return False
     try:
-        from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_supported_on, _triton_grouped_mm_wanted
-        if _triton_grouped_mm_wanted(inputs, weight):
+        from unsloth_zoo.temporary_patches import moe_utils
+        if moe_utils._triton_grouped_mm_wanted(inputs, weight):
             return True
-        return inputs.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and bool(
-            _grouped_mm_supported_on(inputs.device)
-        )
+        if inputs.dtype != weight.dtype or not moe_utils._grouped_mm_supported_on(inputs.device):
+            return False
+        return not moe_utils._torch_grouped_mm_takes_fallback(inputs.device, inputs.dtype, weight.dtype,
+                                                              weight.shape[0])
     except Exception:
         return False
 
