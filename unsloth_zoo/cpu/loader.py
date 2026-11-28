@@ -273,14 +273,19 @@ _FP32_FROZEN_RAM_SHARE = 0.25
 
 
 def _fp32_frozen_storage_pays():
-    """x86 without native bf16, on Windows and on Linux CPUs with AVX-512. There a bf16-stored weight's upcast on every
+    """Apple Silicon, and x86 without native bf16 on Windows and on Linux CPUs with AVX-512. On x86 a bf16-stored weight's upcast on every
     forward, backward and decoded token was 30-34% of a 2-thread Qwen3-0.6B GRPO step (aten::copy_, Xeon 8370C /
     8573C), and float32 storage made GRPO 9-21% faster on Windows. On a Linux AVX-512 Xeon, decoding through float32
     weights was also faster than the per-call upcast (59 vs 101 ms per Qwen3-0.6B token pass). On AVX2-only Linux x86
-    (EPYC 7763) decoding through float32 reads twice the bytes and GRPO was 1-6% slower, so bf16 storage stays there;
-    Apple Silicon has its fp32 rollout instead."""
+    (EPYC 7763) decoding through float32 reads twice the bytes and GRPO was 1-6% slower, so bf16 storage stays there.
+    Apple Silicon: float32 storage made Qwen3-0.6B LoRA steps faster on an M5 Max (6 threads, A/A spread 0.3-1.1%):
+    SFT 0.300 -> 0.288 s (-4.2%), DPO 0.722 -> 0.660 s (-8.7%), GRPO 2 x 16 1.527 -> 1.411 s (-7.6%; the rollouts no
+    longer make their fp32 copy and store bf16 back)."""
     import platform
-    if platform.machine().lower() not in ("amd64", "x86_64"):
+    machine = platform.machine().lower()
+    if sys.platform == "darwin" and machine in ("arm64", "aarch64"):
+        return True
+    if machine not in ("amd64", "x86_64"):
         return False
     if sys.platform == "win32":
         return True
@@ -1099,8 +1104,8 @@ class FastCPUModel:
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
         # fp32 training of a bf16 checkpoint can keep the frozen projections in bf16 (lossless, half their RAM), at the
-        # cost of an upcast per call. Default where fp32 is the default (no native bf16), except on Windows x86 and
-        # AVX-512 Linux x86 when the fp32 weights fit in a quarter of the free RAM; UNSLOTH_CPU_FROZEN_BF16=1 / 0 forces
+        # cost of an upcast per call. Default where fp32 is the default (no native bf16), except on Windows x86,
+        # AVX-512 Linux x86 and Apple Silicon when the fp32 weights fit in a quarter of the free RAM; UNSLOTH_CPU_FROZEN_BF16=1 / 0 forces
         # it on / off, =training keeps it whatever the RAM and OS (bf16 for training, fp32 for generation where that pays).
         frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
         frozen_wanted = frozen_env in ("1", "true", "yes", "on", "training") or (
