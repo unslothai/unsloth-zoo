@@ -812,6 +812,8 @@ def quantize_experts_nvfp4(rows, dtype = torch.bfloat16, transposed = False, chu
         w = rows[e0:e1].to(torch.float32)
         amax = w.abs().amax(dim = (1, 2))
         g = torch.where(amax > 0, (top * _E2M1_MAX) / amax, torch.ones_like(amax))
+        # A tiny amax (below about 1e-35) overflows the global scale to inf, and zero blocks then decode 0 * inf = NaN.
+        g = g.clamp(max = 2.0 ** 127)
         blocks = w.view(e1 - e0, N, K // NVFP4_GROUP, NVFP4_GROUP)
         bmax = blocks.abs().amax(dim = -1)
         q, s, decode = _nvfp4_block_candidate(blocks, bmax, g, _E2M1_MAX)

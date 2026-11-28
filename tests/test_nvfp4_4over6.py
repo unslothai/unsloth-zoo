@@ -130,3 +130,22 @@ def test_compressed_tensors_decompress_is_bit_identical(method):
     bad = scale.view(torch.uint8).clone()
     bad[0, 0, 0] += 1
     assert not torch.equal(ct(bad.view(torch.float8_e4m3fn)), ours)
+
+
+@pytest.mark.parametrize("method", ["max6", "4over6"])
+def test_tiny_amax_expert_keeps_a_finite_global_scale(method):
+    """An expert stack with amax near 1e-37 overflowed top * 6 / amax to inf; its zero blocks decoded 0 * inf = NaN."""
+    from unsloth_zoo.packed_experts import quantize_experts_nvfp4
+    gen = torch.Generator().manual_seed(0)
+    w = torch.zeros(2, 16, 32)
+    w[0] = torch.randn(16, 32, generator = gen)
+    w[1, :, :16] = torch.randn(16, 16, generator = gen) * 1e-37
+    param = quantize_experts_nvfp4(w, torch.bfloat16, method = method)
+    glob = param._companions()[1]
+    assert torch.isfinite(glob).all()
+    dense = param.dequantize(torch.float32)
+    assert torch.isfinite(dense).all()
+    assert torch.equal(dense[1, :, 16:], torch.zeros(16, 16))
+    # In-range experts are untouched by the cap.
+    ref = quantize_experts_nvfp4(w[:1].clone(), torch.bfloat16, method = method)
+    assert torch.equal(param.data[:1], ref.data) and torch.equal(glob[:1], ref._companions()[1])

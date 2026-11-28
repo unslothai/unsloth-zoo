@@ -90,3 +90,25 @@ def test_routing_verification_stays_out_of_the_operands_capture(monkeypatch, car
     assert mrt._routing_impl(_Ids(CARD_1), 8) == "torch"
     assert verified == [] and mrt._VERIFIED == {} and mrt._DISABLED_REASON is None
     assert card_1_capturing["current"] == 0
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
+def test_packed_grouped_mm_probe_stays_out_of_the_operands_capture(monkeypatch, card_1_capturing, fmt):
+    from unsloth_zoo import mxfp4_gemm as mg
+    if not mg._HAS_TRITON:
+        pytest.skip("needs triton importable")
+    probes = []
+    monkeypatch.setattr(mg, "_PACKED_AVAILABLE", {})
+    monkeypatch.setattr(mg, "_triton_too_old", lambda: False)
+    monkeypatch.setattr(mg, "is_rocm_torch", lambda _torch: False)
+    monkeypatch.setattr(mg, "_packed_arch_supported", lambda cap, version: True)
+    monkeypatch.setattr(mg, "_probe_packed", lambda *a: probes.append(a) or True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: (10, 0))
+    assert mg.packed_grouped_mm_available(CARD_1, fmt, torch.bfloat16) is False
+    # Nothing probed or latched: the next uncaptured call decides.
+    assert probes == [] and mg._PACKED_AVAILABLE == {} and card_1_capturing["current"] == 0
+    card_1_capturing["current"] = 0
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert mg.packed_grouped_mm_available(CARD_1, fmt, torch.bfloat16) is True
+    assert len(probes) == 1 and mg._PACKED_AVAILABLE == {(1, fmt, torch.bfloat16): True}
