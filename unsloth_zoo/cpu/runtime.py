@@ -20,6 +20,7 @@ __all__ = [
     "cpu_fp16_supported",
     "cpu_autocast_dtype",
     "cpu_bnb_4bit_supported",
+    "patch_bnb_cpu_dequant_4bit",
     "cpu_capabilities",
     "apply_cpu_security_patches",
     "cpu_compute_cores",
@@ -159,10 +160,144 @@ def cpu_autocast_dtype():
     return None
 
 
+# bitsandbytes' CPU 4-bit dequant entry points: (A, absmax, out, blocksize, m, n), out is m x n.
+_BNB_CPU_DEQUANT_4BIT = {
+    f"cdequantize_blockwise_cpu_{quant}_{dtype}": size
+    for quant in ("nf4", "fp4") for dtype, size in (("fp32", 4), ("bf16", 2), ("fp16", 2))
+}
+# First bitsandbytes release whose CPU 4-bit dequant is right for any width (0.50.2 is the last bad one).
+_BNB_CPU_DEQUANT_FIXED = (0, 50, 3)
+# Values per flat dequant call: the native loops count packed bytes in 32-bit ints.
+_FLAT_DEQUANT_CHUNK = 1 << 28
+
+
+def _bnb_release(version):
+    """Release tuple of a bitsandbytes version string, None when unparsable (a dev build counts as its release)."""
+    try:
+        from packaging.version import Version
+        return tuple(Version(str(version)).release)
+    except Exception:
+        return None
+
+
+def _flat_dequant_4bit(native, element_size):
+    """Wrap one native CPU 4-bit dequant symbol so it always runs on a single flat row.
+
+    bitsandbytes <= 0.50.2 takes absmax per row (``row * (n / blocksize) + col / blocksize``) on
+    its AVX512 (and NEON) path, which is wrong once a row is not a whole number of blocks:
+    in_features % blocksize != 0 (80, 1040, 4304 wide with blocksize 64) dequantizes with
+    another block's scale. Quantization blocks, packed bytes and the output are all flat, so the
+    same call over rows of ``n = m * n`` values is exact: the vector path then sees whole blocks,
+    and bnb's scalar loop takes a tail block. Calls go in chunks of whole blocks so the
+    kernel's 32-bit loop counters never overflow."""
+    import ctypes as ct
+
+    def call(*args):
+        if len(args) != 6 or not all(isinstance(a, ct.c_longlong) for a in args[3:]):
+            return native(*args)
+        A, absmax, out, blocksize, m, n = args
+        bs, total = blocksize.value, m.value * n.value
+        if bs <= 0 or n.value % bs == 0 or total <= 0:
+            return native(*args)
+        step = bs * 16  # whole blocks and a multiple of 16 values, so each chunk but the last is vectorised
+        chunk = max(step, _FLAT_DEQUANT_CHUNK // step * step)
+        a0 = A.value if isinstance(A, ct.c_void_p) else ct.cast(A, ct.c_void_p).value
+        s0 = absmax.value if isinstance(absmax, ct.c_void_p) else ct.cast(absmax, ct.c_void_p).value
+        o0 = out.value if isinstance(out, ct.c_void_p) else ct.cast(out, ct.c_void_p).value
+        result = None
+        for start in range(0, total, chunk):
+            count = min(chunk, total - start)
+            result = native(
+                ct.c_void_p(a0 + start // 2), ct.c_void_p(s0 + (start // bs) * 4),
+                ct.c_void_p(o0 + start * element_size), blocksize, ct.c_longlong(1), ct.c_longlong(count),
+            )
+        return result
+
+    call._unsloth_flat_dequant_4bit = True
+    return call
+
+
+class _FlatDequantLib:
+    """bitsandbytes' native library with its CPU 4-bit dequant symbols routed through _flat_dequant_4bit."""
+
+    def __init__(self, lib):
+        self._unsloth_lib = lib
+        self._unsloth_wrapped = {}
+
+    def __getattr__(self, name):
+        attr = getattr(self._unsloth_lib, name)
+        size = _BNB_CPU_DEQUANT_4BIT.get(name)
+        if size is None or not callable(attr):
+            return attr
+        wrapped = self._unsloth_wrapped.get(name)
+        if wrapped is None:
+            wrapped = self._unsloth_wrapped[name] = _flat_dequant_4bit(attr, size)
+        return wrapped
+
+
+def patch_bnb_cpu_dequant_4bit():
+    """Make bitsandbytes' CPU NF4 / FP4 dequant exact for in_features % blocksize != 0 on releases
+    before 0.50.3. Every CPU 4-bit matmul (QLoRA forward, backward, no-grad gemm) dequantizes
+    through these symbols, so the wrong scale lands in every such layer (relative weight error
+    0.34-0.75 instead of NF4's 0.09). Returns True when the fix is (now) installed."""
+    try:
+        import bitsandbytes as bnb
+        from bitsandbytes.backends.cpu import ops as cpu_ops
+    except Exception:
+        return False
+    release = _bnb_release(getattr(bnb, "__version__", ""))
+    if release is not None and release >= _BNB_CPU_DEQUANT_FIXED:
+        return False
+    lib = getattr(cpu_ops, "lib", None)
+    if lib is None:
+        return False
+    if isinstance(lib, _FlatDequantLib):
+        return True
+    if not any(hasattr(lib, name) for name in _BNB_CPU_DEQUANT_4BIT):
+        return False
+    cpu_ops.lib = _FlatDequantLib(lib)
+    return True
+
+
+def _nf4_reference_dequant(packed, absmax, blocksize, shape, torch):
+    """Flat-block NF4 dequant in torch (high nibble first), the layout bitsandbytes quantizes to."""
+    import bitsandbytes.functional as F
+    code = F.get_4bit_type("nf4", device = "cpu").float()
+    data = packed.reshape(-1).view(torch.uint8)
+    idx = torch.stack([data >> 4, data & 0xF], dim = -1).reshape(-1)[: shape[0] * shape[1]].long()
+    values = code[idx]
+    scale = absmax.float().repeat_interleave(blocksize)[: values.numel()]
+    return (values * scale).reshape(shape)
+
+
+def _bnb_cpu_dequant_4bit_correct(torch, bnb, dtype):
+    """A Linear4bit whose rows are not whole blocks (80 = 64 + 16 wide) must match a torch dequant of
+    its own packed weight: the width-128 probe below cannot see a per-row absmax mistake."""
+    in_features, out_features = 80, 32
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(out_features, in_features, generator = generator) * torch.linspace(0.05, 2.0, in_features)
+    layer = bnb.nn.Linear4bit(in_features, out_features, bias = False, compute_dtype = dtype,
+                              quant_type = "nf4", compress_statistics = False)
+    layer.weight = bnb.nn.Params4bit(weight.to(dtype), requires_grad = False, quant_type = "nf4",
+                                     compress_statistics = False)._quantize("cpu")
+    if hasattr(layer, "support_avx512bf16_for_cpu"):
+        layer.support_avx512bf16_for_cpu = False
+    state = layer.weight.quant_state
+    reference = _nf4_reference_dequant(layer.weight.data, state.absmax, state.blocksize,
+                                       (out_features, in_features), torch)
+    x = torch.randn(8, in_features, generator = generator).to(dtype)
+    y = layer(x).float()
+    expected = x.float() @ reference.to(dtype).float().t()
+    error = float((y - expected).norm() / expected.norm().clamp_min(1e-12))
+    return error < (2e-2 if dtype != torch.float32 else 1e-4)
+
+
 @functools.cache
 def cpu_bnb_4bit_supported():
     """A real NF4 Linear4bit forward + backward on CPU, not an import check: bitsandbytes resolves
-    every native symbol to a raising stub when its library is dead, so only a call proves it."""
+    every native symbol to a raising stub when its library is dead, so only a call proves it.
+    A second, 80-wide layer is checked against a torch dequant of its packed weight, after the
+    bitsandbytes <= 0.50.2 dequant fix is installed, so a wrong-scale dequant falls back to 16-bit."""
     if os.environ.get("UNSLOTH_CPU_LOAD_IN_4BIT", "").strip().lower() in ("0", "false", "no", "off"):
         return False
     try:
@@ -170,6 +305,7 @@ def cpu_bnb_4bit_supported():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             import bitsandbytes as bnb
+            patch_bnb_cpu_dequant_4bit()
             dtype = torch.bfloat16 if cpu_bf16_supported() else torch.float32
             layer = bnb.nn.Linear4bit(128, 64, bias = False, compute_dtype = dtype, quant_type = "nf4")
             weight = layer.weight
@@ -178,7 +314,15 @@ def cpu_bnb_4bit_supported():
             x = torch.randn(4, 128, dtype = dtype, requires_grad = True)
             y = layer(x)
             y.float().sum().backward()
-            return bool(torch.isfinite(y).all()) and x.grad is not None and bool(torch.isfinite(x.grad).all())
+            if not (bool(torch.isfinite(y).all()) and x.grad is not None and bool(torch.isfinite(x.grad).all())):
+                return False
+        if not _bnb_cpu_dequant_4bit_correct(torch, bnb, dtype):
+            warnings.warn(
+                "Unsloth: bitsandbytes' CPU 4-bit dequant gives wrong weights for layers whose width is not "
+                "a multiple of 64 here; loading 16-bit weights instead. Upgrading bitsandbytes may fix it."
+            )
+            return False
+        return True
     except Exception:
         return False
 

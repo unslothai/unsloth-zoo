@@ -33,7 +33,7 @@ from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_chec
 from unsloth_zoo.utils import _is_out_of_memory
 
 from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
-from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
+from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported, patch_bnb_cpu_dequant_4bit
 from .fp16_decode import fp16_decode, fp16_decode_wanted, release_fp16_decode
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
@@ -1023,6 +1023,9 @@ class FastCPUModel:
                 _print(f"{model_name} is already quantized with {quant_method}; loading it with that "
                        f"quantization config instead of bitsandbytes 4-bit.")
                 use_4bit = False
+        if user_quantization and not use_4bit:
+            # A caller's BitsAndBytesConfig skips the probe below; still fix the CPU dequant it will use.
+            patch_bnb_cpu_dequant_4bit()
         if use_4bit and not cpu_bnb_4bit_supported():
             _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
             use_4bit = False
