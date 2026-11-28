@@ -372,3 +372,66 @@ def test_appending_to_a_shard_leaves_the_existing_tensors_byte_identical(tmp_pat
     for key, tensor in original.items():
         assert torch.equal(got[key], tensor), key
     assert torch.equal(got["score.weight"], added["score.weight"])
+
+
+def _composite_head_config(family):
+    import transformers
+
+    extra = {"embedding_size": 32} if family == "Electra" else {}
+    return getattr(transformers, family + "Config")(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=4, pad_token_id=1, **extra)
+
+
+@pytest.mark.parametrize("base_class", [
+    "RobertaForMaskedLM",                 # head absent from the base: seeded
+    "RobertaForSequenceClassification",   # head present: rewritten in place
+    "ElectraForSequenceClassification",
+])
+def test_a_head_of_several_layers_survives_the_merge(tmp_path, base_class):
+    """RoBERTa / Electra heads hold `dense` and `out_proj`; the export raised "Extracted keys ... do not match"."""
+    import transformers
+    from transformers import AutoModelForSequenceClassification
+    from peft import LoraConfig, get_peft_model
+
+    H.set_offline_cpu_env()
+    family = base_class.split("For")[0]
+    base, out = str(tmp_path / "base"), str(tmp_path / "out")
+    torch.manual_seed(H.SEED)
+    getattr(transformers, base_class)(_composite_head_config(family)).save_pretrained(base)
+    model = getattr(transformers, family + "ForSequenceClassification").from_pretrained(base)
+    model.config._name_or_path = base
+    peft_model = get_peft_model(model, LoraConfig(r=4, target_modules=["query"], task_type="SEQ_CLS"))
+    H.seed_lora(peft_model)
+    with torch.no_grad():
+        for name, param in peft_model.named_parameters():
+            if "classifier.modules_to_save" in name:
+                param.add_(0.5)
+    peft_model.eval()
+    ids = torch.tensor([[5, 3, 7]])
+    with torch.no_grad():
+        want = peft_model(ids).logits
+
+    H.run_merge(peft_model, base, out, save_dtype=torch.float32)
+
+    reloaded, info = AutoModelForSequenceClassification.from_pretrained(
+        out, output_loading_info=True, local_files_only=True)
+    assert [k for k in info["missing_keys"] if "classifier" in k] == []
+    trained = peft_model.base_model.model.classifier.modules_to_save["default"].state_dict()
+    for key, tensor in trained.items():
+        assert torch.equal(reloaded.classifier.state_dict()[key], tensor), key
+    with torch.no_grad():
+        assert torch.allclose(reloaded.eval()(ids).logits, want, atol=1e-5)
+
+
+def test_a_head_holding_a_raw_parameter_is_still_refused():
+    """Only `weight` / `bias` are written, so anything else in a head must stop the export."""
+    from transformers import RobertaForSequenceClassification
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.saving_utils import create_lora_statistics
+
+    model = RobertaForSequenceClassification(_composite_head_config("Roberta"))
+    model.classifier.scale = torch.nn.Parameter(torch.ones(1))
+    peft_model = get_peft_model(model, LoraConfig(r=4, target_modules=["query"], task_type="SEQ_CLS"))
+    with pytest.raises(RuntimeError, match="do not match"):
+        create_lora_statistics(peft_model)

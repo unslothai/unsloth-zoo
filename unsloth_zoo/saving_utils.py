@@ -96,6 +96,7 @@ import os
 import posixpath
 import re
 import stat
+import types
 from pathlib import Path
 from typing import Union, List, Optional
 import tempfile
@@ -820,6 +821,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     _embedding_lora_keys = set()
     _untargeted_keys = set()
     _keep_downloaded_keys = set()
+    _composite_weight_keys = {}
 
     inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
@@ -896,6 +898,19 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 new_keys = expand_module_keys(name, module, set())
                 remove_keys.update(new_keys)
                 remove_keys.add(name)
+                # A head made of several layers (RoBERTa, Electra) has no weight of its own: save each layer.
+                adapter = _get_active_adapter(module)
+                head = module.modules_to_save[adapter] if adapter in module.modules_to_save else None
+                # Any other tensor (a raw parameter, a norm's running stats) would not be written: keep refusing those.
+                if head is None or any(not k.endswith((".weight", ".bias")) for k in head.state_dict()): continue
+                for child_name, child in head.named_modules():
+                    if getattr(child, "weight", None) is None: continue
+                    key = f"{name}.{child_name}"
+                    lora_weights[key].module = types.SimpleNamespace(
+                        modules_to_save = {adapter : child}, active_adapters = [adapter],
+                        weight = child.weight, bias = getattr(child, "bias", None),
+                    )
+                    _composite_weight_keys[f"{name}.modules_to_save.{adapter}.{child_name}.weight"] = key
 
         elif (not merge_into_original) and check_if_quantized(module):
             lora_weights[name].module = module
@@ -979,6 +994,9 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
             if name.endswith(".base_layer.weight"):
                 name = name[:-len(".base_layer.weight")]
+
+            elif name in _composite_weight_keys:
+                name = _composite_weight_keys[name]
 
             # modules_to_save wraps embed_tokens / lm_head; strip the wrapper
             # so the key matches lora_weights entries created by the branch above.
