@@ -34,6 +34,7 @@ from unsloth_zoo.utils import _is_out_of_memory
 
 from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
+from .fp16_decode import fp16_decode, fp16_decode_wanted, release_fp16_decode
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
     store_frozen_linears_in_bf16,
@@ -1365,6 +1366,7 @@ class FastCPUModel:
     @staticmethod
     def for_inference(model):
         model.eval()
+        release_fp16_decode(model)  # rollout packs: eval-mode generate decodes through the model's own weights
         _frozen_bf16_for(model, training = False)
         _set_inference_mode(model, True)
         return model
@@ -1550,9 +1552,14 @@ def _unpack_encoding_generate(generate):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
         restore = False
+        decode16 = None
         if isinstance(self, torch.nn.Module) and not self.training:
             # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
             _frozen_bf16_for(self, training = False)
+        elif fp16_decode_wanted(self):
+            # Train-mode rollouts on x86 without native bf16: frozen projections and the LM head decode through fp16
+            # packs (2 bytes per weight read, fp32 math), instead of the per-call bf16 upcast or the fp32 copy below.
+            decode16 = fp16_decode(self)
         elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and \
                 _fp32_rollout_fits(self, *_rollout_shape(self, args, kwargs)):
             # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
@@ -1572,6 +1579,8 @@ def _unpack_encoding_generate(generate):
         except Exception:
             threads = None
         try:
+            if decode16 is not None:
+                decode16.__enter__()  # after the rollout thread count: the packs are built on those threads
             set_stance = getattr(torch.compiler, "set_stance", None)
             modules = self.modules() if isinstance(self, torch.nn.Module) else ()
             if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
@@ -1580,6 +1589,8 @@ def _unpack_encoding_generate(generate):
                     return generate(self, *args, **kwargs)
             return generate(self, *args, **kwargs)
         finally:
+            if decode16 is not None:
+                decode16.__exit__(None, None, None)
             if threads:
                 torch.set_num_threads(training_threads)
             if restore:

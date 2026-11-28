@@ -1,0 +1,269 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""CPU train-mode rollouts on x86 without native bf16 decode the frozen projections and the LM head through FBGEMM fp16
+packs: same greedy tokens as the per-call path, packs built once and rebuilt when a weight changes, forwards restored
+after generate (also on error); eval-mode generate, autograd calls, long prefills, trainable weights, weights that
+are not bf16 values, other CPUs and UNSLOTH_CPU_FP16_DECODE=0 keep the stock path."""
+
+import platform
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+
+def _fbgemm():
+    from unsloth_zoo.cpu.fp16_decode import fp16_decode_available
+    return fp16_decode_available()
+
+
+needs_fbgemm = pytest.mark.skipif(
+    platform.machine().lower() not in ("x86_64", "amd64"), reason = "FBGEMM fp16 GEMM ships in x86 torch builds only",
+)
+
+
+@pytest.fixture
+def no_bf16(monkeypatch):
+    """Runs as on x86 without native bf16 (fp32 training), the CPUs this path is for."""
+    from unsloth_zoo.cpu import fp16_decode, runtime
+    monkeypatch.delenv("UNSLOTH_CPU_FP16_DECODE", raising = False)
+    monkeypatch.setattr(runtime, "cpu_bf16_supported", lambda: False)
+    fp16_decode.ENGAGED[0] = 0
+    return fp16_decode
+
+
+def _tiny_llama(bf16_stored = True, tie = True):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.cpu.ops import store_frozen_linears_in_bf16
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size = 96, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                         num_attention_heads = 4, num_key_value_heads = 2, max_position_embeddings = 128,
+                         tie_word_embeddings = tie)
+    model = LlamaForCausalLM(config).bfloat16()
+    if bf16_stored:
+        assert store_frozen_linears_in_bf16(model) > 0
+        model._unsloth_cpu_frozen_bf16 = "training"
+    else:
+        model.float()  # fp32 storage of bf16 checkpoint values (Windows / AVX-512 Linux)
+    for param in model.parameters():
+        param.requires_grad_(False)
+    loader.FastCPUModel._attach(model)
+    return model.train()
+
+
+def _generate(model, rows = 2, new = 8):
+    ids = torch.randint(1, 96, (rows, 5), generator = torch.Generator().manual_seed(0))
+    return model.generate(input_ids = ids, do_sample = False, max_new_tokens = new, pad_token_id = 0)
+
+
+def _packed(model):
+    from unsloth_zoo.cpu.fp16_decode import _PACKS
+    return [m for m in model.modules() if m in _PACKS]
+
+
+@needs_fbgemm
+def test_fbgemm_fp16_gemm_available_on_x86():
+    assert _fbgemm()
+
+
+@needs_fbgemm
+@pytest.mark.parametrize("bf16_stored", [True, False])
+def test_rollout_decodes_through_packs_same_tokens(no_bf16, monkeypatch, bf16_stored):
+    model = _tiny_llama(bf16_stored)
+    weights = {k: v.clone() for k, v in model.state_dict().items()}
+    tokens = _generate(model)
+    engaged = no_bf16.ENGAGED[0]
+    # 7 projections x 2 layers + the LM head, on the prompt and on every decoded token
+    assert engaged >= 15 * 8
+    assert len(_packed(model)) == 15
+    assert not any("forward" in m.__dict__ for m in model.modules())  # own forwards back after generate
+    state = model.state_dict()
+    assert all(torch.equal(state[k], v) and state[k].dtype == v.dtype for k, v in weights.items())
+    monkeypatch.setenv("UNSLOTH_CPU_FP16_DECODE", "0")
+    no_bf16.ENGAGED[0] = 0
+    assert torch.equal(_generate(model), tokens)
+    assert no_bf16.ENGAGED[0] == 0
+
+
+@needs_fbgemm
+def test_packs_are_built_once_and_rebuilt_when_the_weight_changes(no_bf16, monkeypatch):
+    assert _fbgemm()  # the cached availability check runs before the count starts
+    model = _tiny_llama()
+    calls = []
+    prepack = torch.ops.quantized.linear_prepack_fp16
+
+    class Ops:
+        linear_dynamic_fp16 = torch.ops.quantized.linear_dynamic_fp16
+
+        @staticmethod
+        def linear_prepack_fp16(w, b):
+            calls.append(tuple(w.shape))
+            return prepack(w, b)
+    monkeypatch.setattr(torch.ops, "quantized", Ops)
+    _generate(model)
+    first = len(calls)
+    assert first == 15
+    _generate(model)
+    assert len(calls) == first  # cached
+    q = model.model.layers[0].self_attn.q_proj
+    with torch.no_grad():
+        q.weight.mul_(2)
+    _generate(model)
+    assert len(calls) == first + 1
+    x = torch.randn(3, 32)
+    with torch.no_grad(), no_bf16.fp16_decode(model) as ctx:
+        assert ctx.active
+        y = q(x)
+    torch.testing.assert_close(y, F.linear(x, q.weight.float()), rtol = 1e-5, atol = 1e-5)
+
+
+@needs_fbgemm
+def test_numerics_match_fp32_linear_and_blocked_head(no_bf16, monkeypatch):
+    monkeypatch.setattr(no_bf16, "_HEAD_BLOCK", 40)  # 96-row vocabulary in 3 blocks
+    model = _tiny_llama(bf16_stored = False)
+    head = model.get_output_embeddings()
+    x = torch.randn(2, 1, 32)
+    with torch.no_grad():
+        ref = F.linear(x, head.weight)
+        oracle = F.linear(x.double(), head.weight.double())
+        with no_bf16.fp16_decode(model) as ctx:
+            assert ctx.active
+            y = head(x)
+    assert len(no_bf16._PACKS[head][1]) == 3
+    assert no_bf16.ENGAGED[0] == 1 and y.shape == ref.shape
+    torch.testing.assert_close(y, ref, rtol = 1e-5, atol = 1e-5)
+    assert (y.double() - oracle).abs().max() < 1e-5
+
+
+@needs_fbgemm
+def test_stock_path_for_autograd_long_prefill_and_wrong_dtype(no_bf16):
+    model = _tiny_llama()
+    q = model.model.layers[0].self_attn.q_proj
+    with no_bf16.fp16_decode(model) as ctx:
+        assert ctx.active
+        q(torch.randn(2, 32, requires_grad = True))  # autograd enabled
+        with torch.no_grad():
+            q(torch.randn(no_bf16._MAX_ROWS + 1, 32))  # prefill longer than the gate
+            q(torch.randn(2, 32, dtype = torch.float64))  # not fp32 activations
+            assert no_bf16.ENGAGED[0] == 0  # none of the above
+            q(torch.randn(no_bf16._MAX_ROWS, 32))
+    assert no_bf16.ENGAGED[0] == 1
+
+
+@needs_fbgemm
+def test_forwards_restored_on_error(no_bf16):
+    model = _tiny_llama()
+    with pytest.raises(RuntimeError, match = "boom"):
+        with no_bf16.fp16_decode(model) as ctx:
+            assert ctx.active and any("forward" in m.__dict__ for m in model.modules())
+            raise RuntimeError("boom")
+    assert not any("forward" in m.__dict__ for m in model.modules())
+
+
+@needs_fbgemm
+def test_eval_mode_generate_keeps_stock_path(no_bf16):
+    model = _tiny_llama()
+    model.eval()
+    _generate(model)
+    assert no_bf16.ENGAGED[0] == 0 and not _packed(model)
+
+
+@needs_fbgemm
+def test_for_inference_releases_packs_and_deepcopy_carries_none(no_bf16):
+    import copy
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    model = _tiny_llama()
+    _generate(model)
+    assert len(_packed(model)) == 15
+    clone = copy.deepcopy(model)
+    assert not _packed(clone)
+    FastCPUModel.for_inference(model)
+    assert not _packed(model)
+
+
+@needs_fbgemm
+def test_skips_trainable_out_of_range_and_non_bf16_weights(no_bf16):
+    model = _tiny_llama(bf16_stored = False)
+    layer = model.model.layers[0]
+    layer.mlp.up_proj.weight.requires_grad_(True)  # trainable (full finetuning, modules_to_save)
+    with torch.no_grad():
+        layer.mlp.down_proj.weight[0, 0] = 70000.0  # outside fp16's range
+        layer.self_attn.o_proj.weight.add_(1e-9)  # fp32 values that are not bf16 numbers (fp32 checkpoint)
+    with no_bf16.fp16_decode(model):
+        pass
+    packed = set(map(id, _packed(model)))
+    assert id(layer.mlp.up_proj) not in packed
+    assert id(layer.mlp.down_proj) not in packed
+    assert id(layer.self_attn.o_proj) not in packed
+    assert id(layer.self_attn.q_proj) in packed
+
+
+@needs_fbgemm
+def test_no_packs_when_they_do_not_fit_in_ram(no_bf16, monkeypatch):
+    from unsloth_zoo.cpu import runtime
+    monkeypatch.setattr(runtime, "available_ram", lambda: 1024)
+    model = _tiny_llama()
+    _generate(model)
+    assert no_bf16.ENGAGED[0] == 0 and not _packed(model)
+
+
+@needs_fbgemm
+def test_packs_under_an_fbgemm_engine_and_restores_the_users(no_bf16):
+    if "qnnpack" not in torch.backends.quantized.supported_engines:
+        pytest.skip("no qnnpack engine in this build")
+    model = _tiny_llama()
+    previous = torch.backends.quantized.engine
+    torch.backends.quantized.engine = "qnnpack"  # its prepack has no fp16 packs
+    try:
+        _generate(model)
+        assert torch.backends.quantized.engine == "qnnpack"
+    finally:
+        torch.backends.quantized.engine = previous
+    assert len(_packed(model)) == 15 and no_bf16.ENGAGED[0] > 0
+
+
+def test_no_fbgemm_engine_means_unavailable(monkeypatch):
+    from unsloth_zoo.cpu import fp16_decode
+    engine = type(torch.backends.quantized)
+    monkeypatch.setattr(engine, "supported_engines", property(lambda self: ["onednn"]))  # Windows wheels
+    monkeypatch.setattr(engine, "engine", property(lambda self: "onednn", lambda self, value: None))
+    assert fp16_decode._fbgemm_engine() is None
+    fp16_decode.fp16_decode_available.cache_clear()
+    try:
+        assert fp16_decode.fp16_decode_available() is False
+    finally:
+        fp16_decode.fp16_decode_available.cache_clear()
+
+
+@pytest.mark.parametrize("env, machine, bf16, available, expected", [
+    ("", "x86_64", False, True, True),
+    ("", "AMD64", False, True, True),
+    ("0", "x86_64", False, True, False),
+    ("", "x86_64", True, True, False),  # native bf16: training computes in bf16, not this path
+    ("1", "x86_64", True, True, True),
+    ("", "arm64", False, True, False),
+    ("", "x86_64", False, False, False),  # build without FBGEMM
+])
+def test_gate(monkeypatch, env, machine, bf16, available, expected):
+    from unsloth_zoo.cpu import fp16_decode, runtime
+    monkeypatch.setenv("UNSLOTH_CPU_FP16_DECODE", env)
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    monkeypatch.setattr(runtime, "cpu_bf16_supported", lambda: bf16)
+    monkeypatch.setattr(fp16_decode, "fp16_decode_available", lambda: available)
+    model = torch.nn.Linear(4, 4).train()
+    assert fp16_decode.fp16_decode_wanted(model) is expected
+    assert fp16_decode.fp16_decode_wanted(model.eval()) is False
