@@ -419,17 +419,26 @@ def _patch_cpu_num_items(trainer_cls):
     LM's shifted loss sees (5.x counts labels[..., 1:]). The CPU route keeps stock transformers, so a padded
     single process, DDP or accelerate FSDP2 run divided by that larger count while padding-free, native FSDP2,
     tensor / pipeline / context parallel (which install Unsloth's counter) did not: the same rows gave another
-    loss and gradient. Encoder-decoder models keep transformers' count, as on the GPU route."""
+    loss and gradient. Only causal LM heads: encoder-decoder and classification / QA heads (whose labels are not
+    shifted targets, and which zoo's counter declines) keep transformers' count."""
     original = getattr(trainer_cls, "get_batch_samples", None)
     if original is None or getattr(original, "_unsloth_cpu", False) \
             or getattr(original, "__name__", "") == "_unsloth_get_batch_samples":
         return False
-    from ..loss_utils import _unsloth_get_batch_samples
+    from ..loss_utils import NON_CAUSAL_HEADS, _unsloth_get_batch_samples, _unwrap_training_wrappers
+
+    def causal_head(model):
+        m = _unwrap_training_wrappers(model)
+        if hasattr(m, "get_base_model"):
+            m = m.get_base_model()
+        if m is None or getattr(getattr(m, "config", None), "is_encoder_decoder", False):
+            return False
+        name = type(m).__name__
+        return not any(head in name for head in NON_CAUSAL_HEADS)
 
     @functools.wraps(original)
     def get_batch_samples(self, *args, **kwargs):
-        config = getattr(getattr(self, "model", None), "config", None)
-        if getattr(config, "is_encoder_decoder", False):
+        if not causal_head(getattr(self, "model", None)):
             return original(self, *args, **kwargs)
         return _unsloth_get_batch_samples(self, *args, **kwargs)
 
