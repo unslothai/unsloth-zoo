@@ -198,22 +198,29 @@ def _no_host_sync(device):
     return in_graph_decode_step()
 
 
+# Capture-safety verdicts taken outside a capture (a graph decode step's eager warm-up), reused inside it.
+_CAPTURE_SAFE = {}
+
+
 def _grouped_mm_capture_safe(inputs, weight):
-    """Whether the zoo's grouped GEMM takes a backend that reads no offsets on the host for these operands: its
-    Triton kernel, or torch._grouped_mm where PyTorch serves it with a real grouped kernel (not its own synced
-    per-expert loop, e.g. bf16 on Ampere). Its other fallbacks (the per-expert loop) do read them."""
+    """Whether the zoo's grouped GEMM reads no offsets on the host for these operands
+    (`moe_utils.grouped_mm_backend_reads_host_offsets`). Inside a real capture nothing is probed: the verdict of the
+    warm-up call of the same shapes, else False (the masked path)."""
     if inputs.device.type != "cuda":
         return False
+    key = (inputs.device.index, inputs.dtype, weight.dtype, tuple(inputs.shape), tuple(weight.shape),
+           tuple(weight.stride()))
+    if _tracing_or_capturing(inputs.device):
+        return _CAPTURE_SAFE.get(key, False)
     try:
         from unsloth_zoo.temporary_patches import moe_utils
-        if moe_utils._triton_grouped_mm_wanted(inputs, weight):
-            return True
-        if inputs.dtype != weight.dtype or not moe_utils._grouped_mm_supported_on(inputs.device):
-            return False
-        return not moe_utils._torch_grouped_mm_takes_fallback(inputs.device, inputs.dtype, weight.dtype,
-                                                              weight.shape[0])
+        safe = not moe_utils.grouped_mm_backend_reads_host_offsets(inputs, weight)
     except Exception:
-        return False
+        safe = False
+    if len(_CAPTURE_SAFE) > 4096:
+        _CAPTURE_SAFE.clear()
+    _CAPTURE_SAFE[key] = safe
+    return safe
 
 
 def _masked_grouped_mm(inputs, weight, ends, first, out):

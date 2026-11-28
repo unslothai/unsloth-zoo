@@ -339,21 +339,76 @@ def test_graph_decode_step_avoids_host_sync_grouped_gemm_fallbacks(monkeypatch, 
     torch.testing.assert_close(device, eager)
 
 
-def test_capture_safety_consults_the_native_grouped_mm_fallback(monkeypatch):
-    # bf16 on Ampere with the zoo's Triton kernel off: torch._grouped_mm exists but serves the call with its own
-    # host-synced loop, so a capture must take the masked path.
-    import types
+class _FakeCuda:
+    """Operand stand-in on a CUDA device (CPU host): only what the dispatch predicates read."""
+
+    def __init__(self, shape, dtype = torch.bfloat16, stride = None):
+        self.shape = torch.Size(shape)
+        self.dtype = dtype
+        self.device = torch.device("cuda", 0)
+        self.is_cuda = True
+        self._stride = stride or torch.empty(shape, device = "meta").stride()
+
+    def dim(self):
+        return len(self.shape)
+
+    def stride(self):
+        return self._stride
+
+    def element_size(self):
+        return torch.empty((), dtype = self.dtype).element_size()
+
+
+def _dispatch(monkeypatch, wanted = False, triton_ok = True, supported = True, torch_loop = False):
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16, moe_utils
+
+    monkeypatch.setattr(mse, "_CAPTURE_SAFE", {}, raising = False)
+    monkeypatch.setattr(moe_utils, "_triton_grouped_mm_wanted", lambda inputs, weight: wanted)
+    monkeypatch.setattr(moe_grouped_fp16, "triton_grouped_available", lambda device: triton_ok)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", lambda device: supported)
+    monkeypatch.setattr(moe_utils, "_torch_grouped_mm_takes_fallback", lambda *args: torch_loop)
+
+
+# (Triton wanted, Triton self-check passed, torch._grouped_mm supported and not latched off, torch serves it with its
+# own per-expert loop) -> capture-safe. Ampere bf16: torch's loop; a failed Triton self-check falls back to it.
+@pytest.mark.parametrize("wanted,triton_ok,supported,torch_loop,safe", [
+    (True, True, True, True, True),
+    (True, False, True, True, False),
+    (True, False, True, False, True),
+    (True, False, False, False, False),
+    (False, True, True, True, False),
+    (False, True, True, False, True),
+    (False, True, False, False, False),
+])
+def test_capture_safety_follows_the_backend_that_runs(monkeypatch, wanted, triton_ok, supported, torch_loop, safe):
+    _dispatch(monkeypatch, wanted, triton_ok, supported, torch_loop)
+    assert mse._grouped_mm_capture_safe(_FakeCuda((9, 64)), _FakeCuda((4, 64, 32))) is safe
+
+
+def test_capture_safety_needs_16_byte_rows_for_torch_grouped_mm(monkeypatch):
+    # An unaligned row makes torch._grouped_mm raise on its strides, and the zoo then takes the per-expert loop.
+    _dispatch(monkeypatch)
+    assert mse._grouped_mm_capture_safe(_FakeCuda((9, 64)), _FakeCuda((4, 64, 32)))
+    assert not mse._grouped_mm_capture_safe(_FakeCuda((9, 60)), _FakeCuda((4, 60, 32)))
+    assert not mse._grouped_mm_capture_safe(_FakeCuda((9, 64)), _FakeCuda((4, 64, 30)))
+
+
+def test_capture_reuses_the_warm_up_verdict_and_probes_nothing(monkeypatch):
     from unsloth_zoo.temporary_patches import moe_utils
 
-    monkeypatch.setattr(moe_utils, "_triton_grouped_mm_wanted", lambda inputs, weight: False)
-    monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", lambda device: True)
-    cuda = torch.device("cuda", 0)
-    inputs = types.SimpleNamespace(device = cuda, is_cuda = True, dtype = torch.bfloat16)
-    weight = types.SimpleNamespace(device = cuda, dtype = torch.bfloat16, shape = (8, 64, 32))
-    monkeypatch.setattr(moe_utils, "_torch_grouped_mm_takes_fallback", lambda *args: True)
-    assert not mse._grouped_mm_capture_safe(inputs, weight)
-    monkeypatch.setattr(moe_utils, "_torch_grouped_mm_takes_fallback", lambda *args: False)
+    _dispatch(monkeypatch)
+    inputs, weight = _FakeCuda((9, 64)), _FakeCuda((4, 64, 32))
+    assert mse._grouped_mm_capture_safe(inputs, weight)  # warm-up: verdict taken and kept
+
+    def probe(*args):
+        raise AssertionError("dispatch probed inside a capture")
+
+    monkeypatch.setattr(moe_utils, "_grouped_mm_supported_on", probe)
+    monkeypatch.setattr(moe_utils, "_triton_grouped_mm_wanted", probe)
+    monkeypatch.setattr(mse, "_tracing_or_capturing", lambda device = None: True)
     assert mse._grouped_mm_capture_safe(inputs, weight)
+    # Shapes the warm-up never saw: the masked path.
+    assert not mse._grouped_mm_capture_safe(_FakeCuda((5, 64)), weight)
 
 
 @needs_tracing
