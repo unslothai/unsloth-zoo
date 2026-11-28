@@ -392,7 +392,9 @@ def gemv_kernel(
     tl.store(OUT + rows, out.to(OUT.dtype.element_ty), mask = rmask)
 
 
-@triton.jit
+# M (rows of x per call) only bounds the row masks and the grouped schedule, never a contiguous axis: kept runtime,
+# so prompt lengths / packed batches do not compile one variant per M % 16 / M == 1 class.
+@triton.jit(do_not_specialize = ["M"])
 def mm_kernel(
     X, P, OUT, BIAS, COUNTS, SCHED, tab,
     M, N, K, E, R, row_bytes, stride_xm, stride_om,
