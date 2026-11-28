@@ -840,7 +840,7 @@ if _HAS_TRITON:
         return tl.where(tl.abs(y) < 1e-3, y * (1.0 + y * (-0.5 + y * (1.0 / 3.0))), tl.log(arg))
 
     @triton.jit
-    def _fl_log_mix_fast(delta, beta, onemb):
+    def _fl_log_mix_fast(delta, beta, onemb, MIRROR: tl.constexpr):
         # _fl_log_mix_pair for the per-element passes: no divisions or series logs (one exp and one log per
         # term), still exactly 0 at delta = 0 and keeping the small share near beta 0 / 1.
         x = tl.minimum(tl.maximum(delta, -80.0), 80.0)
@@ -850,10 +850,14 @@ if _HAS_TRITON:
         y = beta * em1
         mix = _fl_log1p_small(y, tl.where(y < -0.5, onemb + beta * r, 1.0 + y))
         mix = tl.where(delta > 80.0, delta + tl.log(beta), mix)
-        rinv = tl.exp(-x)
-        y2 = -onemb * em1 * rinv
-        tmix = -_fl_log1p_small(y2, tl.where(y2 < -0.5, beta + onemb * rinv, 1.0 + y2))
-        tmix = tl.where(delta < -80.0, delta - tl.log(onemb), tmix)
+        if MIRROR:
+            # 1 - beta below 1e-2: delta - mix would cancel the small lt - m, so take it from its own log-mix.
+            rinv = tl.exp(-x)
+            y2 = -onemb * em1 * rinv
+            tmix = -_fl_log1p_small(y2, tl.where(y2 < -0.5, beta + onemb * rinv, 1.0 + y2))
+            tmix = tl.where(delta < -80.0, delta - tl.log(onemb), tmix)
+        else:
+            tmix = delta - mix
         return mix, tmix
 
     @triton.jit
@@ -922,7 +926,8 @@ if _HAS_TRITON:
     def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, aux_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
                            beta, onemb, s_scale, s_cap, t_scale, t_cap, inv_t,
                            MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, write dz, student scale
-                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):  # student cap, teacher scale / cap, vocab cols
+                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr,  # student cap, teacher scale / cap, vocab cols
+                           MIRROR: tl.constexpr):  # 1 - beta < 1e-2: lt - m from its own log-mix
         # Sums without j (aux has j's terms). MODE 0: beta 0, sum q (lt - ls), dz = p - q. MODE 1: beta 1,
         # sum p (d - c), d = ls - lt. MODE 2: interior, sum q (lt - m), sum p (d - c), d = ls - m.
         row = tl.program_id(0)
@@ -947,7 +952,7 @@ if _HAS_TRITON:
             tl.store(o, tl.sum(tl.where(off, p * (ls - lt - tl.load(a + 3)), 0.0), 0))
         else:
             # lt - m = -log((1 - (1 - b)) + (1 - b) exp(ls - lt)): the mirrored log-mix, not (lt - ls) - (m - ls).
-            mix, tmix = _fl_log_mix_fast(lt - ls, beta, onemb)
+            mix, tmix = _fl_log_mix_fast(lt - ls, beta, onemb, MIRROR)
             tl.store(o, tl.sum(tl.where(off, q * tmix, 0.0), 0))
             tl.store(o + 1, tl.sum(tl.where(off, p * (-mix - tl.load(a + 3)), 0.0), 0))
 
@@ -970,7 +975,7 @@ if _HAS_TRITON:
         if MODE == 1:
             d = ls - lt
         else:
-            mix, _ = _fl_log_mix_fast(lt - ls, beta, onemb)
+            mix, _ = _fl_log_mix_fast(lt - ls, beta, onemb, False)
             d = -mix
         # d shifted by c = d_j (collapse-safe d - sum p d); j's term is exactly 0, not this d_j - c (an ulp off).
         g = p * (tl.where(cols == tl.load(a + 2).to(tl.int32), 0.0, d - tl.load(a + 3)) - tl.load(rs_ptr + row))
@@ -2450,7 +2455,8 @@ def _jsd_triton_launch(s, t, factor, beta, inv_t, s_scale, s_cap, t_scale, t_cap
     dz = torch.empty((R, V), device = s.device, dtype = grad_dtype) if want_grad else s.new_empty((1, 1))
     factor = factor.reshape(1).to(torch.float32)
     _fl_jsd_row_kernel[grid](s, t, s.stride(0), V, aux, part, NB, dz, dz.stride(0), factor, float(beta), 1.0 - float(beta),
-                             *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, BLOCK = _JSD_BLOCK, **flags)
+                             *sc, MODE = mode, WRITE_DZ = want_grad and mode == 0, BLOCK = _JSD_BLOCK,
+                             MIRROR = mode == 2 and 1.0 - float(beta) < 1e-2, **flags)
     if mode == 0:
         row = part[..., 0].sum(1) + aux[:, 4]
     elif mode == 1:
