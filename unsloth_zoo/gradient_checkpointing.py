@@ -34,6 +34,7 @@ from .saved_attention import (
     saved_attention_scope,
     save_attention_requested,
     patch_transformers_saved_attention,
+    release_saved_attention_host_pool,
 )
 # Re-exported; lives in integrated_device.py so the import-time allocator block avoids torch.
 from .integrated_device import (
@@ -1180,7 +1181,9 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         ctx.device = hidden_states.device
         saved_hidden_states = hidden_states.to("cpu", non_blocking = True)
         ctx._routing_frame = _new_checkpoint_routing_frame((hidden_states, *args))
-        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
+        ctx._attention_frame = new_saved_attention_frame((hidden_states, *args))
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False), \
+                saved_attention_scope(ctx._attention_frame, False):
             output = forward_function(hidden_states, *args)
         ctx.save_for_backward(saved_hidden_states)
         ctx.forward_function = forward_function
@@ -1196,7 +1199,8 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
-                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
+                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True), \
+                saved_attention_scope(getattr(ctx, "_attention_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # forward() stores whatever a layer returns, but backward() must unpack a 1-tuple;
         # bare-tensor blocks (Qwen2-VL vision, later transformers) used to raise ValueError too many
@@ -1220,7 +1224,9 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
     @torch_amp_custom_fwd
     def forward(ctx, forward_function, hidden_states, *args):
         ctx._routing_frame = _new_checkpoint_routing_frame((hidden_states, *args))
-        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
+        ctx._attention_frame = new_saved_attention_frame((hidden_states, *args))
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False), \
+                saved_attention_scope(ctx._attention_frame, False):
             output = forward_function(hidden_states, *args)
         ctx.save_for_backward(hidden_states)
         ctx.forward_function = forward_function
@@ -1236,7 +1242,8 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
-                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
+                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True), \
+                saved_attention_scope(getattr(ctx, "_attention_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         outputs = output if isinstance(output, tuple) else (output,)
         pairs = [(o, g) for o, g in zip(outputs, dY)
@@ -1898,6 +1905,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global BUFFER_EVENTS_B
     global NEXT_BUFFER_SLOT
     _release_pool_pinned()
+    release_saved_attention_host_pool()
     _reset_pinned_cap()
     CPU_BUFFERS = []
     CPU_INDEX = 0
@@ -2997,6 +3005,7 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         global BUFFER_EVENTS_B
         global NEXT_BUFFER_SLOT
         _release_pool_pinned()
+        release_saved_attention_host_pool()
         for i in range(len(CPU_BUFFERS)):
             if hasattr(CPU_BUFFERS[i], "resize_"): CPU_BUFFERS[i].resize_(0)
             if type(CPU_BUFFERS) is list: CPU_BUFFERS[i] = None
@@ -3068,6 +3077,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
         return
 
     _release_pool_pinned(INITIAL_CPU_BUFFER_COUNT)
+    release_saved_attention_host_pool()
     # Reset CPU buffers to initial size; free any added during training
     for i in range(len(CPU_BUFFERS)):
         if i < INITIAL_CPU_BUFFER_COUNT:

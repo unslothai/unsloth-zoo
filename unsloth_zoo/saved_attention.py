@@ -50,6 +50,7 @@ __all__ = [
     "saved_attention_call",
     "saved_function_call",
     "patch_transformers_saved_attention",
+    "release_saved_attention_host_pool",
 ]
 
 SAVED_ATTENTION_STATS = collections.Counter()
@@ -222,9 +223,10 @@ class _Budget:
     learnt peak: state allocated after that peak was reached (AdamW moments created by the first
     optimizer step, gradients kept across accumulation steps) raises the floor and lifts the expected
     peak by the same amount until a step with that state has been measured."""
-    __slots__ = ("live", "seen_peak", "base_peak", "measured", "capacity", "floor", "peak_floor")
+    __slots__ = ("live", "seen_peak", "base_peak", "measured", "capacity", "floor", "peak_floor", "offloading")
 
     def __init__(self):
+        self.offloading = False
         self.live = 0
         self.seen_peak = None
         self.base_peak = None
@@ -327,8 +329,36 @@ def _auto_admit(frame, tensors):
         SAVED_ATTENTION_STATS["declined_budget"] += 1
         return False
     margin = max(_AUTO_MARGIN_BYTES, int(capacity * _AUTO_MARGIN_FRACTION))
-    if budget.live + estimate > capacity - margin - _expected_peak(budget):
-        SAVED_ATTENTION_STATS["declined_budget"] += 1
+    room = capacity - margin - _expected_peak(budget)
+    # Once this device offloads, one more layer is left free for the reload prefetched a layer ahead.
+    if budget.live + estimate + (estimate if budget.offloading else 0) <= room:
+        return True
+    if _auto_host_allowed(query):
+        budget.offloading = True
+        # The prefetched reload must fit beside what is kept, inside half the margin.
+        if budget.live + estimate <= room + margin // 2:
+            return _HOST
+        SAVED_ATTENTION_STATS["declined_prefetch"] += 1
+    SAVED_ATTENTION_STATS["declined_budget"] += 1
+    return False
+
+
+_HOST = "host"
+
+
+def _auto_host_allowed(query):
+    """Automatic mode: may a call the device budget declined go to pinned host memory instead."""
+    if os.environ.get("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if not _offloadable(query):
+        return False
+    gc = _gc()
+    keep = getattr(gc, "_keep_on_device_indices", None) if gc is not None else None
+    try:
+        # Unified memory (gfx1151, GB10): host memory is the same memory, nothing to gain.
+        if keep is not None and query.device.index in keep():
+            return False
+    except Exception:
         return False
     return True
 
@@ -438,7 +468,7 @@ def saved_attention_scope(frame, replay):
                 _reload_frame(frame)
                 _prefetch_before(frame)
             else:
-                _OFFLOADED_FRAMES.append(weakref.ref(frame))
+                _register_offloaded(frame)
     _TLS.frame = frame
     try:
         yield
@@ -536,13 +566,157 @@ _OFFLOAD_MIN_BYTES = 1 << 20
 _OFFLOADED_FRAMES = []  # weakrefs, first-pass order
 _SIDE_STREAMS = {}
 
+# Host blocks per device: free (block, event of its last copy). Blocks come from the GC's pinned
+# allocator (counted against its host RAM cap) and stay pooled across steps, like the GC's own slots.
+_HOST_POOL = {}
+_HOST_USE = {}           # device index -> [bytes held by entries, most ever held, bytes idle in the pool]
+_HOST_REFUSED = set()    # (device index, bucket) the pinned cap refused: not asked again until a reset
+_HOST_POOL_LOCK = threading.Lock()
+_HOST_POOL_EPOCH = [0]
+_EXACT_BUCKET_BYTES = 4 << 20
+_POOL_SLACK = 1.25       # idle blocks beyond this x the most ever held at once are freed, not pooled
+
+
+def _gc():
+    return sys.modules.get("unsloth_zoo.gradient_checkpointing")
+
+
+def _bucket_bytes(nbytes):
+    # 1/8 power-of-two steps above 4 MiB: lengths that move a little reuse a block, under 12.5% slack.
+    if nbytes <= _EXACT_BUCKET_BYTES:
+        return nbytes
+    step = 1 << (nbytes.bit_length() - 4)
+    return -(-nbytes // step) * step
+
+
+def _block_pinned(block):
+    gc = _gc()
+    attr = getattr(gc, "HOST_PINNED_ATTR", None) if gc is not None else None
+    if attr is not None and hasattr(block, attr):
+        return bool(getattr(block, attr))
+    try:
+        return block.is_pinned()
+    except Exception:
+        return False
+
+
+def _new_block(nbytes):
+    gc = _gc()
+    if gc is not None and hasattr(gc, "_new_host_buffer"):
+        with gc._no_inference_mode():
+            return gc._new_host_buffer(nbytes, torch.uint8)
+    try:
+        return torch.empty(nbytes, dtype = torch.uint8, pin_memory = True)
+    except RuntimeError:
+        return torch.empty(nbytes, dtype = torch.uint8)
+
+
+def _drop_block(block):
+    """Frees a block this module will not reuse, returning its charge to the GC's pinned cap."""
+    gc = _gc()
+    if gc is not None and _block_pinned(block) and hasattr(gc, "_release_pinned"):
+        gc._release_pinned(block.numel())
+
+
+def _use(device_index):
+    use = _HOST_USE.get(device_index)
+    if use is None:
+        use = _HOST_USE[device_index] = [0, 0, 0]
+    return use
+
+
+def _take_block(device_index, nbytes, require_pinned = False):
+    """(block, event to wait for before writing it, epoch), the block holding at least nbytes; block is
+    None when ``require_pinned`` and the pinned cap refused this size."""
+    bucket = _bucket_bytes(nbytes)
+    with _HOST_POOL_LOCK:
+        epoch = _HOST_POOL_EPOCH[0]
+        free = _HOST_POOL.get(device_index)
+        best = None
+        if free:
+            # Smallest idle block that fits, at most twice the request (a logsumexp never takes an output's).
+            for i, (block, _) in enumerate(free):
+                n = block.numel()
+                if nbytes <= n <= 2 * bucket and (best is None or n < free[best][0].numel()):
+                    best = i
+        if best is not None:
+            block, event = free.pop(best)
+            use = _use(device_index)
+            use[2] -= block.numel()
+            use[0] += block.numel()
+            use[1] = max(use[1], use[0])
+            return block, event, epoch
+        if require_pinned and (device_index, bucket) in _HOST_REFUSED:
+            return None, None, epoch
+    block = _new_block(bucket)
+    if require_pinned and not _block_pinned(block):
+        with _HOST_POOL_LOCK:
+            _HOST_REFUSED.add((device_index, bucket))
+        return None, None, epoch
+    with _HOST_POOL_LOCK:
+        if epoch == _HOST_POOL_EPOCH[0]:
+            use = _use(device_index)
+            use[0] += block.numel()
+            use[1] = max(use[1], use[0])
+    return block, None, epoch
+
+
+def _give_block(device_index, block, event, epoch):
+    with _HOST_POOL_LOCK:
+        if epoch == _HOST_POOL_EPOCH[0]:
+            use = _use(device_index)
+            n = block.numel()
+            use[0] = max(use[0] - n, 0)
+            if use[2] + n <= _POOL_SLACK * use[1]:
+                use[2] += n
+                _HOST_POOL.setdefault(device_index, []).append((block, event))
+                return
+    # Taken before a pool reset, or more idle bytes than the run ever needed at once: freed. Its copies
+    # stay ordered: torch's host allocator holds a pinned block until the copies recorded on it are done.
+    _drop_block(block)
+
+
+def release_saved_attention_host_pool():
+    """Frees every pooled host block (GC buffer reset / re-initialise); blocks still held by a pending
+    entry are freed when that entry is, without returning to the pool."""
+    with _HOST_POOL_LOCK:
+        _HOST_POOL_EPOCH[0] += 1
+        blocks = [block for free in _HOST_POOL.values() for block, _ in free]
+        _HOST_POOL.clear()
+        _HOST_USE.clear()
+        _HOST_REFUSED.clear()
+    for block in blocks:
+        _drop_block(block)
+
+
+def host_pool_bytes():
+    """Idle bytes in the host pool."""
+    with _HOST_POOL_LOCK:
+        return sum(block.numel() for free in _HOST_POOL.values() for block, _ in free)
+
 
 class _OnHost:
-    __slots__ = ("host", "device")
+    __slots__ = ("host", "device", "block", "event", "epoch", "pinned")
 
-    def __init__(self, host, device):
+    def __init__(self, host, device, block, event, epoch, pinned):
         self.host = host
         self.device = device
+        self.block = block
+        self.event = event
+        self.epoch = epoch
+        self.pinned = pinned
+
+    def give_back(self, event):
+        block, self.block, self.host = self.block, None, None
+        if block is not None:
+            _give_block(self.device.index, block, event, self.epoch)
+
+    def __del__(self):
+        # Never replayed (retained graph, mismatch, exception): the block's last use is the offload copy.
+        try:
+            self.give_back(self.event)
+        except Exception:
+            pass
 
 
 class _Reloading:
@@ -554,6 +728,16 @@ class _Reloading:
 
 
 def _side_stream(device):
+    """The GC's side stream for this device (one queue for both offloads), else this module's own."""
+    gc = _gc()
+    streams = getattr(gc, "EXTRA_STREAMS", None) if gc is not None else None
+    if streams is not None and getattr(gc, "DEVICE_TYPE", None) in ("cuda", "hip"):
+        try:
+            stream = streams[device.index]
+            if isinstance(stream, torch.cuda.Stream):
+                return stream
+        except Exception:
+            pass
     stream = _SIDE_STREAMS.get(device.index)
     if stream is None:
         stream = torch.cuda.Stream(device = device)
@@ -561,28 +745,72 @@ def _side_stream(device):
     return stream
 
 
-def _to_host(t):
-    if not isinstance(t, torch.Tensor) or not t.is_cuda or t.numel() * t.element_size() < _OFFLOAD_MIN_BYTES:
+def _dense(t):
+    try:
+        from torch._prims_common import is_non_overlapping_and_dense
+        return is_non_overlapping_and_dense(t)
+    except Exception:
+        return t.is_contiguous()
+
+
+def _offloadable(t):
+    return isinstance(t, torch.Tensor) and t.is_cuda and _bytes(t) >= _OFFLOAD_MIN_BYTES
+
+
+def _to_host(t, require_pinned = False):
+    """A host copy of a CUDA tensor in a pooled block, queued on the side stream; None if
+    ``require_pinned`` and the GC's pinned cap refused the block (host RAM does not fit)."""
+    if not _offloadable(t):
         return t
-    stream = _side_stream(t.device)
-    stream.wait_stream(torch.cuda.current_stream(t.device))
-    host = torch.empty_like(t, device = "cpu", pin_memory = True)
+    nbytes = _bytes(t)
+    device = t.device
+    if not _dense(t):
+        if require_pinned:
+            return None
+        # Layout the block cannot hold: a private pinned copy, as before.
+        stream = _side_stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        host = torch.empty_like(t, device = "cpu", pin_memory = True)
+        with torch.cuda.stream(stream):
+            host.copy_(t, non_blocking = True)
+        t.record_stream(stream)
+        SAVED_ATTENTION_STATS["offloaded_bytes"] += nbytes
+        return _OnHost(host, device, None, None, _HOST_POOL_EPOCH[0], True)
+    block, ready, epoch = _take_block(device.index, nbytes, require_pinned)
+    if block is None:
+        return None
+    pinned = _block_pinned(block)
+    host = block[:nbytes].view(t.dtype).as_strided(t.shape, t.stride())
+    stream = _side_stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    if ready is not None:
+        stream.wait_event(ready)  # the block's last reload, if it ran on another stream
     with torch.cuda.stream(stream):
-        host.copy_(t, non_blocking = True)
+        host.copy_(t, non_blocking = pinned)
+        event = torch.cuda.Event()
+        event.record(stream)
     t.record_stream(stream)
-    SAVED_ATTENTION_STATS["offloaded_bytes"] += t.numel() * t.element_size()
-    return _OnHost(host, t.device)
+    SAVED_ATTENTION_STATS["offloaded_bytes"] += nbytes
+    return _OnHost(host, device, block, event, epoch, pinned)
 
 
 def _to_device(item):
     if not isinstance(item, _OnHost):
         return item
+    host = item.host
     stream = _side_stream(item.device)
+    current = torch.cuda.current_stream(item.device)
+    # Allocated on the compute stream (no side-stream pool to grow reserved memory); the side stream
+    # waits for the compute queued so far, so the copy never writes memory still in use there.
+    gpu = torch.empty_strided(host.shape, host.stride(), dtype = host.dtype, device = item.device)
+    stream.wait_stream(current)
     with torch.cuda.stream(stream):
-        gpu = torch.empty_like(item.host, device = item.device)
-        gpu.copy_(item.host, non_blocking = True)
+        gpu.copy_(host, non_blocking = item.pinned)
         event = torch.cuda.Event()
         event.record(stream)
+    gpu.record_stream(stream)
+    # The next offload into this block is ordered after this copy by the event.
+    item.give_back(event)
     return _Reloading(gpu, event)
 
 
@@ -603,9 +831,37 @@ def _map_outputs(fn, out):
     return fn(out)
 
 
-def _offload_entry(entry):
-    for i, (func, sig, out) in enumerate(entry):
-        entry[i] = (func, sig, _map_outputs(_to_host, out))
+def _offload_entry(entry, require_pinned = False):
+    """Moves an entry's outputs to the host pool. With ``require_pinned`` (automatic mode) either every
+    large output gets a pinned block or none is moved and False is returned."""
+    moved = []
+    refused = False
+
+    def move(t):
+        nonlocal refused
+        if refused:
+            return t
+        host = _to_host(t, require_pinned)
+        if host is None:
+            refused = True
+            return t
+        if isinstance(host, _OnHost):
+            moved.append(host)
+        return host
+
+    converted = [(func, sig, _map_outputs(move, out)) for func, sig, out in entry]
+    if refused:
+        for host in moved:
+            host.give_back(host.event)
+        return False
+    entry[:] = converted
+    return True
+
+
+def _register_offloaded(frame):
+    if len(_OFFLOADED_FRAMES) > 4096:
+        _OFFLOADED_FRAMES[:] = [ref for ref in _OFFLOADED_FRAMES if ref() is not None]
+    _OFFLOADED_FRAMES.append(weakref.ref(frame))
 
 
 def _reload_frame(frame):
@@ -710,7 +966,8 @@ def saved_attention_call(function, *tensors):
         # Grad mode here is not the loss forward (block compile's trial run, nested regions).
         if torch.is_grad_enabled():
             return function(*tensors)
-        if frame.auto and not _auto_admit(frame, tensors):
+        admitted = _auto_admit(frame, tensors) if frame.auto else True
+        if not admitted:
             frame.entries.append(None)
             return function(*tensors)
         entry = []
@@ -723,7 +980,17 @@ def saved_attention_call(function, *tensors):
             frame.entries.append(None)
             SAVED_ATTENTION_STATS["random"] += 1
         elif entry:
-            if frame.offload:
+            if admitted is _HOST:
+                # The device budget declined it: kept in pinned host memory if the GC's host cap fits it.
+                if not _offload_entry(entry, require_pinned = True):
+                    frame.entries.append(None)
+                    SAVED_ATTENTION_STATS["declined_host"] += 1
+                    return out
+                if not frame.offload:
+                    frame.offload = True
+                    _register_offloaded(frame)
+                SAVED_ATTENTION_STATS["stored_host"] += len(entry)
+            elif frame.offload and not frame.auto:
                 _offload_entry(entry)
             frame.entries.append(("kernel", entry))
             if frame.auto:

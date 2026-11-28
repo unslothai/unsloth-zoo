@@ -1243,3 +1243,263 @@ def test_rejected_function_graph_is_freed_before_backward(monkeypatch):
     h.float().pow(2).mean().backward()
     for a, b in zip([p.grad for p in params[0]], full[1]):
         torch.testing.assert_close(a, b, rtol = 1e-4, atol = 1e-6)
+
+
+# Automatic mode, host fallback: a call the device budget declines is kept in pinned host memory
+# (the GC's pooled blocks, under its host RAM cap) instead of being recomputed.
+
+
+def _fake_host(monkeypatch, refuse = False):
+    """CPU stand-in for the pinned host copy: every tensor counts as offloadable; a refused copy is None."""
+    moved = []
+
+    def to_host(t, require_pinned = False):
+        if not isinstance(t, torch.Tensor):
+            return t
+        if refuse and require_pinned:
+            return None
+        moved.append(t.numel() * t.element_size())
+        return SA._OnHost(t.clone(), t.device, None, None, SA._HOST_POOL_EPOCH[0], True)
+
+    monkeypatch.setattr(SA, "_offloadable", lambda t: isinstance(t, torch.Tensor))
+    monkeypatch.setattr(SA, "_to_host", to_host)
+    monkeypatch.setattr(SA, "_to_device", lambda item: item.host if isinstance(item, SA._OnHost) else item)
+    return moved
+
+
+def test_auto_offloads_what_the_device_budget_declines(monkeypatch, auto):
+    params, x = _make()
+    full = _main(monkeypatch, params, x, 3)
+    moved = _fake_host(monkeypatch)
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = (1 << 20) + 4 * _LAYER_BYTES + _LAYER_BYTES // 2)
+    # The margin (4 layers) holds the reload prefetched a layer ahead, nothing else fits.
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", 4 * _LAYER_BYTES)
+    saved = _run(params, x, ckpt = True, steps = 3)
+    _close(saved, full)
+    stats = SA.SAVED_ATTENTION_STATS
+    # First step unmeasured (recomputed as before); then every layer goes to the host and is reused.
+    assert stats["declined_unmeasured"] == 3, dict(stats)
+    assert stats["stored_host"] == 6 and stats["reused"] == 6 and stats["declined_budget"] == 0, dict(stats)
+    assert saved[2] == 6 + 3 + 3
+    assert len(moved) >= 6
+    # Nothing was charged to the device budget for outputs that live on the host.
+    assert all(b.live == 0 and b.offloading for b in SA._BUDGETS.values())
+
+
+def test_auto_host_fallback_declines_when_host_ram_does_not_fit(monkeypatch, auto):
+    params, x = _make()
+    full = _main(monkeypatch, params, x, 2)
+    _fake_host(monkeypatch, refuse = True)
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = (1 << 20) + 4 * _LAYER_BYTES + _LAYER_BYTES // 2)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", 4 * _LAYER_BYTES)
+    saved = _run(params, x, ckpt = True, steps = 2)
+    _close(saved, full)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["declined_host"] == 3 and stats["stored"] == 0 and stats["reused"] == 0, dict(stats)
+    assert saved[2] == 12
+
+
+def test_auto_host_fallback_kill_switch(monkeypatch, auto):
+    params, x = _make()
+    _fake_host(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "0")
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = (1 << 20) + 4 * _LAYER_BYTES + _LAYER_BYTES // 2)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", 4 * _LAYER_BYTES)
+    saved = _run(params, x, ckpt = True, steps = 2)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["stored"] == 0 and stats["declined_budget"] == 3 and "stored_host" not in stats, dict(stats)
+    assert saved[2] == 12
+
+
+def test_auto_offloading_device_leaves_a_layer_for_the_prefetch(monkeypatch, auto):
+    params, x = _make()
+    full = _main(monkeypatch, params, x, 3)
+    _fake_host(monkeypatch)
+    base_peak = 1 << 20
+    # Room for two layers: step 2 keeps two on the device and offloads one; from then on one more layer
+    # stays free for the reload prefetched ahead, so step 3 keeps one and offloads two.
+    _fake_memory(monkeypatch, base_peak, capacity = base_peak + 4 * _LAYER_BYTES + _LAYER_BYTES // 2)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", 2 * _LAYER_BYTES)
+    saved = _run(params, x, ckpt = True, steps = 3)
+    _close(saved, full)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["stored"] == 6 and stats["reused"] == 6, dict(stats)
+    assert stats["stored_host"] == 3, dict(stats)
+
+
+def test_auto_host_fallback_needs_room_for_the_prefetched_reload(monkeypatch, auto):
+    params, x = _make()
+    _fake_host(monkeypatch)
+    # Margin smaller than one layer and no room at all: the reload prefetched a layer ahead would not fit.
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 20)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", _LAYER_BYTES)
+    saved = _run(params, x, ckpt = True, steps = 2)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["stored"] == 0 and stats["declined_prefetch"] == 3, dict(stats)
+    assert saved[2] == 12
+
+
+def test_auto_host_fallback_off_on_unified_memory(monkeypatch, auto):
+    query = torch.empty(1, 2, 8, 4)
+    monkeypatch.setattr(SA, "_offloadable", lambda t: True)
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
+    assert not SA._auto_host_allowed(query)
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset())
+    assert SA._auto_host_allowed(query)
+
+
+def test_host_pool_reuses_blocks_and_returns_their_charge(monkeypatch):
+    released = []
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "_block_pinned", lambda block: True)
+    monkeypatch.setattr(G, "_release_pinned", lambda nbytes: released.append(nbytes))
+    size = 5_000_000
+    block, event, epoch = SA._take_block(0, size)
+    assert block.numel() == SA._bucket_bytes(size) >= size and event is None
+    SA._give_block(0, block, "e", epoch)
+    # A slightly longer call of the same bucket reuses the block, with the event of its last copy.
+    again, event, _ = SA._take_block(0, size + 4096)
+    assert again is block and event == "e"
+    SA._give_block(0, again, None, epoch)
+    assert SA.host_pool_bytes() == block.numel()
+    # Another device never shares a block (its copies run on another stream).
+    other, _, _ = SA._take_block(1, size)
+    assert other is not block
+    SA.release_saved_attention_host_pool()
+    assert SA.host_pool_bytes() == 0 and released == [block.numel()]
+    # A block taken before the reset is freed when returned, not pooled.
+    SA._give_block(1, other, None, epoch)
+    assert SA.host_pool_bytes() == 0 and released == [block.numel(), other.numel()]
+
+
+def test_host_pool_stays_bounded_across_lengths(monkeypatch):
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "_HOST_USE", {})
+    monkeypatch.setattr(SA, "_block_pinned", lambda block: True)
+    monkeypatch.setattr(G, "_release_pinned", lambda nbytes: None)
+    big, small = 64 << 20, 5 << 20
+    held = [SA._take_block(0, big) for _ in range(3)]
+    for block, _, epoch in held:
+        SA._give_block(0, block, None, epoch)
+    # A small request never takes a block over twice its size (the logsumexp of a layer, a short batch).
+    block, _, epoch = SA._take_block(0, small)
+    assert block.numel() < 2 * small
+    SA._give_block(0, block, None, epoch)
+    # Idle bytes stay within 1.25x the most ever held at once, whatever the mix of lengths.
+    for n in (small, 2 * small, 3 * small, big, small):
+        taken = [SA._take_block(0, n) for _ in range(3)]
+        for block, _, epoch in taken:
+            SA._give_block(0, block, None, epoch)
+        in_use, most, idle = SA._HOST_USE[0]
+        assert in_use == 0 and idle == SA.host_pool_bytes() <= 1.25 * most
+
+
+def test_host_pool_refusal_is_latched(monkeypatch):
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "_HOST_REFUSED", set())
+    made = []
+    monkeypatch.setattr(SA, "_new_block", lambda n: made.append(n) or torch.empty(n, dtype = torch.uint8))
+    monkeypatch.setattr(SA, "_block_pinned", lambda block: False)
+    assert SA._take_block(0, 8 << 20, require_pinned = True)[0] is None
+    assert SA._take_block(0, 8 << 20, require_pinned = True)[0] is None
+    # The pinned cap is asked once per size (it may flush the host cache, a device sync), not per layer.
+    assert len(made) == 1
+    SA.release_saved_attention_host_pool()
+    assert SA._take_block(0, 8 << 20, require_pinned = True)[0] is None and len(made) == 2
+
+
+def test_host_pool_buckets():
+    assert SA._bucket_bytes(1000) == 1000
+    assert SA._bucket_bytes(4 << 20) == 4 << 20
+    for n in (5 << 20, (5 << 20) + 1, 37 * 1000 * 1000, 3 << 30):
+        b = SA._bucket_bytes(n)
+        assert n <= b < n * 1.125 + 1
+
+
+def test_gc_buffer_reset_releases_the_host_pool(monkeypatch):
+    calls = []
+    monkeypatch.setattr(G, "release_saved_attention_host_pool", lambda: calls.append(1))
+    G.initialize_unsloth_gradient_checkpointing(torch.float32)
+    G.reset_unsloth_gradient_checkpointing_buffers()
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("name", ["Unsloth_Gradient_Checkpointer", "Unsloth_Offloaded_Gradient_Checkpointer"])
+def test_legacy_checkpointers_reuse_attention(monkeypatch, name):
+    Function = getattr(G, name)
+    params, x = _make()
+    full = _run(params, x, ckpt = True)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    for w in params:
+        for p in w:
+            p.grad = None
+    counter = _KernelCounter()
+    with counter:
+        h = x.clone().requires_grad_()
+        for w in params:
+            h = Function.apply(_layer(w, _sdpa, lambda fn, q, k, v: SA.saved_attention_call(fn, q, k, v)), h)
+        loss = h.float().pow(2).mean()
+        loss.backward()
+    grads = [p.grad.clone() for w in params for p in w]
+    _close((loss.detach(), grads), full)
+    assert counter.n == 3 and SA.SAVED_ATTENTION_STATS["reused"] == 3, dict(SA.SAVED_ATTENTION_STATS)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (pinned host memory, side stream)")
+def test_cuda_offload_reuses_pooled_pinned_blocks(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "0")
+    monkeypatch.setattr(SA, "_OFFLOAD_MIN_BYTES", 0)
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    made = []
+    new_block = SA._new_block
+    monkeypatch.setattr(SA, "_new_block", lambda n: made.append(n) or new_block(n))
+    params, x = _make()
+    params = [[p.detach().to("cuda", torch.bfloat16).requires_grad_() for p in w] for w in params]
+    x = x.to("cuda", torch.bfloat16)
+    full = _run(params, x, ckpt = True, steps = 3)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "offload")
+    pinned_before = G.GC_PINNED_BYTES
+    saved = _run(params, x, ckpt = True, steps = 1)
+    first = len(made)
+    saved = _run(params, x, ckpt = True, steps = 2)
+    torch.testing.assert_close(saved[0], full[0])
+    for a, b in zip(saved[1], full[1]):
+        torch.testing.assert_close(a, b)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["reused"] == 9 and stats["mismatch"] == 0 and stats["prefetched"] >= 2, dict(stats)
+    # Steady state allocates no host memory: later steps reuse the first step's blocks.
+    assert first > 0 and len(made) == first, (first, made)
+    pool = SA.host_pool_bytes()
+    assert pool == sum(made)
+    assert all(SA._block_pinned(b) for free in SA._HOST_POOL.values() for b, _ in free)
+    # The blocks are charged against the GC's pinned cap.
+    assert G.GC_PINNED_BYTES >= pinned_before + pool
+    SA.release_saved_attention_host_pool()
+    assert SA.host_pool_bytes() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (pinned host memory, side stream)")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cuda_auto_host_fallback_matches(monkeypatch, auto, dtype):
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "0")
+    monkeypatch.setattr(SA, "_OFFLOAD_MIN_BYTES", 0)
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "save_attention_auto_min_seq", lambda device = None: 1)
+    params, x = _make()
+    params = [[p.detach().to("cuda", dtype).requires_grad_() for p in w] for w in params]
+    x = x.to("cuda", dtype)
+    full = _main(monkeypatch, params, x, 3)
+    # No device room beyond the margin, which still holds the prefetched reload: admitted calls go to the host.
+    monkeypatch.setattr(SA, "_device_capacity", lambda device: 1 << 30)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", 1 << 30)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_FRACTION", 0.0)
+    monkeypatch.setattr(SA, "_expected_peak", lambda budget: 0)
+    saved = _run(params, x, ckpt = True, steps = 3)
+    stats = SA.SAVED_ATTENTION_STATS
+    torch.testing.assert_close(saved[0], full[0])
+    for a, b in zip(saved[1], full[1]):
+        torch.testing.assert_close(a, b)
+    assert stats["declined_unmeasured"] == 3, dict(stats)
+    assert stats["stored_host"] == 6 and stats["reused"] == 6 and stats["mismatch"] == 0, dict(stats)
+    assert stats["offloaded_bytes"] > 0 and stats["prefetched"] >= 2, dict(stats)
+    assert all(b.live == 0 for b in SA._BUDGETS.values())
