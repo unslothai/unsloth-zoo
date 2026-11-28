@@ -426,7 +426,7 @@ def _patch_cpu_num_items(trainer_cls):
     if original is None or getattr(original, "_unsloth_cpu", False) \
             or getattr(original, "__name__", "") == "_unsloth_get_batch_samples":
         return False
-    from ..loss_utils import (
+    from unsloth_zoo.loss_utils import (
         NON_CAUSAL_HEADS, _loss_shifts_labels, _unsloth_get_batch_samples, _unwrap_training_wrappers,
         counts_unshifted_labels, num_items_labels_convention,
     )
