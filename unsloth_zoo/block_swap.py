@@ -756,14 +756,15 @@ class _Block:
         """Write the weights to the spill file and serve the block from disk; encoded when `encode_device` is
         given and the codec takes the region, else read in place from the checkpoint where `index` finds them."""
         mod = _disk()
-        if not (encode_device is not None and self.disk_compressible()) and index is not None:
-            region = mod.inplace_region(index, self.params, self.layout, self.nbytes())
-            if region is not None:
-                self.set_disk([mod.DiskRef(region, off, p.data.nbytes, p.data.shape, p.data.dtype)
-                               for p, off in zip(self.params, self.layout)])
-                return
-        store = mod._shared_spill(self.nbytes())
+        store = None
         if encode_device is not None and self.disk_compressible():
+            try:
+                store = mod._shared_spill(self.nbytes())
+            except ValueError:
+                # No disk room for a spill: still servable in place from the checkpoint, unencoded.
+                if index is None:
+                    raise
+        if store is not None:
             # Outside inference mode: the encoder writes its output over this scratch.
             with _no_inference_mode(), torch.no_grad():
                 raw = torch.zeros(self.nbytes(), dtype = torch.uint8)
@@ -772,6 +773,13 @@ class _Block:
             if self._store_encoded(raw, encode_device, store, None):
                 return
             del raw
+        if index is not None:
+            region = mod.inplace_region(index, self.params, self.layout, self.nbytes())
+            if region is not None:
+                self.set_disk([mod.DiskRef(region, off, p.data.nbytes, p.data.shape, p.data.dtype)
+                               for p, off in zip(self.params, self.layout)])
+                return
+        store = mod._shared_spill(self.nbytes())
         base = store.write_region([(p.data, off) for p, off in zip(self.params, self.layout)], self.nbytes())
         self.set_disk([mod.DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype)
                        for p, off in zip(self.params, self.layout)])
