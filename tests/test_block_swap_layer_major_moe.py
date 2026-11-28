@@ -303,3 +303,58 @@ def test_compiled_layers_with_a_grad_mode_standard_forward_are_refused(gc, monke
     results, why = lm.run_layer_major(_layers(model), fns, model = model)
     assert results is None and "runs under grad mode" in why, why
     assert _grads(model) == {}
+
+
+def test_per_call_router_recorder_hooks_bitwise():
+    """A model forward that records router logits with forward hooks it registers per call and removes after
+    (Unsloth's gpt-oss forward), each hook recording only its own thread's calls: every micro-batch gets its own
+    router logits, and the load-balancing style loss on them is bitwise to standard accumulation."""
+    import threading
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList()
+    for _ in range(3):
+        layer = torch.nn.Module()
+        layer.lin, layer.router = torch.nn.Linear(16, 16), torch.nn.Linear(16, 4)
+        layers.append(layer)
+
+    class Layer(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, x):
+            weight = torch.softmax(self.inner.router(x), -1).amax(-1, keepdim = True)
+            return torch.tanh(self.inner.lin(x)) * weight
+    stack = torch.nn.ModuleList([Layer(l) for l in layers])
+
+    def fn(m):
+        sink, me = [], threading.get_ident()
+
+        def record(module, args, output):
+            if threading.get_ident() == me:
+                sink.append(output)
+        record._unsloth_router_recorder = (me, sink)
+        handles = [layer.inner.router.register_forward_hook(record) for layer in stack]
+        try:
+            x = torch.randn(2, 5, 16, generator = torch.Generator().manual_seed(m)).requires_grad_(True)
+            for layer in stack:
+                x = layer(x)
+        finally:
+            for h in handles:
+                h.remove()
+        assert len(sink) == 3
+        loss = x.square().sum() + 0.1 * sum(torch.logsumexp(r, -1).square().mean() for r in sink)
+        loss.backward()
+        return loss.detach()
+
+    base_losses = [fn(m) for m in range(2)]
+    base = {n: p.grad.clone() for n, p in stack.named_parameters()}
+    for p in stack.parameters():
+        p.grad = None
+    lm.layer_major_stats(reset = True)
+    results, why = lm.run_layer_major(stack, [functools.partial(fn, m) for m in range(2)], model = stack)
+    assert why is None, why
+    assert lm.layer_major_stats()["windows"] == 1
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, results))
+    for n, p in stack.named_parameters():
+        assert torch.equal(base[n], p.grad), n
