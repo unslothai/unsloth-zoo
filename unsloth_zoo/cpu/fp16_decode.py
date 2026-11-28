@@ -63,7 +63,8 @@ _CHECK_ROWS = 4096
 _PROJECTIONS = frozenset((
     "q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj", "gate_proj", "up_proj", "down_proj", "gate_up_proj",
 ))
-# module -> (weight key, [(first row, end row, packed), ...]); weak, so a deepcopy or a freed model carries no packs.
+# module -> (weight key, [(first row, end row, packed), ...] or None when not packable); weak, so a deepcopy or a freed
+# model carries no packs.
 _PACKS = weakref.WeakKeyDictionary()
 # adapter layer -> merge / unmerge calls seen. PEFT writes merged weights through .data (same storage and version), and
 # a bf16 merge + unmerge round trip need not restore the bits, so the count is part of the pack key.
@@ -229,7 +230,8 @@ def _prepare(model):
         key = _key(module, owner)
         cached = _PACKS.get(module, None)
         if cached is not None and cached[0] == key:
-            ready.append((module, owner, key, cached[1]))
+            if cached[1] is not None:  # None: checked before and not packable (fp32 values, out of range)
+                ready.append((module, owner, key, cached[1]))
             continue
         if cached is not None:  # the weight changed (merged, reloaded, edited in place): pack it again
             del _PACKS[module]
@@ -241,7 +243,12 @@ def _prepare(model):
         available = available_ram()
         if available is None or extra > _RAM_SHARE * available:
             return ready or None
-    todo = [entry for entry in stale if _packable(entry[0].weight)]
+    todo = []
+    for entry in stale:
+        if _packable(entry[0].weight):
+            todo.append(entry)
+        else:
+            _PACKS[entry[0]] = (entry[2], None)  # checked once while the weight is unchanged
     if todo:
         jobs = []
         for module, is_head, _, _ in todo:

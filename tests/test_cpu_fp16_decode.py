@@ -72,7 +72,7 @@ def _generate(model, rows = 2, new = 8):
 
 def _packed(model):
     from unsloth_zoo.cpu.fp16_decode import _PACKS
-    return [m for m in model.modules() if m in _PACKS]
+    return [m for m in model.modules() if _PACKS.get(m, (None, None))[1] is not None]
 
 
 @needs_fbgemm
@@ -322,6 +322,28 @@ def test_skips_trainable_out_of_range_and_non_bf16_weights(no_bf16):
     assert id(layer.mlp.down_proj) not in packed
     assert id(layer.self_attn.o_proj) not in packed
     assert id(layer.self_attn.q_proj) in packed
+
+
+@needs_fbgemm
+def test_unpackable_weights_are_checked_once_per_version(no_bf16, monkeypatch):
+    model = _tiny_llama(bf16_stored = False)
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, torch.nn.Linear):
+                module.weight.add_(1e-9)  # fp32 values that are not bf16 numbers: never packed
+    checks = []
+    packable = no_bf16._packable
+    monkeypatch.setattr(no_bf16, "_packable", lambda weight: checks.append(1) or packable(weight))
+    _generate(model)
+    first = len(checks)
+    assert first == 15 and not _packed(model)
+    _generate(model)
+    assert len(checks) == first  # remembered while the weights are unchanged
+    q = model.model.layers[0].self_attn.q_proj
+    with torch.no_grad():
+        q.weight.copy_(q.weight.bfloat16().float())  # now bf16 numbers, a new version
+    _generate(model)
+    assert len(checks) == first + 1 and q in _packed(model)
 
 
 @needs_fbgemm
