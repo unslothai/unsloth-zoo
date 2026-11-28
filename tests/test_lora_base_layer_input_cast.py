@@ -122,3 +122,45 @@ def test_packed_base_weight_is_not_read_under_torch_compile():
 
 def test_patch_lora_forwards_routes_through_the_helper():
     assert "_patch_lora_base_layer_input_cast(source)" in inspect.getsource(patch_lora_forwards)
+
+
+class _PackedBaseWithComputeDtype(_PackedBase):
+    """A real packed base computes in x's dtype outside autocast, so x must arrive in its `compute_dtype` (the dtype
+    its decoded weight has) without `weight` being read."""
+
+    def __init__(self, compute_dtype):
+        super().__init__()
+        self.compute_dtype = compute_dtype
+
+
+@pytest.mark.parametrize("disable", [False, True])
+@pytest.mark.parametrize(
+    "compute_dtype, x_dtype",
+    [
+        (torch.bfloat16, torch.float32),
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_packed_base_gets_its_compute_dtype_without_a_weight_read(disable, compute_dtype, x_dtype):
+    namespace = {"torch": torch}
+    exec(textwrap.dedent(_patch_lora_base_layer_input_cast(FORWARD)), namespace)
+    base = _PackedBaseWithComputeDtype(compute_dtype)
+    layer = SimpleNamespace(disable_adapters = disable, base_layer = base)
+    namespace["unsloth_forward"](layer, torch.zeros(2, 4, dtype = x_dtype))
+    assert base.seen == [compute_dtype]
+    assert base.reads == 0
+
+
+def test_packed_base_compute_dtype_cast_under_torch_compile():
+    namespace = {"torch": torch}
+    exec(textwrap.dedent(_patch_lora_base_layer_input_cast(FORWARD)), namespace)
+    base = _PackedBaseWithComputeDtype(torch.bfloat16)
+    layer = SimpleNamespace(disable_adapters = False, base_layer = base)
+    compiled = torch.compile(namespace["unsloth_forward"], backend = "eager", fullgraph = True)
+    for _ in range(3):
+        out = compiled(layer, torch.ones(2, 4, dtype = torch.float32))
+        assert out.dtype == torch.bfloat16
+    assert base.reads == 0
