@@ -103,6 +103,19 @@ def _old_triton():
 
 
 _OLD_TRITON = _HAS_TRITON and _old_triton()
+_DOT_LOWERS = {}
+
+
+@torch.compiler.assume_constant_result
+def _dot_lowers(index):
+    # Triton < 3.3 aborts the process lowering tl.dot on sm_100 / sm_120 (an assert, not an exception): as mxfp4_gemm.
+    ok = _DOT_LOWERS.get(index)
+    if ok is None:
+        from unsloth_zoo.rocm_build import is_rocm_torch
+        ok = _DOT_LOWERS[index] = not _OLD_TRITON or is_rocm_torch(torch) or torch.cuda.get_device_capability(index)[0] < 10
+    return ok
+
+
 _TABLES = {}
 
 
@@ -301,17 +314,42 @@ def _fused_ok(x, ggml_type):
         return False
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
+    if not _dot_lowers(x.device.index or 0):
+        return False
     if x.dtype == torch.bfloat16:
         # tl.dot needs native bf16 (sm80+); T4 runs fp16.
         return _native_bf16(x.device.index or 0)
     return True
 
 
+# Largest BLOCK_M whose tile config fits a device's shared memory, per (device, type, direction), learnt from the first
+# OutOfResources: T4 (64 KB) cannot hold the 128-row tile of 256-value formats, gfx1151 (64 KB LDS) not even 64 rows.
+_MM_BLOCK_M_CAP = {}
+
+
+def _out_of_resources(err):
+    return type(err).__name__ == "OutOfResources"
+
+
 def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b, grouped):
-    qk, bs = GGML_BLOCK[ggml_type]
-    row_bytes = ggml_row_bytes(ggml_type, K if trans_b else N)
     rows_per_tile = M / E if grouped else M
     BLOCK_M = 16 if rows_per_tile <= 16 else (32 if rows_per_tile <= 32 else (64 if rows_per_tile <= 64 else 128))
+    key = (x2.device.index, ggml_type, trans_b)
+    BLOCK_M = min(BLOCK_M, _MM_BLOCK_M_CAP.get(key, BLOCK_M))
+    while True:
+        try:
+            return _mm_launch_tile(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b, grouped, BLOCK_M)
+        except Exception as err:
+            if BLOCK_M <= 16 or not _out_of_resources(err):
+                raise
+            # A smaller tile is the same product: retry it now, and start there next time.
+            BLOCK_M //= 2
+            _MM_BLOCK_M_CAP[key] = BLOCK_M
+
+
+def _mm_launch_tile(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b, grouped, BLOCK_M):
+    qk, bs = GGML_BLOCK[ggml_type]
+    row_bytes = ggml_row_bytes(ggml_type, K if trans_b else N)
     # Two tile configs from an L4 sweep (17408 x 5120, M = 16 / 64 / 128); the value axis holds whole blocks.
     if BLOCK_M <= 32:
         packed_rows, values, warps, stages = 32, 256, 4, (3 if qk <= 64 else 2)
@@ -352,6 +390,33 @@ def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
     return out
 
 
+def _bias_like(bias, x):
+    return bias if bias is None or bias.dtype == x.dtype else bias.to(x.dtype)
+
+
+def _autocast_input(t):
+    """Under autocast the ops compute in the autocast dtype, as F.linear does: x goes in already cast, so every route
+    (the fused kernels write x's dtype, dequantize + matmul runs autocast off) and the fake impl agree on it."""
+    device_type = t.device.type
+    try:
+        # Autocast-eligible dtypes only: float64 (and other dtypes) stay as given, as autocast leaves them.
+        if t.dtype in (torch.float16, torch.bfloat16, torch.float32) and torch.is_autocast_enabled(device_type):
+            dtype = torch.get_autocast_dtype(device_type)
+            if dtype != t.dtype:
+                return t.to(dtype)
+    except Exception:
+        pass
+    return t
+
+
+def _autocast_off(t):
+    try:
+        return torch.autocast(device_type = t.device.type, enabled = False)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
     """trans_b: y = x @ W^T (+ bias), W = (N, K). Else: y = x @ W."""
     N, K = shape
@@ -377,7 +442,7 @@ def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
             _warn_fallback("fused GEMM", err)
     w = _dequantize_impl(packed, ggml_type, (N, K), x.dtype)
     if trans_b:
-        y = torch.nn.functional.linear(x, w, bias)
+        y = torch.nn.functional.linear(x, w, _bias_like(bias, x))
     else:
         y = x @ w
     return y
@@ -403,7 +468,8 @@ def _traced_linear_ok(x, packed, ggml_type, bias, trans_b):
 
 @torch.library.custom_op("unsloth_zoo::gguf_linear", mutates_args = ())
 def _linear_op(x: torch.Tensor, packed: torch.Tensor, ggml_type: int, shape: List[int], bias: Optional[torch.Tensor]) -> torch.Tensor:
-    return _linear_impl(x, packed, ggml_type, tuple(shape), bias, True)
+    with _autocast_off(x):
+        return _linear_impl(x, packed, ggml_type, tuple(shape), bias, True)
 
 
 @_linear_op.register_fake
@@ -413,7 +479,8 @@ def _linear_fake(x, packed, ggml_type, shape, bias):
 
 @torch.library.custom_op("unsloth_zoo::gguf_linear_backward_input", mutates_args = ())
 def _linear_bwd_op(grad_out: torch.Tensor, packed: torch.Tensor, ggml_type: int, shape: List[int]) -> torch.Tensor:
-    return _linear_impl(grad_out, packed, ggml_type, tuple(shape), None, False)
+    with _autocast_off(grad_out):
+        return _linear_impl(grad_out, packed, ggml_type, tuple(shape), None, False)
 
 
 @_linear_bwd_op.register_fake
@@ -451,9 +518,12 @@ def gguf_linear(x: torch.Tensor, packed: torch.Tensor, ggml_type, shape, bias: O
     _check(packed, ggml_type, shape, ("x", x), ("bias", bias))
     if x.shape[-1] != shape[1]:
         raise ValueError(f"Unsloth: x has {x.shape[-1]} features, the GGUF weight expects {shape[1]}")
+    # The kernels address blocks as contiguous rows of row_bytes: a strided view would be read as other bytes.
+    packed = packed.contiguous()
+    x = _autocast_input(x)
     if _traced_linear_ok(x, packed, ggml_type, bias, True):
-        w = _dequant_traced(packed.contiguous(), ggml_type, shape, x.dtype)
-        return torch.nn.functional.linear(x, w, bias)
+        w = _dequant_traced(packed, ggml_type, shape, x.dtype)
+        return torch.nn.functional.linear(x, w, _bias_like(bias, x))
     return _linear_op(x, packed, ggml_type, shape, bias)
 
 
@@ -464,8 +534,10 @@ def gguf_linear_backward_input(grad_out: torch.Tensor, packed: torch.Tensor, ggm
     _check(packed, ggml_type, shape, ("grad_out", grad_out))
     if grad_out.shape[-1] != shape[0]:
         raise ValueError(f"Unsloth: grad_out has {grad_out.shape[-1]} features, the GGUF weight has {shape[0]} rows")
+    packed = packed.contiguous()
+    grad_out = _autocast_input(grad_out)
     if _traced_linear_ok(grad_out, packed, ggml_type, None, False):
-        return grad_out @ _dequant_traced(packed.contiguous(), ggml_type, shape, grad_out.dtype)
+        return grad_out @ _dequant_traced(packed, ggml_type, shape, grad_out.dtype)
     return _linear_bwd_op(grad_out, packed, ggml_type, shape)
 
 
@@ -530,7 +602,8 @@ def _grouped_impl(x, packed, ggml_type, shape, counts, trans_b):
 
 @torch.library.custom_op("unsloth_zoo::gguf_grouped_mm", mutates_args = ())
 def _grouped_op(x: torch.Tensor, packed: torch.Tensor, ggml_type: int, shape: List[int], counts: torch.Tensor, transpose_b: bool) -> torch.Tensor:
-    return _grouped_impl(x, packed, ggml_type, tuple(shape), counts, transpose_b)
+    with _autocast_off(x):
+        return _grouped_impl(x, packed, ggml_type, tuple(shape), counts, transpose_b)
 
 
 @_grouped_op.register_fake
@@ -568,7 +641,7 @@ def gguf_grouped_mm(x: torch.Tensor, packed: torch.Tensor, ggml_type, shape, cou
         raise ValueError(f"Unsloth: x of shape {tuple(x.shape)} does not match the GGUF expert stack {shape}")
     if counts.dim() != 1 or counts.shape[0] != shape[0]:
         raise ValueError(f"Unsloth: counts must be ({shape[0]},), got {tuple(counts.shape)}")
-    return _grouped_op(x, packed, ggml_type, shape, counts, transpose_b)
+    return _grouped_op(_autocast_input(x), packed.contiguous(), ggml_type, shape, counts, transpose_b)
 
 
 def gguf_kernels_available(device = None) -> bool:

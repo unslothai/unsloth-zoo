@@ -184,3 +184,59 @@ def test_cpu_model_attach_installs_once_and_generate_samples_match(monkeypatch):
         assert n == 0 and torch.equal(fast, stock)
     finally:
         torch.multinomial = saved
+
+
+_COMPILED_DYNAMIC_SAMPLING = r"""
+import importlib.util, sys
+import torch
+import torch._dynamo
+
+spec = importlib.util.spec_from_file_location("_unsloth_cpu_sampling", sys.argv[1])
+sampling = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = sampling  # dynamo resolves the wrapper's globals through its module
+spec.loader.exec_module(sampling)
+FAST = sampling._wrap(torch.multinomial)
+graphs = []
+
+def backend(gm, example_inputs):
+    graphs.append(gm)
+    return gm.forward
+
+def sample(x):
+    return FAST(x, 1)
+
+fn = torch.compile(sample, backend = backend, fullgraph = True, dynamic = True)
+for n in (2048, 8192, 1024):
+    x = torch.softmax(torch.randn(n), -1)
+    torch._dynamo.mark_dynamic(x, 0, min = 2, max = 10000)
+    assert fn(x).shape == (1,)
+print("GRAPHS", len(graphs))
+"""
+
+
+def test_compiled_dynamic_sampling_adds_no_shape_guard():
+    """Under torch.compile the wrapper is torch's call: no guard on the fast path's size threshold, so a marked
+    dynamic range across it compiles once and lengths on both sides of it reuse one graph.
+
+    Runs in a fresh interpreter. Dynamo builds its table of torch functions once per process, the first time it
+    compiles; a test elsewhere that compiles while torch.multinomial is swapped (the wrapper installed by
+    FastCPUModel, then restored) leaves that table pointing at the swap, and this compile then fails with
+    "Attempted to call function marked as skipped" for reasons that have nothing to do with the wrapper."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", _COMPILED_DYNAMIC_SAMPLING, sampling.__file__],
+        capture_output = True, text = True, timeout = 300,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert "GRAPHS 1" in result.stdout.splitlines(), result.stdout
+
+
+@pytest.mark.parametrize("args", [(1.0,), (1, "x"), (1, 1)])
+def test_wrong_argument_types_raise_torchs_error(args):
+    p = torch.softmax(torch.randn(8192), -1)
+    with pytest.raises((TypeError, RuntimeError)):
+        ORIGINAL(p, *args)
+    with pytest.raises((TypeError, RuntimeError)):
+        FAST(p, *args)

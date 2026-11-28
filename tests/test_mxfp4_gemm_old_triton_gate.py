@@ -27,6 +27,8 @@ def test_availability_skips_the_probe_on_old_triton_blackwell(monkeypatch, capab
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: capability)
     monkeypatch.setattr(torch.version, "hip", None)
+    # A ROCm wheel still reads as ROCm through its +rocm version tag: fake the CUDA card all the way.
+    monkeypatch.setattr(mg, "is_rocm_torch", lambda torch_mod = None: False)
     monkeypatch.setattr(mg.triton, "__version__", triton_version)
     monkeypatch.setattr(mg, "_AVAILABLE", {})
     monkeypatch.setattr(mg, "_probe", lambda device: calls.append(device) or True)

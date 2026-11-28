@@ -16,6 +16,8 @@
 
 """fused_linear_jsd (two-head generalized JSD for GKD) against TRL's GKDTrainer.generalized_jsd_loss in float64."""
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -308,6 +310,99 @@ def test_diffuse_rows_keep_the_direct_beta0_gradient(path):
             pytest.skip("Triton on CUDA")
         _, dz = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
     assert (dz.cpu().double() - ref).norm() / ref.norm() < 5e-3
+
+
+@pytest.mark.parametrize("path", ["cpu"] + (["triton", "inductor", "eager"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_identical_student_and_teacher_give_exactly_zero(beta, dtype, path, monkeypatch):
+    """Student == teacher (a fresh LoRA scored against its adapter-off base): loss and gradient are exactly 0.
+
+    The mixture log-prob from logaddexp(ls + log(1 - b), lt + log(b)) is an ulp of |ls| off ls, so the interior
+    beta gave a ~1e-8 gradient there that Adam normalises into full-size LoRA steps away from the teacher."""
+    device = _jsd_route(path, monkeypatch)
+    g = torch.Generator().manual_seed(7)
+    V = 9000  # > one 4096 Triton vocab block
+    h = (torch.randn(2, 5, 32, generator = g)).to(device = device, dtype = dtype)
+    w = (torch.randn(V, 32, generator = g) * 0.5).to(device = device, dtype = dtype)
+    hs = h.clone().requires_grad_(True)
+    loss = fl.fused_linear_jsd(hs, w, h, w, beta = beta)
+    loss.backward()
+    assert loss.item() == 0.0, loss.item()
+    assert torch.count_nonzero(hs.grad) == 0, hs.grad.abs().max().item()
+
+
+@pytest.mark.parametrize("beta", [0.1, 0.5, 0.9])
+def test_identical_rows_body_and_chunk_are_exactly_zero(beta):
+    s = torch.randn(4, 5000, generator = torch.Generator().manual_seed(3)) * 3
+    one = torch.tensor(1.0)
+    for dt in (torch.float32, torch.float64):
+        row, dz = fl._jsd_body(s.to(dt), s.to(dt), one.to(dt), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, dt)
+        assert torch.count_nonzero(row) == 0 and torch.count_nonzero(dz) == 0, (dt, row.abs().max(), dz.abs().max())
+        ls = torch.log_softmax(s.to(dt), -1)
+        row, dz = fl._jsd_chunk(ls.clone(), ls.clone(), beta, True)
+        assert torch.count_nonzero(row) == 0 and torch.count_nonzero(dz) == 0, (dt, row.abs().max(), dz.abs().max())
+
+
+@pytest.mark.parametrize("beta", [0.1, 0.5, 0.9])
+def test_log_mix_matches_logaddexp(beta):
+    """_jsd_log_mix(delta) == log((1 - b) + b exp(delta)) in fp64 across the range, incl. overflowing exp."""
+    d = torch.cat([torch.linspace(-200, 200, 4001, dtype = torch.float64),
+                   torch.tensor([0.0, 1e-12, -1e-12, 1e-6, -1e-6], dtype = torch.float64)])
+    ref = torch.logaddexp(torch.full_like(d, math.log1p(-beta)), d + math.log(beta))
+    torch.testing.assert_close(fl._jsd_log_mix(d, beta), ref, rtol = 1e-12, atol = 1e-15)
+    assert fl._jsd_log_mix(torch.zeros(1, dtype = torch.float32), beta).item() == 0.0
+
+
+@pytest.mark.parametrize("beta", [1e-8, 1.0 - 1e-8])
+@pytest.mark.parametrize("path", ["body", "chunk", "triton"])
+def test_beta_near_endpoints_stays_finite(beta, path):
+    """Large |lt - ls| with beta within 1e-8 of 0 or 1: 1 + u underflows to 0 in log1p form; the sum stays finite."""
+    s = torch.tensor([[0.0, -25.0], [-25.0, 0.0]])
+    t = torch.tensor([[-25.0, 0.0], [0.0, -25.0]])
+    one = torch.tensor(1.0)
+    if path == "body":
+        row, dz = fl._jsd_body(s, t, one, beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    elif path == "chunk":
+        row, dz = fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(t, -1), beta, True)
+    else:
+        if not torch.cuda.is_available() or not fl._use_triton(torch.device("cuda")):
+            pytest.skip("Triton on CUDA")
+        row, dz = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    row, dz = row.cpu().double(), dz.cpu().double()
+    assert torch.isfinite(row).all() and torch.isfinite(dz).all(), (row, dz)
+    for i in range(2):
+        ref, gref = _exact_jsd(s[i], t[i], beta)
+        torch.testing.assert_close(row[i], ref, rtol = 1e-3, atol = 1e-12)
+        torch.testing.assert_close(dz[i], gref, rtol = 1e-3, atol = 1e-12)
+
+
+@pytest.mark.parametrize("path", ["body", "chunk", "triton"])
+def test_beta_near_one_shared_top_token_keeps_small_mixture_mass(path):
+    """beta = 1 - 1e-8 with a shared top token: the (1 - b) p_o share of the off-top mass must survive (loss > 0)."""
+    beta = 1.0 - 1e-8
+    s, t = torch.tensor([[0.0, -1.0]]), torch.tensor([[0.0, -4.0]])
+    one = torch.tensor(1.0)
+    if path == "body":
+        row, _ = fl._jsd_body(s, t, one, beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    elif path == "chunk":
+        row, _ = fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(t, -1), beta, True)
+    else:
+        if not torch.cuda.is_available() or not fl._use_triton(torch.device("cuda")):
+            pytest.skip("Triton on CUDA")
+        row, _ = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    ref, _ = _exact_jsd(s[0], t[0], beta)
+    torch.testing.assert_close(row.cpu().double()[0], ref, rtol = 0.05, atol = 0.0)
+
+
+@pytest.mark.parametrize("beta", [1e-18, 1.0 - 1e-16])
+def test_beta_with_unrepresentable_complement_does_not_raise(beta):
+    """1 - (1 - b) is 0 for b = 1e-18: the mirrored log-mix takes both weights, not a reconstructed one."""
+    s = torch.randn(3, 50, generator = torch.Generator().manual_seed(5))
+    one = torch.tensor(1.0)
+    for row, dz in (fl._jsd_body(s, s + 0.1, one, beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32),
+                    fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(s + 0.1 * s.sin(), -1), beta, True)):
+        assert torch.isfinite(row).all() and torch.isfinite(dz).all()
 
 
 def test_fully_masked_is_finite_zero():

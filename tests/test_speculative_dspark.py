@@ -355,7 +355,9 @@ def test_default_ddp_reduces_the_loss_only_heads(tmp_path):
     trainer = UnslothDSparkTrainer(model = drafter, target_model = target, args = args,
                                    train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist(), "labels": ids[0].tolist()}]),
                                    data_collator = MTPDataCollator(pad_token_id = 0))
-    dist.init_process_group("gloo", store = dist.HashStore(), rank = 0, world_size = 1)
+    # Some Windows torch builds ship no HashStore; a FileStore is the same one-rank rendezvous there.
+    store = dist.HashStore() if hasattr(dist, "HashStore") else dist.FileStore(str(tmp_path / "ddp_store"), 1)
+    dist.init_process_group("gloo", store = store, rank = 0, world_size = 1)
     try:
         ddp = DistributedDataParallel(drafter, find_unused_parameters = True)
         trainer.compute_loss(ddp, {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)}).backward()

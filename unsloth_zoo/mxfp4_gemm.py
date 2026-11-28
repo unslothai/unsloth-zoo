@@ -1170,8 +1170,13 @@ def packed_grouped_mm_available(device, fmt, dtype = torch.bfloat16) -> bool:
         _PACKED_AVAILABLE[key] = False
         return False
     try:
+        # The probe syncs: decide on the next uncaptured call. The query sees only the current device, and a
+        # split-device model can capture on the operand's GPU.
         if torch.cuda.is_current_stream_capturing():
-            return False  # the probe syncs; decide on the next uncaptured call
+            return False
+        with torch.cuda.device(index):
+            if torch.cuda.is_current_stream_capturing():
+                return False
     except Exception:
         return False
     try:

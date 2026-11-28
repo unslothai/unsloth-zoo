@@ -27,6 +27,8 @@ import torch
 def avx2_host(monkeypatch):
     """Runs as on an AVX2-only x86 host without native bf16 (not Apple Silicon)."""
     from unsloth_zoo.cpu import loader, runtime
+    # The fp32 copy is the path when the fp16 decode packs are off or unavailable (test_cpu_fp16_decode covers those).
+    monkeypatch.setenv("UNSLOTH_CPU_FP16_DECODE", "0")
     monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: False)
     monkeypatch.setattr(loader, "cpu_bf16_supported", lambda: False)
     monkeypatch.setattr(runtime, "cpu_flags", lambda: frozenset({"sse4_2", "avx", "avx2", "fma"}))
@@ -128,3 +130,45 @@ def test_wide_rollout_stays_bf16_on_avx512(avx2_host, monkeypatch):
     ids = torch.randint(1, 64, (8, 4), generator = torch.Generator().manual_seed(0))
     seen, _, _ = _decode_dtypes(model, ids, max_new_tokens = 32)
     assert seen == {torch.bfloat16}
+
+
+def test_wide_rollout_keeps_a_trainable_stored_projection_and_its_optimizer_state(avx2_host):
+    """modules_to_save / an unfrozen projection: its bf16 weight and AdamW state survive the fp32 rollout copy."""
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear
+    model = _tiny_bf16_llama()
+    trainable = model.model.layers[0].mlp.down_proj
+    assert isinstance(trainable, Bf16StoredLinear) and trainable.weight.dtype == torch.bfloat16
+    trainable.weight.requires_grad_(True)
+    optimizer = torch.optim.AdamW([trainable.weight], lr = 1e-3, foreach = False)
+    ids = torch.randint(1, 64, (8, 4), generator = torch.Generator().manual_seed(0))
+
+    def step():
+        optimizer.zero_grad()
+        model(input_ids = ids, labels = ids).loss.backward()
+        optimizer.step()
+
+    step()  # bf16 optimizer state exists before the first wide rollout
+    frozen = model.model.layers[1].mlp.down_proj
+    seen = []
+    handle = frozen.register_forward_pre_hook(lambda mod, args: seen.append(mod.weight.dtype))
+    try:
+        model.generate(input_ids = ids, do_sample = False, pad_token_id = 0, max_new_tokens = 32)
+    finally:
+        handle.remove()
+    assert torch.float32 in seen  # the frozen projections still decode through the fp32 copy
+    assert frozen.weight.dtype == torch.bfloat16
+    assert trainable.weight.dtype == torch.bfloat16
+    step()  # bf16 moments against a bf16 parameter and gradient
+    assert trainable.weight.dtype == torch.bfloat16
+
+
+def test_fp32_rollout_copy_counts_every_local_training_process(avx2_host, monkeypatch):
+    """Each rank on the host makes its own copy from the same free RAM."""
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear
+    model = _tiny_bf16_llama()
+    extra = 2 * sum(m.weight.numel() for m in model.modules() if isinstance(m, Bf16StoredLinear))
+    monkeypatch.setattr(avx2_host, "available_ram", lambda: int(extra / avx2_host._FP32_ROLLOUT_RAM_SHARE) * 2)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    assert avx2_host._fp32_rollout_fits(model, 8, 64) is True
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")  # four copies do not fit in twice one copy's budget
+    assert avx2_host._fp32_rollout_fits(model, 8, 64) is False

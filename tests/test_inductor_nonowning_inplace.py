@@ -189,3 +189,15 @@ def test_cpu_compile_path_installs_the_guard():
 def test_temporary_patches_reexports_the_installer():
     from unsloth_zoo.temporary_patches import inductor_nonowning_inplace as shim
     assert shim.patch_inductor_nonowning_inplace is guard.patch_inductor_nonowning_inplace
+
+
+def test_subprocess_compile_mode_set_after_import_is_still_guarded(monkeypatch):
+    """TORCHINDUCTOR_FX_COMPILE_MODE=subprocess set after import (before the first compile): the next install call,
+    compile_cpu_layers' one, turns in-place buffers off for the worker that never runs this patch."""
+    import torch._inductor.config as inductor_config
+    if not guard.patch_inductor_nonowning_inplace():
+        pytest.skip("guard not installed on this torch")
+    monkeypatch.setattr(inductor_config, "inplace_buffers", True)
+    monkeypatch.setenv("TORCHINDUCTOR_FX_COMPILE_MODE", "subprocess")
+    assert guard.patch_inductor_nonowning_inplace() is True
+    assert inductor_config.inplace_buffers is False

@@ -34,6 +34,7 @@ from unsloth_zoo.utils import _is_out_of_memory
 
 from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
+from .fp16_decode import fp16_decode, fp16_decode_wanted, release_fp16_decode
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
     store_frozen_linears_in_bf16,
@@ -1365,6 +1366,7 @@ class FastCPUModel:
     @staticmethod
     def for_inference(model):
         model.eval()
+        release_fp16_decode(model)  # rollout packs: eval-mode generate decodes through the model's own weights
         _frozen_bf16_for(model, training = False)
         _set_inference_mode(model, True)
         return model
@@ -1530,7 +1532,9 @@ def _fp32_rollout_fits(model, rows = None, new_tokens = None):
     if extra == 0:
         return False
     available = available_ram()
-    return available is not None and extra <= _FP32_ROLLOUT_RAM_SHARE * available
+    # Every training process on this host reads the same free RAM and makes its own copy.
+    from .runtime import _local_world_size
+    return available is not None and extra * _local_world_size() <= _FP32_ROLLOUT_RAM_SHARE * available
 
 
 def _frozen_bf16_for(model, training):
@@ -1550,18 +1554,10 @@ def _unpack_encoding_generate(generate):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
         restore = False
+        decode16 = None
         if isinstance(self, torch.nn.Module) and not self.training:
             # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
             _frozen_bf16_for(self, training = False)
-        elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and \
-                _fp32_rollout_fits(self, *_rollout_shape(self, args, kwargs)):
-            # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
-            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon (and wide AVX2
-            # rollouts slower), then store bf16.
-            # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
-            # tensors, and the next training forward could not save them for backward.
-            with torch.inference_mode(False):
-                restore = set_bf16_stored_dtype(self, torch.float32) > 0
         # Decode only: SMT siblings where they speed up the per-token GEMVs (runtime.rollout_threads), then back.
         training_threads, threads = torch.get_num_threads(), None
         try:
@@ -1572,6 +1568,26 @@ def _unpack_encoding_generate(generate):
         except Exception:
             threads = None
         try:
+            rows, new_tokens = _rollout_shape(self, args, kwargs) if isinstance(self, torch.nn.Module) else (None, None)
+            if isinstance(self, torch.nn.Module) and self.training and fp16_decode_wanted(self, rows):
+                # Train-mode rollouts on x86 without native bf16: frozen projections and the LM head decode through
+                # fp16 packs (2 bytes per weight read, fp32 math), built on the rollout threads, instead of the
+                # per-call bf16 upcast or the fp32 copy below.
+                decode16 = fp16_decode(self).__enter__()
+                if not decode16.active:
+                    decode16 = None
+            if decode16 is None and isinstance(self, torch.nn.Module) and self.training and \
+                    _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self, rows, new_tokens):
+                # Generating mid-training (GRPO / online DPO rollouts, train mode) without packs: decode with fp32
+                # frozen weights too, as upcasting every projection per token made a CPU GRPO step 1.6x slower on
+                # Apple Silicon (and wide AVX2 rollouts slower), then store bf16.
+                # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
+                # tensors, and the next training forward could not save them for backward.
+                with torch.inference_mode(False):
+                    # Frozen projections only (the ones counted in _fp32_rollout_fits): a trainable one
+                    # (modules_to_save) keeps bf16, as the restore below skips trainable weights and its optimizer
+                    # state is bf16.
+                    restore = set_bf16_stored_dtype(self, torch.float32, frozen_only = True) > 0
             set_stance = getattr(torch.compiler, "set_stance", None)
             modules = self.modules() if isinstance(self, torch.nn.Module) else ()
             if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
@@ -1580,6 +1596,8 @@ def _unpack_encoding_generate(generate):
                     return generate(self, *args, **kwargs)
             return generate(self, *args, **kwargs)
         finally:
+            if decode16 is not None:
+                decode16.__exit__(None, None, None)
             if threads:
                 torch.set_num_threads(training_threads)
             if restore:

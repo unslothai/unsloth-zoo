@@ -5381,8 +5381,9 @@ pass
 
 def _patch_lora_base_layer_input_cast(source):
     # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
-    # Packed bases (`_unsloth_mxfp4_packed_linear`: MXFP4, GGUF) cast x themselves and decode a fresh 16-bit `weight`
-    # on every read: the class check comes first so neither the call nor Dynamo's guards on it ever read `weight`.
+    # Packed bases (`_unsloth_mxfp4_packed_linear`: MXFP4, GGUF) decode a fresh 16-bit `weight` on every read, and
+    # outside autocast they compute in x's dtype: x goes to their `compute_dtype` (the decoded weight's dtype) instead,
+    # and the class check comes first so neither the call nor Dynamo's guards on it ever read `weight`.
     _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
     _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
     if not _m:
@@ -5391,7 +5392,11 @@ def _patch_lora_base_layer_input_cast(source):
     return source.replace(
         _base_layer_call,
         f"if not torch.is_autocast_enabled() "
-        f"and not getattr(type(self.base_layer), '_unsloth_mxfp4_packed_linear', False) "
+        f"and getattr(type(self.base_layer), '_unsloth_mxfp4_packed_linear', False):\n"
+        f"{_ind}    if getattr(self.base_layer, 'compute_dtype', None) in (torch.float16, torch.bfloat16, torch.float32) "
+        f"and x.dtype != self.base_layer.compute_dtype:\n"
+        f"{_ind}        x = x.to(self.base_layer.compute_dtype)\n"
+        f"{_ind}elif not torch.is_autocast_enabled() "
         f"and hasattr(self.base_layer, 'weight') "
         f"and self.base_layer.weight is not None "
         f"and not hasattr(self.base_layer.weight, 'quant_state') "
@@ -5430,6 +5435,32 @@ def _patch_lora_update(source):
         return source.replace(old1, f"return {update}")
     return looped
 pass
+
+
+# A frozen base on Unsloth's fp8 / int8 GEMMs (float8_training with LoRA, load_in_8bit = "int8") carries
+# `_unsloth_fused_lora_forward`: one autograd op running the base GEMM with the LoRA term in its epilogue and
+# a fused input gradient, as FastLanguageModel's projections do. It returns None when it cannot run (several
+# adapters, DoRA, mixed batches, ...) and PEFT's forward below runs unchanged.
+_LORA_FROZEN_BASE_FUSED = (
+    "_unsloth_fused = getattr(self.base_layer, '_unsloth_fused_lora_forward', None)\n"
+    "if _unsloth_fused is not None:\n"
+    "    _unsloth_out = _unsloth_fused(self, x, args, kwargs)\n"
+    "    if _unsloth_out is not None:\n"
+    "        return _unsloth_out\n"
+)
+
+
+def _patch_lora_frozen_base_fused(source):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Insert the frozen-base fused LoRA call as the first statement of the forward body."""
+    if "_unsloth_fused_lora_forward" in source:
+        return source
+    match = re.search(r"^def unsloth_forward\(self, x\b.*?\).*?:[ \t]*\n([ \t]+)", source, re.MULTILINE | re.DOTALL)
+    if match is None or "*args" not in match.group(0) or "**kwargs" not in match.group(0):
+        return source
+    indent = match.group(1)
+    hook = "".join(indent + line + "\n" for line in _LORA_FROZEN_BASE_FUSED.splitlines())
+    return source[: match.start(1)] + hook + source[match.start(1) :]
 
 
 def patch_lora_forwards(torch_compile_options):
@@ -5496,6 +5527,8 @@ def patch_lora_forwards(torch_compile_options):
             "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
             if integer_input_inline else "",
         )
+        if child == "Linear":
+            source = _patch_lora_frozen_base_fused(source)
 
         if hash(source) != old_hash:
             success += 1
