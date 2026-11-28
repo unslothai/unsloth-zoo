@@ -122,13 +122,16 @@ def fp16_decode_available():
         return False
 
 
-def fp16_decode_wanted(model):
+def fp16_decode_wanted(model, rows = None):
     """True for a train-mode generate on x86 without native bf16 when the model computes in fp32 and this torch
-    build has FBGEMM's fp16 GEMM. UNSLOTH_CPU_FP16_DECODE=0 turns it off, =1 skips the CPU check."""
+    build has FBGEMM's fp16 GEMM, unless the rollout decodes more than _MAX_ROWS rows per token (then no decode call
+    could use the packs). UNSLOTH_CPU_FP16_DECODE=0 turns it off, =1 skips the CPU check."""
     setting = _env()
     if setting in ("0", "false", "no", "off"):
         return False
     if not isinstance(model, torch.nn.Module) or not model.training:
+        return False
+    if rows is not None and rows > _MAX_ROWS:
         return False
     if setting not in ("1", "true", "yes", "on"):
         from .runtime import cpu_bf16_supported

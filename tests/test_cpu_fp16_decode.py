@@ -174,6 +174,25 @@ def test_rollout_without_packs_keeps_the_fp32_copy(no_bf16, monkeypatch):
 
 
 @needs_fbgemm
+def test_rollout_wider_than_the_pack_limit_keeps_the_fp32_copy(no_bf16, monkeypatch):
+    """More rows per decoded token than the packs serve: no packs, the fp32 copy (AVX2 hosts) as before."""
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(no_bf16, "_MAX_ROWS", 4)
+    monkeypatch.setattr(loader, "_fp32_rollout_fits", lambda model, rows = None, new_tokens = None: rows == 8)
+    model = _tiny_llama()
+    stored = [m for m in model.modules() if type(m).__name__ == "Bf16StoredLinear"]
+    seen = []
+    handles = [m.register_forward_pre_hook(lambda mod, args: seen.append(mod.weight.dtype)) for m in stored]
+    try:
+        _generate(model, rows = 8)
+    finally:
+        for h in handles:
+            h.remove()
+    assert set(seen) == {torch.float32} and no_bf16.ENGAGED[0] == 0 and not _packed(model)
+    assert no_bf16.fp16_decode_wanted(model, rows = 4) and not no_bf16.fp16_decode_wanted(model, rows = 5)
+
+
+@needs_fbgemm
 def test_numerics_match_fp32_linear_and_blocked_head(no_bf16, monkeypatch):
     monkeypatch.setattr(no_bf16, "_HEAD_BLOCK", 40)  # 96-row vocabulary in 3 blocks
     model = _tiny_llama(bf16_stored = False)

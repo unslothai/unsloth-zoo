@@ -1566,7 +1566,8 @@ def _unpack_encoding_generate(generate):
         except Exception:
             threads = None
         try:
-            if isinstance(self, torch.nn.Module) and self.training and fp16_decode_wanted(self):
+            rows, new_tokens = _rollout_shape(self, args, kwargs) if isinstance(self, torch.nn.Module) else (None, None)
+            if isinstance(self, torch.nn.Module) and self.training and fp16_decode_wanted(self, rows):
                 # Train-mode rollouts on x86 without native bf16: frozen projections and the LM head decode through
                 # fp16 packs (2 bytes per weight read, fp32 math), built on the rollout threads, instead of the
                 # per-call bf16 upcast or the fp32 copy below.
@@ -1574,7 +1575,7 @@ def _unpack_encoding_generate(generate):
                 if not decode16.active:
                     decode16 = None
             if decode16 is None and isinstance(self, torch.nn.Module) and self.training and \
-                    _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self, *_rollout_shape(self, args, kwargs)):
+                    _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self, rows, new_tokens):
                 # Generating mid-training (GRPO / online DPO rollouts, train mode) without packs: decode with fp32
                 # frozen weights too, as upcasting every projection per token made a CPU GRPO step 1.6x slower on
                 # Apple Silicon (and wide AVX2 rollouts slower), then store bf16.
