@@ -2856,7 +2856,13 @@ def standardize_data_formats(
                 uniques[key].append(value)
     pass
 
-    assert(len(uniques.keys()) == 2)
+    if len(uniques.keys()) != 2:
+        raise RuntimeError(
+            f"Unsloth: Cannot standardize this dataset. Each message in `conversations` must have "
+            f"exactly 2 text fields (a role and its content), but found {len(uniques.keys())}: "
+            f"{sorted(uniques.keys())}. Remove the extra fields first, for example with `dataset.map`."
+        )
+    pass
 
     keys = list(uniques.keys())
     all_aliases = set(
