@@ -1610,8 +1610,9 @@ class BlockSwap:
         if c is None:
             return True
         dec = (self._decoders or {}).get(torch.device(next(iter(b.sizes))))
-        return (dec is not None and dec.staging[0].numel() >= min(c.chunk, c.words) * 3 // 2
-                and dec.aux[0].numel() >= c.aux_nbytes)
+        # A staged chunk never exceeds the fixed-width layout's chunk of the same words, whatever the format.
+        chunk = min(getattr(c, "chunk", _codec().CHUNK), c.words) * 3 // 2
+        return dec is not None and dec.staging[0].numel() >= chunk and dec.aux[0].numel() >= c.aux_nbytes
 
     def _release_decoders(self):
         """Drop every decoder's GPU buffers (callers drained the decode streams first)."""
