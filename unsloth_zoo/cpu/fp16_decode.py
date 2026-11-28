@@ -158,9 +158,12 @@ def _candidates(model):
         head = None
     owners = {id(module.base_layer): module for module in model.modules()
               if isinstance(getattr(module, "base_layer", None), torch.nn.Linear)}
+    from .ops import Bf16StoredLinear
     found, seen = [], set()
     for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear) or id(module) in seen:
+        # Only forwards that are F.linear: other Linear subclasses (BitNet, quantized, ...) do more, and an instance
+        # forward (hooks that wrap it) would be bypassed.
+        if type(module) not in (torch.nn.Linear, Bf16StoredLinear) or "forward" in module.__dict__ or id(module) in seen:
             continue
         is_head = module is head
         if not is_head and _base_name(name) not in _PROJECTIONS:

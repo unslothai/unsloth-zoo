@@ -19,6 +19,7 @@ after generate (also on error); eval-mode generate, autograd calls, long prefill
 are not bf16 values, other CPUs and UNSLOTH_CPU_FP16_DECODE=0 keep the stock path."""
 
 import platform
+import types
 
 import pytest
 import torch
@@ -344,6 +345,23 @@ def test_unpackable_weights_are_checked_once_per_version(no_bf16, monkeypatch):
         q.weight.copy_(q.weight.bfloat16().float())  # now bf16 numbers, a new version
     _generate(model)
     assert len(checks) == first + 1 and q in _packed(model)
+
+
+@needs_fbgemm
+def test_only_plain_linear_forwards_are_packed(no_bf16):
+    class ScaledLinear(torch.nn.Linear):  # a Linear subclass whose forward is more than F.linear (BitNet-like)
+        def forward(self, x):
+            return 2 * super().forward(x)
+    model = _tiny_llama(bf16_stored = False)
+    layer = model.model.layers[0]
+    layer.self_attn.k_proj.__class__ = ScaledLinear
+    v = layer.self_attn.v_proj
+    v.forward = types.MethodType(lambda self, x: F.linear(x, self.weight) + 1, v)  # an instance forward (a hook)
+    with no_bf16.fp16_decode(model):
+        pass
+    packed = set(map(id, _packed(model)))
+    assert id(layer.self_attn.k_proj) not in packed and id(v) not in packed and id(layer.self_attn.q_proj) in packed
+    assert "forward" in v.__dict__  # left as it was
 
 
 @needs_fbgemm
