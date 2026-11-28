@@ -229,7 +229,7 @@ def _mm_launch(x2, packed, ggml_type, out, bias, counts, M, N, K, E, R, trans_b,
         TYPE = ggml_type, QK = qk, BS = bs, TRANS_B = trans_b, GROUPED = grouped,
         E_POW2 = 1 << max(E - 1, 0).bit_length(), HAS_BIAS = bias is not None, HOST_SCHED = host_sched,
         BLOCK_M = BLOCK_M, BLOCK_N = BLOCK_N, BLOCK_K = BLOCK_K, SPLIT = ggml_type in _SPLIT_MM,
-        num_warps = warps, num_stages = stages,
+        num_warps = warps, num_stages = stages, enable_fp_fusion = True,
     )
     return out
 
@@ -243,6 +243,7 @@ def _gemv_launch(x1, packed, ggml_type, out, bias, N, K):
         x1, packed, out, x1 if bias is None else bias, _table(x1.device), N, K, ggml_row_bytes(ggml_type, K),
         TYPE = ggml_type, QK = qk, BS = bs, HAS_BIAS = bias is not None,
         BLOCK_N = BLOCK_N, NB = NB, SPLIT = ggml_type not in _NO_SPLIT_GEMV, num_warps = 4,
+        enable_fp_fusion = True,
     )
     return out
 
