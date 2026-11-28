@@ -225,6 +225,104 @@ def test_compile_fullgraph_no_breaks():
 
 
 @cuda
+@pytest.mark.skipif(not gguf_ops._TRACED, reason = "traced dequantize is off (torch < 2.14 or UNSLOTH_GGUF_TRACED=0)")
+@pytest.mark.parametrize("ggml_type", [T.Q4_K, T.Q6_K, T.Q8_0, T.IQ4_XS], ids = _id)
+def test_compiled_graph_launches_the_dequant_kernel(ggml_type):
+    # Under torch.compile with a symbolic row count above the fused row cap (training batches), dequantize / linear /
+    # dX launch the Triton dequantize kernel from the graph (no custom-op call per use), bitwise equal to eager.
+    # Row counts the fused kernels take (one row, or up to the cap) keep their custom op: still bitwise eager.
+    dtype = _half()
+    N, K = 48, _row_length(ggml_type, 4)
+    packed = random_packed(ggml_type, N, K, special = False).cuda()
+    targets = []
+
+    def backend(gm, example_inputs):
+        targets.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
+        from torch._inductor.compile_fx import compile_fx
+        return compile_fx(gm, example_inputs)
+
+    def fn(x, g):
+        y = gguf_linear(x, packed, ggml_type, (N, K))
+        dx = gguf_linear_backward_input(g, packed, ggml_type, (N, K))
+        w = dequantize_gguf(packed, ggml_type, (N, K), x.dtype)
+        return y, dx, w
+
+    def check(compiled, M):
+        x = (torch.randn(M, K, device = "cuda") * 1e-2).to(dtype)
+        g = (torch.randn(M, N, device = "cuda") * 1e-2).to(dtype)
+        got, want = compiled(x, g), fn(x, g)
+        for name, a, b in zip(("linear", "dX", "dequant"), got, want):
+            assert torch.isfinite(b).all(), name
+            assert torch.equal(a, b), f"compiled {name} differs from eager at M = {M}"
+
+    cap = gguf_ops._fused_max_rows(torch.device("cuda"), ggml_type)
+    torch._dynamo.reset()
+    compiled = torch.compile(fn, backend = backend, fullgraph = True, dynamic = True)
+    for M in (cap + 21, cap + 130):
+        check(compiled, M)
+    assert not [t for t in targets if "unsloth_zoo" in t], targets
+    assert any("triton_kernel_wrapper" in t for t in targets), targets
+    targets.clear()
+    check(compiled, max(2, cap // 2))
+    assert any("unsloth_zoo.gguf_linear" in t for t in targets), targets
+    # A single row: the fused GEMV (custom op) under a static compile, as in decode.
+    targets.clear()
+    torch._dynamo.reset()
+    x1 = (torch.randn(1, K, device = "cuda") * 1e-2).to(dtype)
+    one = torch.compile(lambda x: gguf_linear(x, packed, ggml_type, (N, K)), backend = backend, fullgraph = True, dynamic = False)
+    assert torch.equal(one(x1), gguf_linear(x1, packed, ggml_type, (N, K)))
+    assert any("unsloth_zoo.gguf_linear" in t for t in targets), targets
+    torch._dynamo.reset()
+
+
+def test_traced_dequantize_setting(monkeypatch):
+    # Inductor re-emits a user Triton kernel with fp fusion on before torch 2.14: the traced launch is off there.
+    has_triton = gguf_ops._HAS_TRITON
+    monkeypatch.delenv("UNSLOTH_GGUF_TRACED", raising = False)
+    monkeypatch.setattr(torch, "__version__", "2.13.1+cu130")
+    assert gguf_ops._traced_setting() is False
+    monkeypatch.setattr(torch, "__version__", "2.14.0+cu130")
+    assert gguf_ops._traced_setting() is has_triton
+    monkeypatch.setenv("UNSLOTH_GGUF_TRACED", "0")
+    assert gguf_ops._traced_setting() is False
+    monkeypatch.setattr(torch, "__version__", "2.6.0")
+    monkeypatch.setenv("UNSLOTH_GGUF_TRACED", "1")
+    assert gguf_ops._traced_setting() is has_triton
+
+
+@cuda
+def test_traced_kill_switch_keeps_the_custom_ops(monkeypatch):
+    monkeypatch.setattr(gguf_ops, "_TRACED", False)
+    packed = random_packed(T.Q4_K, 32, 512, special = False).cuda()
+    targets = []
+
+    def backend(gm, example_inputs):
+        targets.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
+        return gm.forward
+
+    torch._dynamo.reset()
+    fn = torch.compile(lambda x: gguf_linear(x, packed, T.Q4_K, (32, 512)), backend = backend, fullgraph = True)
+    x = (torch.randn(300, 512, device = "cuda") * 1e-2).to(_half())
+    assert torch.equal(fn(x), gguf_linear(x, packed, T.Q4_K, (32, 512)))
+    assert any("unsloth_zoo.gguf_linear" in t for t in targets), targets
+    assert not any("triton_kernel_wrapper" in t for t in targets), targets
+    torch._dynamo.reset()
+
+
+def test_ggml_type_id_accepts_ints_names_and_enums():
+    import enum
+
+    class Plain(enum.Enum):
+        Q4_K = int(T.Q4_K)
+
+    assert gguf_ops.ggml_type_id(int(T.Q4_K)) == T.Q4_K
+    assert gguf_ops.ggml_type_id("q4_k") == T.Q4_K
+    assert gguf_ops.ggml_type_id(Plain.Q4_K) == T.Q4_K
+    with pytest.raises(NotImplementedError):
+        gguf_ops.ggml_type_id(9999)
+
+
+@cuda
 def test_device_mismatch_raises():
     packed = random_packed(T.Q8_0, 4, 64)
     with pytest.raises(ValueError):

@@ -108,7 +108,11 @@ def ggml_type_id(ggml_type) -> int:
         if not hasattr(GGMLType, key):
             raise ValueError(f"Unsloth: unknown ggml type {ggml_type!r}")
         return getattr(GGMLType, key)
-    value = int(getattr(ggml_type, "value", ggml_type))
+    try:
+        # ints, IntEnums (gguf-py) and SymInts: a getattr on a SymInt would break a torch.compile graph
+        value = int(ggml_type)
+    except TypeError:
+        value = int(getattr(ggml_type, "value", ggml_type))
     if value not in GGML_BLOCK:
         name = GGML_TYPE_NAMES.get(value, str(value))
         raise NotImplementedError(f"Unsloth: ggml type {name} is not supported by the GGUF kernels")

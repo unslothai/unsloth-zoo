@@ -31,6 +31,7 @@ from .formats import (
 )
 from .reference import dequantize_reference
 from .ops import (
+    COMPILE_TRACED_DEQUANTIZE,
     dequantize_gguf,
     gguf_grouped_mm,
     gguf_kernels_available,
@@ -39,6 +40,7 @@ from .ops import (
 )
 
 __all__ = [
+    "COMPILE_TRACED_DEQUANTIZE",
     "GGML_BLOCK",
     "GGML_TYPE_NAMES",
     "GGMLType",
