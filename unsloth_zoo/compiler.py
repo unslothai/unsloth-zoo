@@ -5381,6 +5381,8 @@ pass
 
 def _patch_lora_base_layer_input_cast(source):
     # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
+    # Packed bases (`_unsloth_mxfp4_packed_linear`: MXFP4, GGUF) cast x themselves and decode a fresh 16-bit `weight`
+    # on every read: the class check comes first so neither the call nor Dynamo's guards on it ever read `weight`.
     _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
     _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
     if not _m:
@@ -5388,7 +5390,9 @@ def _patch_lora_base_layer_input_cast(source):
     _ind = _m.group(1)
     return source.replace(
         _base_layer_call,
-        f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+        f"if not torch.is_autocast_enabled() "
+        f"and not getattr(type(self.base_layer), '_unsloth_mxfp4_packed_linear', False) "
+        f"and hasattr(self.base_layer, 'weight') "
         f"and self.base_layer.weight is not None "
         f"and not hasattr(self.base_layer.weight, 'quant_state') "
         f"and self.base_layer.weight.is_floating_point() "

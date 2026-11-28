@@ -84,5 +84,41 @@ def test_packed_or_integer_weights_never_become_the_activation_dtype():
     assert _run(four_bit) == [torch.bfloat16]
 
 
+class _PackedBase(_Base):
+    """A packed base (MXFP4 / GGUF): `weight` decodes the whole matrix on every read, so it must never be read."""
+
+    _unsloth_mxfp4_packed_linear = True
+
+    def __init__(self):
+        self.seen, self.reads = [], 0
+
+    @property
+    def weight(self):
+        self.reads += 1
+        return torch.zeros(4, 4, dtype = torch.float32)
+
+
+def test_packed_base_weight_is_never_read():
+    namespace = {"torch": torch}
+    exec(textwrap.dedent(_patch_lora_base_layer_input_cast(FORWARD)), namespace)
+    for disable in (False, True):
+        base = _PackedBase()
+        layer = SimpleNamespace(disable_adapters = disable, base_layer = base)
+        namespace["unsloth_forward"](layer, torch.zeros(2, 4, dtype = torch.bfloat16))
+        assert base.reads == 0
+        assert base.seen == [torch.bfloat16]
+
+
+def test_packed_base_weight_is_not_read_under_torch_compile():
+    namespace = {"torch": torch}
+    exec(textwrap.dedent(_patch_lora_base_layer_input_cast(FORWARD)), namespace)
+    base = _PackedBase()
+    layer = SimpleNamespace(disable_adapters = False, base_layer = base)
+    compiled = torch.compile(namespace["unsloth_forward"], backend = "eager", fullgraph = True)
+    for _ in range(3):
+        compiled(layer, torch.zeros(2, 4, dtype = torch.bfloat16))
+    assert base.reads == 0
+
+
 def test_patch_lora_forwards_routes_through_the_helper():
     assert "_patch_lora_base_layer_input_cast(source)" in inspect.getsource(patch_lora_forwards)
