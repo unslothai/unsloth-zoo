@@ -257,7 +257,8 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
             # [BT, BV]
             b_dv = tl.load(p_dv, mask=m_tv, other=0.0)
 
-            b_dgk += tl.sum(b_h * b_dh, axis=0)
+            # Unsloth: reduce h * dh in fp32 (h / dh are stored in k.dtype), as in chunk_o.
+            b_dgk += tl.sum(b_h.to(tl.float32) * b_dh.to(tl.float32), axis=0)
             b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
             b_dk += tl.dot(b_v_new, b_dh.to(b_v_new.dtype))
             b_dw += tl.dot(b_dv.to(b_v_new.dtype), b_h.to(b_v_new.dtype))

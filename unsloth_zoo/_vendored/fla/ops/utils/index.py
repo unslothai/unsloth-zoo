@@ -143,7 +143,12 @@ def prepare_position_ids(cu_seqlens: torch.LongTensor, cu_seqlens_cpu: torch.Lon
 
 @tensor_cache
 def prepare_sequence_ids(cu_seqlens: torch.LongTensor, cu_seqlens_cpu: torch.LongTensor | None = None) -> torch.LongTensor:
-    return prepare_position_ids(cu_seqlens, cu_seqlens_cpu).eq(0).cumsum(0) - 1
+    # Unsloth: a token's sequence is the number of segment ends at or before it. Counting
+    # position == 0 starts skipped zero-length segments, so every later token got the
+    # wrong sequence id. searchsorted adds no host sync beyond prepare_position_ids.
+    position_ids = prepare_position_ids(cu_seqlens, cu_seqlens_cpu)
+    tokens = torch.arange(position_ids.numel(), device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    return torch.searchsorted(cu_seqlens[1:].contiguous(), tokens, right=True).to(cu_seqlens)
 
 
 @tensor_cache

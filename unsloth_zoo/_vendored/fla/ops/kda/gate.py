@@ -194,8 +194,10 @@ def kda_gate_bwd_kernel(
     else:
         b_A = exp(b_A)
         b_inner = b_A * b_g
-        b_sig = tl.sigmoid(b_inner)
-        b_dsig = b_sig * (1.0 - b_sig)
+        # Unsloth: sigma'(x) = r / (1 + r)^2 with r = exp(-|x|). s * (1 - s) rounds to 0
+        # once sigmoid saturates to 1.0 in fp32 (x > ~17), dropping the gradient.
+        b_r = exp(-tl.abs(b_inner))
+        b_dsig = b_r / ((1.0 + b_r) * (1.0 + b_r))
         # Common term: dy * (LB * dsig)
         b_d_inner_term = b_dyg * (lower_bound * b_dsig)
         # dg = d_inner_term * A
@@ -280,9 +282,10 @@ def kda_gate_bwd(
         lower_bound=lower_bound,
     )
 
+    # Unsloth: reduce the bias gradient from the fp32 dg, before the downcast to g.dtype.
+    dbias = dg.view(-1, H * K).sum(0).to(dt_bias) if dt_bias is not None else None
     dg = dg.view_as(g).type_as(g)
     dA = dA.sum(0).view_as(A_log).type_as(A_log)
-    dbias = dg.view(-1, H * K).sum(0).to(dt_bias) if dt_bias is not None else None
 
     return dg, dA, dbias
 
