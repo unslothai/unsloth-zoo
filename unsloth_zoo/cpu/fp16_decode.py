@@ -204,31 +204,31 @@ def _prepare(model):
         key = _key(module, owner)
         cached = _PACKS.get(module, None)
         if cached is not None and cached[0] == key:
-            ready.append((module, cached[1]))
+            ready.append((module, owner, key, cached[1]))
             continue
         if cached is not None:  # the weight changed (merged, reloaded, edited in place): pack it again
             del _PACKS[module]
-        stale.append((module, is_head, key))
+        stale.append((module, is_head, key, owner))
     if stale:
         # RAM first: before any check or pack allocates, for every weight that would need one.
         from .runtime import available_ram
-        extra = 2 * sum(module.weight.numel() for module, _, _ in stale)
+        extra = 2 * sum(module.weight.numel() for module, _, _, _ in stale)
         available = available_ram()
         if available is None or extra > _RAM_SHARE * available:
             return ready or None
     todo = [entry for entry in stale if _packable(entry[0].weight)]
     if todo:
         jobs = []
-        for module, is_head, _ in todo:
+        for module, is_head, _, _ in todo:
             if is_head and module.weight.shape[0] > _HEAD_BLOCK:
                 jobs.extend((module, True, start) for start in range(0, module.weight.shape[0], _HEAD_BLOCK))
             else:
                 jobs.append((module, False, 0))
         packed = _pack_parallel(jobs)
-        for module, _, key in todo:
+        for module, _, key, owner in todo:
             parts = sorted(packed[id(module)], key = lambda part: part[0])
             _PACKS[module] = (key, parts)
-            ready.append((module, parts))
+            ready.append((module, owner, key, parts))
     return ready
 
 
@@ -257,13 +257,14 @@ def _pack_parallel(jobs):
     return out
 
 
-def _decode_forward(module, parts, forward):
+def _decode_forward(module, owner, key, parts, forward):
     run = torch.ops.quantized.linear_dynamic_fp16
     out_features = module.weight.shape[0]
 
     def wrapped(x, *args, **kwargs):
         if args or kwargs or x.dtype != torch.float32 or x.device.type != "cpu" or torch.is_grad_enabled() \
-                or x.shape[-1] != module.weight.shape[1]:
+                or x.shape[-1] != module.weight.shape[1] or _key(module, owner) != key:
+            # The key again per call: PEFT unmerges a disabled adapter inside its forward, right before this call.
             return forward(x, *args, **kwargs)
         rows = x.numel() // x.shape[-1] if x.shape[-1] else 0
         if rows == 0 or rows > _MAX_ROWS:
@@ -301,9 +302,9 @@ class fp16_decode:
             ready = _prepare(self.model) if fp16_decode_wanted(self.model) else None
         except Exception:
             ready = None
-        for module, parts in ready or ():
+        for module, owner, key, parts in ready or ():
             own = module.__dict__.get("forward", None)
-            module.forward = _decode_forward(module, parts, module.forward)
+            module.forward = _decode_forward(module, owner, key, parts, module.forward)
             self._patched.append((module, own))
         self.active = bool(self._patched)
         return self

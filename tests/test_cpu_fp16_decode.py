@@ -133,8 +133,9 @@ def test_packs_are_built_once_and_rebuilt_when_the_weight_changes(no_bf16, monke
 
 @needs_fbgemm
 def test_packs_follow_peft_merge_and_unmerge(no_bf16):
+    """bf16-stored base: the merged weight is still bf16 numbers, so it is packed again (an fp32 merge is not)."""
     from peft import LoraConfig, get_peft_model
-    model = _tiny_llama(bf16_stored = False)
+    model = _tiny_llama()
     model = get_peft_model(model, LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False))
     model.train()
     lora = model.base_model.model.model.layers[0].self_attn.q_proj
@@ -143,15 +144,42 @@ def test_packs_follow_peft_merge_and_unmerge(no_bf16):
     def packed_out():
         with torch.no_grad(), no_bf16.fp16_decode(model) as ctx:
             assert ctx.active
-            return lora.base_layer(x)
+            calls = no_bf16.ENGAGED[0]
+            y = lora.base_layer(x)
+            assert no_bf16.ENGAGED[0] == calls + 1  # answered from the pack
+            return y
     before = packed_out()
-    torch.testing.assert_close(before, F.linear(x, lora.base_layer.weight), rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(before, F.linear(x, lora.base_layer.weight.float()), rtol = 1e-5, atol = 1e-5)
     model.merge_adapter()  # writes the merged weight through .data: same storage and version
     merged = packed_out()
-    torch.testing.assert_close(merged, F.linear(x, lora.base_layer.weight), rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(merged, F.linear(x, lora.base_layer.weight.float()), rtol = 1e-5, atol = 1e-5)
     assert (merged - before).abs().max() > 1e-3
     model.unmerge_adapter()
-    torch.testing.assert_close(packed_out(), F.linear(x, lora.base_layer.weight), rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(packed_out(), F.linear(x, lora.base_layer.weight.float()), rtol = 1e-5, atol = 1e-5)
+
+
+@needs_fbgemm
+def test_disabled_adapter_unmerged_mid_rollout_uses_the_unmerged_weight(no_bf16):
+    """merge_adapter, then a rollout under disable_adapter: PEFT unmerges inside the LoRA forward, after the packs
+    were picked, so a pack built from the merged weight must not answer that call."""
+    from peft import LoraConfig, get_peft_model
+    model = _tiny_llama()
+    model = get_peft_model(model, LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False))
+    model.train()
+    lora = model.base_model.model.model.layers[0].self_attn.q_proj
+    x = torch.randn(2, 32)
+    model.merge_adapter()
+    with torch.no_grad(), no_bf16.fp16_decode(model) as ctx:
+        assert ctx.active
+        calls = no_bf16.ENGAGED[0]
+        merged = lora.base_layer(x)
+        assert no_bf16.ENGAGED[0] == calls + 1  # packed from the merged weight
+        with model.disable_adapter():
+            y = lora(x)  # PEFT unmerges here, then calls base_layer
+    assert not lora.merged
+    unmerged = F.linear(x, lora.base_layer.weight.float())
+    assert (merged - unmerged).abs().max() > 1e-3
+    torch.testing.assert_close(y, unmerged, rtol = 1e-5, atol = 1e-5)
 
 
 @needs_fbgemm
