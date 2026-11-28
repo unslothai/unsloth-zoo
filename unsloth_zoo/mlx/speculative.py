@@ -35,6 +35,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
+from statistics import median
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator, Literal, Sequence
 
@@ -1201,10 +1202,10 @@ class SizedTreeBudget:
     probability and each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
 
     COST_ALPHA = 1 / 8
+    PRICE_SAMPLES, MIN_LOAD_SAVING = 32, 0.05
     RATE_ALPHA, RATE_ROUNDS = 1 / 64, 16   # until this many rounds set the rate, a round sizes by its own best ratio
     # A gap longer than this many cycles is a reply's start or a plain window, not a width's cycle, unless as many follow it.
     GAP_CYCLES = 3
-    # A width never verified stays priced by the load's noisy timing, so every few rounds verify the least measured one.
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SAMPLES = 8, 64, 4
     # A round costs about two plain steps.
     MIN_ROUND_TOKENS = 2.0
@@ -1212,10 +1213,19 @@ class SizedTreeBudget:
 
     def __init__(self, tree_costs: dict[int, float]):
         self.load_costs = dict(tree_costs)
-        self.live = {rows: _Ema() for rows in tree_costs}
         self._emitted, self._spent = _Ema(), _Ema()
         self._last, self._gaps, self._rounds, self._reply = None, 0, 0, None
         self.samples = dict.fromkeys(tree_costs, 0)
+        narrow_cost = tree_costs[min(tree_costs)]
+        if min(tree_costs.values()) < narrow_cost * (1 - self.MIN_LOAD_SAVING):
+            self._prices = dict(sorted(tree_costs.items()))
+            self._intervals = {rows: deque(maxlen = self.PRICE_SAMPLES) for rows in tree_costs}
+            self._last_sample_round = dict.fromkeys(tree_costs, 0)
+            self._next_price_round = self.PROBE_EVERY
+            self._probe_due, self._probe_attempted = 0, False
+        else:
+            self._prices = None
+            self.live = {rows: _Ema() for rows in tree_costs}
 
     def choose(self) -> int:
         """The rows to draft, every width being a prefix of the widest."""
@@ -1226,11 +1236,41 @@ class SizedTreeBudget:
         return state.stats.expected(RowPlan("draft", trained)) < self.MIN_ROUND_TOKENS
 
     def _cost(self, rows: int) -> float:
+        if self._prices is not None:
+            return self._prices[rows]
         live = self.live[rows]
         if live.value is not None:
             return live.value
         measured = [(entry.value, self.load_costs[width]) for width, entry in self.live.items() if entry.value is not None]
         return self.load_costs[rows] * (sum(a for a, _ in measured) / sum(b for _, b in measured) if measured else 1.0)
+
+    def _update_prices(self) -> None:
+        observed = {
+            rows: sorted(intervals)[len(intervals) // 4]
+            for rows, intervals in self._intervals.items()
+            if intervals
+        }
+        scale = median(value / self.load_costs[rows] for rows, value in observed.items())
+        for rows, load_cost in self.load_costs.items():
+            samples = len(self._intervals[rows])
+            age = (self._rounds - self._last_sample_round[rows]) / self.PROBE_EVERY
+            weight = samples / (max(samples, self.PROBE_SAMPLES) + age)
+            prior = load_cost * scale
+            self._prices[rows] = prior + weight * (observed.get(rows, prior) - prior)
+
+    def _cost_frontier(self, offered: int) -> list[int]:
+        frontier, cheapest_live, cheapest_load = [], math.inf, math.inf
+        for rows in reversed(self._prices):
+            if rows > offered:
+                continue
+            cost, load = self._prices[rows], self.load_costs[rows]
+            # Keep the load frontier eligible until probes can replace its startup prices.
+            pending = self.samples[rows] < self.PROBE_SAMPLES and load < cheapest_load
+            if cost < cheapest_live or pending:
+                frontier.append(rows)
+            cheapest_live, cheapest_load = min(cost, cheapest_live), min(load, cheapest_load)
+        frontier.reverse()
+        return frontier
 
     def size(self, nodes: Sequence[tuple[float, int]]) -> int:
         """The rows to verify, from each node after the anchor, best first: its path probability and depth."""
@@ -1240,14 +1280,34 @@ class SizedTreeBudget:
         tokens, best, most = 1.0, min(self.load_costs), -math.inf
         for rows, (probability, _) in enumerate(nodes, 2):
             tokens += probability
-            if rows in self.live:
-                value = tokens / self._cost(rows) if rate is None else tokens - rate * self._cost(rows)
+            if rows in self.load_costs:
+                cost = self._cost(rows)
+                value = tokens / cost if rate is None else tokens - rate * cost
                 if value > most:
                     best, most = rows, value
         self._rounds += 1
-        stale = min(self.samples, key = self.samples.get)
-        every = self.PROBE_EVERY if self.samples[stale] < self.PROBE_SAMPLES else self.PROBE_SETTLED_EVERY
-        return stale if self._rounds % every == 0 else best
+        probe_round = self._rounds
+        frontier = self.samples
+        due = probe_round % self.PROBE_EVERY == 0
+        if self._prices is not None:
+            if due and (not self._probe_due or probe_round % self.PROBE_SETTLED_EVERY == 0):
+                self._probe_due = probe_round
+                self._probe_attempted = False
+            if not self._probe_due or self._last is None:
+                return best
+            probe_round = self._probe_due
+            frontier = self._cost_frontier(len(nodes) + 1)
+        elif not due:
+            return best
+        stale = min(frontier, key = self.samples.get, default = best)
+        settled = self.samples[stale] >= self.PROBE_SAMPLES
+        probe = not settled or probe_round % self.PROBE_SETTLED_EVERY == 0
+        if self._prices is not None:
+            # Retry once so repeated unusable intervals cannot turn every round into a probe.
+            if not probe or self._probe_attempted:
+                self._probe_due = 0
+            self._probe_attempted = probe
+        return stale if probe else best
 
     def reply_round(self, reply: ReplyStats) -> None:
         """A round of ``reply`` is about to be observed: what passed since another reply's round is no cycle, however many replies run one round."""
@@ -1259,8 +1319,18 @@ class SizedTreeBudget:
         self._emitted.update(1 + len(ranks), self.RATE_ALPHA)
         self._spent.update(self._cost(rows), self.RATE_ALPHA)
         if self._last is not None:
-            if end - self._last < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
-                self.live[rows].update(end - self._last, self.COST_ALPHA)
+            interval = end - self._last
+            if interval < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
+                if self._prices is None:
+                    self.live[rows].update(interval, self.COST_ALPHA)
+                else:
+                    self._intervals[rows].append(interval)
+                    self._last_sample_round[rows] = self._rounds
+                    # A probe without a usable interval is still due.
+                    self._probe_due = 0
+                    if self._rounds >= self._next_price_round:
+                        self._update_prices()
+                        self._next_price_round = self._rounds + self.PROBE_EVERY
                 self.samples[rows] += 1
                 self._gaps = 0
             else:
@@ -1823,6 +1893,7 @@ class SpeculativeEngine:
             sizes, sized = isinstance(budget, SizedTreeBudget), []
 
             def size():
+                budget.reply_round(states[0].stats)
                 # The verify asks with its first layers submitted, which run while this waits for the lattice.
                 mx.eval(tree.score, tree.block.depth)
                 nodes = zip(tree.score.tolist()[1:], tree.block.depth.tolist()[1:])
@@ -1867,7 +1938,6 @@ class SpeculativeEngine:
             raise
         mx.async_eval([_committed_eval_state(entry) for entry in [*self.cache, *(self.draft_cache or [])]])
         if isinstance(budget, SizedTreeBudget):
-            budget.reply_round(states[0].stats)
             ranks = tree.rank.tolist()
             budget.observe(tree.tokens.size, {ranks[r] for r in rows[1:]}, time.perf_counter())
         elif budget is not None:

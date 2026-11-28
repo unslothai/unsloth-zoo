@@ -1377,6 +1377,40 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
     assert {pick for round, pick in enumerate(picks, 1) if round % 8 or round > 64 and round % 64} == {5}
 
 
+def test_sized_tree_budget_keeps_stock_probes_without_a_clear_load_saving():
+    for wider_cost, expected in ((0.99, 3), (0.96, 3), (0.94, 4), (0.89, 4)):
+        budget = SizedTreeBudget({3: 1.0, 4: wider_cost})
+        budget.observe(3, (), 0.0)
+        assert [budget.size([(1.0, 1)] * 3) for _ in range(budget.PROBE_EVERY)][-1] == expected
+
+
+def test_sized_tree_budget_probes_only_available_cost_frontier():
+    for offered, price, first_round, pending, counts, interval, widths in (
+        (6, 1.0, 8, 0, (0, 8), 100.0, (5, 5, 5, 5)), (4, 1.0, 8, 0, (0, 8), 100.0, (4, 4, 4, 4)),
+        (6, 1.75, 8, 0, (0, 8), 100.0, (6, 5, 5, 6)), (6, 1.4, 72, 64, (4, 8), 100.0, (6, 5, 5, 6)),
+        (6, 1.0, 7, 0, (8, 0), 1.0, (5, 6, 5, 5)),
+    ):
+        budget = SizedTreeBudget({3: 2.0, 4: 2.0, 5: 1.0, 6: 1.5})
+        budget._prices[5], budget.samples[5], budget.samples[6] = price, *counts
+        budget._rounds, budget._probe_due = first_round - 1, pending
+        budget.reply_round(object())
+        for end, expected in zip((0.0, interval, 200.0, 201.0), widths):
+            assert budget.size([(1.0, 1)] * (offered - 1)) == expected
+            budget.observe(expected, (), end)
+
+
+def test_sized_tree_budget_prices_replay():
+    for load_costs in ({3: 1.0, 4: 2.0, 5: 0.5}, {5: 0.5, 4: 2.0, 3: 1.0}):
+        budget = SizedTreeBudget(load_costs)
+        expected = {3: 1.75 + 1 / 4.5, 4: 3.125, 5: 0.875}
+        for rows, end in zip((3, 3, 3, 3, 3, 4, 4, 4, 4, 4), (0, 2.5, 3.5, 5.5, 8.25, 11.25, 15.25, 100, 103.5, 104.5)):
+            budget.reply_round(end >= 100)
+            budget.size([(1.0, 1)] * 4)
+            assert budget._prices == (load_costs if end <= 103.5 else expected)
+            budget.observe(rows, (), end)
+        assert budget._prices == expected
+
+
 def test_tree_calibration_refits_each_depth_from_the_children_of_accepted_rows():
     import math
     import mlx.core as mx
