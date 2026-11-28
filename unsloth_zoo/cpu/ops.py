@@ -914,11 +914,12 @@ def patch_cpu_router_aux_ga(model):
     forwards whose source adds exactly that term (zoo's own rewriter recognises it). Returns True when installed."""
     if os.environ.get("UNSLOTH_CPU_ROUTER_AUX_GA", "1") == "0":
         return False
-    # Absolute, and here rather than at module level: fused_losses stays out of the CPU backend's import.
-    from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unsloth_ga_scale_aux_loss
     target = next((m for m in model.modules() if "router_aux_loss_coef" in vars(m)), None)
     if target is None or vars(target).get("_unsloth_cpu_router_aux_ga", False):
         return False
+    # Only for a model with a router: the fused_losses package imports temporary_patches, which a dense CPU load
+    # (every load calls this) must not. Absolute, as transformers' remote-code save resolves relative imports.
+    from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unsloth_ga_scale_aux_loss
     class_forward = type(target).forward
     try:
         source = inspect.getsource(inspect.unwrap(class_forward))
