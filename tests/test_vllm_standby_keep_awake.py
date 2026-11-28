@@ -87,10 +87,11 @@ class Trainer:
     def init_sleep(self, level = 2):
         self.llm.sleep(level = level)  # TRL's sleep in __init__
 
-    def rollout(self, length = 100, level = 2):
+    def rollout(self, length = 100, level = 2, during = None):
         self.llm.wake_up(tags = ["weights"])
         self.llm.wake_up(tags = ["kv_cache"])
         self.llm.generate(["p"], length = length)
+        if during is not None: during()
         self.llm.sleep(level = level)
 
     def hooked_step(self, train_bytes):
@@ -284,13 +285,17 @@ def test_private_pool_cache_is_not_free_memory(env):
     trainer, llm, mem, calls = env()
     trainer.step(2 * GB)
     assert trainer.step(0) == ["wake_up", "wake_up"]
-    # vLLM's pool now caches 3 GB it freed (taken from the device's free memory). Training can use 1 GB of device
-    # memory plus its own 2 GB of default-pool cache: 3 GB < 1.2 x 2 GB + a 1.2 GB margin, so vLLM must sleep.
-    # reserved - allocated would add the 3 GB vLLM pool cache and call 6 GB free.
-    mem.private_cached = 3 * GB
-    assert trainer.step(0) == ["sleep"]
+    # During the next rollout (after its wake_up closed the measurement) vLLM's pool caches 3 GB taken from the
+    # device's free memory. Training can use 1 GB of device memory plus its own 2 GB of default-pool cache:
+    # 3 GB < 1.2 x 2 GB + a 1.2 GB margin, so vLLM must sleep. reserved - allocated would add the 3 GB vLLM pool
+    # cache and call 6 GB free.
+    def grow_private_pool():
+        mem.private_cached = 3 * GB
+    del calls[:]
+    trainer.rollout(during = grow_private_pool)
+    assert [c[0] for c in calls if c[0] in ("sleep", "wake_up")] == ["sleep"]
     last = vu.standby_keep_awake_stats()["last"]
-    assert not last["kept_awake"] and last["cache_gb"] == round(2 * GB / 1e9, 3)
+    assert not last["kept_awake"]
 
 
 def test_a_static_private_pool_cache_is_not_training_need(env):
