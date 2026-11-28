@@ -469,6 +469,29 @@ def gguf_linear_backward_input(grad_out: torch.Tensor, packed: torch.Tensor, ggm
     return _linear_bwd_op(grad_out, packed, ggml_type, shape)
 
 
+def _no_host_sync(device):
+    """Whether this call runs inside a CUDA graph capture, or a decode step Unsloth plans to capture (its eager
+    warm-up must take the capture's kernels so the first replay validates bitwise)."""
+    try:
+        from unsloth_zoo.decode_graph_state import in_graph_decode_step
+        if in_graph_decode_step():
+            return True
+    except Exception:
+        pass
+    if device.type != "cuda" or not torch.cuda.is_initialized():
+        return False
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return True
+        if device.index is not None and device.index != torch.cuda.current_device():
+            # The query only sees the current device; a split-device model may capture on another GPU.
+            with torch.cuda.device(device):
+                return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        pass
+    return False
+
+
 def _grouped_impl(x, packed, ggml_type, shape, counts, trans_b):
     E, N, K = shape
     inner, outer = (K, N) if trans_b else (N, K)
@@ -486,6 +509,15 @@ def _grouped_impl(x, packed, ggml_type, shape, counts, trans_b):
                 raise
             _warn_fallback("grouped GEMM", err)
     w = _dequantize_impl(packed, ggml_type, (E, N, K), x.dtype)
+    if _no_host_sync(x.device):
+        # Inside a CUDA graph capture (or a decode step planned for one) the expert bounds stay on the device.
+        ends = torch.cumsum(counts.to(torch.int64), 0)
+        row = torch.arange(M, device = x.device)[:, None]
+        for e in range(E):
+            we = w[e]
+            keep = (row >= ends[e] - counts[e]) & (row < ends[e])
+            out = torch.where(keep, x @ (we.t() if trans_b else we), out)
+        return out
     ends = torch.cumsum(counts.to(torch.int64), 0).tolist()
     start = 0
     for e, end in enumerate(ends):

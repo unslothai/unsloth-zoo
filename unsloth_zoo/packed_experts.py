@@ -40,6 +40,7 @@ __all__ = [
     "PACKED_EXPERT_STATS",
     "PACKED_EXPERT_OWN_GROUPED_LINEAR",
     "PACKED_EXPERT_OWN_GROUPED_MM",
+    "PACKED_EXPERT_OWN_GROUPED_OP",
 ]
 
 try:
@@ -294,10 +295,31 @@ def mxfp8_experts_dequantize(codes, scales, dtype = torch.bfloat16, transpose = 
     return buf
 
 
+# Every stack class by a name a traced graph can carry as a constant, so the op below can rebuild a stack of a format
+# this module does not know (Unsloth's GGUF stacks) from its bytes and plain arguments.
+_OWN_CLASSES = {}
+
+
+def _register_own_class(cls):
+    key = f"{cls.__module__}.{cls.__qualname__}"
+    if _OWN_CLASSES.get(key, cls) is not cls:
+        # Two classes of one name (a factory, a reloaded module): the later one gets its own key.
+        n = 2
+        while f"{key}#{n}" in _OWN_CLASSES:
+            n += 1
+        key = f"{key}#{n}"
+    cls._unsloth_own_key = key
+    _OWN_CLASSES[key] = cls
+
+
 class _PackedExpertParam(torch.nn.Parameter):
     """Frozen packed expert stack; rebuildable as ``cls(data, requires_grad, **__dict__)`` (accelerate)."""
 
     packed_format = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        _register_own_class(cls)
 
     def __new__(
         cls, data, requires_grad = False, packed_scales = None, packed_global = None, packed_transposed = False,
@@ -674,9 +696,12 @@ class _PackedGroupedLinear(torch.autograd.Function):
 
 # Packed stacks of any other format (a ``_PackedExpertParam`` subclass with its own ``_decode``, e.g. Unsloth's GGUF
 # expert stacks) run their own ``packed_grouped_mm`` if they bring one, else the chunked dequantize + grouped GEMM
-# below; callers check these flags before relying on them.
+# below; callers check these flags before relying on them. PACKED_EXPERT_OWN_GROUPED_OP: those calls run as one
+# custom op (``unsloth_zoo::packed_experts_own_mm``), so torch.compile traces through them without a graph break, and
+# they never sync to host inside a CUDA graph capture.
 PACKED_EXPERT_OWN_GROUPED_LINEAR = True
 PACKED_EXPERT_OWN_GROUPED_MM = True
+PACKED_EXPERT_OWN_GROUPED_OP = True
 _BUILTIN_FORMATS = ("nvfp4", "mxfp8")
 
 
@@ -710,6 +735,156 @@ class _OwnPackedGroupedLinear(torch.autograd.Function):
         return dx, None, None, None
 
 
+# The op carries a stack as its bytes, its two companion tensors and its other constructor arguments
+# (`_init_kwargs()`) encoded in one string: a graph constant, so a compiled region specializes on it as on the
+# ggml type of a packed Linear.
+_COMPANIONS = ("packed_scales", "packed_global")
+
+
+def _own_op_meta(param):
+    """`name=<tag><value>` pairs of the non-tensor constructor arguments, or None when one cannot be encoded."""
+    kwargs = param._init_kwargs()
+    parts = []
+    for name in sorted(kwargs):
+        if name in _COMPANIONS:
+            continue
+        value = kwargs[name]
+        if isinstance(value, bool):
+            parts.append(f"{name}=b{int(value)}")
+        elif isinstance(value, int):
+            parts.append(f"{name}=i{value}")
+        elif isinstance(value, torch.dtype):
+            parts.append(f"{name}=d{str(value)[6:]}")
+        elif isinstance(value, str) and ";" not in value:
+            parts.append(f"{name}=s{value}")
+        elif value is None:
+            parts.append(f"{name}=n")
+        else:
+            return None
+    scales = kwargs.get("packed_scales")
+    glob = kwargs.get("packed_global")
+    if not isinstance(scales, torch.Tensor) or not (glob is None or isinstance(glob, torch.Tensor)):
+        return None
+    parts.append(f"~glob=b{int(glob is not None)}")
+    return ";".join(parts)
+
+
+_PARSED_META = {}
+
+
+def _parse_own_meta(meta):
+    parsed = _PARSED_META.get(meta)
+    if parsed is None:
+        kwargs, has_glob = {}, False
+        for part in meta.split(";") if meta else ():
+            name, value = part.split("=", 1)
+            tag, body = value[:1], value[1:]
+            if tag == "b":
+                value = body == "1"
+            elif tag == "i":
+                value = int(body)
+            elif tag == "d":
+                value = getattr(torch, body)
+            elif tag == "s":
+                value = body
+            else:
+                value = None
+            if name == "~glob":
+                has_glob = value
+            else:
+                kwargs[name] = value
+        parsed = _PARSED_META[meta] = (kwargs, has_glob)
+    return parsed
+
+
+def _own_rebuild(key, codes, scales, glob, meta):
+    cls = _OWN_CLASSES[key]
+    kwargs, has_glob = _parse_own_meta(meta)
+    return cls(codes, packed_scales = scales, packed_global = glob if has_glob else None, **kwargs)
+
+
+def _own_op_impl(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b):
+    with torch.no_grad():
+        param = _own_rebuild(key, codes, scales, glob, meta)
+        return _own_grouped_impl(inputs, param, counts, transpose_b)
+
+
+_OWN_OP = None
+
+
+def _register_own_op():
+    global _OWN_OP
+    if _OWN_OP is not None:
+        return _OWN_OP or None
+    _OWN_OP = False
+    custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
+    if custom_op is None or not hasattr(torch.library, "register_autograd"):
+        return None
+    try:
+        op = torch.ops.unsloth_zoo.packed_experts_own_mm.default
+    except (AttributeError, RuntimeError):
+        op = None
+    if op is None:
+        try:
+            # Not cudagraph_unsafe: under a capture every route is free of host syncs (single chunk, fused kernel,
+            # or device-side chunk offsets), so Inductor's CUDA graphs keep the whole MoE block.
+            @custom_op("unsloth_zoo::packed_experts_own_mm", mutates_args = ())
+            def packed_experts_own_mm(
+                inputs: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, glob: torch.Tensor,
+                counts: torch.Tensor, key: str, meta: str, rows: int, cols: int, transpose_b: bool,
+            ) -> torch.Tensor:
+                return _own_op_impl(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b)
+
+            @packed_experts_own_mm.register_fake
+            def _(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b):
+                # (E, rows, cols) packed rows: x @ W_e^T has `rows` features, x @ W_e has `cols`.
+                return inputs.new_empty((inputs.shape[0], rows if transpose_b else cols))
+
+            def _setup(ctx, inputs, output):
+                _, codes, scales, glob, counts, key, meta, rows, cols, transpose_b = inputs
+                ctx.save_for_backward(codes, scales, glob, counts)
+                ctx.key, ctx.meta, ctx.rows, ctx.cols, ctx.transpose_b = key, meta, rows, cols, transpose_b
+
+            def _backward(ctx, grad):
+                codes, scales, glob, counts = ctx.saved_tensors
+                dx = None
+                if ctx.needs_input_grad[0]:
+                    dx = torch.ops.unsloth_zoo.packed_experts_own_mm(
+                        grad.contiguous(), codes, scales, glob, counts, ctx.key, ctx.meta, ctx.rows, ctx.cols,
+                        not ctx.transpose_b,
+                    )
+                return dx, None, None, None, None, None, None, None, None, None
+
+            packed_experts_own_mm.register_autograd(_backward, setup_context = _setup)
+            op = torch.ops.unsloth_zoo.packed_experts_own_mm.default
+        except Exception:
+            return None
+    _OWN_OP = op
+    return op
+
+
+try:
+    _register_own_op()
+except Exception:  # pragma: no cover
+    _OWN_OP = False
+
+
+def _own_grouped_linear(inputs, param, counts, transpose_b):
+    if not torch.compiler.is_compiling():
+        PACKED_EXPERT_STATS["calls"] += 1
+    counts = counts.to(device = inputs.device)
+    op = _register_own_op()
+    key = getattr(type(param), "_unsloth_own_key", None)
+    meta = None if op is None or key is None else _own_op_meta(param)
+    if meta is None:
+        return torch.compiler.disable(_OwnPackedGroupedLinear.apply)(inputs, param, counts, bool(transpose_b))
+    scales, glob = param._companions()
+    if glob is None:
+        glob = scales.new_empty((0,))
+    _, rows, cols = param.packed_dims()
+    return op(inputs, param.data, scales, glob, counts, key, meta, int(rows), int(cols), bool(transpose_b))
+
+
 def packed_expert_grouped_linear(inputs, param, counts, transpose_b):
     """``inputs`` (expert-sorted rows) @ W_e for a frozen NVFP4 / MXFP8 / block-FP8 stack; ``transpose_b``: the grouped
     GEMM's (E, K, N) operand is the transpose of the packed (E, N, K) rows. Forward and dX only (frozen base)."""
@@ -717,10 +892,7 @@ def packed_expert_grouped_linear(inputs, param, counts, transpose_b):
         from unsloth_zoo.temporary_patches.moe_fp8_grouped import fp8_block_grouped_linear
         return fp8_block_grouped_linear(inputs, param, counts, transpose_b)
     if param.packed_format not in _BUILTIN_FORMATS:
-        if not torch.compiler.is_compiling():
-            PACKED_EXPERT_STATS["calls"] += 1
-        counts = counts.to(device = inputs.device)
-        return torch.compiler.disable(_OwnPackedGroupedLinear.apply)(inputs, param, counts, bool(transpose_b))
+        return _own_grouped_linear(inputs, param, counts, transpose_b)
     if not torch.compiler.is_compiling():
         PACKED_EXPERT_STATS["calls"] += 1
     scales, glob = param._companions()

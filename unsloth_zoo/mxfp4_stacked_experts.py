@@ -127,6 +127,9 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     while first < E:
         last = min(E, first + step)
         if ends is None and (first > 0 or last < E):
+            if _no_host_sync(device):
+                # A CUDA graph capture (or a decode step planned for one) cannot read the offsets on the host.
+                return _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step, out_dim)
             ends = torch.cumsum(counts, 0).tolist()   # several chunks slice rows: one host sync
         if ends is None:
             # One chunk covers every expert and every row: no host offsets needed.
@@ -179,6 +182,40 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
         del weight
         first = last
     return out if out is not None else inputs.new_empty((inputs.shape[0], out_dim))
+
+
+def _no_host_sync(device):
+    """Inside a CUDA graph capture, or a decode step Unsloth plans to capture (its eager warm-up must take the same
+    kernels for the first replay to validate bitwise)."""
+    if _tracing_or_capturing(device):
+        return True
+    try:
+        from unsloth_zoo.decode_graph_state import in_graph_decode_step
+    except Exception:
+        return False
+    return in_graph_decode_step()
+
+
+def _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step, out_dim):
+    """`_chunked_grouped_mm` without host offsets: each chunk's grouped GEMM runs over every row with the absolute
+    expert ends as offsets (its first expert's group also takes the rows before the chunk, rows after its last
+    end are left out), and only the chunk's own rows are kept. Same chunk memory, more rows multiplied."""
+    E = param._original_shape[0]
+    M = inputs.shape[0]
+    if M == 0:
+        return inputs.new_empty((0, out_dim))
+    ends = torch.cumsum(counts, 0, dtype = torch.int32)
+    row = torch.arange(M, device = inputs.device, dtype = torch.int32)[:, None]
+    out = inputs.new_zeros((M, out_dim))
+    for first in range(0, E, step):
+        last = min(E, first + step)
+        weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
+        part = _grouped_mm(inputs, weight, ends[first:last].contiguous())
+        lo = ends[first - 1] if first > 0 else ends.new_zeros(())
+        keep = (row >= lo) & (row < ends[last - 1])
+        out = torch.where(keep, part, out)
+        del weight, part
+    return out
 
 
 def _fused_fallback_ok(inputs, param):
