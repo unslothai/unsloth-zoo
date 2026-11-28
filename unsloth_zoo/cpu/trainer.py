@@ -412,6 +412,32 @@ def _patch_cpu_autocast_cache(trainer_cls):
     trainer_cls.autocast_smart_context_manager = autocast_smart_context_manager
 
 
+def _patch_cpu_num_items(trainer_cls):
+    """Count num_items_in_batch with zoo's counter (the one the GPU route installs), not transformers' own.
+
+    transformers 4.x counts it over the unshifted labels: one target per supervised row start more than a causal
+    LM's shifted loss sees (5.x counts labels[..., 1:]). The CPU route keeps stock transformers, so a padded
+    single process, DDP or accelerate FSDP2 run divided by that larger count while padding-free, native FSDP2,
+    tensor / pipeline / context parallel (which install Unsloth's counter) did not: the same rows gave another
+    loss and gradient. Encoder-decoder models keep transformers' count, as on the GPU route."""
+    original = getattr(trainer_cls, "get_batch_samples", None)
+    if original is None or getattr(original, "_unsloth_cpu", False) \
+            or getattr(original, "__name__", "") == "_unsloth_get_batch_samples":
+        return False
+    from ..loss_utils import _unsloth_get_batch_samples
+
+    @functools.wraps(original)
+    def get_batch_samples(self, *args, **kwargs):
+        config = getattr(getattr(self, "model", None), "config", None)
+        if getattr(config, "is_encoder_decoder", False):
+            return original(self, *args, **kwargs)
+        return _unsloth_get_batch_samples(self, *args, **kwargs)
+
+    get_batch_samples._unsloth_cpu = True
+    trainer_cls.get_batch_samples = get_batch_samples
+    return True
+
+
 def _chunked_ce_model(trainer, model):
     """The CPU model whose forward Unsloth patched (patch_chunked_causal_lm_loss), behind accelerate / PEFT wrappers."""
     unwrapped = trainer.accelerator.unwrap_model(model) if getattr(trainer, "accelerator", None) is not None else model
@@ -935,6 +961,8 @@ def install_cpu_training_defaults():
         _patch_cpu_fp16_accelerator(Trainer)
         _patch_cpu_preference_trainers(Trainer)
     _patch_cpu_autocast_cache(Trainer)
+    if os.environ.get("UNSLOTH_CPU_NUM_ITEMS", "1") != "0":
+        _patch_cpu_num_items(Trainer)
     try:
         import trl
         from trl.trainer import sft_trainer
