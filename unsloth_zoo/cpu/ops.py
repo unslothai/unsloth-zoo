@@ -785,8 +785,9 @@ def store_frozen_linears_in_bf16(model):
     return len(stored)
 
 
-def set_bf16_stored_dtype(model, dtype):
-    """Bf16StoredLinear to dtype (lossless); frozen upcasts revert; modules_to_save kept exact."""
+def set_bf16_stored_dtype(model, dtype, frozen_only = False):
+    """Bf16StoredLinear to dtype (lossless); frozen upcasts revert; modules_to_save kept exact. frozen_only: upcast
+    frozen weights only, so a trainable one (modules_to_save) keeps its dtype and its optimizer state's."""
     moved = 0
     for module in model.modules():
         weight = getattr(module, "weight", None)
@@ -796,7 +797,7 @@ def set_bf16_stored_dtype(model, dtype):
             if not getattr(module, "_unsloth_upcast", False) or weight.requires_grad:
                 continue
             module._unsloth_upcast = False
-        elif weight.dtype == torch.bfloat16:
+        elif weight.dtype == torch.bfloat16 and not (frozen_only and weight.requires_grad):
             module._unsloth_upcast = True
         else:
             continue

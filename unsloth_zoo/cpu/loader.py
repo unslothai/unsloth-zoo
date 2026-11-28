@@ -1530,7 +1530,9 @@ def _fp32_rollout_fits(model, rows = None, new_tokens = None):
     if extra == 0:
         return False
     available = available_ram()
-    return available is not None and extra <= _FP32_ROLLOUT_RAM_SHARE * available
+    # Every training process on this host reads the same free RAM and makes its own copy.
+    from .runtime import _local_world_size
+    return available is not None and extra * _local_world_size() <= _FP32_ROLLOUT_RAM_SHARE * available
 
 
 def _frozen_bf16_for(model, training):
@@ -1561,7 +1563,9 @@ def _unpack_encoding_generate(generate):
             # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
             # tensors, and the next training forward could not save them for backward.
             with torch.inference_mode(False):
-                restore = set_bf16_stored_dtype(self, torch.float32) > 0
+                # Frozen projections only (the ones counted above): a trainable one (modules_to_save) keeps bf16,
+                # as the restore below skips trainable weights and its optimizer state is bf16.
+                restore = set_bf16_stored_dtype(self, torch.float32, frozen_only = True) > 0
         # Decode only: SMT siblings where they speed up the per-token GEMVs (runtime.rollout_threads), then back.
         training_threads, threads = torch.get_num_threads(), None
         try:
