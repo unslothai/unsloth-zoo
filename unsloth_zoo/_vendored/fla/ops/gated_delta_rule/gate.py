@@ -217,9 +217,10 @@ def gdn_gate_bwd(
         BT=BT,
     )
 
+    # Unsloth: reduce the bias gradient from the fp32 dg, before the downcast to g.dtype.
+    dbias = dg.view(-1, H).sum(0).to(dt_bias) if dt_bias is not None else None
     dg = dg.view_as(g).type_as(g)
     dA = dA.sum(0).view_as(A_log).type_as(A_log)
-    dbias = dg.view(-1, H).sum(0).to(dt_bias) if dt_bias is not None else None
 
     return dg, dA, dbias
 

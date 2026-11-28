@@ -143,7 +143,11 @@ def prepare_position_ids(cu_seqlens: torch.LongTensor, cu_seqlens_cpu: torch.Lon
 
 @tensor_cache
 def prepare_sequence_ids(cu_seqlens: torch.LongTensor, cu_seqlens_cpu: torch.LongTensor | None = None) -> torch.LongTensor:
-    return prepare_position_ids(cu_seqlens, cu_seqlens_cpu).eq(0).cumsum(0) - 1
+    # Unsloth: label tokens from the segment lengths. Counting position == 0 starts
+    # skipped zero-length segments, so every later token got the wrong sequence id.
+    src = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    seq_ids, _ = _segmented_arange(prepare_lens(src))
+    return seq_ids.to(cu_seqlens)
 
 
 @tensor_cache

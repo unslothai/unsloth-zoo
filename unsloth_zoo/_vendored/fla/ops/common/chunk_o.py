@@ -326,7 +326,10 @@ def chunk_bwd_kernel_dqkwg(
         b_h = tl.load(p_h, mask=m_h, other=0.0)
         b_dh = tl.load(p_dh, mask=m_h, other=0.0)
         if USE_G:
-            b_dg_last += (tl.sum(b_h * b_dh))
+            # Unsloth: reduce h * dh in fp32. h / dh are stored in k.dtype, and a 16-bit
+            # product + tree sum over the [BV, BK] tile loses the gate gradient (and
+            # overflows to inf in fp16 for large states).
+            b_dg_last += tl.sum(b_h.to(tl.float32) * b_dh.to(tl.float32))
         # [BT, BV] @ [BV, BT] -> [BT, BT]
         b_ds += tl.dot(b_do, tl.trans(b_v))
         # [BT, BV] @ [BV, BK] -> [BT, BK]

@@ -265,6 +265,23 @@ modifications =
       upstream as of fla 9d478fa): chunk_bwd_kernel_dqkwg takes B as a runtime
       argument in do_not_specialize (it only feeds the dg offset B * T), so the
       GDN / KDA backward no longer compiles one variant per batch size.
+    - Modified by Unsloth (inline "Unsloth:" comments), gate-gradient numerics:
+        * ops/common/chunk_o.py (chunk_bwd_kernel_dqkwg) and ops/kda/chunk_bwd.py
+          (chunk_kda_bwd_kernel_wy_dqkg_fused): the h * dh tile product that feeds
+          the gate gradient is cast to fp32 before tl.sum. h / dh are stored in
+          k.dtype, so the [BV, BK] product and its tree sum ran in bf16 / fp16
+          (fp16 overflowed to inf for large states).
+        * ops/common/chunk_h.py (chunk_fwd_kernel_h, g_gamma path): rows past the
+          end of a partial last chunk are masked out of exp2(b_g_last - b_g), which
+          overflows there and turned h into NaN (0 * inf).
+        * ops/gated_delta_rule/gate.py and ops/kda/gate.py: the dt_bias gradient is
+          summed from the fp32 dg before dg is cast to g.dtype.
+        * ops/kda/gate.py (lower-bound gate backward): sigmoid'(x) is computed as
+          r / (1 + r)^2 with r = exp(-|x|); s * (1 - s) was 0 once sigmoid rounded
+          to 1.0 in fp32.
+        * ops/utils/index.py: prepare_sequence_ids labels tokens from the segment
+          lengths, so zero-length segments in cu_seqlens no longer shift the ids
+          of every later sequence (also fixes prepare_token_indices).
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
