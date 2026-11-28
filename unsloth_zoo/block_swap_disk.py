@@ -46,6 +46,7 @@ __all__ = [
     "disk_tier_reason",
     "host_limit_bytes",
     "SpillFile",
+    "StripedSpill",
     "DiskTier",
     "DiskRef",
     "spill_params",
@@ -455,12 +456,320 @@ def _has_room(directory, need_bytes):
     return st.f_bavail * st.f_frsize >= need_bytes + _MARGIN_BYTES
 
 
+# Striping ---------------------------------------------------------------------------------------------------------
+# Every spilled region can be split over several local disks, each read on its own threads, so a block arrives at
+# their summed bandwidth (Colab A100 High-RAM: local NVMe 0.74 GB/s + boot persistent disk 0.38 GB/s, 1.12 together).
+# Auto: only beside a primary spill directory on a real block device, only other real block devices (a different
+# disk, rw, room for their share), split by each one's measured O_DIRECT read speed. 0 = one file; a list of
+# directories (os.pathsep separated) stripes over exactly those.
+_STRIPE_ENV = "UNSLOTH_OFFLOAD_DISK_STRIPE"
+# A disk slower than this share of the summed speed is left out: its part would finish last.
+_STRIPE_MIN_SHARE = 0.15
+_PROBE_BYTES = 512 << 20
+_PROBE_SPEEDS = {}
+# A disk added beside the primary is often the boot disk, which also holds the user's files (checkpoints, the
+# Hugging Face cache): its share is taken only while this much of it stays free after.
+_STRIPE_KEEP_FREE_BYTES = 20 << 30
+_STRIPE_KEEP_FREE_FRACTION = 0.10
+
+
+def _keeps_free(directory, need_bytes):
+    """True when `directory` holds `need_bytes` and still keeps the larger of 20 GiB or 10% of its disk free."""
+    try:
+        st = os.statvfs(directory)
+    except (OSError, AttributeError):
+        return False
+    keep = max(_STRIPE_KEEP_FREE_BYTES, int(_STRIPE_KEEP_FREE_FRACTION * st.f_blocks * st.f_frsize))
+    return st.f_bavail * st.f_frsize >= need_bytes + keep
+
+
+def _block_disk(source):
+    """The whole disk behind a /dev block source (a partition maps to its parent), or None if not a block device."""
+    if not source or not source.startswith("/dev/") or source.startswith("/dev/loop"):
+        return None
+    name = os.path.basename(os.path.realpath(source))
+    sysdir = os.path.realpath(os.path.join("/sys/class/block", name))
+    if os.path.exists(os.path.join(sysdir, "partition")):
+        return os.path.basename(os.path.dirname(sysdir))
+    return name
+
+
+def _mounts():
+    """[(mount point, fs type, source, options)] from /proc/mounts."""
+    out = []
+    try:
+        with open("/proc/mounts", "r", encoding = "utf-8", errors = "replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 4:
+                    out.append((parts[1].replace("\\040", " "), parts[2], parts[0], parts[3].split(",")))
+    except OSError:
+        pass
+    return out
+
+
+def _dev(path):
+    return os.stat(path).st_dev
+
+
+def _real_disk_dir(directory):
+    """The disk name when `directory` sits on a real local block device (no overlay, loop, network or RAM fs)."""
+    kind, source = _fs_source(directory)
+    if kind is None or kind in _LAYERED_FS or kind in _RAM_FS:
+        return None
+    return _block_disk(source)
+
+
+def _stripe_candidates(primary):
+    """Directories on other real local disks than the primary's, one per disk (directory mounts only)."""
+    disk = _real_disk_dir(primary)
+    if disk is None:
+        return []
+    try:
+        seen_dev = {_dev(primary)}
+    except OSError:
+        return []
+    seen_disk, out = {disk}, []
+    for mnt, kind, source, opts in _mounts():
+        if "rw" not in opts or kind in _LAYERED_FS or kind in _RAM_FS:
+            continue
+        d = _block_disk(source)
+        if d is None or d in seen_disk:
+            continue
+        try:
+            dev = _dev(mnt)
+            if not os.path.isdir(mnt) or dev in seen_dev or not os.access(mnt, os.W_OK):
+                continue
+        except OSError:
+            continue
+        seen_disk.add(d)
+        seen_dev.add(dev)
+        out.append(mnt)
+    return out
+
+
+def _read_speed(directory):
+    """O_DIRECT read GB/s of a fresh file in `directory` (64 MiB reads, 4 in flight, as the disk tier reads), or
+    None where O_DIRECT is refused. Measured once per directory per process."""
+    if directory in _PROBE_SPEEDS:
+        return _PROBE_SPEEDS[directory]
+    speed = None
+    try:
+        f = SpillFile(_PROBE_BYTES, directory = directory)
+        try:
+            if f.direct:
+                chunk = 64 << 20
+                owner, buf = _aligned_empty(chunk * 4, pin = False)
+                buf.fill_(0x5A)
+                for off in range(0, _PROBE_BYTES, chunk * 4):
+                    f.write_region([(buf, 0)], chunk * 4)
+                t0 = time.perf_counter()
+                with ThreadPoolExecutor(max_workers = 4) as ex:
+                    list(ex.map(lambda k: f.read(k * chunk, buf[(k % 4) * chunk:(k % 4 + 1) * chunk]),
+                                range(_PROBE_BYTES // chunk)))
+                speed = _PROBE_BYTES / 1e9 / max(time.perf_counter() - t0, 1e-6)
+                del owner, buf
+        finally:
+            f.close()
+    except OSError:
+        speed = None
+    _PROBE_SPEEDS[directory] = speed
+    return speed
+
+
+def _stripe_dirs(need_bytes):
+    """[(directory, weight)] to spill `need_bytes` over; one entry = no striping (today's single file)."""
+    value = os.environ.get(_STRIPE_ENV, "auto").strip()
+    low = value.lower()
+    if low in ("0", "false", "no", "off", "never"):
+        return [(pick_spill_dir(need_bytes), 1.0)]
+    if low in ("", "1", "auto", "true", "yes", "on"):
+        primary = pick_spill_dir(need_bytes)
+        if os.environ.get(_DIR_ENV, "").strip():
+            return [(primary, 1.0)]
+        dirs = [primary] + _stripe_candidates(primary)
+    else:
+        dirs = [d for d in value.split(os.pathsep) if d]
+        primary = dirs[0]
+    if len(dirs) == 1:
+        return [(primary, 1.0)]
+    speeds = [(d, _read_speed(d)) for d in dirs]
+    speeds = [(d, v) for d, v in speeds if v]
+    if not speeds or speeds[0][0] != primary:
+        return [(primary, 1.0)]
+    total = sum(v for _, v in speeds)
+    speeds = [(d, v) for d, v in speeds if d == primary or v >= _STRIPE_MIN_SHARE * total]
+    total = sum(v for _, v in speeds)
+    # Each disk needs room for its share of the spill plus the margin.
+    out = [(d, v / total) for d, v in speeds if d == primary or _keeps_free(d, int(need_bytes * v / total))]
+    total = sum(w for _, w in out)
+    return [(d, w / total) for d, w in out]
+
+
+class StripedSpill:
+    """A spill file split over several disks: each region is cut into per-file parts sized by the disks' read
+    speeds (ALIGN aligned), so its parts finish reading at about the same time. Same interface as SpillFile;
+    `extents` tells the disk tier which file serves which bytes, so each file is read on its own threads."""
+
+    direct = True
+
+    def __init__(self, dirs_weights, need_bytes):
+        self.files = []
+        try:
+            for d, w in dirs_weights:
+                self.files.append(SpillFile(int(need_bytes * w) + ALIGN, directory = d))
+        except BaseException:
+            for f in self.files:
+                f.close()
+            raise
+        self.weights = [w for _, w in dirs_weights]
+        self.direct = all(f.direct for f in self.files)
+        self.directory = " + ".join(f.directory for f in self.files)
+        self.size = 0
+        self.lock = threading.Lock()
+        # Region base -> [(file, file offset, region offset, bytes)]; regions are disjoint virtual ranges.
+        self.regions = {}
+        self.bases = []
+
+    @property
+    def fd(self):
+        return None if any(f.fd is None for f in self.files) else self.files[0].fd
+
+    @property
+    def written(self):
+        return sum(f.written for f in self.files)
+
+    def has_room(self, need_bytes):
+        return all((_has_room if k == 0 else _keeps_free)(f.directory, int(need_bytes * w))
+                   for k, (f, w) in enumerate(zip(self.files, self.weights)))
+
+    def _split(self, total, caps = None):
+        """Bytes per file for `total` (ALIGN multiples summing to it), by weight, each at most caps[i]."""
+        k = len(self.files)
+        caps = caps or [None] * k
+        parts = [0] * k
+        left = total
+        for i in range(k - 1):
+            n = min(left, int(total * self.weights[i]) // ALIGN * ALIGN)
+            if caps[i] is not None:
+                n = min(n, caps[i])
+            parts[i] = n
+            left -= n
+        parts[-1] = left
+        # Over a cap (a rewrite into shorter old parts): move the excess to files with room left.
+        for i in range(k):
+            if caps[i] is not None and parts[i] > caps[i]:
+                extra, parts[i] = parts[i] - caps[i], caps[i]
+                for j in range(k):
+                    room = (caps[j] - parts[j]) if caps[j] is not None else extra
+                    m = min(extra, max(0, room))
+                    parts[j] += m
+                    extra -= m
+                if extra:
+                    raise ValueError("Unsloth: a striped spill rewrite is longer than the region it replaces.")
+        return parts
+
+    @staticmethod
+    def _shift(pieces, delta):
+        return [(t, off - delta) for t, off in pieces]
+
+    def write_region(self, pieces, region_bytes, at = None):
+        total = _round_up(region_bytes)
+        if at is not None and int(at) in self.regions:
+            # A whole region rewritten shorter (an encoding over the raw bytes): re-split it by weight inside
+            # its old parts, so the files stay balanced.
+            base = int(at)
+            old = self.regions[base]
+            caps = [sum(n for f, _, _, n in old if f is g) for g in self.files]
+            first = {}
+            for f, foff, _, n in old:
+                first.setdefault(id(f), foff)
+            parts = self._split(total, caps)
+            ext, voff = [], 0
+            for f, n in zip(self.files, parts):
+                if n:
+                    foff = first[id(f)]
+                    f.write_region(self._shift(pieces, voff), n, at = foff)
+                    ext.append((f, foff, voff, n))
+                    voff += n
+            with self.lock:
+                self.regions[base] = ext
+            return base
+        if at is not None:
+            # A sub-range of a region (a tail the load-time spill reserved): written through its current extents.
+            at = int(at)
+            for f, foff, lo, n in self.extents(at, total):
+                f.write_region(self._shift(pieces, lo), n, at = foff)
+            return at
+        with self.lock:
+            base = self.size
+            self.size += total
+            self.bases.append(base)
+        ext, voff = [], 0
+        for f, n in zip(self.files, self._split(total)):
+            if n:
+                foff = f.write_region(self._shift(pieces, voff), n)
+                ext.append((f, foff, voff, n))
+                voff += n
+        with self.lock:
+            self.regions[base] = ext
+        return base
+
+    def extents(self, offset, nbytes):
+        """[(file, file offset, offset relative to `offset`, bytes)] covering [offset, offset + nbytes); bytes no
+        part maps (past a shortened rewrite) are absent and read as zeros."""
+        import bisect
+        end, out = offset + nbytes, []
+        k = max(0, bisect.bisect_right(self.bases, offset) - 1)
+        for base in self.bases[k:]:
+            if base >= end:
+                break
+            for f, foff, v, n in self.regions.get(base, ()):
+                lo, hi = max(base + v, offset), min(base + v + n, end)
+                if lo < hi:
+                    out.append((f, foff + lo - base - v, lo - offset, hi - lo))
+        return out
+
+    def read(self, offset, dst):
+        n = dst.numel()
+        covered = []
+        for f, foff, rel, m in self.extents(offset, n):
+            f.read(foff, dst[rel:rel + m])
+            covered.append((rel, rel + m))
+        pos = 0
+        for lo, hi in sorted(covered):
+            if lo > pos:
+                dst[pos:lo].zero_()
+            pos = max(pos, hi)
+        if pos < n:
+            dst[pos:].zero_()
+
+    def close(self):
+        for f in self.files:
+            f.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _new_spill(need_bytes):
+    dirs = _stripe_dirs(need_bytes)
+    if len(dirs) == 1:
+        return SpillFile(need_bytes, directory = dirs[0][0])
+    return StripedSpill(dirs, need_bytes)
+
+
 def _shared_spill(need_bytes):
     """One spill file per process: layers spilled at load and at install share it. Reused only while its directory
     still holds `need_bytes` plus the margin; else a fresh pick (another directory, or the refusal)."""
     store = live_spill()
-    if store is None or not _has_room(store.directory, need_bytes):
-        store = SpillFile(need_bytes)
+    room = (store.has_room(need_bytes) if isinstance(store, StripedSpill) else _has_room(store.directory, need_bytes)) \
+        if store is not None else False
+    if not room:
+        store = _new_spill(need_bytes)
         _SPILL[:] = [weakref.ref(store)]
     return store
 
@@ -525,6 +834,9 @@ class DiskTier:
         self.inflight = deque()                    # blocks being read (or read, card copy not enqueued yet)
         self.orphans = []                          # (staging slot, futures) of reads whose block was evicted
         self.pool = ThreadPoolExecutor(max_workers = _qd(), thread_name_prefix = "unsloth_disk")
+        # A striped spill's files each get their own readers, so every disk works on every block.
+        self.pools = {}
+        self.file_bytes = {}
         self.chunk = _chunk()
         self.reads = 0
         self.read_bytes = 0
@@ -535,23 +847,48 @@ class DiskTier:
     def host_bytes(self):
         return sum(r[1].numel() for r in self.ring)
 
-    def _read_run(self, store, offset, dst):
+    def _read_run(self, store, offset, dst, key = None):
         t0 = time.perf_counter()
         store.read(offset, dst)
         dt = (time.perf_counter() - t0) * 1000.0
         with self._lock:
             self.read_ms += dt
             self.read_bytes += dst.numel()
+            if key is not None:
+                self.file_bytes[key] = self.file_bytes.get(key, 0) + dst.numel()
+
+    def _pool_for(self, f):
+        pool = self.pools.get(id(f))
+        if pool is None:
+            pool = self.pools[id(f)] = (ThreadPoolExecutor(max_workers = _qd(), thread_name_prefix = "unsloth_disk"), f)
+        return pool[0]
 
     def _start(self, block, sid):
         block.stage = sid
         stage = self.ring[sid][1]
         futs = []
+        store = block.disk_store
         for file_off, length, stage_off in block.disk_runs:
+            if isinstance(store, StripedSpill):
+                # Each file's part in chunks on that file's readers, submitted round robin across the files.
+                queues = []
+                for f, foff, rel, m in store.extents(file_off, length):
+                    q, pos = [], 0
+                    while pos < m:
+                        n = min(self.chunk, m - pos)
+                        q.append((f, foff + pos, stage[stage_off + rel + pos:stage_off + rel + pos + n]))
+                        pos += n
+                    queues.append(q)
+                for k in range(max((len(q) for q in queues), default = 0)):
+                    for q in queues:
+                        if k < len(q):
+                            f, off, dst = q[k]
+                            futs.append(self._pool_for(f).submit(self._read_run, f, off, dst, f.directory))
+                continue
             pos = 0
             while pos < length:
                 n = min(self.chunk, length - pos)
-                futs.append(self.pool.submit(self._read_run, block.disk_store, file_off + pos,
+                futs.append(self.pool.submit(self._read_run, store, file_off + pos,
                                              stage[stage_off + pos:stage_off + pos + n]))
                 pos += n
         block.disk_futs = futs
@@ -697,6 +1034,9 @@ class DiskTier:
         except Exception:
             pass
         self.pool.shutdown(wait = True)
+        for pool, _ in self.pools.values():
+            pool.shutdown(wait = True)
+        self.pools = {}
         self.ring = []
 
 
