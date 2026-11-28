@@ -21,6 +21,11 @@ exactly like its slot on the card, in the weights' own storage format (4-bit, pa
 A fetch reads the layer with O_DIRECT, so no page cache competes with the pinned host tier, into a small pinned
 staging ring on worker threads, then copies it to the card's slot on the swap's copy stream.
 Only used where host RAM would otherwise refuse the offload; UNSLOTH_OFFLOAD_DISK=0 restores that refusal.
+
+Weights whose bytes are already in a safetensors file of the model's checkpoint (as loaded, not transformed) are not
+copied: CheckpointRegion serves them from the shard files in place, matched and verified byte for byte once when
+the layer goes to disk. Only weights the loader changed (a quantization, a fused or transposed tensor) are spilled.
+UNSLOTH_OFFLOAD_DISK_INPLACE=0 always spills.
 """
 
 import os
@@ -47,6 +52,11 @@ __all__ = [
     "disk_ref",
     "read_bytes",
     "consume_cuda_error",
+    "inplace_reason",
+    "CheckpointIndex",
+    "CheckpointRegion",
+    "checkpoint_index",
+    "inplace_region",
 ]
 
 ALIGN = 4096
@@ -55,6 +65,7 @@ _DIR_ENV = "UNSLOTH_OFFLOAD_DISK_DIR"
 _LIMIT_ENV = "UNSLOTH_OFFLOAD_HOST_LIMIT"
 _QD_ENV = "UNSLOTH_OFFLOAD_DISK_QD"
 _CHUNK_ENV = "UNSLOTH_OFFLOAD_DISK_CHUNK_MB"
+_INPLACE_ENV = "UNSLOTH_OFFLOAD_DISK_INPLACE"
 _WRITE_CHUNK = 64 << 20
 _MARGIN_BYTES = 2 << 30
 # Filesystems that live in RAM: spilling there costs the RAM it is meant to save.
@@ -452,11 +463,18 @@ def _shared_spill(need_bytes):
     return store
 
 
-def spill_params(params, layout, region_bytes, need_bytes = None, store = None):
+def spill_params(params, layout, region_bytes, need_bytes = None, store = None, index = None):
     """Write `params` (at their `layout` offsets in one region) to the spill file and turn each into a one-element
-    placeholder tagged with its DiskRef. The originals' storages go once nothing else holds them."""
-    store = store or _shared_spill(need_bytes if need_bytes is not None else region_bytes)
-    base = store.write_region([(p.data, off) for p, off in zip(params, layout)], region_bytes)
+    placeholder tagged with its DiskRef. The originals' storages go once nothing else holds them. With a checkpoint
+    `index`, weights found in its files byte for byte are served from there instead (only the rest is written)."""
+    base = 0
+    if store is None and index is not None:
+        store = inplace_region(index, params, layout, region_bytes)
+    if store is None:
+        store = _shared_spill(need_bytes if need_bytes is not None else region_bytes)
+        base = store.write_region([(p.data, off) for p, off in zip(params, layout)], region_bytes)
+    elif not isinstance(store, CheckpointRegion):
+        base = store.write_region([(p.data, off) for p, off in zip(params, layout)], region_bytes)
     with torch.no_grad():
         for p, off in zip(params, layout):
             hold = placeholder_like(p.data)
@@ -680,3 +698,308 @@ def read_bytes(store, offset, nbytes):
     owner, buf = _aligned_empty(max(hi - lo, ALIGN), pin = False)
     store.read(lo, buf[:hi - lo] if hi > lo else buf)
     return buf[offset - lo:offset - lo + nbytes], owner
+
+
+# In-place reads from the checkpoint --------------------------------------------------------------------------------
+
+_FP_BYTES = 16                 # prefix of each checkpoint tensor used to find candidates
+_VERIFY_CHUNK = 64 << 20
+_MAX_CANDIDATES = 8            # tensors with the same prefix tried per position (repeated content)
+
+
+def inplace_reason():
+    """Why disk-tier weights cannot be read in place from the checkpoint here, or None."""
+    value = os.environ.get(_INPLACE_ENV, "auto").strip().lower()
+    if value in ("0", "false", "no", "off", "never"):
+        return f"{_INPLACE_ENV}=0"
+    return disk_tier_reason()
+
+
+def _safetensors_entries(path):
+    """[(absolute data offset, nbytes)] of a safetensors file's tensors, from its header (u64 length + JSON)."""
+    import json
+    import struct
+    with open(path, "rb") as f:
+        head = f.read(8)
+        if len(head) != 8:
+            return []
+        (n,) = struct.unpack("<Q", head)
+        if n <= 0 or n > (256 << 20):
+            return []
+        meta = json.loads(f.read(n))
+    out = []
+    for name, info in meta.items():
+        if name == "__metadata__" or not isinstance(info, dict):
+            continue
+        lo, hi = (int(x) for x in info.get("data_offsets", (0, 0)))
+        if hi > lo:
+            out.append((8 + n + lo, hi - lo))
+    return out
+
+
+class _CkptFile:
+    """One checkpoint shard, opened read only (buffered: tensors start at any byte, O_DIRECT needs 4 KiB)."""
+    __slots__ = ("path", "fd", "size", "__weakref__")
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDONLY)
+        self.size = os.fstat(self.fd).st_size
+
+    def read_into(self, offset, dst, drop = False):
+        mv = memoryview(dst.numpy())
+        n, done = dst.numel(), 0
+        while done < n:
+            got = os.preadv(self.fd, [mv[done:]], offset + done)
+            if got <= 0:
+                raise OSError(f"Unsloth: short read from the checkpoint file {self.path} at {offset + done}")
+            done += got
+        if drop:
+            # Training reads every disk layer twice a step: keep the page cache for the host tier.
+            try:
+                os.posix_fadvise(self.fd, offset, n, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+
+    def close(self, _close = os.close):
+        fd, self.fd = getattr(self, "fd", None), None
+        if fd is not None:
+            try:
+                _close(fd)
+            except OSError:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class CheckpointIndex:
+    """The tensors of a model's safetensors files: where each one's bytes start, found by their first bytes."""
+
+    def __init__(self, paths):
+        self.files, self.entries = [], []
+        self.directory = os.path.dirname(os.path.realpath(paths[0])) if paths else None
+        for path in paths:
+            try:
+                entries = _safetensors_entries(path)
+                f = _CkptFile(path) if entries else None
+            except (OSError, ValueError):
+                continue
+            if f is None:
+                continue
+            self.files.append(f)
+            self.entries += [(f, off, n) for off, n in entries if n >= _FP_BYTES and off + n <= f.size]
+        self._fp = None
+        self._scratch = None
+        self.verified_bytes = 0
+
+    def _fingerprints(self):
+        if self._fp is None:
+            fp, key = {}, torch.empty(_FP_BYTES, dtype = torch.uint8)
+            for f, off, n in self.entries:
+                f.read_into(off, key)
+                fp.setdefault(key.numpy().tobytes(), []).append((f, off, n))
+            self._fp = fp
+        return self._fp
+
+    def _equal(self, f, offset, flat):
+        """File bytes at `offset` equal uint8 `flat` (any device), compared in chunks."""
+        if self._scratch is None:
+            self._scratch = (torch.empty(_VERIFY_CHUNK, dtype = torch.uint8),
+                             torch.empty(_VERIFY_CHUNK, dtype = torch.uint8))
+        disk, host = self._scratch
+        done, total = 0, flat.numel()
+        while done < total:
+            k = min(_VERIFY_CHUNK, total - done)
+            f.read_into(offset + done, disk[:k])
+            piece = flat[done:done + k]
+            if piece.device.type != "cpu":
+                host[:k].copy_(piece)
+                piece = host[:k]
+            self.verified_bytes += k
+            if not torch.equal(disk[:k], piece):
+                return False
+            done += k
+        return True
+
+    def match(self, flat):
+        """[(file, file offset, nbytes, offset in flat)] whose bytes are uint8 `flat` exactly, or None. `flat` may
+        be one tensor of the file, the first part of one, or several back to back (stacked experts)."""
+        fp = self._fingerprints()
+        key = torch.empty(_FP_BYTES, dtype = torch.uint8)
+        n, pos, out = flat.numel(), 0, []
+        while pos < n:
+            if n - pos < _FP_BYTES:
+                return None
+            key.copy_(flat[pos:pos + _FP_BYTES])
+            cands = fp.get(key.numpy().tobytes())
+            if not cands:
+                return None
+            if out:
+                # The next tensor of the same file first: a stacked weight is usually laid out like the file.
+                f0, o0, n0, _ = out[-1]
+                cands = sorted(cands, key = lambda c: not (c[0] is f0 and c[1] == o0 + n0))
+            for f, off, m in cands[:_MAX_CANDIDATES]:
+                take = min(m, n - pos)
+                if self._equal(f, off, flat[pos:pos + take]):
+                    if out and out[-1][0] is f and out[-1][1] + out[-1][2] == off and out[-1][3] + out[-1][2] == pos:
+                        f0, o0, n0, p0 = out.pop()
+                        out.append((f0, o0, n0 + take, p0))
+                    else:
+                        out.append((f, off, take, pos))
+                    pos += take
+                    break
+            else:
+                return None
+        return out
+
+    def release_scratch(self):
+        self._scratch = None
+
+
+class CheckpointRegion:
+    """A swapped layer's region read in place: extents (region offset, bytes, source, source offset) over the
+    checkpoint files, unmapped bytes read as zeros. Writes (weights kept in RAM at load, an encoding) never touch
+    the checkpoint: they go to the spill file and are mapped over the region."""
+
+    direct = False
+
+    def __init__(self, index, size):
+        self.index = index
+        self.size = _round_up(size)
+        self.directory = index.directory
+        self.starts, self.ext = [], []
+        self.written = 0
+        self.ckpt_bytes = 0
+        self.lock = threading.Lock()
+
+    def _carve(self, lo, hi):
+        keep = []
+        for v, n, src, off in self.ext:
+            if v + n <= lo or v >= hi:
+                keep.append((v, n, src, off))
+                continue
+            if v < lo:
+                keep.append((v, lo - v, src, off))
+            if v + n > hi:
+                keep.append((hi, v + n - hi, src, off + hi - v))
+        self.ext = keep
+
+    def map(self, voff, nbytes, src, offset):
+        with self.lock:
+            self._carve(voff, voff + nbytes)
+            self.ext.append((int(voff), int(nbytes), src, int(offset)))
+            self.ext.sort(key = lambda e: e[0])
+            self.starts = [e[0] for e in self.ext]
+            self.ckpt_bytes = sum(n for _, n, s, _ in self.ext if isinstance(s, _CkptFile))
+
+    def write_region(self, pieces, region_bytes, at = None):
+        """Like SpillFile.write_region, through the spill file: the region's bytes there now come from the spill."""
+        spill = _shared_spill(region_bytes)
+        base = spill.write_region(pieces, region_bytes)
+        with self.lock:
+            if at is None:
+                at = self.size
+                self.size += _round_up(region_bytes)
+        self.map(at, region_bytes, spill, base)
+        self.written += _round_up(region_bytes)
+        return int(at)
+
+    def read(self, offset, dst):
+        """Fill uint8 `dst` from region `offset` (any offset and length)."""
+        import bisect
+        n = dst.numel()
+        end, covered = offset + n, offset
+        k = max(0, bisect.bisect_right(self.starts, offset) - 1)
+        for v, m, src, off in self.ext[k:]:
+            if v >= end:
+                break
+            if v + m <= offset:
+                continue
+            lo, hi = max(v, offset), min(v + m, end)
+            if lo > covered:
+                dst[covered - offset:lo - offset].zero_()
+            piece = dst[lo - offset:hi - offset]
+            if isinstance(src, _CkptFile):
+                src.read_into(off + lo - v, piece, drop = True)
+            else:
+                buf, owner = read_bytes(src, off + lo - v, hi - lo)
+                piece.copy_(buf)
+                del owner
+            covered = hi
+        if covered < end:
+            dst[covered - offset:].zero_()
+
+    def close(self):
+        pass
+
+
+def inplace_region(index, params, layout, region_bytes):
+    """A CheckpointRegion holding `params` at their `layout` offsets, or None when none is in the checkpoint.
+    Weights not found are written to the spill file and mapped in."""
+    region = CheckpointRegion(index, region_bytes)
+    missing = []
+    for p, off in zip(params, layout):
+        data = p.data
+        ext = None
+        if data.numel() and data.is_contiguous() and data.device.type != "meta":
+            ext = index.match(data.detach().reshape(-1).view(torch.uint8))
+        if ext is None:
+            missing.append((p, off))
+            continue
+        for f, foff, n, poff in ext:
+            region.map(off + poff, n, f, foff)
+    index.release_scratch()
+    if not region.ckpt_bytes:
+        return None
+    for p, off in missing:
+        region.write_region([(p.data, 0)], p.data.nbytes, at = off)
+    return region
+
+
+# Checkpoint files -> their index; weak, so the shard file descriptors close with the last region using them.
+_INDEXES = weakref.WeakValueDictionary()
+
+
+def _checkpoint_files(model):
+    """The .safetensors files `model` was loaded from (a local directory, or the Hugging Face cache), else []."""
+    import glob
+    config = getattr(model, "config", None)
+    name = getattr(model, "name_or_path", None) or getattr(config, "_name_or_path", None)
+    if not isinstance(name, str) or not name:
+        return []
+    folder = name if os.path.isdir(name) else None
+    if folder is None:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            revision = getattr(config, "_commit_hash", None)
+            for fname in ("model.safetensors.index.json", "model.safetensors"):
+                hit = try_to_load_from_cache(name, fname, revision = revision)
+                if isinstance(hit, str):
+                    folder = os.path.dirname(hit)
+                    break
+        except Exception:
+            return []
+    if folder is None:
+        return []
+    return sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+
+
+def checkpoint_index(model):
+    """The CheckpointIndex of `model`'s safetensors files, or None (in-place reads off, or none found)."""
+    if model is None or inplace_reason() is not None:
+        return None
+    files = _checkpoint_files(model)
+    if not files:
+        return None
+    key = tuple(files)
+    index = _INDEXES.get(key)
+    if index is None:
+        index = CheckpointIndex(files)
+        if not index.files:
+            return None
+        _INDEXES[key] = index
+    return index

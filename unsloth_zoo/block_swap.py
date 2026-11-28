@@ -752,10 +752,16 @@ class _Block:
     def compressible(self):
         return self.disk is None and bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
 
-    def spill(self, encode_device = None):
+    def spill(self, encode_device = None, index = None):
         """Write the weights to the spill file and serve the block from disk; encoded when `encode_device` is
-        given and the codec takes the region."""
+        given and the codec takes the region, else read in place from the checkpoint where `index` finds them."""
         mod = _disk()
+        if not (encode_device is not None and self.disk_compressible()) and index is not None:
+            region = mod.inplace_region(index, self.params, self.layout, self.nbytes())
+            if region is not None:
+                self.set_disk([mod.DiskRef(region, off, p.data.nbytes, p.data.shape, p.data.dtype)
+                               for p, off in zip(self.params, self.layout)])
+                return
         store = mod._shared_spill(self.nbytes())
         if encode_device is not None and self.disk_compressible():
             # Outside inference mode: the encoder writes its output over this scratch.
@@ -1044,6 +1050,8 @@ class BlockSwap:
     _disk_tier = None
     _disk_seen = {}
     _disk_decoders = {}
+    _owner = None
+    _ckpt_index = None
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
@@ -1137,6 +1145,7 @@ class BlockSwap:
             except TypeError:  # a plain list of layers
                 owner = None
             owner = owner() if owner is not None else None
+        self._owner = weakref.ref(owner) if owner is not None else None
         host_storages, users = _creditable_host_storages(swapped, layers, owner)
         # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
         file_backed = _file_backed_ranges()
@@ -1333,8 +1342,14 @@ class BlockSwap:
         if spread is not None and sum(self.blocks[k].nbytes() for k in movable if k not in spread) \
                 + sum(b.nbytes() for k, b in enumerate(self.blocks) if b.disk is None and k not in movable) <= budget:
             spill = spread
-        # Held until remove(): the shared file is weakly referenced, and the blocks only take it as they spill.
-        self._spill_hold = mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
+        index_of = getattr(mod, "checkpoint_index", None)
+        owner = getattr(self, "_owner", None)
+        owner = owner() if owner is not None else None
+        self._ckpt_index = index_of(owner) if index_of is not None and owner is not None else None
+        if self._ckpt_index is None:
+            # Held until remove(): the shared file is weakly referenced, and the blocks only take it as they spill.
+            # Read in place, a layer takes spill room only for weights the checkpoint does not hold as loaded.
+            self._spill_hold = mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
         self._to_spill = spill
         return True
 
@@ -1347,6 +1362,10 @@ class BlockSwap:
         store = disk[0].disk_store
         packed = (f", stored losslessly compressed as {stored / 2**30:.2f} GiB" if any(b.compressed() for b in disk)
                   else "")
+        region = getattr(_disk(), "CheckpointRegion", None)
+        inplace = sum(b.disk_store.ckpt_bytes for b in disk if region is not None and isinstance(b.disk_store, region))
+        if inplace:
+            packed += f", {inplace / 2**30:.2f} GiB of it read in place from the checkpoint files (no copy)"
         print(f"Unsloth: offload_layers serves {len(disk)} of {len(self.blocks)} swapped layers "
               f"({nbytes / 2**30:.2f} GiB{packed}) from disk at {store.directory}, since GPU and host RAM cannot hold "
               f"them ({self.ram_bytes() / 2**30:.2f} GiB stay in host RAM). Each forward and each backward reads them "
@@ -1571,7 +1590,7 @@ class BlockSwap:
             return False
         dec = self._disk_decoders.get(torch.device(next(iter(b.sizes)))) if self._disk_decoders and b.sizes else None
         if b.disk is None:
-            b.spill(encode_device = dec.device if dec is not None else None)
+            b.spill(encode_device = dec.device if dec is not None else None, index = self._ckpt_index)
         elif dec is not None:
             b.encode_disk(dec.device)
         if b.compressed():
@@ -2300,7 +2319,10 @@ class BlockSwap:
         tier = getattr(self, "_disk_tier", None)
         disk = [b for b in self.blocks if getattr(b, "disk", None) is not None]
         out = {"disk_layers": len(disk), "disk_bytes": sum(b.nbytes() for b in disk),
-               "disk_dir": disk[0].disk_store.directory if disk else None}
+               "disk_dir": disk[0].disk_store.directory if disk else None,
+               # Bytes read in place from the checkpoint files, and bytes this process wrote to its spill file.
+               "disk_inplace_bytes": sum(getattr(b.disk_store, "ckpt_bytes", 0) for b in disk),
+               "disk_spill_written": getattr(getattr(_disk(), "live_spill", lambda: None)(), "written", 0)}
         now = tier.stats() if tier is not None else {}
         seen = getattr(self, "_disk_seen", None) or {}
         for k in ("disk_reads", "disk_read_bytes", "disk_read_ms", "disk_wait_ms"):
@@ -2667,9 +2689,9 @@ def _slot_layout(params, devices, tail = ()):
     return layout, sizes
 
 
-def _spill_layer_weights(layer, shared_ids, need_bytes):
+def _spill_layer_weights(layer, shared_ids, need_bytes, index = None):
     """Spill a frozen layer's swappable weights in _Block's slot layout (a fetch is one read); the rest goes to
-    host RAM as usual. Returns the region's bytes."""
+    host RAM as usual. Returns the region's bytes. Weights `index` finds in the checkpoint are read from there."""
     # Small 1-D weights (norms, biases) stay in host RAM: a spill saves nothing there, and a later dtype change
     # (a norm upcast to float32) is then an ordinary in-memory cast; BlockSwap writes them into the region.
     own = [p for _, p in _swappable(layer) if id(p) not in shared_ids]
@@ -2685,7 +2707,7 @@ def _spill_layer_weights(layer, shared_ids, need_bytes):
         off = -(-off // _TAIL_ALIGN) * _TAIL_ALIGN + sum(
             -(-p.numel() * max(_RAM_1D_RESERVE, p.element_size()) // _ALIGN) * _ALIGN for p in tail)
     if params:
-        _disk().spill_params(params, layout, off, need_bytes = need_bytes(off))
+        _disk().spill_params(params, layout, off, need_bytes = need_bytes(off), index = index)
     spilled = {id(p) for p in params}
     with torch.no_grad():
         for p in layer.parameters():
@@ -2876,10 +2898,13 @@ class _HostLoad:
         self.decl, self.kind_ratios = {}, {}
         self.cpu_to_come = 0
         self.disk, self.disk_sizes = set(), []
+        # The checkpoint's index once a layer goes to disk (False: none), so its weights are read in place.
+        self.model_ref, self.ckpt_index = None, None
 
     def bind(self, model):
         if self.layers is not None:
             return
+        self.model_ref = weakref.ref(model)
         layers = find_decoder_layers(model)
         name = next((k for k, m in model.named_modules() if m is layers), None)
         self.layers = layers
@@ -3087,7 +3112,12 @@ class _HostLoad:
                     p.requires_grad_(False)
         others = {id(p) for j, other in enumerate(self.layers) if j != i for p in other.parameters()}
         left = len([j for j in self.indices if j not in self.done])
-        off = _spill_layer_weights(layer, others, lambda first: first * max(1, left))
+        if self.ckpt_index is None:
+            index_of = getattr(mod, "checkpoint_index", None)
+            model = self.model_ref() if self.model_ref is not None else None
+            self.ckpt_index = (index_of(model) if index_of is not None else None) or False
+        off = _spill_layer_weights(layer, others, lambda first: first * max(1, left),
+                                   index = self.ckpt_index or None)
         self.done.add(i)
         self.done_bytes.append(0)
         self.disk.add(i)
