@@ -845,8 +845,8 @@ def _offload_entry(entry, require_pinned = False):
 
     def move(t):
         nonlocal refused
-        if refused:
-            return t
+        if refused or not isinstance(t, torch.Tensor):
+            return t  # None / int outputs (flash attention's unused cumulative lengths, max lengths)
         host = _to_host(t, require_pinned)
         if host is None:
             refused = True

@@ -1408,6 +1408,15 @@ def test_host_pool_refusal_is_latched(monkeypatch):
     assert SA._take_block(0, 8 << 20, require_pinned = True)[0] is None and len(made) == 2
 
 
+def test_offload_entry_keeps_non_tensor_outputs(monkeypatch):
+    _fake_host(monkeypatch)
+    t = torch.ones(4)
+    entry = [("f", "sig", (t, None, 3, t))]
+    assert SA._offload_entry(entry, require_pinned = True)
+    func, sig, out = entry[0]
+    assert isinstance(out[0], SA._OnHost) and out[1] is None and out[2] == 3 and isinstance(out[3], SA._OnHost)
+
+
 def test_dense_layouts():
     assert SA._dense(torch.empty(2, 3, 4))
     # Flash attention's output: (B, H, S, D) shape over (B, S, H, D) memory.
