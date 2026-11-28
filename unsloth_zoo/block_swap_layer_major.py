@@ -216,7 +216,11 @@ def _capture_collector():
 
 
 def _is_capture_hook(hook):
-    """transformers 5.x output-capturing forward hook: it records only while a collector is active."""
+    """transformers 5.x output-capturing forward hook (it records only while a collector is active), or a
+    per-call router recorder that records only its own thread's calls (Unsloth's gpt-oss model forward marks it
+    `_unsloth_router_recorder = (thread id, list)`)."""
+    if getattr(hook, "_unsloth_router_recorder", None) is not None:
+        return True
     return getattr(hook, "__module__", None) == "transformers.utils.output_capturing" and \
         getattr(hook, "__name__", None) == "output_capturing_hook"
 
@@ -1263,6 +1267,13 @@ class _Window:
         active = _capture_collector()
         if active is not None:
             out.append((active, None))
+        me = threading.get_ident()
+        for mod in layer.modules():
+            for hook in mod._forward_hooks.values():
+                rec = getattr(hook, "_unsloth_router_recorder", None)
+                if rec is not None and rec[0] == me and isinstance(rec[1], list):
+                    # One sink per model call; its entries are this layer's recorded router outputs.
+                    out.append(({"router_logits": rec[1]}, [(mod, "router_logits", "hook")]))
         if self.thread_forwards:
             found = {}
             for mod in layer.modules():
@@ -1347,6 +1358,13 @@ class _Window:
                 for mod, key, index in recs:
                     if key not in sinks[ci]:
                         continue
+                    if index == "hook":
+                        sink = sinks[ci][key]
+                        handle = mod.register_forward_hook(
+                            lambda module, args, output, sink = sink: sink.append(
+                                output[0] if isinstance(output, tuple) else output))
+                        installed.append((None, handle))
+                        continue
                     desc = self.thread_forwards[type(mod)]
                     inner = desc.override(mod) or desc.__get__(mod, type(mod))
                     desc.__set__(mod, _capture_wrapper(inner, sinks[ci][key], index))
@@ -1354,7 +1372,10 @@ class _Window:
             yield sinks
         finally:
             for desc, mod in installed:
-                desc.overrides().pop(id(mod), None)
+                if desc is None:
+                    mod.remove()   # a temporary hook handle
+                else:
+                    desc.overrides().pop(id(mod), None)
             if var is not None:
                 var.reset(token)
 

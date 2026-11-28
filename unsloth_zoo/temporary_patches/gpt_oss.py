@@ -4309,8 +4309,13 @@ def patch_GptOssModel():
             router_hooks = []
             if kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
                 all_router_logits = []
+                _recording_thread = threading.get_ident()
                 def _record_router_logits(module, args, output):
-                    all_router_logits.append(output[0] if isinstance(output, tuple) else output)
+                    # Only this call's thread: a layer-major window runs several micro-batches' model calls on
+                    # their own threads at once (block_swap_layer_major reads the sink below).
+                    if threading.get_ident() == _recording_thread:
+                        all_router_logits.append(output[0] if isinstance(output, tuple) else output)
+                _record_router_logits._unsloth_router_recorder = (_recording_thread, all_router_logits)
                 for decoder_layer in self.layers:
                     router = getattr(getattr(decoder_layer, "mlp", None), "router", None)
                     if router is not None:
