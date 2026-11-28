@@ -803,10 +803,34 @@ def _own_rebuild(key, codes, scales, glob, meta):
     return cls(codes, packed_scales = scales, packed_global = glob if has_glob else None, **kwargs)
 
 
+def _autocast_dtype(inputs):
+    """The dtype autocast would run this call's matmuls in (float32 inputs only), else None."""
+    if inputs.dtype != torch.float32:
+        return None
+    device_type = inputs.device.type
+    try:
+        if not torch.is_autocast_enabled(device_type):
+            return None
+        dtype = torch.get_autocast_dtype(device_type)
+    except Exception:
+        return None
+    return dtype if dtype != torch.float32 else None
+
+
+def _autocast_off(device_type):
+    try:
+        return torch.autocast(device_type, enabled = False)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _own_op_impl(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b):
     if type(codes) is not torch.Tensor:
         codes = codes.as_subclass(torch.Tensor)  # an eager call passes the stack itself
-    with torch.no_grad():
+    # Inputs arrive already in the autocast dtype (_own_grouped_linear): an eager call still runs under the caller's
+    # autocast and a compiled one does not, so keep it off here for both to compute the same products.
+    with torch.no_grad(), _autocast_off(inputs.device.type):
         param = _own_rebuild(key, codes, scales, glob, meta)
         return _own_grouped_impl(inputs, param, counts, transpose_b)
 
@@ -877,6 +901,11 @@ def _own_grouped_linear(inputs, param, counts, transpose_b):
     counts = counts.to(device = inputs.device)
     op = _register_own_op()
     key = getattr(type(param), "_unsloth_own_key", None)
+    autocast_dtype = None if op is None else _autocast_dtype(inputs)
+    if autocast_dtype is not None:
+        # What autocast does to the grouped GEMM's operands, done before the op so eager and compiled calls agree
+        # (a custom op's fake output keeps its input dtype; its backward casts dX back to float32).
+        inputs = inputs.to(autocast_dtype)
     meta = None if op is None or key is None else _own_op_meta(param)
     if meta is None:
         return torch.compiler.disable(_OwnPackedGroupedLinear.apply)(inputs, param, counts, bool(transpose_b))

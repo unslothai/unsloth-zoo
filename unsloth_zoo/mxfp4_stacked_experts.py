@@ -211,6 +211,9 @@ def _chunked_grouped_mm_on_device(inputs, param, counts, dtype, transpose, step,
         last = min(E, first + step)
         weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
         part = _grouped_mm(inputs, weight, ends[first:last].contiguous())
+        if part.shape[0] < M:
+            # The per-expert loop fallback returns rows only through the chunk's last end.
+            part = torch.nn.functional.pad(part, (0, 0, 0, M - part.shape[0]))
         lo = ends[first - 1] if first > 0 else ends.new_zeros(())
         keep = (row >= lo) & (row < ends[last - 1])
         out = torch.where(keep, part, out)

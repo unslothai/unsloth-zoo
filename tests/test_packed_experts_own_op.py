@@ -278,3 +278,45 @@ def test_own_format_under_inductor_cuda_graphs():
         out = compiled(x, counts)
     torch.testing.assert_close(out, f(x, counts))
     assert counters["inductor"].get("cudagraph_skips", 0) == 0
+
+
+def test_multi_chunk_in_a_graph_decode_step_with_the_loop_fallback():
+    # On CPU the zoo's grouped GEMM is the per-expert loop, whose output stops at the last offset it is given.
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+    x = torch.randn(9, 64)
+    one = pe.packed_expert_grouped_linear(x, param, counts, True)
+    import unsloth_zoo.mxfp4_stacked_experts as stacked
+    original = stacked._chunk_bytes
+    stacked._chunk_bytes = lambda: 32 * 64 * 4  # one expert per chunk
+    try:
+        with graph_generate(), graph_decode_step():
+            device = pe.packed_expert_grouped_linear(x, param, counts, True)
+    finally:
+        stacked._chunk_bytes = original
+    torch.testing.assert_close(device, one)
+
+
+@needs_tracing
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_float32_inputs_under_autocast_match_eager_when_compiled(backend):
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+
+    def f(x, counts):
+        return pe.packed_expert_grouped_linear(x, param, counts, True)
+
+    x = torch.randn(9, 64, requires_grad = True)
+    x2 = x.detach().clone().requires_grad_(True)
+    torch._dynamo.reset()
+    compiled = torch.compile(f, backend = backend, fullgraph = True)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        eager = f(x, counts)
+        out = compiled(x2, counts)
+    assert eager.dtype == out.dtype == torch.bfloat16
+    assert torch.equal(out, eager)
+    g = torch.randn_like(eager)
+    eager.backward(g)
+    out.backward(g)
+    assert x.grad.dtype == x2.grad.dtype == torch.float32
+    assert torch.equal(x.grad, x2.grad)
