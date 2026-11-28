@@ -35,6 +35,7 @@ __all__ = [
     "packed_expert_grouped_linear",
     "quantize_experts_nvfp4",
     "nvfp4_weight_quant_method",
+    "mxfp4_weight_quant_method",
     "quantize_experts_mxfp4",
     "quantize_experts_mxfp8",
     "PACKED_EXPERT_STATS",
@@ -780,9 +781,10 @@ def nvfp4_weight_quant_method(method = None):
 
 
 def _nvfp4_block_candidate(blocks, bmax, g, top):
-    """codes, e4m3 scales and fp32 decode of blocks with the block max mapped to ``top`` (6 or 4)."""
-    s = (bmax / top * g[:, None, None]).clamp(max = _E4M3_MAX).to(torch.float8_e4m3fn)
-    decode = s.to(torch.float32) / g[:, None, None]
+    """codes, e4m3 scales and fp32 decode of blocks with the block max mapped to ``top`` (6 or 4); ``g`` broadcasts
+    to ``bmax``."""
+    s = (bmax / top * g).clamp(max = _E4M3_MAX).to(torch.float8_e4m3fn)
+    decode = s.to(torch.float32) / g
     y = torch.where(decode[..., None] > 0, blocks / decode[..., None], torch.zeros_like(blocks))
     return _round_e2m1(y), s, decode
 
@@ -791,6 +793,41 @@ def _e2m1_codes_to_float(codes):
     lut = torch.tensor(_E2M1, dtype = torch.float32, device = codes.device)
     values = lut[(codes & 7).long()]
     return torch.where((codes & 8).bool(), -values, values)
+
+
+def _e2m1_magnitude(a):
+    """Nearest E2M1 magnitude of a >= 0 as a value, equal to ``_e2m1_codes_to_float(_round_e2m1(a))``: the grid steps
+    are 0.5 below 2, 1 below 4 and 2 up to the saturation at 6, and round-half-even of a / step lands on the even code
+    at every midpoint."""
+    a = a.clamp(max = _E2M1_MAX)
+    step = torch.where(a < 2.0, 0.5, torch.where(a < 4.0, 1.0, 2.0)).to(a.dtype)
+    return torch.round(a / step) * step
+
+
+def _block_error(ax, decode):
+    """Squared error per block of ``|x|`` (``ax``) under ``decode``; the sign drops out, so this is bit-equal to the
+    error of the signed codes."""
+    d = decode[..., None]
+    y = torch.where(d > 0, ax / d, torch.zeros_like(ax))
+    return ((_e2m1_magnitude(y) * d - ax) ** 2).sum(dim = -1)
+
+
+def _nvfp4_pick_scales(blocks, bmax, g, method):
+    """Per-block codes and e4m3 scales under global scale ``g`` (broadcast to ``bmax``). ``max6``: max -> 6.
+    ``4over6``: the lower squared error of max -> 6 and max -> 4 (ties keep /6); the errors come from the magnitudes,
+    so only the winning scale is rounded to codes."""
+    if method == "max6":
+        q, s, _ = _nvfp4_block_candidate(blocks, bmax, g, _E2M1_MAX)
+        return q, s
+    codes6 = (bmax / _E2M1_MAX * g).clamp(max = _E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
+    codes4 = (bmax / 4.0 * g).clamp(max = _E4M3_MAX).to(torch.float8_e4m3fn).view(torch.uint8)
+    ax = blocks.abs()
+    err6 = _block_error(ax, codes6.view(torch.float8_e4m3fn).to(torch.float32) / g)
+    err4 = _block_error(ax, codes4.view(torch.float8_e4m3fn).to(torch.float32) / g)
+    s = torch.where(err4 < err6, codes4, codes6).view(torch.float8_e4m3fn)
+    del ax, err6, err4
+    d = (s.to(torch.float32) / g)[..., None]
+    return _round_e2m1(torch.where(d > 0, blocks / d, torch.zeros_like(blocks))), s
 
 
 def quantize_experts_nvfp4(rows, dtype = torch.bfloat16, transposed = False, chunk_experts = 8, method = None):
@@ -816,15 +853,7 @@ def quantize_experts_nvfp4(rows, dtype = torch.bfloat16, transposed = False, chu
         g = g.clamp(max = 2.0 ** 127)
         blocks = w.view(e1 - e0, N, K // NVFP4_GROUP, NVFP4_GROUP)
         bmax = blocks.abs().amax(dim = -1)
-        q, s, decode = _nvfp4_block_candidate(blocks, bmax, g, _E2M1_MAX)
-        if method == "4over6":
-            q4, s4, decode4 = _nvfp4_block_candidate(blocks, bmax, g, 4.0)
-            err6 = ((_e2m1_codes_to_float(q) * decode[..., None] - blocks) ** 2).sum(dim = -1)
-            err4 = ((_e2m1_codes_to_float(q4) * decode4[..., None] - blocks) ** 2).sum(dim = -1)
-            take4 = err4 < err6
-            q = torch.where(take4[..., None], q4, q)
-            s = torch.where(take4, s4.view(torch.uint8), s.view(torch.uint8)).view(torch.float8_e4m3fn)
-            del q4, s4, decode4, err6, err4, take4
+        q, s = _nvfp4_pick_scales(blocks, bmax, g[:, None, None], method)
         codes[e0:e1] = _pack_nibbles(q.reshape(e1 - e0, N, K))
         scales[e0:e1] = s
         glob[e0:e1, 0] = g
@@ -839,9 +868,46 @@ def _mx_exponent(bmax, emax_elem):
     return e.clamp(-127, 127)
 
 
-def quantize_experts_mxfp4(rows, dtype = torch.bfloat16, transposed = False, chunk_experts = 8):
-    """RTN MXFP4 (OCP: e2m1 + e8m0 per 32) of an (E, N, K) stack as an ``Mxfp4ExpertParam``."""
+MXFP4_WEIGHT_QUANT_ENV = "UNSLOTH_MXFP4_WEIGHT_QUANT"   # same name and values as unsloth's MXFP4 quantiser
+_MXFP4_METHODS = {
+    "rtn": "rtn", "ocp": "rtn", "off": "rtn", "0": "rtn",
+    "mse": "mse", "search": "mse", "on": "mse", "1": "mse",
+}
+_MXFP4_DEFAULT_METHOD = "mse"
+
+
+def mxfp4_weight_quant_method(method = None):
+    """MXFP4 shared-exponent rule: ``mse`` (the default: per 32-value block the lower squared error of the OCP exponent
+    and the next one up, which never clips the block max; ties keep the OCP exponent) or ``rtn`` (OCP floor(log2(amax))
+    - 2 only, the block max may clip at 6). ``method`` beats UNSLOTH_MXFP4_WEIGHT_QUANT. Either is valid OCP MXFP4."""
+    raw = method if method is not None else os.environ.get(MXFP4_WEIGHT_QUANT_ENV, "")
+    value = str(raw).strip().lower().replace("-", "_").replace(" ", "")
+    if value == "":
+        return _MXFP4_DEFAULT_METHOD
+    if value not in _MXFP4_METHODS:
+        raise ValueError(f"Unsloth: {MXFP4_WEIGHT_QUANT_ENV}={raw!r} is not one of rtn, mse")
+    return _MXFP4_METHODS[value]
+
+
+def _mxfp4_pick_exponents(w, method):
+    """Codes and e8m0 exponents of (..., 32) blocks ``w`` (fp32) by ``mxfp4_weight_quant_method``."""
+    bmax = w.abs().amax(dim = -1)
+    e = _mx_exponent(bmax, 2)
+    if method == "mse":
+        # Only a block whose max clips at e (bmax > 6 * 2^e) can gain from e + 1: below that the e + 1 grid inside
+        # [0, 6 * 2^e] is a subset of the e grid, so no element gets closer.
+        idx = ((bmax > _E2M1_MAX * torch.exp2(e)) & (e < 127)).nonzero(as_tuple = True)
+        if idx[0].numel():
+            ax, ec = w[idx].abs(), e[idx]
+            e[idx] = torch.where(_block_error(ax, torch.exp2(ec + 1)) < _block_error(ax, torch.exp2(ec)), ec + 1, ec)
+    return _round_e2m1(w / torch.exp2(e)[..., None]), e
+
+
+def quantize_experts_mxfp4(rows, dtype = torch.bfloat16, transposed = False, chunk_experts = 8, method = None):
+    """MXFP4 (OCP: e2m1 + e8m0 per 32) of an (E, N, K) stack as an ``Mxfp4ExpertParam``; ``method`` picks the shared
+    exponent rule (``mxfp4_weight_quant_method``)."""
     from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
+    method = mxfp4_weight_quant_method(method)
     E, N, K = rows.shape
     if K % MX_GROUP:
         raise ValueError(f"Unsloth: MXFP4 needs K divisible by {MX_GROUP}, got {K}")
@@ -851,8 +917,7 @@ def quantize_experts_mxfp4(rows, dtype = torch.bfloat16, transposed = False, chu
     for e0 in range(0, E, chunk_experts):
         e1 = min(E, e0 + chunk_experts)
         w = rows[e0:e1].to(torch.float32).view(e1 - e0, N, G, MX_GROUP)
-        e = _mx_exponent(w.abs().amax(dim = -1), 2)
-        q = _round_e2m1(w / torch.exp2(e)[..., None])
+        q, e = _mxfp4_pick_exponents(w, method)
         blocks[e0:e1] = _pack_nibbles(q)
         scales[e0:e1] = (e + 127).to(torch.uint8)
     return Mxfp4ExpertParam(blocks, mxfp4_scales = scales, mxfp4_transposed = transposed, mxfp4_dtype = dtype)

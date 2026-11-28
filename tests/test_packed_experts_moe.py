@@ -280,3 +280,27 @@ def test_rtn_env_parsing(monkeypatch):
     monkeypatch.setenv(pe.EXPERTS_QUANTIZE_ENV, "int3")
     with pytest.raises(ValueError):
         pe.experts_quantize_format()
+
+
+@pytest.mark.parametrize("layout", ["qwen", "gpt_oss"])
+def test_load_time_mxfp4_follows_the_exponent_search_env(monkeypatch, layout):
+    """UNSLOTH_MXFP4_WEIGHT_QUANT (unset = mse, or rtn) reaches the load-time stack quantizer."""
+    E, H, I = 4, 128, 64
+    g = torch.Generator().manual_seed(5)
+    shapes = ((E, 2 * I, H), (E, H, I)) if layout == "qwen" else ((E, H, 2 * I), (E, I, H))
+    gu, dn = (torch.randn(*s, generator = g).mul(torch.logspace(-2, 0, s[-1])).to(torch.bfloat16) for s in shapes)
+    cls = _QwenExperts if layout == "qwen" else _GptOssLayoutExperts
+    for env, method, other in ((None, "mse", "rtn"), ("rtn", "rtn", "mse")):
+        if env is None:
+            monkeypatch.delenv("UNSLOTH_MXFP4_WEIGHT_QUANT", raising = False)
+        else:
+            monkeypatch.setenv("UNSLOTH_MXFP4_WEIGHT_QUANT", env)
+        model = _Block(cls(nn.Parameter(gu, requires_grad = False), nn.Parameter(dn, requires_grad = False), E, H, I))
+        assert pe.quantize_moe_expert_stacks(model, "mxfp4") == 2
+        for name, dense in (("gate_up_proj", gu), ("down_proj", dn)):
+            rows = dense.transpose(-2, -1) if layout == "gpt_oss" else dense
+            param = model.experts._parameters[name]
+            want = pe.quantize_experts_mxfp4(rows, method = method)
+            alt = pe.quantize_experts_mxfp4(rows, method = other)
+            assert torch.equal(param.data, want.data) and torch.equal(param.mxfp4_scales, want.mxfp4_scales)
+            assert not torch.equal(param.mxfp4_scales, alt.mxfp4_scales)
