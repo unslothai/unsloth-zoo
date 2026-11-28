@@ -231,6 +231,23 @@ def test_secondary_disk_keeps_room_for_the_users_files(monkeypatch, tmp_path):
     assert _disk._keeps_free(str(tmp_path), 19 << 30) and not _disk._keeps_free(str(tmp_path), 21 << 30)
 
 
+def test_dropping_a_disk_rechecks_the_others_larger_shares(monkeypatch, tmp_path):
+    """Three equally fast disks, 180 GiB to spill: 60 GiB each. A secondary that holds 65 GiB is fine at that
+    share, but once the other secondary drops out its share becomes 90 GiB, so it must drop out too."""
+    dirs = [str(tmp_path / n) for n in ("p", "a", "b")]
+    for d in dirs:
+        os.makedirs(d)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK_STRIPE", os.pathsep.join(dirs))
+    for d in dirs:
+        monkeypatch.setitem(_disk._PROBE_SPEEDS, d, 1.0)
+    room = {dirs[1]: 65 << 30, dirs[2]: 10 << 30}
+    monkeypatch.setattr(_disk, "_keeps_free", lambda d, n: n <= room[d])
+    assert _disk._stripe_dirs(180 << 30) == [(dirs[0], 1.0)]
+    room[dirs[1]] = 95 << 30
+    got = _disk._stripe_dirs(180 << 30)
+    assert [d for d, _ in got] == dirs[:2] and abs(got[0][1] - 0.5) < 1e-9
+
+
 def test_list_env_stripes_over_exactly_those_dirs(monkeypatch, tmp_path):
     a, b = tmp_path / "x", tmp_path / "y"
     a.mkdir()

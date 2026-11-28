@@ -599,11 +599,14 @@ def _stripe_dirs(need_bytes):
         return [(primary, 1.0)]
     total = sum(v for _, v in speeds)
     speeds = [(d, v) for d, v in speeds if d == primary or v >= _STRIPE_MIN_SHARE * total]
-    total = sum(v for _, v in speeds)
-    # Each disk needs room for its share of the spill plus the margin.
-    out = [(d, v / total) for d, v in speeds if d == primary or _keeps_free(d, int(need_bytes * v / total))]
-    total = sum(w for _, w in out)
-    return [(d, w / total) for d, w in out]
+    # Each added disk needs room for its share of the spill plus its free floor. Dropping one raises the others'
+    # shares, so check again until every disk left holds its final share (the primary holds the whole spill).
+    while True:
+        total = sum(v for _, v in speeds)
+        keep = [(d, v) for d, v in speeds if d == primary or _keeps_free(d, int(need_bytes * v / total))]
+        if len(keep) == len(speeds):
+            return [(d, v / total) for d, v in speeds]
+        speeds = keep
 
 
 class StripedSpill:
