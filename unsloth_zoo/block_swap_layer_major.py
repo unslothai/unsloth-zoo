@@ -75,6 +75,8 @@ __all__ = [
     "run_layer_major",
     "stall_fraction",
     "swap_totals",
+    "compile_epoch",
+    "COMPILED_IN_WINDOW",
 ]
 
 _STATS = {"windows": 0, "micro_batches": 0, "layer_calls": 0, "recomputes": 0, "aborts": 0, "rng_mismatches": 0,
@@ -387,6 +389,30 @@ def rng_advance(snapshot, consumption):
             out.append((d, state))
         cuda = tuple(out)
     return cpu, cuda
+
+
+# torch.compile state is a hidden input of a step: Dynamo specialises a graph on the first shapes and grad mode it
+# sees and recompiles (with dynamic shapes) on the next ones, so the window's order of first calls (every micro-batch's
+# no-grad forward before any recompute) can pick other graphs, and other kernels, than standard accumulation's for the
+# same call. A window therefore must not compile anything: the caller runs windows only once a standard step compiled
+# nothing, and a window that compiled rolls back.
+COMPILED_IN_WINDOW = "torch.compile built new graphs inside the window"
+
+
+def compile_epoch():
+    """A value that changes whenever Dynamo / AOTAutograd / Inductor compiles something in this process (None when
+    torch._dynamo was never imported)."""
+    utils = sys.modules.get("torch._dynamo.utils")
+    counters = getattr(utils, "counters", None)
+    if counters is None:
+        return None
+    try:
+        inductor = counters.get("inductor", {})
+        return (sum(counters.get("frames", {}).values()), counters.get("stats", {}).get("unique_graphs", 0),
+                sum(counters.get("aot_autograd", {}).values()),
+                sum(v for k, v in inductor.items() if str(k).startswith("fxgraph_cache")))
+    except Exception:
+        return ("unknown",)
 
 
 def _autocast_state():
@@ -1397,6 +1423,7 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
         w.rng_start.append(rng_advance(w.rng_start[-1], planned if planned is not None else ZERO_CONSUMPTION))
     w.rng_cursor, w.rng_end = list(w.rng_start), [None] * n
     w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
+    epoch = compile_epoch()
     try:
         with _intercept(w, layers) as orig_calls:
             events = []
@@ -1439,6 +1466,8 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
             if w.abort_reason is None and any(p.grad is not g or (g is not None and g._version != v)
                                               for p, g, v in watched):
                 w.abort_reason = "a loss part wrote a decoder layer weight's gradient (a regulariser on it)"
+            if w.abort_reason is None and compile_epoch() != epoch:
+                w.abort_reason = f"{COMPILED_IN_WINDOW} (forward: a new micro-batch shape or grad mode)"
     finally:
         # The first-input hooks only watch the loss parts; a reused input tensor must not keep the window alive.
         for handle in w.input_hooks:
@@ -1479,6 +1508,10 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
         del error
         w.saved = w.outs = w.h0 = None
         return roll_back(reason)
+    if compile_epoch() != epoch:
+        # The decoder recompute compiled a graph standard accumulation would have compiled at another point.
+        w.saved = w.outs = w.h0 = None
+        return roll_back(f"{COMPILED_IN_WINDOW} (decoder backward)")
     if not agreement.vote(True):
         w.saved = w.outs = w.h0 = None
         return roll_back(_DISAGREE)

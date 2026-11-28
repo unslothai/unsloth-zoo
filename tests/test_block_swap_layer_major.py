@@ -127,6 +127,11 @@ def _layer_major(model, batches, items, swapper = None):
     model.zero_grad(set_to_none = True)
     fns = [lambda b = b: _step(model, b, items) for b in batches]
     losses, why = lm.run_layer_major(_layers(model), fns, swapper = swapper, model = model)
+    if why is not None and why.startswith(lm.COMPILED_IN_WINDOW):
+        # A compiled helper inside the layers built its no-grad variant in the window (non-reentrant standard
+        # accumulation never runs it without gradients): rolled back; the next window finds it built.
+        assert all(p.grad is None for p in model.parameters())
+        losses, why = lm.run_layer_major(_layers(model), fns, swapper = swapper, model = model)
     assert why is None, why
     return losses, _grads(model)
 
