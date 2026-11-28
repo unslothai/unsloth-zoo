@@ -488,3 +488,32 @@ def test_compiled_first_call_moves_left_behind_companions_onto_the_stack():
     torch.testing.assert_close(out, _reference(x, param, counts, True))
     torch.compile(f, backend = "aot_eager")(x, counts)
     assert param.packed_scales is moved
+
+
+@pytest.mark.parametrize("transpose_b", [True, False])
+def test_own_op_passes_opcheck(transpose_b):
+    # Schema, fake (meta) impl, autograd registration and aliasing, on a plain uint8 operand as a trace passes it.
+    if not hasattr(torch.library, "opcheck"):
+        pytest.skip("torch.library.opcheck needs torch >= 2.4")
+    param = _toy()
+    scales, _ = param._companions()
+    key, meta = type(param)._unsloth_own_key, pe._own_op_meta(param)
+    E, N, K = param.shape
+    x = torch.randn(9, K if transpose_b else N, requires_grad = True)
+    args = (x, param.as_subclass(torch.Tensor), scales, scales.new_empty((0,)), torch.tensor([2, 3, 0, 4]),
+            key, meta, N, K, transpose_b)
+    torch.library.opcheck(torch.ops.unsloth_zoo.packed_experts_own_mm_v1.default, args)
+
+
+def test_kill_switch_is_read_at_call_time(monkeypatch):
+    param = _toy()
+    counts = torch.tensor([2, 3, 0, 4])
+    x = torch.randn(9, 64)
+    seen = []
+    original = pe._OwnPackedGroupedLinear.apply
+    monkeypatch.setattr(pe._OwnPackedGroupedLinear, "apply", lambda *a: seen.append(1) or original(*a))
+    ref = _reference(x, param, counts, True)
+    monkeypatch.setenv("UNSLOTH_PACKED_EXPERT_OWN_OP", "0")
+    assert torch.equal(pe.packed_expert_grouped_linear(x, param, counts, True), ref) and seen == [1]
+    monkeypatch.setenv("UNSLOTH_PACKED_EXPERT_OWN_OP", "1")
+    assert torch.equal(pe.packed_expert_grouped_linear(x, param, counts, True), ref) and seen == [1]

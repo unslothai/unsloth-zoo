@@ -697,8 +697,8 @@ class _PackedGroupedLinear(torch.autograd.Function):
 # Packed stacks of any other format (a ``_PackedExpertParam`` subclass with its own ``_decode``, e.g. Unsloth's GGUF
 # expert stacks) run their own ``packed_grouped_mm`` if they bring one, else the chunked dequantize + grouped GEMM
 # below; callers check these flags before relying on them. PACKED_EXPERT_OWN_GROUPED_OP: those calls run as one
-# custom op (``unsloth_zoo::packed_experts_own_mm``), so torch.compile traces through them without a graph break, and
-# they never sync to host inside a CUDA graph capture.
+# custom op (``unsloth_zoo::packed_experts_own_mm_v1``), so torch.compile traces through them without a graph break, and
+# they never sync to host inside a CUDA graph capture. UNSLOTH_PACKED_EXPERT_OWN_OP=0 restores the eager path.
 PACKED_EXPERT_OWN_GROUPED_LINEAR = True
 PACKED_EXPERT_OWN_GROUPED_MM = True
 PACKED_EXPERT_OWN_GROUPED_OP = True
@@ -847,21 +847,21 @@ def _register_own_op():
     if custom_op is None or not hasattr(torch.library, "register_autograd"):
         return None
     try:
-        op = torch.ops.unsloth_zoo.packed_experts_own_mm.default
+        op = torch.ops.unsloth_zoo.packed_experts_own_mm_v1.default
     except (AttributeError, RuntimeError):
         op = None
     if op is None:
         try:
             # Not cudagraph_unsafe: under a capture every route is free of host syncs (single chunk, fused kernel,
             # or device-side chunk offsets), so Inductor's CUDA graphs keep the whole MoE block.
-            @custom_op("unsloth_zoo::packed_experts_own_mm", mutates_args = ())
-            def packed_experts_own_mm(
+            @custom_op("unsloth_zoo::packed_experts_own_mm_v1", mutates_args = ())
+            def packed_experts_own_mm_v1(
                 inputs: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, glob: torch.Tensor,
                 counts: torch.Tensor, key: str, meta: str, rows: int, cols: int, transpose_b: bool,
             ) -> torch.Tensor:
                 return _own_op_impl(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b)
 
-            @packed_experts_own_mm.register_fake
+            @packed_experts_own_mm_v1.register_fake
             def _(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b):
                 # (E, rows, cols) packed rows: x @ W_e^T has `rows` features, x @ W_e has `cols`.
                 return inputs.new_empty((inputs.shape[0], rows if transpose_b else cols))
@@ -875,14 +875,14 @@ def _register_own_op():
                 codes, scales, glob, counts = ctx.saved_tensors
                 dx = None
                 if ctx.needs_input_grad[0]:
-                    dx = torch.ops.unsloth_zoo.packed_experts_own_mm(
+                    dx = torch.ops.unsloth_zoo.packed_experts_own_mm_v1(
                         grad.contiguous(), codes, scales, glob, counts, ctx.key, ctx.meta, ctx.rows, ctx.cols,
                         not ctx.transpose_b,
                     )
                 return dx, None, None, None, None, None, None, None, None, None
 
-            packed_experts_own_mm.register_autograd(_backward, setup_context = _setup)
-            op = torch.ops.unsloth_zoo.packed_experts_own_mm.default
+            packed_experts_own_mm_v1.register_autograd(_backward, setup_context = _setup)
+            op = torch.ops.unsloth_zoo.packed_experts_own_mm_v1.default
         except Exception:
             return None
     _OWN_OP = op
@@ -900,11 +900,21 @@ def _companions_eagerly(param):
     return param._companions()
 
 
+# Kill switch, read at every eager call; a compiled region keeps the value its trace saw.
+_OWN_OP_ENABLED = [True]
+
+
+def _own_op_enabled():
+    if not torch.compiler.is_compiling():
+        _OWN_OP_ENABLED[0] = os.environ.get("UNSLOTH_PACKED_EXPERT_OWN_OP", "1").strip().lower() not in ("0", "false", "no", "off")
+    return _OWN_OP_ENABLED[0]
+
+
 def _own_grouped_linear(inputs, param, counts, transpose_b):
     if not torch.compiler.is_compiling():
         PACKED_EXPERT_STATS["calls"] += 1
     counts = counts.to(device = inputs.device)
-    op = _register_own_op()
+    op = _register_own_op() if _own_op_enabled() else None
     key = getattr(type(param), "_unsloth_own_key", None)
     autocast_dtype = None if op is None else _autocast_dtype(inputs)
     if autocast_dtype is not None:
