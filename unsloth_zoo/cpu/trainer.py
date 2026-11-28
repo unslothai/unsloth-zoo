@@ -419,26 +419,33 @@ def _patch_cpu_num_items(trainer_cls):
     LM's shifted loss sees (5.x counts labels[..., 1:]). The CPU route keeps stock transformers, so a padded
     single process, DDP or accelerate FSDP2 run divided by that larger count while padding-free, native FSDP2,
     tensor / pipeline / context parallel (which install Unsloth's counter) did not: the same rows gave another
-    loss and gradient. Only causal LM heads: encoder-decoder and classification / QA heads (whose labels are not
-    shifted targets, and which zoo's counter declines) keep transformers' count."""
+    loss and gradient. Only heads with a positive causal-loss signal: masked LM, classification / QA and
+    encoder-decoder heads (whose labels are not shifted targets, and which zoo's counter declines) keep
+    transformers' count."""
     original = getattr(trainer_cls, "get_batch_samples", None)
     if original is None or getattr(original, "_unsloth_cpu", False) \
             or getattr(original, "__name__", "") == "_unsloth_get_batch_samples":
         return False
-    from ..loss_utils import NON_CAUSAL_HEADS, _unsloth_get_batch_samples, _unwrap_training_wrappers
+    from ..loss_utils import (
+        NON_CAUSAL_HEADS, _loss_shifts_labels, _unsloth_get_batch_samples, _unwrap_training_wrappers,
+        counts_unshifted_labels, num_items_labels_convention,
+    )
 
-    def causal_head(model):
+    def causal_head(trainer, model):
+        """A positive causal-loss signal (the head shifts labels, or Unsloth recorded its count convention);
+        masked LM, classification, QA and encoder-decoder heads have none and keep transformers' count."""
         m = _unwrap_training_wrappers(model)
         if hasattr(m, "get_base_model"):
             m = m.get_base_model()
-        if m is None or getattr(getattr(m, "config", None), "is_encoder_decoder", False):
+        if m is None or any(head in type(m).__name__ for head in NON_CAUSAL_HEADS):
             return False
-        name = type(m).__name__
-        return not any(head in name for head in NON_CAUSAL_HEADS)
+        if num_items_labels_convention(model) is not None or counts_unshifted_labels(m):
+            return True
+        return _loss_shifts_labels(trainer, m, bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False)))
 
     @functools.wraps(original)
     def get_batch_samples(self, *args, **kwargs):
-        if not causal_head(getattr(self, "model", None)):
+        if not causal_head(self, getattr(self, "model", None)):
             return original(self, *args, **kwargs)
         return _unsloth_get_batch_samples(self, *args, **kwargs)
 

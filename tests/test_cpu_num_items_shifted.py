@@ -64,7 +64,16 @@ cls_model = LlamaForSequenceClassification(LlamaConfig(
 cls_trainer = Trainer(model = cls_model, args = args, compute_loss_func = lambda outputs, labels, num_items_in_batch = None: outputs.logits.sum())
 cls_batches = [{"input_ids": torch.randint(1, 64, (2, 5)), "labels": torch.tensor([0, 1])} for _ in range(2)]
 _, cls_count = cls_trainer.get_batch_samples(iter(cls_batches), 2, torch.device("cpu"))
+# A masked LM (token-aligned labels, no shift, not in any head list) keeps transformers' count too.
+from transformers import BertConfig, BertForMaskedLM
+mlm_model = BertForMaskedLM(BertConfig(
+    vocab_size = 64, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1, num_attention_heads = 2,
+))
+mlm_trainer = Trainer(model = mlm_model, args = args, compute_loss_func = lambda outputs, labels, num_items_in_batch = None: outputs.logits.sum())
+mlm_batches = [{"input_ids": torch.randint(1, 64, (2, 5)), "labels": torch.randint(1, 64, (2, 5))} for _ in range(2)]
+_, mlm_count = mlm_trainer.get_batch_samples(iter(mlm_batches), 2, torch.device("cpu"))
 print("RESULT " + json.dumps({
+    "mlm_count": None if mlm_count is None else int(mlm_count),
     "cls_count": None if cls_count is None else int(cls_count),
     "count": None if count is None else int(count),
     "shifted": int(sum((b["labels"][:, 1:] != -100).sum() for b in batches)),
@@ -95,6 +104,7 @@ def test_cpu_route_counts_shifted_causal_targets():
     assert res["shifted"] == res["unshifted"] - 4, res  # 4 rows, each supervised from position 0
     assert res["count"] == res["shifted"], res
     assert res["cls_count"] == 4, res  # 2 batches x 2 labels, as stock transformers counts them
+    assert res["mlm_count"] == 20, res  # 2 batches of (2, 5) supervised tokens, unshifted as the loss sees them
 
 
 def test_kill_switch_keeps_transformers_count():
