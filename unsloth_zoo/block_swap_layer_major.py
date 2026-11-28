@@ -748,6 +748,9 @@ class _Window:
         self.layer_devices = [{p.device for p in layer.parameters() if p.is_cuda} for layer in self.layers]
         # Layers whose standard forward runs under grad mode: the window's no-grad forward must match its recompute.
         self.check_values = [False] * self.L
+        # Layers whose standard forward is a non-reentrant checkpoint: the window's forward and recompute go through
+        # that checkpoint too (its own recompute then runs inside the backward, as in standard training).
+        self.through_checkpoint = [False] * self.L
         self.in_backward = False
         self.input_used = [False] * n
 
@@ -864,6 +867,7 @@ class _Window:
             forward = ExitStack()
             forward.enter_context(torch.enable_grad())
             frames = [None, None, None, False]
+            self.through_checkpoint[l] = bool(getattr(layer, "gradient_checkpointing", False) and layer.training)
         with forward:
             if frames[0] is not None:
                 self._abort(frames[0])
@@ -1108,7 +1112,8 @@ class _Window:
                     args2, kwargs2, where, ac, rng, metadata = saved
                     x = args2[0] if where == 0 else kwargs2[where]
                     x.requires_grad_(True)
-                    with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng), \
+                    with torch.enable_grad(), _autocast(ac), \
+                            (nullcontext() if self.through_checkpoint[l] else _checkpointing_off(layer)), _replay_rng(rng), \
                             (attention[0](attention[1], True) if attention is not None else nullcontext()), \
                             _routing_replay(routing), self._capture(aux) as sinks:
                         out = orig_call(layer, *args2, **kwargs2)
