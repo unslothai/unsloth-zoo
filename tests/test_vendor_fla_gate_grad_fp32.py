@@ -77,8 +77,8 @@ _SEQ_IDS_CHILD = textwrap.dedent(
     sys.modules["fla.utils"] = utils
     spec = importlib.util.spec_from_file_location("fla.ops.utils.index", root + "/ops/utils/index.py")
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-    for cu in ([0, 0, 3, 5], [0, 3, 3, 3, 7], [0, 2, 4, 4]):
-        cu = torch.tensor(cu)
+    for cu, dtype in (([0, 0, 3, 5], torch.int64), ([0, 3, 3, 3, 7], torch.int32), ([0, 2, 4, 4], torch.int32)):
+        cu = torch.tensor(cu, dtype = dtype)
         lens = torch.diff(cu)
         want = torch.repeat_interleave(torch.arange(lens.numel()), lens)
         got = mod.prepare_sequence_ids(cu)

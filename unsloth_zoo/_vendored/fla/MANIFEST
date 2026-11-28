@@ -279,9 +279,9 @@ modifications =
         * ops/kda/gate.py (lower-bound gate backward): sigmoid'(x) is computed as
           r / (1 + r)^2 with r = exp(-|x|); s * (1 - s) was 0 once sigmoid rounded
           to 1.0 in fp32.
-        * ops/utils/index.py: prepare_sequence_ids labels tokens from the segment
-          lengths, so zero-length segments in cu_seqlens no longer shift the ids
-          of every later sequence (also fixes prepare_token_indices).
+        * ops/utils/index.py: prepare_sequence_ids counts segment ends with
+          searchsorted, so zero-length segments in cu_seqlens no longer shift the
+          ids of every later sequence (also fixes prepare_token_indices).
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
