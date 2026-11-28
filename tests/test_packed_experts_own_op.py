@@ -466,3 +466,25 @@ def test_an_oom_inside_a_real_capture_still_raises(monkeypatch):
     monkeypatch.setattr(mse, "_dequantize_chunk", dequantize)
     with pytest.raises(torch.cuda.OutOfMemoryError):
         mse._chunked_grouped_mm_on_device(torch.randn(9, 64), param, counts, torch.float32, True, 2, 32)
+
+
+@needs_tracing
+@pytest.mark.skipif(not _CUDA, reason = "needs an NVIDIA CUDA device")
+def test_compiled_first_call_moves_left_behind_companions_onto_the_stack():
+    # Accelerate rebuilds a stack on the GPU but leaves its companions on the CPU; a compiled first call must move
+    # them on the stack itself, not on the op's temporary rebuild (which would copy them on every call).
+    param = _toy(device = "cuda")
+    param.packed_scales = param.packed_scales.cpu()
+    counts = torch.tensor([2, 3, 0, 4], device = "cuda")
+    x = torch.randn(9, 64, device = "cuda", dtype = torch.bfloat16)
+
+    def f(x, counts):
+        return pe.packed_expert_grouped_linear(x, param, counts, True)
+
+    torch._dynamo.reset()
+    out = torch.compile(f, backend = "aot_eager")(x, counts)
+    assert param.packed_scales.is_cuda
+    moved = param.packed_scales
+    torch.testing.assert_close(out, _reference(x, param, counts, True))
+    torch.compile(f, backend = "aot_eager")(x, counts)
+    assert param.packed_scales is moved

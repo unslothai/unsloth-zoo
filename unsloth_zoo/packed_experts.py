@@ -895,6 +895,11 @@ except Exception:  # pragma: no cover
     _OWN_OP = False
 
 
+@torch.compiler.disable
+def _companions_eagerly(param):
+    return param._companions()
+
+
 def _own_grouped_linear(inputs, param, counts, transpose_b):
     if not torch.compiler.is_compiling():
         PACKED_EXPERT_STATS["calls"] += 1
@@ -914,6 +919,11 @@ def _own_grouped_linear(inputs, param, counts, transpose_b):
         # `packed_dims()`): pass the param itself and read its plain attributes. The op rebuilds the stack, whose
         # own `_companions()` moves the companions where its blocks are.
         scales, glob = param.packed_scales, param.packed_global
+        if scales.device != inputs.device or (glob is not None and glob.device != inputs.device):
+            # Accelerate rebuilt the stack on another device and left its companions behind, and no eager call has
+            # moved them yet: move them on the stack itself (one graph break, in this trace only), so later calls
+            # and captures never copy them again.
+            scales, glob = _companions_eagerly(param)
     else:
         scales, glob = param._companions()
     if glob is None:
