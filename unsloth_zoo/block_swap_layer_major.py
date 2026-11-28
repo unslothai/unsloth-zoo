@@ -619,8 +619,8 @@ def compile_epoch():
         return None
     try:
         inductor = counters.get("inductor", {})
-        return (("frames", sum(counters.get("frames", {}).values())),
-                ("graphs", counters.get("stats", {}).get("unique_graphs", 0)),
+        # Graphs, not frames: Dynamo also counts frames it looks at and leaves alone (no tensors, skipped files).
+        return (("graphs", counters.get("stats", {}).get("unique_graphs", 0)),
                 ("aot_autograd", sum(counters.get("aot_autograd", {}).values())),
                 ("inductor_graphs", sum(v for k, v in inductor.items() if str(k).startswith("fxgraph_cache"))))
     except Exception:
