@@ -1106,6 +1106,9 @@ class _Window:
         # {"records": [(collector #, key, ordinal, leaf)], "recorders": [None (5.x collector) or
         # [(module, key, index)] (4.x capture wrappers)], "extras": [(position, leaf)]}.
         self.aux = [[None] * n for _ in range(self.L)]
+        # Layers run through their own non-reentrant checkpoint: the forward's graph (it keeps no activations, only the
+        # checkpoint's recompute), backpropagated as standard accumulation does: (hidden output, {id(leaf): output}).
+        self.graphs = [[None] * n for _ in range(self.L)]
         self.thread_forwards = {}   # class -> _ThreadForward (transformers 4.x forward-swapping capture)
         # Every layer's output as the model sees it: a leaf, so a loss on intermediate hidden states (and the
         # loss part on the last one) leaves its gradient there for the backward.
@@ -1293,6 +1296,9 @@ class _Window:
         self.saved[l][m] += (_output_metadata(out),)
         replace = self._aux_leaves(l, m, collectors, before, out, extras, x,
                                    grads = not no_grad_forward, shim = frames[3])
+        if self.through_checkpoint[l] and out_h.grad_fn is not None:
+            aux = self.aux[l][m]
+            self.graphs[l][m] = (out_h, dict(aux["originals"]) if aux is not None else {})
         if l in self.held and m == self.n - 1:
             self.held.discard(l)
             self.swapper.unhold(l)
@@ -1362,7 +1368,7 @@ class _Window:
         attentions) are differentiable in standard training only when its forward runs under grad mode (`grads`):
         a reentrant checkpoint records them without gradients. Tensors the layer returns after the hidden states
         get gradients through any checkpoint. Returns {position: leaf} for the rebuilt output."""
-        records, recorders, replace, made = [], [], {}, {}
+        records, recorders, replace, made, originals = [], [], {}, {}, {}
 
         def leafify(t):
             if id(t) in made:
@@ -1372,6 +1378,8 @@ class _Window:
                             "an input)")
             # A grad-mode forward's output has a graph: a detached leaf replaces it where it was recorded.
             made[id(t)] = t.requires_grad_(True) if t.is_leaf else t.detach().requires_grad_(True)
+            if made[id(t)] is not t:
+                originals[id(made[id(t)])] = t
             return made[id(t)]
 
         for ci, ((sink, recs), counts) in enumerate(zip(collectors, before)):
@@ -1397,9 +1405,11 @@ class _Window:
                     replace[i] = made[id(t)] if id(t) in made else (
                         t.requires_grad_(True) if t.is_leaf and not t.requires_grad and t is not x
                         else t.detach().requires_grad_(True))
+                    if replace[i] is not t and t.grad_fn is not None:
+                        originals[id(replace[i])] = t
         if records or replace:
             self.aux[l][m] = {"records": records, "recorders": recorders,
-                              "extras": list(replace.items())}
+                              "extras": list(replace.items()), "originals": originals}
         return replace
 
     @contextmanager
@@ -1531,6 +1541,26 @@ class _Window:
                         continue
                     args2, kwargs2, where, ac, rng, metadata = saved
                     x = args2[0] if where == 0 else kwargs2[where]
+                    kept, self.graphs[l][m] = self.graphs[l][m], None
+                    if kept is not None:
+                        # The forward ran through the layer's non-reentrant checkpoint under grad mode, as standard
+                        # accumulation's does: backpropagating its graph runs the checkpoint's own recompute, the same
+                        # call (and compiled graph) standard accumulation's backward makes.
+                        out_h, originals = kept
+                        roots, grads = ([out_h], [g[m]]) if g[m] is not None else ([], [])
+                        for _, a in wanted:
+                            if a.grad is not None:
+                                if id(a) not in originals:
+                                    raise _ReplayAbort("an auxiliary output of a checkpointed layer has no graph")
+                                roots.append(originals[id(a)])
+                                grads.append(a.grad)
+                        del leaf, wanted, aux, kept, originals
+                        torch.autograd.backward(roots, grads)
+                        del roots, grads, out_h
+                        _STATS["recomputes"] += 1
+                        g[m] = x.grad
+                        del x, args2, kwargs2, saved
+                        continue
                     x.requires_grad_(True)
                     with torch.enable_grad(), _autocast(ac), \
                             (nullcontext() if self.through_checkpoint[l] else _checkpointing_off(layer)), _replay_rng(rng), \
@@ -1986,7 +2016,7 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
                 w.swapper.unhold(l)
             w.held.clear()
     if w.abort_reason is not None:
-        w.saved = w.outs = w.h0 = w.aux = w.routing = None
+        w.saved = w.outs = w.h0 = w.aux = w.routing = w.graphs = None
         error, w.error = w.error, None
         if error is not None and (agreement.stage == 1 or
                                   (not isinstance(error, torch.OutOfMemoryError) and not _recompile_limit(error))):
@@ -2019,13 +2049,13 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
                   else "torch.compile recompile limit in the decoder backward")
         traceback.clear_frames(error.__traceback__)
         del error
-        w.saved = w.outs = w.h0 = None
+        w.saved = w.outs = w.h0 = w.graphs = None
         return roll_back(reason)
     if compile_epoch() != epoch:
         # The decoder recompute compiled a graph standard accumulation would have compiled at another point.
-        w.saved = w.outs = w.h0 = None
+        w.saved = w.outs = w.h0 = w.graphs = None
         return roll_back(f"{COMPILED_IN_WINDOW} (decoder backward: {_epoch_change(epoch, compile_epoch())})")
     if not agreement.vote(True):
-        w.saved = w.outs = w.h0 = None
+        w.saved = w.outs = w.h0 = w.graphs = None
         return roll_back(_DISAGREE)
     return w.results, None
