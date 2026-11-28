@@ -32,6 +32,8 @@ from typing import List, Optional
 
 import torch
 
+from unsloth_zoo.rocm_build import is_rocm_torch
+
 from .formats import GGML_BLOCK, GGMLType as T, TABLE_OFFSETS, ggml_packed_bytes, ggml_row_bytes, ggml_type_id, table_values
 from .reference import dequantize_reference
 
@@ -73,7 +75,7 @@ def _row_cap(index, big_blocks):
     key = (index, big_blocks)
     cap = _ROW_CAPS.get(key)
     if cap is None:
-        hbm = torch.version.hip is None and torch.cuda.get_device_capability(index) in _HBM_ARCHS
+        hbm = not is_rocm_torch() and torch.cuda.get_device_capability(index) in _HBM_ARCHS
         cap = (8 if big_blocks else 16) if hbm else 128
         _ROW_CAPS[key] = cap
     return cap
@@ -162,7 +164,7 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
     K = shape[-1]
     rows = packed.numel() // ggml_row_bytes(ggml_type, K)
     # sm < 80 has no bf16 conversion instruction (Triton 3.2 cannot emit one): decode to float32, round in torch.
-    native = dtype != torch.bfloat16 or torch.version.hip is not None or torch.cuda.get_device_capability(packed.device)[0] >= 8
+    native = dtype != torch.bfloat16 or is_rocm_torch() or torch.cuda.get_device_capability(packed.device)[0] >= 8
     out = torch.empty(shape, dtype = dtype if native else torch.float32, device = packed.device)
     if out.numel() == 0:
         return out.to(dtype)
@@ -231,7 +233,7 @@ _NATIVE_BF16 = {}
 def _native_bf16(index):
     native = _NATIVE_BF16.get(index)
     if native is None:
-        native = _NATIVE_BF16[index] = torch.version.hip is not None or torch.cuda.get_device_capability(index)[0] >= 8
+        native = _NATIVE_BF16[index] = is_rocm_torch() or torch.cuda.get_device_capability(index)[0] >= 8
     return native
 
 
