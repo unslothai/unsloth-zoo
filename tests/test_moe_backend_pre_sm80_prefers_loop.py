@@ -38,6 +38,9 @@ def _patch(module, monkeypatch, platform, capability, grouped_mm, env):
     monkeypatch.setattr(module, "_check_torch_grouped_mm_supported", lambda *a, **k: grouped_mm)
     monkeypatch.setattr(module, "_check_grouped_gemm_available", lambda: on_gpu)
     monkeypatch.setattr(module, "_grouped_mm_triton_standin_available", lambda device: False, raising = False)
+    # The faked platforms are generic cards: keep a real gfx1151 under a ROCm wheel (torch.__version__ "+rocm")
+    # from taking its unsloth_triton preference.
+    monkeypatch.setattr(module, "_rocm_arch_prefers_unsloth_triton", lambda: False, raising = False)
     monkeypatch.setattr(torch.version, "hip", "6.3" if platform == "hip" else None)
 
     def _capability(*args, **kwargs):
