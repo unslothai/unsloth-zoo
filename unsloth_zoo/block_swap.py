@@ -96,6 +96,13 @@ def _disk_compress_requested():
     return os.environ.get(_DISK_COMPRESS_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _host_codec_with_disk():
+    """Store the host RAM blocks encoded too while the disk tier serves some (UNSLOTH_BLOCK_SWAP_COMPRESS unset or
+    1; 0 keeps them raw). Steps are then disk bound, so the decode is free, and the RAM it saves takes disk blocks
+    back into RAM: each one moved saves two disk reads per micro-batch."""
+    return os.environ.get(_COMPRESS_ENV, "auto").strip().lower() not in ("0", "false", "no", "off")
+
+
 # fp8 disk-tier blocks (weights plus their scales) are entropy coded byte by byte (about 0.83x raw) unless this is 0
 # (or UNSLOTH_BLOCK_SWAP_CODEC=v1, which keeps only the fixed-width bf16 format).
 _FP8_COMPRESS_ENV = "UNSLOTH_OFFLOAD_DISK_COMPRESS_FP8"
@@ -885,6 +892,33 @@ class _Block:
     def compressed(self):
         return any(c is not None for c in self.codec.values())
 
+    def stored_bytes(self):
+        """Bytes this disk block takes on disk: its encoding when compressed, else the raw region."""
+        c = next((c for c in self.codec.values() if c is not None), None) if self.codec else None
+        return c.nbytes if c is not None else self.nbytes()
+
+    def promote(self, region):
+        """Serve this disk block from host RAM from now on: its stored bytes (encoded or raw, unchanged) are read
+        into `region`, a view of the host arena."""
+        mod = _disk()
+        d = next(iter(self.sizes))
+        c = self.codec.get(d)
+        n = self.stored_bytes()
+        with _no_inference_mode():
+            buf, owner = mod.read_bytes(self.disk_store, self.disk["base"], n)
+        # In the caller's mode, like pack(): the arena is an inference tensor when installed under inference_mode.
+        with torch.no_grad():
+            region[:n].copy_(buf[:n])
+        del buf, owner
+        self.host_buf = {d: region[:n]}
+        self.host = [None if c is not None else
+                     region[off:off + torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()]
+                     .view(dt).view(shape) for shape, dt, _, off in self.sig]
+        for p in self.params:
+            p.__dict__.pop("_unsloth_disk", None)
+        self.disk, self.disk_store, self.disk_runs, self.disk_state = None, None, (), 0
+        self.disk_ready, self.disk_futs, self.stage, self.tier = {}, None, None, None
+
     def wire_bytes(self):
         return sum(t.numel() for t in self.host_buf.values())
 
@@ -1258,6 +1292,10 @@ class BlockSwap:
             self._decoders = {}
             _end_host_session()
             raise
+
+        def fit_with(extra):
+            # The host check above with `extra` bytes of scratch on top (late bound: sizes follow the disk plan).
+            return _check_host_fit(sizes + [self._staging_bytes()], on_host = need - peak, slack = slack + extra)
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:
@@ -1295,9 +1333,17 @@ class BlockSwap:
                             layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
 
             if self._staging_bytes():
-                self._disk_tier = _disk().DiskTier(self._staging_bytes() // 2, slots = 2)
                 self._disk_decoders = self._disk_compress_check()
+                # Before the staging ring is allocated: the host recheck counts the ring itself, and a ring already
+                # taken out of free RAM would be counted twice.
+                if not self._compress and self._disk_decoders and _host_codec_with_disk():
+                    self._compress_beside_disk(fit_with)
+                self._disk_tier = _disk().DiskTier(self._staging_bytes() // 2, slots = 2)
             self._pack()
+            if self._disk_tier is not None and not any(b.disk is not None for b in self.blocks):
+                # Every disk block moved into the host RAM the encoded blocks freed: no reads, no staging ring.
+                self._disk_tier.close()
+                self._disk_tier = None
             if self._disk_decoders and not any(b.compressed() and b.disk is not None for b in self.blocks):
                 self._disk_decoders = {}
             if self._compress:
@@ -1420,6 +1466,10 @@ class BlockSwap:
         inplace = sum(b.disk_store.ckpt_bytes for b in disk if _reads_in_place(b.disk_store))
         if inplace:
             packed += f", {inplace / 2**30:.2f} GiB of it read in place from the checkpoint files (no copy)"
+        moved = getattr(self, "_promoted", 0)
+        if moved:
+            packed += (f"; {moved} more stay in host RAM, which holds its layers losslessly compressed "
+                       f"({_COMPRESS_ENV}=0 keeps them raw)")
         print(f"Unsloth: offload_layers serves {len(disk)} of {len(self.blocks)} swapped layers "
               f"({nbytes / 2**30:.2f} GiB{packed}) from disk at {store.directory}, since GPU and host RAM cannot hold "
               f"them ({self.ram_bytes() / 2**30:.2f} GiB stay in host RAM). Each forward and each backward reads them "
@@ -1535,6 +1585,59 @@ class BlockSwap:
             return {}
         return out
 
+    def _compress_beside_disk(self, fit_with):
+        """The disk tier serves some blocks: store the host RAM blocks encoded too, decoded by the disk decoders
+        (no new card memory), when those decoders' buffers fit them and host RAM has room for the encoder's scratch.
+        _pack_registered then moves disk blocks into the RAM this frees."""
+        codec = _codec()
+        host = [b for k, b in enumerate(self.blocks) if not self._on_disk(k) and b.compressible()]
+        if codec is None or not host or not _can_register():
+            return
+        for b in host:
+            for d, n in b.sizes.items():
+                d = torch.device(d)
+                dec = self._disk_decoders.get(d)
+                if (dec is None or not dec.use_triton
+                        or dec.staging[0].numel() < min(codec.CHUNK, n // 2) * 3 // 2
+                        or dec.aux[0].numel() < codec.max_aux_nbytes(n)):
+                    return
+        # Disk blocks kept in RAM or moved there decode with the decoders sized for them.
+        decs = {d: dec for d, dec in self._disk_decoders.items() if dec.use_triton}
+        scratch = max(b.nbytes() for b in host)
+        try:
+            self._host_own = fit_with(scratch)
+        except ValueError:
+            return
+        self._compress, self._decoders, self._encode_scratch = True, decs, scratch
+        self._compress_note = "triton (beside the disk tier)"
+
+    def _promote(self, arena, used, ends):
+        """Move disk blocks into the arena room the encoded host blocks left, never past the raw bytes host RAM
+        was checked for, so host RAM use stays as approved. Returns the next free arena offset."""
+        disk = [k for k, b in enumerate(self.blocks) if b.disk is not None and len(b.sizes) == 1]
+        for k in _promotion_order(disk, len(self.blocks), self.depth):
+            b = self.blocks[k]
+            need = b.stored_bytes()
+            if used + need > arena.numel() or not self._decodes_here(b):
+                continue
+            b.promote(arena[used:used + need])
+            if isinstance(self._to_spill, set):
+                self._to_spill.discard(k)
+            self._promoted = getattr(self, "_promoted", 0) + 1
+            used += -(-need // _ALIGN) * _ALIGN
+            ends.append(used)
+        return used
+
+    def _decodes_here(self, b):
+        """A raw block, or an encoded one the host-tier decoders have buffers for."""
+        c = next((c for c in b.codec.values() if c is not None), None) if b.codec else None
+        if c is None:
+            return True
+        dec = (self._decoders or {}).get(torch.device(next(iter(b.sizes))))
+        # A staged chunk never exceeds the fixed-width layout's chunk of the same words, whatever the format.
+        chunk = min(getattr(c, "chunk", _codec().CHUNK), c.words) * 3 // 2
+        return dec is not None and dec.staging[0].numel() >= chunk and dec.aux[0].numel() >= c.aux_nbytes
+
     def _release_decoders(self):
         """Drop every decoder's GPU buffers (callers drained the decode streams first)."""
         self._decoders = {}
@@ -1608,8 +1711,15 @@ class BlockSwap:
             return False
         total = sum(b.nbytes() for k, b in enumerate(self.blocks) if not self._on_disk(k))
         arena = _lazy_host_empty(total)
-        used, ends = 0, []
+        used, ends, held = 0, [], []
+        credit = getattr(self, "_host_credit", None) or [0] * len(self.blocks)
         for k, b in enumerate(self.blocks):
+            if (self._compress and b.disk is None and k in self._to_spill and not credit[k]
+                    and b.disk_compressible()):
+                # Planned for disk at raw size: kept in host RAM below instead when the encoded host blocks leave
+                # room for it (its weights are on the card, so holding them a little longer costs no host RAM).
+                held.append(k)
+                continue
             if self._to_disk(k, b):
                 ends.append(used)
                 continue
@@ -1626,6 +1736,19 @@ class BlockSwap:
             self._release(b)
             ends.append(used)
             self._publish_packed(k)
+        for k in _promotion_order(held, len(self.blocks), self.depth):
+            b = self.blocks[k]
+            if used + b.nbytes() <= arena.numel():
+                used = b.pack_compressed(arena, used, self.device)
+                self._to_spill.discard(k)
+                self._promoted = getattr(self, "_promoted", 0) + 1
+                self._release(b)
+                ends.append(used)
+                self._publish_packed(k)
+            else:
+                self._to_disk(k, b)
+        if self._compress and self._disk_tier is not None:
+            used = self._promote(arena, used, ends)
         # Pin whole blocks only: a copy from half-pinned memory is staged synchronously.
         budget = _pin_budget()
         pin = max([e for e in ends if e <= budget], default = 0)
@@ -2376,7 +2499,9 @@ class BlockSwap:
                "disk_dir": disk[0].disk_store.directory if disk else None,
                # Bytes read in place from the checkpoint files, and bytes this process wrote to its spill file.
                "disk_inplace_bytes": sum(getattr(b.disk_store, "ckpt_bytes", 0) for b in disk),
-               "disk_spill_written": getattr(getattr(_disk(), "live_spill", lambda: None)(), "written", 0)}
+               "disk_spill_written": getattr(getattr(_disk(), "live_spill", lambda: None)(), "written", 0),
+               # Planned for disk but held in the host RAM the encoded host blocks freed.
+               "disk_promoted": getattr(self, "_promoted", 0)}
         now = tier.stats() if tier is not None else {}
         seen = getattr(self, "_disk_seen", None) or {}
         for k in ("disk_reads", "disk_read_bytes", "disk_read_ms", "disk_wait_ms"):
@@ -2559,6 +2684,15 @@ def _disk_placement(movable, n_disk, depth):
     if left > 0:
         pick += [rest[(2 * t + 1) * len(rest) // (2 * left)] for t in range(left)]
     return {m[j] for j in pick}
+
+
+def _promotion_order(disk, n_blocks, depth):
+    """Disk block positions in the order to move them into host RAM: first those read twice per micro-batch, every
+    other one so the rest stay spread out, then those at a turnaround (kept on the card there, read once)."""
+    depth = max(0, int(depth))
+    ends = {n_blocks - 1 - j for j in range(depth)} | ({j for j in range(depth)} if _KEEP_BOTTOM else set())
+    mid = [k for k in disk if k not in ends]
+    return mid[::2] + mid[1::2] + [k for k in disk if k in ends]
 
 
 def _disk_tier_indices(layers, indices, host_free_bytes = None, prefetch_depth = 2):

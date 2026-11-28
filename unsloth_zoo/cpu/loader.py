@@ -37,6 +37,7 @@ from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .fp16_decode import fp16_decode, fp16_decode_wanted, release_fp16_decode
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
+    patch_cpu_router_aux_ga,
     store_frozen_linears_in_bf16,
 )
 
@@ -1208,6 +1209,7 @@ class FastCPUModel:
                 param.requires_grad_(True)
             FastCPUModel._prepare(model, use_gradient_checkpointing)
         chunked = False if return_logits else patch_chunked_causal_lm_loss(model)
+        patch_cpu_router_aux_ga(model)
         _print(
             f"{type(model).__name__} on {torch.get_num_threads()} CPU threads. "
             f"dtype = {dtype}, 4-bit = {use_4bit}, chunked CE = {chunked}."

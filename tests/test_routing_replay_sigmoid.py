@@ -291,6 +291,30 @@ def test_lfm2_forced_low_score_experts_keep_the_router_epsilon(replay):
     assert float(own_weights.max()) < 0.5  # the epsilon matters here: 1e-20 would give 0.75 each
 
 
+def test_router_epsilon_comes_from_the_family_not_the_forward_source(monkeypatch):
+    # A compiled, wrapped or patched forward has no readable source (or other text): the epsilon must not change.
+    def no_source(obj):
+        raise AssertionError("read the router's source")
+
+    monkeypatch.setattr(rr.inspect, "getsource", no_source)
+
+    def wrapped_forward(self, *args, **kwargs):
+        return None
+
+    Lfm2 = type("Lfm2MoeTopKRouter", (torch.nn.Module,), {"forward": wrapped_forward})
+    Lfm2.__module__ = "transformers.models.lfm2_moe.modeling_lfm2_moe"
+    Hy = type("HYV3TopKRouter", (torch.nn.Module,), {"forward": wrapped_forward})
+    Hy.__module__ = "transformers.models.hy_v3.modeling_hy_v3"
+    Sub = type("MyRouter", (Lfm2,), {})
+    Sub.__module__ = "my_package.router"
+    assert rr._renorm_eps(Lfm2()) == 1e-6
+    assert rr._renorm_eps(Sub()) == 1e-6
+    assert rr._renorm_eps(Hy()) == rr._DEFAULT_RENORM_EPS == 1e-20
+    stated = Hy()
+    stated._unsloth_replay_eps = 1e-9
+    assert rr._renorm_eps(stated) == 1e-9
+
+
 def test_scaled_rollout_weights_reach_a_scaled_router(replay, monkeypatch):
     # DeepSeek-V3 weights sum to routed_scaling_factor (2.5): rollout weights on that scale, close to the trainer's,
     # must be ingested and used, not dropped for summing past 1.

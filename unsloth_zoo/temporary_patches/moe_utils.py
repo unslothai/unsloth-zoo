@@ -364,6 +364,34 @@ def _match_grouped_mm_dtypes(inputs, weight):
     return inputs.to(dtype), weight.to(dtype)
 
 
+def grouped_mm_backend_reads_host_offsets(inputs, weight) -> bool:
+    """Whether `_grouped_mm_with_backward_fix(inputs, weight, offsets)` would read `offsets` on the host (a sync a CUDA
+    graph capture cannot take), for an eager call; True on any doubt. Mirrors the dispatch below, so keep the two in
+    step: the Triton kernels only when wanted and their self-check passed (else `_grouped_mm_triton_impl` falls back
+    to `_grouped_mm_eager`); then torch._grouped_mm only where it is supported and not latched off
+    (`_latch_grouped_mm_refused` clears the support flag), torch serves it with a real grouped kernel rather than
+    its own per-expert loop (`_torch_grouped_mm_takes_fallback`), and the strides are 16-byte rows (else the
+    per-expert loop). The fp16 compiled op runs only while tracing, which never reaches here. Not for use inside a
+    capture: the availability checks may run their one-time probes."""
+    if torch.compiler.is_compiling():
+        return True
+    device = inputs.device
+    if device.type != "cuda" or weight.device != device or inputs.dtype != weight.dtype:
+        return True
+    if inputs.dim() != 2 or weight.dim() != 3:
+        return True
+    if _triton_grouped_mm_wanted(inputs, weight):
+        from unsloth_zoo.temporary_patches import moe_grouped_fp16
+        if moe_grouped_fp16.triton_grouped_available(device):
+            return False
+    if not _grouped_mm_supported_on(device):
+        return True
+    if _torch_grouped_mm_takes_fallback(device, inputs.dtype, weight.dtype, weight.shape[0]):
+        return True
+    elem = inputs.element_size()
+    return (inputs.shape[1] * elem) % 16 != 0 or (weight.shape[-1] * elem) % 16 != 0
+
+
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
 ) -> torch.Tensor:
