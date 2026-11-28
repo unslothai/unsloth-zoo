@@ -183,7 +183,7 @@ def get_trl_metrics():
     # TRL >= 0.26.0 moved trainers to trl/experimental/*/ and left thin re-export shims in trl/trainer/; prefer the experimental file when both exist.
     trl_root = os.path.split(filepath)[0]
     exp_dir = os.path.join(trl_root, "experimental")
-    # TRL >= 0.29 keeps ORPO, CPO, Online DPO, ... only under trl/experimental/{name}/{name}_trainer.py, with no trl.trainer entry.
+    # TRL >= 0.29: ORPO, CPO, Online DPO, ... exist only as trl/experimental/{name}/{name}_trainer.py.
     if os.path.isdir(exp_dir):
         for name in sorted(os.listdir(exp_dir)):
             if os.path.exists(os.path.join(exp_dir, name, f"{name}_trainer.py")):

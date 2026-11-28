@@ -54,7 +54,6 @@ def _write(path, text):
 
 
 def _fake_trl(root, orpo_in_trainer):
-    # trl.trainer lists only the stable trainers; ORPO lives in trl/experimental/orpo, as on TRL >= 0.29.
     _write(os.path.join(root, "trl", "__init__.py"), "")
     names = ["dpo_trainer"] + (["orpo_trainer"] if orpo_in_trainer else [])
     _write(os.path.join(root, "trl", "trainer", "__init__.py"), "".join(f"{n} = None\n" for n in names))
@@ -65,7 +64,6 @@ def _fake_trl(root, orpo_in_trainer):
         _write(os.path.join(root, "trl", "experimental", "__init__.py"), "")
         _write(os.path.join(root, "trl", "experimental", "orpo", "__init__.py"), "")
         _write(os.path.join(root, "trl", "experimental", "orpo", "orpo_trainer.py"), _ORPO_SOURCE)
-        # A directory without a <name>_trainer.py is not a trainer.
         _write(os.path.join(root, "trl", "experimental", "utils", "__init__.py"), "")
 
 
@@ -76,7 +74,7 @@ def _drop_trl_modules():
 
 @pytest.fixture
 def fake_trl(tmp_path, monkeypatch):
-    # The fake trl.* modules must not outlive the test: later tests import the installed TRL.
+    # Fake trl.* must not outlive the test: later tests import the installed TRL.
     saved = {m: sys.modules[m] for m in list(sys.modules) if m == "trl" or m.startswith("trl.")}
 
     def make(orpo_in_trainer):
