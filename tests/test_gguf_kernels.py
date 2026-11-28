@@ -228,9 +228,9 @@ def test_compile_fullgraph_no_breaks():
 @pytest.mark.skipif(not gguf_ops._TRACED, reason = "traced dequantize is off (torch < 2.14 or UNSLOTH_GGUF_TRACED=0)")
 @pytest.mark.parametrize("ggml_type", [T.Q4_K, T.Q6_K, T.Q8_0, T.IQ4_XS], ids = _id)
 def test_compiled_graph_launches_the_dequant_kernel(ggml_type):
-    # Under torch.compile with a symbolic row count above the fused row cap (training batches), dequantize / linear /
-    # dX launch the Triton dequantize kernel from the graph (no custom-op call per use), bitwise equal to eager.
-    # Row counts the fused kernels take (one row, or up to the cap) keep their custom op: still bitwise eager.
+    # Under torch.compile (symbolic row count) dequantize / linear / dX launch the Triton dequantize kernel from the
+    # graph (no custom-op call per use): bitwise dequantize + aten matmul at every row count, the dense product.
+    # A single row keeps the fused GEMV custom op, bitwise its eager run.
     dtype = _half()
     N, K = 48, _row_length(ggml_type, 4)
     packed = random_packed(ggml_type, N, K, special = False).cuda()
@@ -247,31 +247,51 @@ def test_compiled_graph_launches_the_dequant_kernel(ggml_type):
         w = dequantize_gguf(packed, ggml_type, (N, K), x.dtype)
         return y, dx, w
 
-    def check(compiled, M):
-        x = (torch.randn(M, K, device = "cuda") * 1e-2).to(dtype)
-        g = (torch.randn(M, N, device = "cuda") * 1e-2).to(dtype)
-        got, want = compiled(x, g), fn(x, g)
-        for name, a, b in zip(("linear", "dX", "dequant"), got, want):
-            assert torch.isfinite(b).all(), name
-            assert torch.equal(a, b), f"compiled {name} differs from eager at M = {M}"
-
-    cap = gguf_ops._fused_max_rows(torch.device("cuda"), ggml_type)
     torch._dynamo.reset()
     compiled = torch.compile(fn, backend = backend, fullgraph = True, dynamic = True)
-    for M in (cap + 21, cap + 130):
-        check(compiled, M)
+    w = dequantize_gguf(packed, ggml_type, (N, K), dtype)
+    for M in (5, 37, 130):
+        x = (torch.randn(M, K, device = "cuda") * 1e-2).to(dtype)
+        g = (torch.randn(M, N, device = "cuda") * 1e-2).to(dtype)
+        got, want = compiled(x, g), (torch.nn.functional.linear(x, w), g @ w, w)
+        for name, a, b in zip(("linear", "dX", "dequant"), got, want):
+            assert torch.isfinite(b).all(), name
+            assert torch.equal(a, b), f"compiled {name} differs from dequantize + matmul at M = {M}"
     assert not [t for t in targets if "unsloth_zoo" in t], targets
     assert any("triton_kernel_wrapper" in t for t in targets), targets
-    targets.clear()
-    check(compiled, max(2, cap // 2))
-    assert any("unsloth_zoo.gguf_linear" in t for t in targets), targets
-    # A single row: the fused GEMV (custom op) under a static compile, as in decode.
     targets.clear()
     torch._dynamo.reset()
     x1 = (torch.randn(1, K, device = "cuda") * 1e-2).to(dtype)
     one = torch.compile(lambda x: gguf_linear(x, packed, ggml_type, (N, K)), backend = backend, fullgraph = True, dynamic = False)
     assert torch.equal(one(x1), gguf_linear(x1, packed, ggml_type, (N, K)))
     assert any("unsloth_zoo.gguf_linear" in t for t in targets), targets
+    torch._dynamo.reset()
+
+
+@cuda
+@pytest.mark.skipif(not gguf_ops._TRACED, reason = "traced dequantize is off (torch < 2.14 or UNSLOTH_GGUF_TRACED=0)")
+def test_compiled_differentiable_linear_keeps_the_packed_only_backward():
+    # x requiring grad: the custom op (its autograd saves only the packed bytes), never an aten matmul that would keep
+    # the 16-bit weight alive until backward.
+    dtype = _half()
+    packed = random_packed(T.Q4_K, 64, 512, special = False).cuda()
+    targets = []
+
+    def backend(gm, example_inputs):
+        targets.extend(str(n.target) for n in gm.graph.nodes if n.op == "call_function")
+        return gm.forward
+
+    torch._dynamo.reset()
+    fn = torch.compile(lambda x: gguf_linear(x, packed, T.Q4_K, (64, 512)), backend = backend, fullgraph = True)
+    x = (torch.randn(300, 512, device = "cuda") * 1e-2).to(dtype).requires_grad_()
+    x2 = x.detach().clone().requires_grad_()
+    y, y2 = fn(x), gguf_linear(x2, packed, T.Q4_K, (64, 512))
+    assert torch.equal(y, y2)
+    y.float().sum().backward()
+    y2.float().sum().backward()
+    assert torch.equal(x.grad, x2.grad)
+    assert any("unsloth_zoo.gguf_linear" in t for t in targets), targets
+    assert not any("triton_kernel_wrapper" in t for t in targets), targets
     torch._dynamo.reset()
 
 

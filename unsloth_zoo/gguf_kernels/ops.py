@@ -383,18 +383,22 @@ def _linear_impl(x, packed, ggml_type, shape, bias, trans_b):
     return y
 
 
-def _fused_rows(x, ggml_type, trans_b):
-    """Whether _linear_impl picks a fused kernel (GEMV / tile GEMM) for this row count, so a compiled graph keeps
-    that custom op and stays bitwise its eager run. A symbolic row count only adds a guard on which side of the row
-    cap it is (training batches sit above it: one graph)."""
+def _traced_linear_ok(x, packed, ggml_type, bias, trans_b):
+    """Whether a compiled graph runs this linear as the traced dequantize + an aten matmul.
+
+    - Only without autograd through it: a differentiable call keeps the custom op, whose backward saves just the
+      packed bytes and decodes again (an aten matmul would keep the 16-bit weight alive until backward).
+    - A single row keeps the fused GEMV (decode). Sizes 0 and 1 are static under torch.compile, so this adds no guard.
+      Every other row count runs dequantize + matmul, the dense model's product; eager picks the fused tile kernel
+      for rows up to the row cap, within bf16 rounding of it."""
+    if not _traced_ok(packed, ggml_type, x.dtype):
+        return False
+    if torch.is_grad_enabled() and (x.requires_grad or (bias is not None and bias.requires_grad)):
+        return False
     M = 1
     for d in x.shape[:-1]:
         M = M * d
-    if not _fused_ok(x, ggml_type):
-        return False
-    if M == 1 and trans_b:
-        return True
-    return x.dtype != torch.float32 and 0 < M <= _fused_max_rows(x.device, ggml_type)
+    return not (trans_b and M == 1 and _fused_ok(x, ggml_type))
 
 
 @torch.library.custom_op("unsloth_zoo::gguf_linear", mutates_args = ())
@@ -447,7 +451,7 @@ def gguf_linear(x: torch.Tensor, packed: torch.Tensor, ggml_type, shape, bias: O
     _check(packed, ggml_type, shape, ("x", x), ("bias", bias))
     if x.shape[-1] != shape[1]:
         raise ValueError(f"Unsloth: x has {x.shape[-1]} features, the GGUF weight expects {shape[1]}")
-    if _traced_ok(packed, ggml_type, x.dtype) and not _fused_rows(x, ggml_type, True):
+    if _traced_linear_ok(x, packed, ggml_type, bias, True):
         w = _dequant_traced(packed.contiguous(), ggml_type, shape, x.dtype)
         return torch.nn.functional.linear(x, w, bias)
     return _linear_op(x, packed, ggml_type, shape, bias)
@@ -460,7 +464,7 @@ def gguf_linear_backward_input(grad_out: torch.Tensor, packed: torch.Tensor, ggm
     _check(packed, ggml_type, shape, ("grad_out", grad_out))
     if grad_out.shape[-1] != shape[0]:
         raise ValueError(f"Unsloth: grad_out has {grad_out.shape[-1]} features, the GGUF weight has {shape[0]} rows")
-    if _traced_ok(packed, ggml_type, grad_out.dtype) and not _fused_rows(grad_out, ggml_type, False):
+    if _traced_linear_ok(grad_out, packed, ggml_type, None, False):
         return grad_out @ _dequant_traced(packed.contiguous(), ggml_type, shape, grad_out.dtype)
     return _linear_bwd_op(grad_out, packed, ggml_type, shape)
 
