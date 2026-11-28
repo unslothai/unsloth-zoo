@@ -26,6 +26,10 @@ from unsloth_zoo.decode_graph_state import graph_decode_step, graph_generate
 from unsloth_zoo.mxfp4_stacked_experts import _grouped_mm
 
 _CUDA = torch.cuda.is_available() and torch.version.hip is None
+# Dynamo before 2.10 (checked: 2.6) traces a Parameter subclass held outside a module as a plain object, so the call
+# graph-breaks there as it did before the op (same results); 2.10, 2.11 and 2.14 trace it whole.
+_TRACES_PARAM_SUBCLASS = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 10)
+needs_tracing = pytest.mark.skipif(not _TRACES_PARAM_SUBCLASS, reason = "Dynamo before torch 2.10")
 
 
 class _ToyExpertParam(pe._PackedExpertParam):
@@ -80,6 +84,7 @@ def test_own_op_flag_is_published():
     assert pe._register_own_op() is not None
 
 
+@needs_tracing
 @pytest.mark.parametrize("cls", [_ToyExpertParam, _ToyOwnGemm])
 def test_own_format_traces_without_a_graph_break(cls):
     param = _toy(cls)
@@ -94,6 +99,7 @@ def test_own_format_traces_without_a_graph_break(cls):
     assert explain.graph_count == 1
 
 
+@needs_tracing
 @pytest.mark.parametrize("transpose_b", [True, False])
 @pytest.mark.parametrize("cls", [_ToyExpertParam, _ToyOwnGemm])
 def test_own_format_fullgraph_forward_and_dx_equal_eager(cls, transpose_b):
@@ -254,6 +260,7 @@ def test_gguf_grouped_float32_captures_in_a_cuda_graph():
     torch.testing.assert_close(static_out, eager)
 
 
+@needs_tracing
 @pytest.mark.skipif(not _CUDA, reason = "needs an NVIDIA CUDA device")
 def test_own_format_under_inductor_cuda_graphs():
     param = _toy(_ToyOwnGemm, device = "cuda")

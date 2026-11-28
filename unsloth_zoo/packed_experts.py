@@ -804,6 +804,8 @@ def _own_rebuild(key, codes, scales, glob, meta):
 
 
 def _own_op_impl(inputs, codes, scales, glob, counts, key, meta, rows, cols, transpose_b):
+    if type(codes) is not torch.Tensor:
+        codes = codes.as_subclass(torch.Tensor)  # an eager call passes the stack itself
     with torch.no_grad():
         param = _own_rebuild(key, codes, scales, glob, meta)
         return _own_grouped_impl(inputs, param, counts, transpose_b)
@@ -878,11 +880,19 @@ def _own_grouped_linear(inputs, param, counts, transpose_b):
     meta = None if op is None or key is None else _own_op_meta(param)
     if meta is None:
         return torch.compiler.disable(_OwnPackedGroupedLinear.apply)(inputs, param, counts, bool(transpose_b))
-    scales, glob = param._companions()
+    if torch.compiler.is_compiling():
+        # Dynamo before torch 2.7 cannot trace `.data` / `.device` of a param subclass (`_companions()`,
+        # `packed_dims()`): pass the param itself and read its plain attributes. The op rebuilds the stack, whose
+        # own `_companions()` moves the companions where its blocks are.
+        scales, glob = param.packed_scales, param.packed_global
+    else:
+        scales, glob = param._companions()
     if glob is None:
         glob = scales.new_empty((0,))
-    _, rows, cols = param.packed_dims()
-    return op(inputs, param.data, scales, glob, counts, key, meta, int(rows), int(cols), bool(transpose_b))
+    # Logical (E, N, K) rows, or (E, K, N) for a transposed stack; the packed rows are (E, N, *).
+    shape = param._original_shape
+    rows, cols = (shape[2], shape[1]) if param.packed_transposed else (shape[1], shape[2])
+    return op(inputs, param, scales, glob, counts, key, meta, int(rows), int(cols), bool(transpose_b))
 
 
 def packed_expert_grouped_linear(inputs, param, counts, transpose_b):
