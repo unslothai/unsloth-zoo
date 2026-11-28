@@ -52,6 +52,17 @@ def test_cpu_autocast_output_dtype_matches_under_compile():
     torch.testing.assert_close(grad, x.grad)
 
 
+def test_cpu_autocast_keeps_a_float64_input():
+    # Autocast leaves float64 alone: so does the entry point (dequantize + F.linear returned float64 before).
+    packed, shape = _weight()
+    x = torch.randn(3, 256, dtype = torch.float64)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        y = gguf_linear(x, packed, T.Q4_K, shape)
+    assert y.dtype == torch.float64
+    w = dequantize_gguf(packed, T.Q4_K, shape, torch.float64)
+    torch.testing.assert_close(y, x @ w.T)
+
+
 def test_bias_of_another_dtype_outside_autocast():
     packed, shape = _weight()
     x = torch.randn(5, 256, dtype = torch.bfloat16)

@@ -399,7 +399,8 @@ def _autocast_input(t):
     (the fused kernels write x's dtype, dequantize + matmul runs autocast off) and the fake impl agree on it."""
     device_type = t.device.type
     try:
-        if t.is_floating_point() and torch.is_autocast_enabled(device_type):
+        # Autocast-eligible dtypes only: float64 (and other dtypes) stay as given, as autocast leaves them.
+        if t.dtype in (torch.float16, torch.bfloat16, torch.float32) and torch.is_autocast_enabled(device_type):
             dtype = torch.get_autocast_dtype(device_type)
             if dtype != t.dtype:
                 return t.to(dtype)
