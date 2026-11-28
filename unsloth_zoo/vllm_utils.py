@@ -1502,8 +1502,9 @@ pass
 
 
 def _standby_check_oom(stats):
-    """Turn keep-awake off for this process when the allocator ran out of memory while vLLM was kept awake."""
-    mark, stats["oom_mark"] = stats.get("oom_mark"), None
+    """Turn keep-awake off for this process when the allocator ran out of memory while vLLM was kept awake (the mark
+    is set by a kept-awake decision and cleared by a real sleep)."""
+    mark = stats.get("oom_mark")
     if mark is None or stats.get("disabled"): return
     try: ooms = _standby_oom_count()
     except Exception: return
@@ -1624,6 +1625,7 @@ def patch_vllm_standby_keep_awake():
             return None
         if enabled: stats["slept"] += 1
         self._unsloth_standby_awake = False
+        stats["oom_mark"] = None
         result = _orig_sleep(self, *args, **kwargs)
         if s["pending"] is not None:
             # Measure the training step from after the sleep released the KV and emptied the cache.

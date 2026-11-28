@@ -334,6 +334,18 @@ def test_out_of_memory_while_awake_makes_every_later_sleep_real(env):
     assert stats["disabled"] and stats["kept_awake"] == 1
 
 
+def test_out_of_memory_after_a_level_zero_pause_still_counts(env):
+    trainer, llm, mem, calls = env()
+    trainer.step(1 * GB)
+    assert trainer.step(0) == ["wake_up", "wake_up"]
+    llm.sleep(level = 0)
+    llm.wake_up(tags = ["scheduling"])
+    mem.num_ooms += 1
+    # the pause's wake_up reached vLLM, so this step's wake_ups do too; its sleep is real
+    assert trainer.step(0) == ["wake_up", "wake_up", "sleep"]
+    assert vu.standby_keep_awake_stats()["disabled"]
+
+
 def test_out_of_memory_while_asleep_does_not_turn_it_off(env):
     trainer, llm, mem, calls = env()
     mem.num_ooms += 1  # e.g. a probe before the first rollout, with vLLM asleep
