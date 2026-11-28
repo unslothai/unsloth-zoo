@@ -1,4 +1,4 @@
-"""x86 without native bf16 (Windows, and Linux with AVX-512): a bf16 checkpoint's frozen projections stay float32 when
+"""Apple Silicon and x86 without native bf16 (Windows, and Linux with AVX-512): a bf16 checkpoint's frozen projections stay float32 when
 the float32 model fits in a quarter of the free RAM (no per-call upcast), bf16-stored otherwise and on other hosts;
 UNSLOTH_CPU_FROZEN_BF16 still decides."""
 import pytest
@@ -140,7 +140,7 @@ def test_other_hosts_keep_bf16_storage(monkeypatch, checkpoint):
     assert _stored(model) == 14 and model._unsloth_cpu_frozen_bf16 == "training"
 
 
-def test_fp32_frozen_storage_pays_on_windows_x86_and_avx512_linux(monkeypatch):
+def test_fp32_frozen_storage_pays_on_windows_x86_avx512_linux_and_apple_silicon(monkeypatch):
     import platform
     import sys
     from unsloth_zoo.cpu import loader, runtime
@@ -153,7 +153,9 @@ def test_fp32_frozen_storage_pays_on_windows_x86_and_avx512_linux(monkeypatch):
         ("linux", "x86_64", avx2, False),    # EPYC 7763: fp32 decode reads 2x the bytes, GRPO was slower
         ("linux", "x86_64", frozenset(), False),
         ("linux", "aarch64", frozenset({"asimd", "avx512f"}), False),
-        ("darwin", "x86_64", avx512, False), ("darwin", "arm64", frozenset(), False),
+        ("darwin", "x86_64", avx512, False),
+        ("darwin", "arm64", frozenset(), True),    # Apple Silicon: no per-call upcast, no per-rollout fp32 copy
+        ("darwin", "aarch64", frozenset(), True),
     ):
         monkeypatch.setattr(sys, "platform", plat)
         monkeypatch.setattr(platform, "machine", lambda m = machine: m)
