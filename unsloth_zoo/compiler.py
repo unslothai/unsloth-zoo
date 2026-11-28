@@ -5437,6 +5437,32 @@ def _patch_lora_update(source):
 pass
 
 
+# A frozen base on Unsloth's fp8 / int8 GEMMs (float8_training with LoRA, load_in_8bit = "int8") carries
+# `_unsloth_fused_lora_forward`: one autograd op running the base GEMM with the LoRA term in its epilogue and
+# a fused input gradient, as FastLanguageModel's projections do. It returns None when it cannot run (several
+# adapters, DoRA, mixed batches, ...) and PEFT's forward below runs unchanged.
+_LORA_FROZEN_BASE_FUSED = (
+    "_unsloth_fused = getattr(self.base_layer, '_unsloth_fused_lora_forward', None)\n"
+    "if _unsloth_fused is not None:\n"
+    "    _unsloth_out = _unsloth_fused(self, x, args, kwargs)\n"
+    "    if _unsloth_out is not None:\n"
+    "        return _unsloth_out\n"
+)
+
+
+def _patch_lora_frozen_base_fused(source):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Insert the frozen-base fused LoRA call as the first statement of the forward body."""
+    if "_unsloth_fused_lora_forward" in source:
+        return source
+    match = re.search(r"^def unsloth_forward\(self, x\b.*?\).*?:[ \t]*\n([ \t]+)", source, re.MULTILINE | re.DOTALL)
+    if match is None or "*args" not in match.group(0) or "**kwargs" not in match.group(0):
+        return source
+    indent = match.group(1)
+    hook = "".join(indent + line + "\n" for line in _LORA_FROZEN_BASE_FUSED.splitlines())
+    return source[: match.start(1)] + hook + source[match.start(1) :]
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -5501,6 +5527,8 @@ def patch_lora_forwards(torch_compile_options):
             "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
             if integer_input_inline else "",
         )
+        if child == "Linear":
+            source = _patch_lora_frozen_base_fused(source)
 
         if hash(source) != old_hash:
             success += 1
