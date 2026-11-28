@@ -101,6 +101,8 @@ def _clean(monkeypatch):
     # sm89) leaves it active once anything asked for the threshold.
     monkeypatch.setattr(SA, "_AUTO_ACTIVE", [False])
     yield
+    if hasattr(SA, "release_saved_attention_host_pool"):
+        SA.release_saved_attention_host_pool()
     SA.SAVED_ATTENTION_STATS.clear()
 
 
@@ -1253,16 +1255,18 @@ def _fake_host(monkeypatch, refuse = False):
     """CPU stand-in for the pinned host copy: every tensor counts as offloadable; a refused copy is None."""
     moved = []
 
-    def to_host(t, require_pinned = False):
-        if not isinstance(t, torch.Tensor):
-            return t
-        if refuse and require_pinned:
-            return None
+    def plan(t, require_pinned):
+        return None if refuse and require_pinned else "plan"
+
+    def copy(t, plan):
         moved.append(t.numel() * t.element_size())
         return SA._OnHost(t.clone(), t.device, None, None, SA._HOST_POOL_EPOCH[0], True)
 
     monkeypatch.setattr(SA, "_offloadable", lambda t: isinstance(t, torch.Tensor))
-    monkeypatch.setattr(SA, "_to_host", to_host)
+    monkeypatch.setattr(G, "_pinned_memory_disabled", lambda: False)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "1")
+    monkeypatch.setattr(SA, "_plan_host", plan)
+    monkeypatch.setattr(SA, "_copy_to_host", copy)
     monkeypatch.setattr(SA, "_to_device", lambda item: item.host if isinstance(item, SA._OnHost) else item)
     return moved
 
@@ -1283,7 +1287,7 @@ def test_auto_offloads_what_the_device_budget_declines(monkeypatch, auto):
     assert saved[2] == 6 + 3 + 3
     assert len(moved) >= 6
     # Nothing was charged to the device budget for outputs that live on the host.
-    assert all(b.live == 0 and b.offloading for b in SA._BUDGETS.values())
+    assert all(b.live == 0 and b.reserve > 0 for b in SA._BUDGETS.values())
 
 
 def test_auto_host_fallback_declines_when_host_ram_does_not_fit(monkeypatch, auto):
@@ -1295,7 +1299,10 @@ def test_auto_host_fallback_declines_when_host_ram_does_not_fit(monkeypatch, aut
     saved = _run(params, x, ckpt = True, steps = 2)
     _close(saved, full)
     stats = SA.SAVED_ATTENTION_STATS
-    assert stats["declined_host"] == 3 and stats["stored"] == 0 and stats["reused"] == 0, dict(stats)
+    # The first refusal turns the device back to GPU-only keeping (no reserve, no more host attempts).
+    assert stats["declined_host"] == 1 and stats["declined_budget"] == 2, dict(stats)
+    assert stats["stored"] == 0 and stats["reused"] == 0, dict(stats)
+    assert all(b.host_refused and b.reserve == 0 for b in SA._BUDGETS.values())
     assert saved[2] == 12
 
 
@@ -1339,9 +1346,31 @@ def test_auto_host_fallback_needs_room_for_the_prefetched_reload(monkeypatch, au
     assert saved[2] == 12
 
 
-def test_auto_host_fallback_off_on_unified_memory(monkeypatch, auto):
+def test_auto_host_fallback_is_opt_in_until_a_gpu_is_measured(monkeypatch, auto):
     query = torch.empty(1, 2, 8, 4)
     monkeypatch.setattr(SA, "_offloadable", lambda t: True)
+    monkeypatch.setattr(G, "_pinned_memory_disabled", lambda: False)
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset())
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    monkeypatch.delenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", raising = False)
+    assert SA._AUTO_HOST_MIN_SEQ == {} and not SA._auto_host_allowed(query)
+    monkeypatch.setattr(SA, "_AUTO_HOST_MIN_SEQ", {(8, 0): 8})
+    assert SA._auto_host_allowed(query)
+    monkeypatch.setattr(SA, "_AUTO_HOST_MIN_SEQ", {(8, 0): 16})
+    assert not SA._auto_host_allowed(query)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "1")
+    assert SA._auto_host_allowed(query)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "0")
+    monkeypatch.setattr(SA, "_AUTO_HOST_MIN_SEQ", {(8, 0): 8})
+    assert not SA._auto_host_allowed(query)
+
+
+def test_auto_host_fallback_off_on_unified_memory(monkeypatch, auto):
+    query = torch.empty(1, 2, 8, 4)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "1")
+    monkeypatch.setattr(SA, "_offloadable", lambda t: True)
+    monkeypatch.setattr(G, "_pinned_memory_disabled", lambda: False)
     monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
     assert not SA._auto_host_allowed(query)
     monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset())
@@ -1405,8 +1434,17 @@ def test_host_pool_frees_blocks_outgrown_by_a_longer_call(monkeypatch):
     for block, _, epoch in taken:
         SA._give_block(0, block, None, epoch)
     assert SA.host_pool_bytes() == 3 * short
-    # A longer step: the short blocks can serve none of its calls, so the first miss frees them.
+    # A longer step: the short blocks can serve none of its calls, so the first miss frees them, and
+    # holds no reference to them while the replacement is allocated.
+    import gc
+    from torch.multiprocessing.reductions import StorageWeakRef
+    refs = [StorageWeakRef(b.untyped_storage()) for b, _, _ in taken]
+    del taken, block
+    seen = []
+    monkeypatch.setattr(SA, "_new_block", lambda n: (gc.collect(), seen.append([r.expired() for r in refs]))
+                        and torch.empty(n, dtype = torch.uint8))
     block, _, epoch = SA._take_block(0, long)
+    assert seen == [[True] * 3], seen
     assert SA.host_pool_bytes() == 0 and released == [short] * 3
     SA._give_block(0, block, None, epoch)
     assert SA.host_pool_bytes() == block.numel() and SA._HOST_USE[0][2] == block.numel()
@@ -1435,6 +1473,90 @@ def test_offload_entry_keeps_non_tensor_outputs(monkeypatch):
     assert isinstance(out[0], SA._OnHost) and out[1] is None and out[2] == 3 and isinstance(out[3], SA._OnHost)
 
 
+def test_finalizer_never_takes_the_pool_lock(monkeypatch):
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "_HOST_USE", {})
+    monkeypatch.setattr(SA, "_block_pinned", lambda block: True)
+    block, _, epoch = SA._take_block(0, 8 << 20)
+    item = SA._OnHost(block, torch.device("cpu"), block, None, epoch, True)
+    item.device = types.SimpleNamespace(index = 0)
+    # The garbage collector can finalize an entry while this thread holds the lock: it only queues.
+    with SA._HOST_POOL_LOCK:
+        item.__del__()
+    assert len(SA._HOST_RETURNS) == 1
+    again, _, _ = SA._take_block(0, 8 << 20)
+    assert again is block and not SA._HOST_RETURNS
+
+
+def test_pageable_blocks_are_never_pooled(monkeypatch):
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "_HOST_USE", {})
+    monkeypatch.setattr(SA, "_block_pinned", lambda block: False)
+    block, _, epoch = SA._take_block(0, 8 << 20)  # explicit offload with the pinned cap full: pageable
+    SA._give_block(0, block, None, epoch)
+    assert SA.host_pool_bytes() == 0 and SA._HOST_USE[0][0] == 0
+
+
+def test_refused_output_copies_nothing(monkeypatch):
+    taken, copies = [], []
+    monkeypatch.setattr(SA, "_offloadable", lambda t: isinstance(t, torch.Tensor))
+    monkeypatch.setattr(SA, "_plan_host", lambda t, req: None if t.numel() == 2 else taken.append(t) or ("b", None, 0))
+    monkeypatch.setattr(SA, "_copy_to_host", lambda t, plan: copies.append(t))
+    given = []
+    monkeypatch.setattr(SA, "_give_block", lambda *a: given.append(a))
+    entry = [("f", "sig", (torch.ones(4), torch.ones(2)))]
+    # Every block is taken before any copy: the second output's refusal leaves no copy behind.
+    assert SA._offload_entry(entry, require_pinned = True) == 0
+    assert copies == [] and len(given) == 1 and isinstance(entry[0][2][0], torch.Tensor)
+
+
+def _host_budget(monkeypatch, layer, margin):
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = (1 << 20) + margin)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", margin)
+    monkeypatch.setattr(SA, "_auto_host_allowed", lambda query: True)
+    frame = SA.SavedAttentionFrame(auto = True)
+    query = torch.empty(layer // 4 // 2, 1, 1, 2)  # fp32: estimate = bytes + one fp32 per row
+    estimate = SA._bytes(query) + query.numel() // 2 * 4
+    SA._auto_admit(frame, [query])
+    SA._auto_release(frame, True)  # one measured step
+    SA.SAVED_ATTENTION_STATS.clear()
+    return query, estimate
+
+
+def test_prefetch_check_counts_the_whole_frame(monkeypatch, auto):
+    query, estimate = _host_budget(monkeypatch, 1 << 16, margin = 4 * (1 << 16))
+    frame = SA.SavedAttentionFrame(auto = True)
+    room_for = (4 * (1 << 16)) // 2 // estimate  # calls of this frame whose reload fits in half the margin
+    results = []
+    for _ in range(room_for + 1):
+        results.append(SA._auto_admit(frame, [query]))
+        if results[-1] is SA._HOST:
+            frame.host_bytes += estimate
+    assert results[:room_for] == [SA._HOST] * room_for and results[-1] is False
+    assert SA.SAVED_ATTENTION_STATS["declined_prefetch"] == 1 and SA.SAVED_ATTENTION_STATS["declined_budget"] == 0
+    (budget,) = SA._BUDGETS.values()
+    assert budget.reserve == (room_for + 1) * estimate
+
+
+def test_reserve_only_applies_while_the_host_fallback_can_run(monkeypatch, auto):
+    query, estimate = _host_budget(monkeypatch, 1 << 16, margin = 1 << 20)
+    (budget,) = SA._BUDGETS.values()
+    monkeypatch.setattr(SA, "_device_capacity", lambda device: (1 << 20) + (1 << 20) + 2 * estimate)
+    budget.capacity = None
+    budget.reserve = 2 * estimate
+    # The reserve would leave no room for a GPU keep, but with the fallback off it is not applied.
+    monkeypatch.setattr(SA, "_auto_host_allowed", lambda query: False)
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [query]) is True
+    budget.live = 0
+    monkeypatch.setattr(SA, "_auto_host_allowed", lambda query: True)
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [query]) is SA._HOST
+    budget.live = 0
+    budget.host_refused = True
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [query]) is True
+    SA.release_saved_attention_host_pool()
+    assert budget.reserve == 0 and not budget.host_refused
+
+
 def test_dense_layouts():
     assert SA._dense(torch.empty(2, 3, 4))
     # Flash attention's output: (B, H, S, D) shape over (B, S, H, D) memory.
@@ -1460,29 +1582,10 @@ def test_gc_buffer_reset_releases_the_host_pool(monkeypatch):
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("name", ["Unsloth_Gradient_Checkpointer", "Unsloth_Offloaded_Gradient_Checkpointer"])
-def test_legacy_checkpointers_reuse_attention(monkeypatch, name):
-    Function = getattr(G, name)
-    params, x = _make()
-    full = _run(params, x, ckpt = True)
-    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
-    for w in params:
-        for p in w:
-            p.grad = None
-    counter = _KernelCounter()
-    with counter:
-        h = x.clone().requires_grad_()
-        for w in params:
-            h = Function.apply(_layer(w, _sdpa, lambda fn, q, k, v: SA.saved_attention_call(fn, q, k, v)), h)
-        loss = h.float().pow(2).mean()
-        loss.backward()
-    grads = [p.grad.clone() for w in params for p in w]
-    _close((loss.detach(), grads), full)
-    assert counter.n == 3 and SA.SAVED_ATTENTION_STATS["reused"] == 3, dict(SA.SAVED_ATTENTION_STATS)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (pinned host memory, side stream)")
 def test_cuda_offload_reuses_pooled_pinned_blocks(monkeypatch):
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("no bf16 on this GPU")
     monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "0")
     monkeypatch.setattr(SA, "_OFFLOAD_MIN_BYTES", 0)
     monkeypatch.setattr(SA, "_HOST_POOL", {})
@@ -1517,7 +1620,12 @@ def test_cuda_offload_reuses_pooled_pinned_blocks(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (pinned host memory, side stream)")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_cuda_auto_host_fallback_matches(monkeypatch, auto, dtype):
+    if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("no bf16 on this GPU")
+    if torch.cuda.current_device() in G._keep_on_device_indices():
+        pytest.skip("unified memory: the host fallback is off by design")
     monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "0")
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "1")
     monkeypatch.setattr(SA, "_OFFLOAD_MIN_BYTES", 0)
     monkeypatch.setattr(SA, "_HOST_POOL", {})
     monkeypatch.setattr(SA, "save_attention_auto_min_seq", lambda device = None: 1)
