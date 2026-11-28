@@ -632,10 +632,11 @@ def _bf16_sdpa_in_fp32_pays():
 
 
 def patch_cpu_bf16_sdpa_fp32():
-    """bf16 training attention on CPU (query needs a gradient) computed by the fp32 SDPA kernel: bf16 query / key /
-    value (and a floating mask) are upcast exactly, the output is rounded back to bf16 and the gradients flow back
-    through the casts in bf16. No-grad calls (decode, reference forwards) keep the bf16 kernel, where the forward is
-    as fast and the KV cache would need an upcast per token."""
+    """bf16 attention on CPU computed by the fp32 SDPA kernel: bf16 query / key / value (and a floating mask) are
+    upcast exactly, the output is rounded back to bf16 and gradients flow back through the casts in bf16. Taken by
+    every call whose query needs a gradient and by every full-sequence call (as many queries as keys), so no-grad
+    reference / old-policy forwards of DPO and GRPO see the same attention as the policy forward they are compared
+    with. Decode steps against a KV cache keep the bf16 kernel: the cache would need an upcast per token."""
     if not _bf16_sdpa_in_fp32_pays():
         return False
     try:
@@ -649,8 +650,9 @@ def patch_cpu_bf16_sdpa_fp32():
 
     @functools.wraps(original)
     def sdpa_attention_forward(module, query, key, value, attention_mask, *args, **kwargs):
-        if not (isinstance(query, torch.Tensor) and query.device.type == "cpu" and query.dtype == torch.bfloat16
-                and query.requires_grad and torch.is_grad_enabled()):
+        if not (isinstance(query, torch.Tensor) and isinstance(key, torch.Tensor) and query.device.type == "cpu"
+                and query.dtype == torch.bfloat16
+                and ((query.requires_grad and torch.is_grad_enabled()) or query.shape[-2] == key.shape[-2])):
             return original(module, query, key, value, attention_mask, *args, **kwargs)
         if not torch.compiler.is_compiling():
             SDPA_FP32_ENGAGED[0] += 1

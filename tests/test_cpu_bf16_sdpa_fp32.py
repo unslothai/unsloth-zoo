@@ -13,9 +13,10 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""bf16 CPU training on Arm: attention calls whose query needs a gradient run through the fp32 SDPA kernel (exact
-upcast in, output rounded to bf16, gradients back in bf16), matching an fp32 SDPA on the same bf16 values; no-grad
-calls, fp32 queries, other CPUs and UNSLOTH_CPU_SDPA_FP32=0 keep transformers' own function."""
+"""bf16 CPU training on Arm: attention calls whose query needs a gradient, and full-sequence no-grad calls (reference
+forwards), run through the fp32 SDPA kernel (exact upcast in, output rounded to bf16, gradients back in bf16),
+matching an fp32 SDPA on the same bf16 values; cached decode steps, fp32 queries, other CPUs and
+UNSLOTH_CPU_SDPA_FP32=0 keep transformers' own function."""
 import platform
 
 import pytest
@@ -179,7 +180,7 @@ def test_inner_call_sees_fp32_even_under_autocast(mapping, monkeypatch):
     assert seen[0][4] is False
 
 
-def test_no_grad_and_fp32_calls_keep_the_stock_function(mapping, monkeypatch):
+def test_cached_decode_and_fp32_calls_keep_the_stock_function(mapping, monkeypatch):
     from transformers.integrations import sdpa_attention
     from unsloth_zoo.cpu import ops
     table, original = mapping
@@ -192,11 +193,27 @@ def test_no_grad_and_fp32_calls_keep_the_stock_function(mapping, monkeypatch):
     table["sdpa"] = spy
     monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", spy)
     ops.patch_cpu_bf16_sdpa_fp32()
+    q, k, v = _qkv(grad = False)
     with torch.no_grad():
-        table["sdpa"](_Attn(), *_qkv(), None)               # decode / reference forward
-    table["sdpa"](_Attn(), *_qkv(grad = False), None)       # frozen activations, nothing to differentiate
+        table["sdpa"](_Attn(), q[:, :, -1:], k, v, None)    # one decoded token against a 24-token cache
+        table["sdpa"](_Attn(), q[:, :, -3:], k, v, None)    # a few tokens against the cache
     table["sdpa"](_Attn(), *_qkv(torch.float32), None)      # fp32 training
     assert seen == [torch.bfloat16, torch.bfloat16, torch.float32] and ops.SDPA_FP32_ENGAGED[0] == 0
+
+
+def test_no_grad_full_sequence_matches_the_training_call(mapping):
+    """DPO reference / GRPO old-policy forwards run without grad: they take the same fp32 kernel, so with equal
+    weights the policy and reference attention outputs are bitwise equal (DPO's first loss stays log 2)."""
+    from unsloth_zoo.cpu import ops
+    table, _ = mapping
+    ops.patch_cpu_bf16_sdpa_fp32()
+    q, k, v = _qkv()
+    trained, _ = table["sdpa"](_Attn(), q, k, v, None)
+    with torch.no_grad():
+        reference, _ = table["sdpa"](_Attn(), q.detach(), k.detach(), v.detach(), None)
+    reference_no_grad_input, _ = table["sdpa"](_Attn(), *_qkv(grad = False), None)
+    assert torch.equal(trained.detach(), reference) and torch.equal(reference, reference_no_grad_input)
+    assert ops.SDPA_FP32_ENGAGED[0] == 3
 
 
 def test_tiny_model_training_step_engages(mapping):
@@ -209,11 +226,14 @@ def test_tiny_model_training_step_engages(mapping):
     torch.manual_seed(0)
     model = LlamaForCausalLM(config).bfloat16()
     ids = torch.randint(0, 64, (2, 16), generator = torch.Generator().manual_seed(0))
-    loss = model(input_ids = ids, labels = ids).loss
-    loss.backward()
+    out = model(input_ids = ids, labels = ids)
+    out.loss.backward()
     assert ops.SDPA_FP32_ENGAGED[0] == 2  # one per layer
-    assert torch.isfinite(loss) and all(p.grad is not None and torch.isfinite(p.grad).all()
-                                        for p in model.parameters() if p.requires_grad)
-    with torch.no_grad():
-        model(input_ids = ids)
-    assert ops.SDPA_FP32_ENGAGED[0] == 2
+    assert torch.isfinite(out.loss) and all(p.grad is not None and torch.isfinite(p.grad).all()
+                                            for p in model.parameters() if p.requires_grad)
+    policy = model(input_ids = ids).logits
+    with torch.no_grad():  # a reference forward: same attention, same logits
+        assert torch.equal(model(input_ids = ids).logits, policy.detach())
+    assert ops.SDPA_FP32_ENGAGED[0] == 6
+    model.generate(input_ids = ids[:, :8], max_new_tokens = 4, do_sample = False, pad_token_id = 0)
+    assert ops.SDPA_FP32_ENGAGED[0] == 8  # the prefill only; the cached decode steps keep the bf16 kernel
