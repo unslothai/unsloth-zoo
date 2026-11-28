@@ -840,7 +840,7 @@ if _HAS_TRITON:
         return tl.where(tl.abs(y) < 1e-3, y * (1.0 + y * (-0.5 + y * (1.0 / 3.0))), tl.log(arg))
 
     @triton.jit
-    def _fl_log_mix_fast(delta, beta, onemb, MIRROR: tl.constexpr):
+    def _fl_log_mix_fast(delta, beta, onemb, MIRROR: tl.constexpr):  # 1 - beta small: teacher share from its own log-mix
         # _fl_log_mix_pair for the per-element passes: no divisions or series logs (one exp and one log per
         # term), still exactly 0 at delta = 0 and keeping the small share near beta 0 / 1.
         x = tl.minimum(tl.maximum(delta, -80.0), 80.0)
