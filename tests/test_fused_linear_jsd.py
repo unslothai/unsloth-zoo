@@ -16,6 +16,8 @@
 
 """fused_linear_jsd (two-head generalized JSD for GKD) against TRL's GKDTrainer.generalized_jsd_loss in float64."""
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -308,6 +310,48 @@ def test_diffuse_rows_keep_the_direct_beta0_gradient(path):
             pytest.skip("Triton on CUDA")
         _, dz = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
     assert (dz.cpu().double() - ref).norm() / ref.norm() < 5e-3
+
+
+@pytest.mark.parametrize("path", ["cpu"] + (["triton", "inductor", "eager"] if torch.cuda.is_available() else []))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("beta", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_identical_student_and_teacher_give_exactly_zero(beta, dtype, path, monkeypatch):
+    """Student == teacher (a fresh LoRA scored against its adapter-off base): loss and gradient are exactly 0.
+
+    The mixture log-prob from logaddexp(ls + log(1 - b), lt + log(b)) is an ulp of |ls| off ls, so the interior
+    beta gave a ~1e-8 gradient there that Adam normalises into full-size LoRA steps away from the teacher."""
+    device = _jsd_route(path, monkeypatch)
+    g = torch.Generator().manual_seed(7)
+    V = 9000  # > one 4096 Triton vocab block
+    h = (torch.randn(2, 5, 32, generator = g)).to(device = device, dtype = dtype)
+    w = (torch.randn(V, 32, generator = g) * 0.5).to(device = device, dtype = dtype)
+    hs = h.clone().requires_grad_(True)
+    loss = fl.fused_linear_jsd(hs, w, h, w, beta = beta)
+    loss.backward()
+    assert loss.item() == 0.0, loss.item()
+    assert torch.count_nonzero(hs.grad) == 0, hs.grad.abs().max().item()
+
+
+@pytest.mark.parametrize("beta", [0.1, 0.5, 0.9])
+def test_identical_rows_body_and_chunk_are_exactly_zero(beta):
+    s = torch.randn(4, 5000, generator = torch.Generator().manual_seed(3)) * 3
+    one = torch.tensor(1.0)
+    for dt in (torch.float32, torch.float64):
+        row, dz = fl._jsd_body(s.to(dt), s.to(dt), one.to(dt), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, dt)
+        assert torch.count_nonzero(row) == 0 and torch.count_nonzero(dz) == 0, (dt, row.abs().max(), dz.abs().max())
+        ls = torch.log_softmax(s.to(dt), -1)
+        row, dz = fl._jsd_chunk(ls.clone(), ls.clone(), beta, True)
+        assert torch.count_nonzero(row) == 0 and torch.count_nonzero(dz) == 0, (dt, row.abs().max(), dz.abs().max())
+
+
+@pytest.mark.parametrize("beta", [0.1, 0.5, 0.9])
+def test_log_mix_matches_logaddexp(beta):
+    """_jsd_log_mix(delta) == log((1 - b) + b exp(delta)) in fp64 across the range, incl. overflowing exp."""
+    d = torch.cat([torch.linspace(-200, 200, 4001, dtype = torch.float64),
+                   torch.tensor([0.0, 1e-12, -1e-12, 1e-6, -1e-6], dtype = torch.float64)])
+    ref = torch.logaddexp(torch.full_like(d, math.log1p(-beta)), d + math.log(beta))
+    torch.testing.assert_close(fl._jsd_log_mix(d, beta), ref, rtol = 1e-12, atol = 1e-15)
+    assert fl._jsd_log_mix(torch.zeros(1, dtype = torch.float32), beta).item() == 0.0
 
 
 def test_fully_masked_is_finite_zero():
