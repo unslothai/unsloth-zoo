@@ -1046,7 +1046,10 @@ def _probs_gather(probs, ids, renorm):
 
 
 _DEFAULT_RENORM_EPS = 1e-20
-_RENORM_EPS_RE = re.compile(r"\.sum\([^()]*\)\s*\+\s*([0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)\s*\)")
+# The constant a sigmoid router adds to its top-k sum before dividing, by model family where it is not 1e-20
+# (DeepSeek-V3, GLM-4 MoE, HY-V3, dots). Matched on the router's class (its module path or name), never on the text
+# of its forward, which a compiled, wrapped or patched forward changes.
+_RENORM_EPS_BY_FAMILY = {"lfm2_moe": 1e-6}
 
 
 def _sigmoid_gather(logits, ids, renorm, eps = _DEFAULT_RENORM_EPS):
@@ -1060,19 +1063,20 @@ def _sigmoid_gather(logits, ids, renorm, eps = _DEFAULT_RENORM_EPS):
 
 def _renorm_eps(module):
     """The constant the router adds to the top-k sum before dividing (LFM2-MoE: 1e-6, DeepSeek-V3 / HY-V3:
-    1e-20), read once from its forward's source. On natural selections it is negligible, so detection cannot tell
-    it apart; on forced low-score experts it decides the weights. 1e-20 when the source has none."""
+    1e-20), by the router's model family (_RENORM_EPS_BY_FAMILY); a router may also state it as
+    `_unsloth_replay_eps`. On natural selections it is negligible, so detection cannot tell it apart; on forced
+    low-score experts it decides the weights. 1e-20 for every other family."""
     eps = getattr(module, "_unsloth_replay_eps", None)
     if eps is not None:
         return eps
     eps = _DEFAULT_RENORM_EPS
-    try:
-        found = _RENORM_EPS_RE.findall(inspect.getsource(type(module).forward))
-        values = {float(v) for v in found}
-        if len(values) == 1:
-            eps = max(values.pop(), _DEFAULT_RENORM_EPS)
-    except (OSError, TypeError, ValueError):
-        pass
+    for cls in type(module).__mro__:
+        path = str(getattr(cls, "__module__", "") or "").lower().split(".")
+        name = str(getattr(cls, "__name__", "") or "").lower()
+        hits = [f for f in _RENORM_EPS_BY_FAMILY if f in path or name.startswith(f.replace("_", ""))]
+        if hits:
+            eps = _RENORM_EPS_BY_FAMILY[hits[0]]
+            break
     module._unsloth_replay_eps = eps
     return eps
 
