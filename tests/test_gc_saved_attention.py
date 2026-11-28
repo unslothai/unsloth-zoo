@@ -1346,6 +1346,28 @@ def test_auto_host_fallback_needs_room_for_the_prefetched_reload(monkeypatch, au
     assert saved[2] == 12
 
 
+def test_auto_host_fallback_default_table(monkeypatch, auto):
+    monkeypatch.setattr(SA, "_offloadable", lambda t: True)
+    monkeypatch.setattr(G, "_pinned_memory_disabled", lambda: False)
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset())
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.delenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", raising = False)
+    long, short = torch.empty(1, 1, 65536, 1), torch.empty(1, 1, 32768, 1)
+    # Measured: sm80 (A100) from 64K. Not measured faster: L4 (sm89), T4 (sm75), sm120; shorter calls.
+    assert SA._AUTO_HOST_MIN_SEQ == {(8, 0): 65536}
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    assert SA._auto_host_allowed(long) and not SA._auto_host_allowed(short)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", "0")
+    assert not SA._auto_host_allowed(long)
+    monkeypatch.delenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD")
+    for capability in ((8, 9), (7, 5), (12, 0), (9, 0), (10, 0)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, c = capability: c)
+        assert not SA._auto_host_allowed(long), capability
+    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
+    assert not SA._auto_host_allowed(long)
+
+
 def test_auto_host_fallback_is_opt_in_until_a_gpu_is_measured(monkeypatch, auto):
     query = torch.empty(1, 2, 8, 4)
     monkeypatch.setattr(SA, "_offloadable", lambda t: True)
@@ -1354,7 +1376,8 @@ def test_auto_host_fallback_is_opt_in_until_a_gpu_is_measured(monkeypatch, auto)
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (8, 0))
     monkeypatch.delenv("UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD", raising = False)
-    assert SA._AUTO_HOST_MIN_SEQ == {} and not SA._auto_host_allowed(query)
+    monkeypatch.setattr(SA, "_AUTO_HOST_MIN_SEQ", {})
+    assert not SA._auto_host_allowed(query)
     monkeypatch.setattr(SA, "_AUTO_HOST_MIN_SEQ", {(8, 0): 8})
     assert SA._auto_host_allowed(query)
     monkeypatch.setattr(SA, "_AUTO_HOST_MIN_SEQ", {(8, 0): 16})

@@ -351,9 +351,10 @@ _HOST = "host"
 
 
 # Automatic host fallback: compute capability -> shortest query length measured faster than main by
-# more than A/A + 5% (Colab, Qwen3-8B LoRA). None qualifies yet: A100 32K +5.0% (A/A 0.6%), L4 32K
-# +3.3%, A100 near full +2.3%, so it is opt-in (UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD=1).
-_AUTO_HOST_MIN_SEQ = {}
+# more than A/A + 5% (Colab, Qwen3-8B bf16 LoRA). It only moves layers the device budget already
+# declined. sm80: A100-40GB 64K +12.5% (A/A 0.9%), A100-80GB 128K +14.5%; 32K stays under the bar
+# (+2.3% to +5.0%). L4 (sm89) 32K +3.4%, 64K does not fit. Elsewhere: UNSLOTH_GC_SAVE_ATTENTION_AUTO_OFFLOAD=1.
+_AUTO_HOST_MIN_SEQ = {(8, 0): 65536}
 
 
 def _auto_host_setting():
