@@ -142,10 +142,12 @@ def _base_name(name):
 
 
 def _candidates(model):
-    """Frozen fp32-computing Linear projections and the output embedding: (module, is_head)."""
+    """Frozen fp32-computing Linear projections and the output embedding: (module, is_head, adapter layer or None)."""
     head = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
     if not isinstance(head, torch.nn.Linear):
         head = None
+    owners = {id(module.base_layer): module for module in model.modules()
+              if isinstance(getattr(module, "base_layer", None), torch.nn.Linear)}
     found, seen = [], set()
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear) or id(module) in seen:
@@ -160,15 +162,19 @@ def _candidates(model):
         if bias is not None and (bias.requires_grad or bias.dtype not in (torch.bfloat16, torch.float32)):
             continue
         seen.add(id(module))
-        found.append((module, is_head))
+        found.append((module, is_head, owners.get(id(module))))
     return found
 
 
-def _key(module):
+def _key(module, owner):
+    """Storage, version and shape of the weight (and bias), plus the adapters PEFT merged into it: merge_adapter /
+    unmerge_adapter write through ``.data``, which moves neither the storage nor the version."""
     weight, bias = module.weight, module.bias
     key = (weight.data_ptr(), weight._version, weight.dtype, tuple(weight.shape))
     if bias is not None:
         key += (bias.data_ptr(), bias._version)
+    if owner is not None:
+        key += (tuple(getattr(owner, "merged_adapters", ()) or ()),)
     return key
 
 
@@ -183,31 +189,32 @@ def _packable(weight):
 def _prepare(model):
     """Packs for every eligible module (built in parallel where missing or stale), or None when they do not fit."""
     todo, ready = [], []
-    for module, is_head in _candidates(model):
+    for module, is_head, owner in _candidates(model):
+        key = _key(module, owner)
         cached = _PACKS.get(module, None)
-        if cached is not None and cached[0] == _key(module):
+        if cached is not None and cached[0] == key:
             ready.append((module, cached[1]))
             continue
         if cached is not None:  # the weight changed (merged, reloaded, edited in place): pack it again
             del _PACKS[module]
         if _packable(module.weight):
-            todo.append((module, is_head))
+            todo.append((module, is_head, key))
     if todo:
         from .runtime import available_ram
-        extra = 2 * sum(module.weight.numel() for module, _ in todo)
+        extra = 2 * sum(module.weight.numel() for module, _, _ in todo)
         available = available_ram()
         if available is None or extra > _RAM_SHARE * available:
             return ready or None
         jobs = []
-        for module, is_head in todo:
+        for module, is_head, _ in todo:
             if is_head and module.weight.shape[0] > _HEAD_BLOCK:
                 jobs.extend((module, True, start) for start in range(0, module.weight.shape[0], _HEAD_BLOCK))
             else:
                 jobs.append((module, False, 0))
         packed = _pack_parallel(jobs)
-        for module, is_head in todo:
+        for module, _, key in todo:
             parts = sorted(packed[id(module)], key = lambda part: part[0])
-            _PACKS[module] = (_key(module), parts)
+            _PACKS[module] = (key, parts)
             ready.append((module, parts))
     return ready
 

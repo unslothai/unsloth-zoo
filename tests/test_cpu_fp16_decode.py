@@ -132,6 +132,48 @@ def test_packs_are_built_once_and_rebuilt_when_the_weight_changes(no_bf16, monke
 
 
 @needs_fbgemm
+def test_packs_follow_peft_merge_and_unmerge(no_bf16):
+    from peft import LoraConfig, get_peft_model
+    model = _tiny_llama(bf16_stored = False)
+    model = get_peft_model(model, LoraConfig(r = 4, lora_alpha = 8, target_modules = ["q_proj"], init_lora_weights = False))
+    model.train()
+    lora = model.base_model.model.model.layers[0].self_attn.q_proj
+    x = torch.randn(2, 32)
+
+    def packed_out():
+        with torch.no_grad(), no_bf16.fp16_decode(model) as ctx:
+            assert ctx.active
+            return lora.base_layer(x)
+    before = packed_out()
+    torch.testing.assert_close(before, F.linear(x, lora.base_layer.weight), rtol = 1e-5, atol = 1e-5)
+    model.merge_adapter()  # writes the merged weight through .data: same storage and version
+    merged = packed_out()
+    torch.testing.assert_close(merged, F.linear(x, lora.base_layer.weight), rtol = 1e-5, atol = 1e-5)
+    assert (merged - before).abs().max() > 1e-3
+    model.unmerge_adapter()
+    torch.testing.assert_close(packed_out(), F.linear(x, lora.base_layer.weight), rtol = 1e-5, atol = 1e-5)
+
+
+@needs_fbgemm
+def test_rollout_without_packs_keeps_the_fp32_copy(no_bf16, monkeypatch):
+    """No packs (RAM short for them): a wide rollout on an AVX2 host still decodes through the fp32 copy."""
+    from unsloth_zoo.cpu import loader
+    model = _tiny_llama()
+    monkeypatch.setattr(no_bf16, "_prepare", lambda model: None)
+    monkeypatch.setattr(loader, "_fp32_rollout_fits", lambda model, rows = None, new_tokens = None: True)
+    seen = []
+    stored = [m for m in model.modules() if type(m).__name__ == "Bf16StoredLinear"]
+    handles = [m.register_forward_pre_hook(lambda mod, args: seen.append(mod.weight.dtype)) for m in stored]
+    try:
+        _generate(model)
+    finally:
+        for h in handles:
+            h.remove()
+    assert set(seen) == {torch.float32} and {m.weight.dtype for m in stored} == {torch.bfloat16}
+    assert no_bf16.ENGAGED[0] == 0
+
+
+@needs_fbgemm
 def test_numerics_match_fp32_linear_and_blocked_head(no_bf16, monkeypatch):
     monkeypatch.setattr(no_bf16, "_HEAD_BLOCK", 40)  # 96-row vocabulary in 3 blocks
     model = _tiny_llama(bf16_stored = False)
