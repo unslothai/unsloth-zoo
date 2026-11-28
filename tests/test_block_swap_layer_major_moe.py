@@ -277,18 +277,21 @@ def test_unsloth_non_reentrant_checkpoint_engages_bitwise():
     assert any(_ROUTER.search(k) and with_aux[k].abs().sum() > 0 for k in with_aux)
 
 
-def test_forward_swapping_capture_in_compiled_layers_is_refused():
-    """transformers 4.x records router logits by swapping module forwards per call; the window keeps those per
-    thread through a class-level forward, which compiled decoder layers cannot trace: refused up front."""
+def test_forward_swapping_capture_in_compiled_layers_bitwise():
+    """transformers 4.x records router logits by assigning capture wrappers to the recorded modules' instance forward
+    per model call: the window swaps those per turn, so compiled decoder code sees the same instance-forward protocol
+    as in standard training. Once standard steps compiled the graphs, a window runs bitwise and compiles nothing."""
     if not lm._forward_swapping_capture():
         pytest.skip("transformers 5.x records router logits per thread through hooks")
     model = _model("qwen3_moe", "non_reentrant")
-    _layers(model)[1].compile()
+    for layer in _layers(model):
+        layer.compile(backend = "aot_eager")
     batches, items = _batches()
-    fns = [functools.partial(_step, model, b, items) for b in batches]
-    results, why = lm.run_layer_major(_layers(model), fns, model = model)
-    assert results is None and "compiled decoder layers" in why, why
-    assert _grads(model) == {}
+    for _ in range(2):   # standard steps compile every graph the window will need
+        model.zero_grad(set_to_none = True)
+        [_step(model, b, items) for b in batches]
+    _compare(model)
+    assert all(getattr(m.__dict__["forward"], "__self__", None) is m for m in model.modules() if "forward" in m.__dict__)
 
 
 @pytest.mark.parametrize("gc", ["non_reentrant", "none"])
