@@ -122,12 +122,12 @@ def test_old_triton_on_blackwell_keeps_tl_dot_off(monkeypatch):
 def test_strided_packed_view_reads_its_own_bytes(rows):
     # packed[::2] has the logical (rows, row_bytes) shape but a doubled row stride: the fused kernels index rows by
     # row_bytes, so they must see a contiguous copy.
-    full, (N, K) = _weight(rows = 64, device = "cuda")
+    full, (_, K) = _weight(rows = 64, device = "cuda")
     strided = full[::2]
     assert not strided.is_contiguous()
     shape = (32, K)
     x = torch.randn(rows, K, device = "cuda", dtype = torch.bfloat16)
-    g = torch.randn(rows, N, device = "cuda", dtype = torch.bfloat16)
+    g = torch.randn(rows, 32, device = "cuda", dtype = torch.bfloat16)
     want = gguf_linear(x, strided.contiguous(), T.Q4_K, shape)
     got = gguf_linear(x, strided, T.Q4_K, shape)
     assert torch.equal(got, want)
