@@ -103,6 +103,15 @@ def _host_codec_with_disk():
     return os.environ.get(_COMPRESS_ENV, "auto").strip().lower() not in ("0", "false", "no", "off")
 
 
+# fp8 disk-tier blocks (weights plus their scales) are entropy coded byte by byte (about 0.83x raw) unless this is 0
+# (or UNSLOTH_BLOCK_SWAP_CODEC=v1, which keeps only the fixed-width bf16 format).
+_FP8_COMPRESS_ENV = "UNSLOTH_OFFLOAD_DISK_COMPRESS_FP8"
+
+
+def _fp8_compress_requested():
+    return os.environ.get(_FP8_COMPRESS_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 _CODEC = []
 
 
@@ -733,7 +742,7 @@ class _Block:
         out = raw if at is None else None
         try:
             with _no_inference_mode():
-                enc = codec.encode_region(raw, device = encode_device, out = out)
+                enc = codec.encode_region(raw, device = encode_device, out = out, kind = self.codec_kind())
         except torch.cuda.OutOfMemoryError:
             enc = None
         if enc is None:
@@ -741,7 +750,7 @@ class _Block:
         parts, c = enc
         pieces = [(t, off) for off, t in parts]
         if out is not None:
-            pieces.insert(0, (out[:c.words * 3 // 2], 0))
+            pieces.insert(0, (out[:c.body_nbytes], 0))
         try:
             base = store.write_region(pieces, c.nbytes, at = at)
         except BaseException:
@@ -814,7 +823,18 @@ class _Block:
                        for p, off in zip(self.params, self.layout)])
 
     def disk_compressible(self):
-        return len(self.sizes) == 1 and bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
+        return len(self.sizes) == 1 and bool(self.params) and self.codec_kind() is not None
+
+    def codec_kind(self):
+        """How the lossless codec reads this block's region: "bf16" (all bf16), "bytes" (fp8 weights with their
+        scales, UNSLOTH_OFFLOAD_DISK_COMPRESS_FP8=0 keeps them raw), or None (raw)."""
+        dtypes = {p.dtype for p in self.params}
+        if dtypes == {torch.bfloat16}:
+            return "bf16"
+        fp8 = {getattr(torch, n) for n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, n)}
+        if dtypes & fp8 and dtypes <= fp8 | {torch.bfloat16, torch.float16, torch.float32} and _fp8_compress_requested():
+            return "bytes"
+        return None
 
     def disk_views(self, target = "cpu"):
         """The block's weights read back from disk, on `target`."""
