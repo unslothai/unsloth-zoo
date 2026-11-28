@@ -2851,9 +2851,19 @@ def standardize_data_formats(
     for example in examples:
         for message in example["conversations"]:
             for key, value in message.items():
-                if type(value) is not str:
-                    raise RuntimeError("Unsloth: Cannot standardize non text datasets!")
                 uniques[key].append(value)
+    pass
+
+    # Per-turn metadata such as the "weight" in Open-Orca/SlimOrca and teknium/OpenHermes-2.5 is null or a number,
+    # never the role or the text, so it is left out of the role and content choice instead of failing the dataset.
+    for key in list(uniques.keys()):
+        values = uniques[key]
+        if all(type(value) is str for value in values):
+            continue
+        if all(value is None or type(value) in (int, float, bool) for value in values):
+            del uniques[key]
+            continue
+        raise RuntimeError("Unsloth: Cannot standardize non text datasets!")
     pass
 
     assert(len(uniques.keys()) == 2)
