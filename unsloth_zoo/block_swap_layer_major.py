@@ -31,9 +31,10 @@ all micro-batches of one optimizer step through a layer while it is on the card 
 
 Each micro-batch keeps its own shapes, kernels and loss normalisation, and every weight gradient accumulates
 micro-batch 0 first, as plain accumulation does, so losses and gradients are bitwise those of standard gradient
-accumulation with per-layer checkpointing. Dropout masks are replayed in the recompute (drawn in layer-major order,
-so with dropout they differ from standard accumulation's). The price is memory: every micro-batch's layer inputs are
-held at once (gradient checkpointing holds one micro-batch's), see `boundary_bytes`.
+accumulation with per-layer checkpointing. Random draws (dropout, embedding noise) follow standard accumulation's
+order too: each micro-batch runs on its own generator cursor, started where the previous micro-batch's standard step
+ends (`rng_plan`, checked after the forward), and the recompute replays each layer's masks. The price is memory: every
+micro-batch's layer inputs are held at once (gradient checkpointing holds one micro-batch's), see `boundary_bytes`.
 
 Anything outside the protocol (a layer called out of order or twice, hidden states changed or written in place between
 layers, a layer input other than the hidden states that needs gradients, a mapping passed between layers (shared KV
@@ -65,13 +66,19 @@ __all__ = [
     "LayerMajorAbort",
     "layer_major_mode",
     "layer_major_stats",
+    "rng_advance",
+    "rng_consumption",
+    "rng_load",
+    "rng_same",
+    "rng_snapshot",
     "boundary_bytes",
     "run_layer_major",
     "stall_fraction",
     "swap_totals",
 ]
 
-_STATS = {"windows": 0, "micro_batches": 0, "layer_calls": 0, "recomputes": 0, "aborts": 0, "last_abort": None}
+_STATS = {"windows": 0, "micro_batches": 0, "layer_calls": 0, "recomputes": 0, "aborts": 0, "rng_mismatches": 0,
+          "last_abort": None}
 _TLS = threading.local()
 _CACHE_KWARGS = ("past_key_value", "past_key_values", "cache", "layer_past")
 
@@ -214,6 +221,172 @@ def _set_all_rng_state(state):
     torch.set_rng_state(cpu)
     if cuda is not None:
         torch.cuda.set_rng_state_all(cuda)
+
+
+# ---- generator states in standard order ----
+# Standard accumulation draws every random number of micro-batch 0 (its embedding noise, every layer's dropout, its
+# head), then all of micro-batch 1's, and so on; the window interleaves the micro-batches per layer. Each micro-batch
+# therefore runs on its own generator cursor (loaded when its worker gets the turn, saved when it passes it), starting
+# where standard accumulation would start it: micro-batch m starts where micro-batch m - 1 ends. A micro-batch's draws
+# depend only on its own computation, so the caller passes how many each one takes (rng_plan, learned from standard
+# steps); the window checks that every micro-batch ended exactly where the next one started.
+
+_MT_N, _MT_M = 624, 397
+# CPU generator state (CPUGeneratorImplState): seed u64, left i32, seeded i32, next u64, 624 x u64 MT19937 words, then
+# the cached normal samples, which a draw count cannot carry.
+_CPU_STATE_BYTES = 5056
+_CPU_WORDS = 24
+_CPU_TAIL = _CPU_WORDS + 8 * _MT_N
+# Most MT19937 twists rng_consumption walks before calling CPU consumption uncountable (~1.6e8 draws).
+_MT_MAX_TWISTS = 1 << 18
+
+
+def _mt_twist(words):
+    """One MT19937 state regeneration (ATen's mt19937::next_state) of 624 uint32 words."""
+    import numpy as np
+    old = words
+    new = np.empty_like(old)
+    upper, lower, matrix = np.uint32(0x80000000), np.uint32(0x7fffffff), np.uint32(0x9908b0df)
+
+    def mix(u, v):
+        return (((u & upper) | (v & lower)) >> np.uint32(1)) ^ np.where(v & np.uint32(1), matrix, np.uint32(0))
+
+    k = _MT_N - _MT_M   # 227
+    new[:k] = old[_MT_M:] ^ mix(old[:k], old[1:k + 1])
+    new[k:2 * k] = new[:k] ^ mix(old[k:2 * k], old[k + 1:2 * k + 1])
+    new[2 * k:_MT_N - 1] = new[k:_MT_N - 1 - k] ^ mix(old[2 * k:_MT_N - 1], old[2 * k + 1:_MT_N])
+    new[_MT_N - 1] = new[_MT_M - 1] ^ mix(old[_MT_N - 1:], new[:1])[0]
+    return new
+
+
+def _cpu_parse(state):
+    """(header without left / next, next normalised, words, tail) of a CPU generator state."""
+    import numpy as np
+    import struct
+    if len(state) != _CPU_STATE_BYTES:
+        return None
+    seed, left, seeded, nxt = struct.unpack_from("<QiiQ", state, 0)
+    if left + nxt != _MT_N + 1:
+        if not (left == 1 and nxt == 0):
+            return None
+        nxt = _MT_N   # freshly seeded: the next draw regenerates, exactly as after 624 draws
+    words = np.frombuffer(state, dtype = "<u8", count = _MT_N, offset = _CPU_WORDS).astype(np.uint32)
+    return (seed, seeded), nxt, words, bytes(state[_CPU_TAIL:])
+
+
+def _cpu_build(head, nxt, words, tail):
+    import numpy as np
+    import struct
+    seed, seeded = head
+    return (struct.pack("<QiiQ", seed, _MT_N + 1 - nxt, seeded, nxt) + words.astype("<u8").tobytes() + tail)
+
+
+def _cpu_same(a, b):
+    if a == b:
+        return True
+    pa, pb = _cpu_parse(a), _cpu_parse(b)
+    if pa is None or pb is None:
+        return False
+    return pa[0] == pb[0] and pa[1] == pb[1] and pa[3] == pb[3] and bool((pa[2] == pb[2]).all())
+
+
+def _rng_devices():
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        return list(range(torch.cuda.device_count()))
+    return []
+
+
+def rng_snapshot(devices = None):
+    """The CPU generator's state and the default CUDA generators' (all initialised devices, or `devices`), as bytes."""
+    devices = _rng_devices() if devices is None else [torch.device(d).index if not isinstance(d, int) else d
+                                                       for d in devices]
+    cuda = tuple((d, bytes(torch.cuda.default_generators[d].get_state().numpy().tobytes())) for d in devices)
+    return bytes(torch.get_rng_state().numpy().tobytes()), cuda
+
+
+def rng_load(snapshot):
+    cpu, cuda = snapshot
+    torch.set_rng_state(torch.frombuffer(bytearray(cpu), dtype = torch.uint8))
+    for d, state in cuda:
+        torch.cuda.default_generators[d].set_state(torch.frombuffer(bytearray(state), dtype = torch.uint8))
+
+
+def _cuda_split(state):
+    import struct
+    seed, offset = struct.unpack_from("<QQ", state, 0)
+    return seed, offset
+
+
+def rng_same(a, b):
+    """Whether two snapshots are the same generator positions (a freshly seeded CPU state equals one 624 draws on)."""
+    if not _cpu_same(a[0], b[0]):
+        return False
+    other = dict(b[1])
+    for d, state in a[1]:
+        if d in other and state != other[d]:
+            return False
+    return True
+
+
+def rng_consumption(before, after):
+    """What a stretch of work drew between two snapshots: (CPU 32-bit draw count, ((device, Philox offset delta),
+    ...)), or None when it cannot be replayed by count (a reseed, the CPU's cached normal samples changed, or more
+    than _MT_MAX_TWISTS regenerations)."""
+    if before[0] == after[0]:
+        count = 0
+    else:
+        pa, pb = _cpu_parse(before[0]), _cpu_parse(after[0])
+        if pa is None or pb is None or pa[0] != pb[0] or pa[3] != pb[3]:
+            return None
+        words, twists = pa[2], 0
+        while not (words == pb[2]).all():
+            twists += 1
+            if twists > _MT_MAX_TWISTS:
+                return None
+            words = _mt_twist(words)
+        count = twists * _MT_N + pb[1] - pa[1]
+        if count < 0:
+            return None
+    deltas, other = [], dict(after[1])
+    for d, state in before[1]:
+        if d not in other:
+            return None
+        (s0, o0), (s1, o1) = _cuda_split(state), _cuda_split(other[d])
+        if s0 != s1 or o1 < o0 or len(state) != len(other[d]):
+            return None
+        if o1 != o0:
+            deltas.append((d, o1 - o0))
+    return count, tuple(deltas)
+
+
+ZERO_CONSUMPTION = (0, ())
+
+
+def rng_advance(snapshot, consumption):
+    """`snapshot` moved on by `consumption` (see rng_consumption)."""
+    import struct
+    cpu, cuda = snapshot
+    count, deltas = consumption
+    if count:
+        p = _cpu_parse(cpu)
+        if p is None:
+            raise ValueError("unrecognised CPU generator state")
+        head, nxt, words, tail = p
+        total = nxt + int(count)
+        twists = (total - 1) // _MT_N
+        for _ in range(twists):
+            words = _mt_twist(words)
+        cpu = _cpu_build(head, total - twists * _MT_N, words, tail)
+    if deltas:
+        delta = dict(deltas)
+        out = []
+        for d, state in cuda:
+            if delta.get(d):
+                seed, offset = _cuda_split(state)
+                state = struct.pack("<QQ", seed, offset + int(delta[d])) + state[16:]
+            out.append((d, state))
+        cuda = tuple(out)
+    return cpu, cuda
 
 
 def _autocast_state():
@@ -550,6 +723,9 @@ class _Window:
         self.check_values = [False] * self.L
         self.in_backward = False
         self.input_used = [False] * n
+        # Generator cursors in standard order (set by _execute_window): start[m] where micro-batch m starts, cursor[m]
+        # where it is now (saved when its worker passes the turn), end[m] where it finished.
+        self.rng_start = self.rng_cursor = self.rng_end = None
 
     def _call_signature(self, l):
         """Forward hooks and instance-level forwards in layer l (and the global hooks): what a per-call output
@@ -567,6 +743,9 @@ class _Window:
                 self.cv.wait()
             if self.abort_reason is not None:
                 raise LayerMajorAbort(self.abort_reason)
+        if self.rng_cursor is not None:
+            # This micro-batch's draws continue where its own last ran, not where the previous worker stopped.
+            rng_load(self.rng_cursor[m])
 
     def _next_alive(self, m):
         for k in range(1, self.n + 1):
@@ -576,6 +755,8 @@ class _Window:
         return None
 
     def _pass_turn(self, m):
+        if self.rng_cursor is not None:
+            self.rng_cursor[m] = rng_snapshot(self.rng_devices)
         with self.cv:
             self.turn = self._next_alive(m)
             self.cv.notify_all()
@@ -723,6 +904,8 @@ class _Window:
                     self.abort_reason = f"micro-batch {m} raised {type(e).__name__}: {e}"
         finally:
             _TLS.window = None
+            if self.rng_cursor is not None and self.turn == m:
+                self.rng_end[m] = rng_snapshot(self.rng_devices)
             with self.cv:
                 self.alive[m] = False
                 self.turn = self._next_alive(m)
@@ -870,7 +1053,7 @@ _WINDOW_LOCK = threading.Lock()
 _WINDOW_PID = os.getpid()
 
 
-def run_layer_major(layers, micro_fns, swapper = None, model = None, agree = None):
+def run_layer_major(layers, micro_fns, swapper = None, model = None, agree = None, rng_plan = None, rng_trace = None):
     """Run `micro_fns` (one full training step per micro-batch: forward, loss, its scaling and backward) layer-major
     over `layers`. Returns (results, None) with every gradient accumulated, or (None, reason) after a safe abort or
     refusal: every trainable gradient of `model` (and of `layers`) and the RNG state are as they were, so the caller
@@ -878,7 +1061,13 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None, agree = Non
     at a time: a concurrent caller is refused (the decoder classes and the worker pool are shared).
 
     Data parallel needs `agree` (see _Agreement): all ranks keep or all roll back. Micro-batches must not reduce
-    gradients (run them on the module inside DDP); the caller reduces after the window."""
+    gradients (run them on the module inside DDP); the caller reduces after the window.
+
+    Random draws: micro-batch m starts from the state standard accumulation gives it, the window's start moved on by
+    `rng_plan[0] + ... + rng_plan[m - 1]` (rng_consumption of each micro-batch's standard training step; None: no
+    draws). A micro-batch that ends anywhere else rolls the window back ("random draws of micro-batch ..."), so a
+    wrong or missing plan costs a standard retry, never different numerics. `rng_trace`, a list, receives each
+    micro-batch's (start, end) snapshots for the caller to learn from (rng_consumption)."""
     agreement = _Agreement(agree)
     if os.getpid() != _WINDOW_PID:
         agreement.close()
@@ -893,7 +1082,7 @@ def run_layer_major(layers, micro_fns, swapper = None, model = None, agree = Non
     try:
         reset = getattr(swapper, "reset", None)
         try:
-            results, why = _run_layer_major(layers, micro_fns, swapper, model, agreement)
+            results, why = _run_layer_major(layers, micro_fns, swapper, model, agreement, rng_plan, rng_trace)
         except BaseException:
             # The gradients and RNG are already put back; blocks a raising window left pending are released.
             if reset is not None:
@@ -938,7 +1127,7 @@ def _tied_trainable_io(model):
     return any(id(p) in trainable for p in head.parameters())
 
 
-def _run_layer_major(layers, micro_fns, swapper, model, agreement):
+def _run_layer_major(layers, micro_fns, swapper, model, agreement, rng_plan = None, rng_trace = None):
     n = len(micro_fns)
     if n < 1 or not len(layers):
         return None, "nothing to run"
@@ -1001,7 +1190,8 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
     scope = getattr(swapper, "layer_major_window", None)
     try:
         with scope() if scope is not None else nullcontext():
-            results, why = _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement)
+            results, why = _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement,
+                                           rng_plan, rng_trace)
         if results is not None:
             if scope is not None:
                 try:
@@ -1021,7 +1211,8 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
         raise
 
 
-def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement):
+def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, rng_plan = None,
+                    rng_trace = None):
     device, streams = None, ()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         device = torch.device("cuda", torch.cuda.current_device())
@@ -1031,6 +1222,13 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
         streams = tuple(torch.cuda.current_stream(d) for d in sorted(devices, key = lambda d: d.index or 0))
     w = _Window(layers, n, swapper, device, streams)
     w.agreement = agreement
+    w.rng_devices = _rng_devices()
+    start = rng_snapshot(w.rng_devices)
+    w.rng_start = [start]
+    for m in range(n - 1):
+        planned = rng_plan[m] if rng_plan is not None and m < len(rng_plan) else None
+        w.rng_start.append(rng_advance(w.rng_start[-1], planned if planned is not None else ZERO_CONSUMPTION))
+    w.rng_cursor, w.rng_end = list(w.rng_start), [None] * n
     w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
     try:
         with _intercept(w, layers) as orig_calls:
@@ -1048,6 +1246,19 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
                 for done in events:
                     done.wait()
                 raise
+            if rng_trace is not None:
+                rng_trace[:] = list(zip(w.rng_start, w.rng_end))
+            if w.abort_reason is None:
+                for m in range(n):
+                    if w.rng_end[m] is None:
+                        w.abort_reason = f"micro-batch {m} finished without its generator state"
+                        break
+                    if m + 1 < n and not rng_same(w.rng_end[m], w.rng_start[m + 1]):
+                        # Micro-batch m + 1 ran its draws from a state standard accumulation would not give it.
+                        _STATS["rng_mismatches"] += 1
+                        w.abort_reason = (f"random draws of micro-batch {m} differ from the plan (micro-batch "
+                                          f"{m + 1} started from another generator state than standard accumulation)")
+                        break
             if w.abort_reason is None and any(out is not None and out.grad is not None
                                               for row in w.outs[:-1] for out in row):
                 # Autograd would interleave those contributions with the decoder's; the window adds them first.
@@ -1085,6 +1296,8 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
             error.__traceback__ = None
         del error
         return roll_back(w.abort_reason)
+    # Standard accumulation leaves the generators where the last micro-batch ended (the recompute replays its own).
+    rng_load(w.rng_end[-1])
     try:
         w.backward(orig_calls)
     except (torch.OutOfMemoryError, _ReplayAbort, Exception) as error:

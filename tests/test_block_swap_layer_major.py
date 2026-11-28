@@ -625,8 +625,13 @@ def test_another_rank_voting_no_at_commit_restores_gradients_and_rng():
     def draw(m):
         torch.rand(1)
 
+    # Each micro-batch draws one number: the plan says so, so the window reaches the commit vote.
+    a = lm.rng_snapshot()
+    torch.rand(1)
+    plan = [lm.rng_consumption(a, lm.rng_snapshot())]
+    torch.manual_seed(5)
     losses, why = lm.run_layer_major(_layers(model), _voting_fns(model, batches, items, [], fail = draw),
-                                     model = model, agree = votes)
+                                     model = model, agree = votes, rng_plan = plan)
     assert losses is None and "another rank" in why
     assert votes.calls == [(True, "forward"), (True, "commit")]
     _assert_same(before, _grads(model))
@@ -1579,9 +1584,14 @@ def test_an_error_ending_the_step_restores_gradients_rng_and_swapper():
         torch.rand(3)
 
     head.grad = torch.full((16,), 7.0)
+    a = lm.rng_snapshot()
+    torch.rand(3)
+    plan = [lm.rng_consumption(a, lm.rng_snapshot())]   # each micro-batch draws: the window gets that far
+    torch.set_rng_state(torch.frombuffer(bytearray(a[0]), dtype = torch.uint8))
     rng = torch.get_rng_state()
     with pytest.raises(RuntimeError, match = "prefetch failed"):
-        lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], swapper = Swap(), model = owner)
+        lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], swapper = Swap(), model = owner,
+                           rng_plan = plan)
     assert torch.equal(head.grad, torch.full((16,), 7.0))
     assert torch.equal(torch.get_rng_state(), rng)
     assert Swap.resets == 1
@@ -2101,3 +2111,174 @@ def test_gpu_pool_growth_out_of_memory_keeps_the_pool(monkeypatch):
     finally:
         monkeypatch.undo()
         sw.remove()
+
+
+# ---------------------------------------------------------------- random draws in standard order
+def _set_dropout(model, p):
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Dropout):
+            mod.p = p
+    model.config.attention_dropout = p
+    for mod in model.modules():
+        if hasattr(mod, "attention_dropout"):
+            mod.attention_dropout = p
+
+
+def _noise_hook(module, args, out):
+    # NEFTune-like: noise on the embedding output, drawn before micro-batch's first layer.
+    return out + torch.zeros_like(out).uniform_(-0.1, 0.1) if module.training else out
+
+
+def _random_step(model, batch, items, head_dropout = 0.0):
+    """A training step whose loss part draws too (dropout on the logits) when head_dropout > 0."""
+    out = model(**{k: v for k, v in batch.items() if k != "labels"})
+    logits = torch.nn.functional.dropout(out.logits, head_dropout, True) if head_dropout else out.logits
+    loss = torch.nn.functional.cross_entropy(logits[:, :-1].flatten(0, 1).float(), batch["labels"][:, 1:].flatten(),
+                                             ignore_index = -100, reduction = "sum") / items
+    loss.backward()
+    return loss.detach()
+
+
+def _standard_with_plan(model, batches, items, seed, **kw):
+    """Standard accumulation from `seed`, recording what each micro-batch's step drew: (losses, grads, plan, end)."""
+    model.zero_grad(set_to_none = True)
+    torch.manual_seed(seed)
+    losses, plan = [], []
+    for b in batches:
+        a = lm.rng_snapshot()
+        losses.append(_random_step(model, b, items, **kw))
+        plan.append(lm.rng_consumption(a, lm.rng_snapshot()))
+    return losses, _grads(model), plan, torch.get_rng_state()
+
+
+@pytest.mark.parametrize("reentrant", [True, False])
+@pytest.mark.parametrize("where", ["lora_and_attention", "embedding_noise", "loss_part", "all"])
+def test_random_draws_follow_standard_order_with_a_plan(reentrant, where):
+    """Dropout in the layers (LoRA and attention), noise before the first layer and dropout in the loss part, with
+    micro-batches of different lengths: with the plan learned from a standard step the window gives the standard
+    losses, gradients and final generator state bitwise."""
+    model = _model(reentrant)
+    head = 0.0
+    if where in ("lora_and_attention", "all"):
+        _set_dropout(model, 0.3)
+    if where in ("embedding_noise", "all"):
+        model.get_input_embeddings().register_forward_hook(_noise_hook)
+    if where in ("loss_part", "all"):
+        head = 0.2
+    batches, items = _batches()
+    base_losses, base_grads, plan, base_end = _standard_with_plan(model, batches, items, 11, head_dropout = head)
+    assert all(c is not None and c != lm.ZERO_CONSUMPTION for c in plan)
+    assert len(set(plan)) == len(plan)   # unequal shapes: each micro-batch draws a different amount
+    model.zero_grad(set_to_none = True)
+    torch.manual_seed(11)
+    before = dict(lm.layer_major_stats())
+    fns = [lambda b = b: _random_step(model, b, items, head_dropout = head) for b in batches]
+    losses, why = lm.run_layer_major(_layers(model), fns, model = model, rng_plan = plan[:-1])
+    assert why is None, why
+    assert lm.layer_major_stats()["windows"] == before["windows"] + 1
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, _grads(model))
+    assert torch.equal(torch.get_rng_state(), base_end)
+
+
+def test_draws_without_a_plan_roll_back_and_report_what_they_drew():
+    """No plan (none expected) but the layers draw: the window rolls back (gradients and generators as before), the
+    trace gives each micro-batch's real consumption, and that as the plan makes the retry exact."""
+    model = _model()
+    _set_dropout(model, 0.3)
+    batches, items = _batches()
+    base_losses, base_grads, plan, base_end = _standard_with_plan(model, batches, items, 3)
+    model.zero_grad(set_to_none = True)
+    torch.manual_seed(3)
+    start = torch.get_rng_state()
+    trace = []
+    fns = [lambda b = b: _random_step(model, b, items) for b in batches]
+    mism = lm.layer_major_stats()["rng_mismatches"]
+    losses, why = lm.run_layer_major(_layers(model), fns, model = model, rng_trace = trace)
+    assert losses is None and why.startswith("random draws of micro-batch 0"), why
+    assert lm.layer_major_stats()["rng_mismatches"] == mism + 1
+    assert not _grads(model)
+    assert torch.equal(torch.get_rng_state(), start)
+    # Micro-batch 0 started from the real state, so its consumption is exact: the plan's first entry.
+    learned = lm.rng_consumption(*trace[0])
+    assert learned == plan[0]
+    losses, why = lm.run_layer_major(_layers(model), fns, model = model, rng_plan = plan[:-1])
+    assert why is None, why
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, _grads(model))
+    assert torch.equal(torch.get_rng_state(), base_end)
+
+
+def test_a_wrong_plan_rolls_back():
+    model = _model()
+    _set_dropout(model, 0.3)
+    batches, items = _batches()
+    _, _, plan, _ = _standard_with_plan(model, batches, items, 3)
+    model.zero_grad(set_to_none = True)
+    torch.manual_seed(3)
+    wrong = [plan[1], plan[0]]
+    fns = [lambda b = b: _random_step(model, b, items) for b in batches]
+    losses, why = lm.run_layer_major(_layers(model), fns, model = model, rng_plan = wrong)
+    assert losses is None and why.startswith("random draws"), why
+    assert not _grads(model)
+
+
+def test_no_draws_need_no_plan():
+    """Without random draws the default (no plan) is exact, and the generators end where they started."""
+    model = _model()
+    batches, items = _batches()
+    torch.manual_seed(2)
+    base_losses, base_grads = _standard(model, batches, items)
+    end = torch.get_rng_state()
+    torch.manual_seed(2)
+    losses, grads = _layer_major(model, batches, items)
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, grads)
+    assert torch.equal(torch.get_rng_state(), end)
+
+
+@pytest.mark.parametrize("seed_first", [True, False])
+@pytest.mark.parametrize("n", [0, 1, 5, 623, 624, 625, 1247, 1248, 1249, 20000])
+def test_cpu_draw_counts_and_advance_match_torch(seed_first, n):
+    torch.manual_seed(4)
+    if not seed_first:
+        torch.rand(37)
+    a = lm.rng_snapshot([])
+    torch.randint(0, 2 ** 16, (n,))
+    b = lm.rng_snapshot([])
+    assert lm.rng_consumption(a, b) == (n, ())
+    assert lm.rng_same(lm.rng_advance(a, (n, ())), b)
+    if n:
+        assert not lm.rng_same(lm.rng_advance(a, (n - 1, ())), b)
+
+
+def test_cpu_normal_cache_is_uncountable():
+    """Scalar normal sampling caches a sample in the generator state: no count can reproduce it."""
+    torch.manual_seed(4)
+    a = lm.rng_snapshot([])
+    torch.randn(3)
+    assert lm.rng_consumption(a, lm.rng_snapshot([])) is None
+    torch.manual_seed(4)
+    a = lm.rng_snapshot([])
+    torch.manual_seed(5)
+    assert lm.rng_consumption(a, lm.rng_snapshot([])) is None
+
+
+@_cuda
+def test_gpu_draws_follow_standard_order_with_a_plan():
+    """CUDA Philox offsets: dropout on the GPU with micro-batches of different lengths, bitwise with the plan."""
+    dev = torch.device("cuda", 0)
+    model = _model(device = dev)
+    _set_dropout(model, 0.3)
+    batches, items = _batches(device = dev)
+    base_losses, base_grads, plan, _ = _standard_with_plan(model, batches, items, 9, head_dropout = 0.2)
+    assert all(dict(c[1]).get(0) for c in plan)
+    base_cuda = torch.cuda.get_rng_state(dev)
+    model.zero_grad(set_to_none = True)
+    torch.manual_seed(9)
+    fns = [lambda b = b: _random_step(model, b, items, head_dropout = 0.2) for b in batches]
+    losses, why = lm.run_layer_major(_layers(model), fns, model = model, rng_plan = plan[:-1])
+    assert why is None, why
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    _assert_same(base_grads, _grads(model))
+    assert torch.equal(torch.cuda.get_rng_state(dev), base_cuda)
