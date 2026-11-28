@@ -295,3 +295,33 @@ def test_host_recheck_runs_before_the_staging_ring_is_taken(monkeypatch):
     assert seen == [None], seen
     assert sw._disk_tier is not None and sw._compress
     sw.remove()
+
+
+@_codec_gpu
+def test_load_time_spill_moved_back_under_inference_mode(monkeypatch):
+    """Installed under torch.inference_mode(), the host arena is an inference tensor: moving a disk layer into it
+    must not raise, and the forward matches no swap."""
+    base = _stack()
+    with torch.no_grad():
+        h = torch.randn(4, 32, base[0].norm.numel(), device = "cuda", dtype = torch.bfloat16)
+        want = h
+        for layer in base:
+            want = layer(want)
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 5)))
+    layers = copy.deepcopy(base)
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    state = _mod._HostLoad(11, "tail")
+    state.layers, state.indices = layers, _mod.swap_indices(len(layers), 11, "tail")
+    for i in state.indices:
+        state.evict(i)
+    assert state.disk
+    with torch.inference_mode():
+        sw = BlockSwap(layers, state.indices, prefetch_depth = 2, placement = "tail")
+    assert sw.stats()["disk_promoted"] >= 1
+    with torch.no_grad():
+        got = h
+        for layer in layers:
+            got = layer(got)
+    assert torch.equal(got, want)
+    sw.remove()

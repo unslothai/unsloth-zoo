@@ -886,6 +886,8 @@ class _Block:
         n = self.stored_bytes()
         with _no_inference_mode():
             buf, owner = mod.read_bytes(self.disk_store, self.disk["base"], n)
+        # In the caller's mode, like pack(): the arena is an inference tensor when installed under inference_mode.
+        with torch.no_grad():
             region[:n].copy_(buf[:n])
         del buf, owner
         self.host_buf = {d: region[:n]}
