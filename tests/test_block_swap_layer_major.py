@@ -2288,3 +2288,47 @@ def test_gpu_draws_follow_standard_order_with_a_plan():
     assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
     _assert_same(base_grads, _grads(model))
     assert torch.equal(torch.cuda.get_rng_state(dev), base_cuda)
+
+
+# ---------------------------------------------------------------- torch.compile inside the layers
+def test_a_window_that_compiles_rolls_back_and_the_next_one_runs():
+    """Dynamo picks a graph from the first shapes / grad mode it sees, so the window's call order (every micro-batch's
+    no-grad forward before any recompute) can compile other graphs than standard accumulation: a window that compiles
+    rolls back with gradients and RNG put back; once the graphs exist the next window runs, bitwise."""
+    torch._dynamo.reset()
+    compiled = torch.compile(lambda x: torch.tanh(x) * 2, backend = "eager", dynamic = False)
+
+    class Compiled(_Toy):
+        def forward(self, x, cache = None, **kwargs):
+            return compiled(self.lin(x))
+
+    layers = _toy_stack(Compiled)
+    xs = [torch.randn(2, 4 + m, 16, generator = torch.Generator().manual_seed(m)) for m in range(3)]
+
+    def fn(m):
+        x = xs[m].clone().requires_grad_(True)
+        for layer in layers:
+            x = layer(x)
+        loss = x.square().mean()
+        loss.backward()
+        return loss.detach()
+
+    def standard():
+        for p in layers.parameters():
+            p.grad = None
+        losses = [fn(m) for m in range(3)]
+        return losses, [p.grad.clone() for p in layers.parameters()]
+
+    base_losses, base_grads = standard()   # grad-mode graphs only
+    rng = torch.get_rng_state()
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(3)])
+    assert losses is None and why.startswith(lm.COMPILED_IN_WINDOW), why
+    assert all(p.grad is None for p in layers.parameters())
+    assert torch.equal(torch.get_rng_state(), rng)
+    epoch = lm.compile_epoch()
+    losses, why = _toy_run(layers, [functools.partial(fn, m) for m in range(3)])
+    assert why is None, why
+    assert lm.compile_epoch() == epoch
+    assert all(torch.equal(a, b) for a, b in zip(base_losses, losses))
+    assert all(torch.equal(p.grad, g) for p, g in zip(layers.parameters(), base_grads))
+    torch._dynamo.reset()
