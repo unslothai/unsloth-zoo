@@ -15,20 +15,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""CPU checks of the GGUF kernel routes ROCm takes (measured on gfx1151, Linux and Windows): fp16 dequantize decodes
-to float32 in the kernel and rounds in torch (the kernel's fp16 store writes -0.0 as +0.0 there), and the one-row
-Q4_1 GEMV uses the flat layout (the split one is wrong there). NVIDIA keeps both routes as they were."""
-
-import contextlib
-import types
+"""CPU checks of the GEMV layout ROCm takes: the one-row Q4_1 GEMV uses the flat layout there (gfx1151 Linux and
+Windows decode its split layout wrongly). NVIDIA keeps the layout it had for every format."""
 
 import pytest
-import torch
 
 from unsloth_zoo import rocm_build
+from unsloth_zoo.gguf_kernels import GGML_BLOCK
 from unsloth_zoo.gguf_kernels import GGMLType as T
 from unsloth_zoo.gguf_kernels import ops as O
-from unsloth_zoo.gguf_kernels.testing import random_packed
 
 
 @pytest.fixture(params = [True, False], ids = ["rocm", "cuda"])
@@ -43,30 +38,14 @@ def test_q4_1_gemv_layout(rocm):
         assert O._gemv_split(t) is True, t
 
 
+def test_cuda_layout_unchanged_for_every_format(monkeypatch):
+    monkeypatch.setattr(rocm_build, "is_rocm_torch", lambda torch_mod = None: False)
+    for no_split in (frozenset(), frozenset(GGML_BLOCK)):
+        monkeypatch.setattr(O, "_NO_SPLIT_GEMV", no_split)
+        for t in GGML_BLOCK:
+            assert O._gemv_split(t) is (t not in no_split), t
+
+
 def test_no_split_list_still_wins(rocm, monkeypatch):
     monkeypatch.setattr(O, "_NO_SPLIT_GEMV", frozenset((T.Q4_0, T.Q4_1)))
     assert O._gemv_split(T.Q4_0) is False and O._gemv_split(T.Q4_1) is False
-
-
-class _Launch:
-    def __init__(self):
-        self.out_dtypes = []
-
-    def __getitem__(self, grid):
-        def run(packed, out, *args, **kwargs):
-            self.out_dtypes.append(out.dtype)
-            out.fill_(-0.0)
-        return run
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32], ids = str)
-def test_fp16_dequant_store_dtype(rocm, dtype, monkeypatch):
-    launch = _Launch()
-    monkeypatch.setattr(O, "_tk", types.SimpleNamespace(dequantize_kernel = launch))
-    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
-    packed = random_packed(T.Q4_0, 4, 64)
-    out = O._dequant_triton(packed, T.Q4_0, (4, 64), dtype)
-    assert out.dtype == dtype and out.shape == (4, 64)
-    assert launch.out_dtypes == [torch.float32 if (rocm and dtype == torch.float16) else dtype]
-    # torch's rounding keeps the sign of zero
-    assert torch.signbit(out).all()

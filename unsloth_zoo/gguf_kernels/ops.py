@@ -165,9 +165,7 @@ def _dequant_triton(packed, ggml_type, shape, dtype):
     K = shape[-1]
     rows = packed.numel() // ggml_row_bytes(ggml_type, K)
     # sm < 80 has no bf16 conversion instruction (Triton 3.2 cannot emit one): decode to float32, round in torch.
-    # ROCm: the kernel's fp16 store writes -0.0 as +0.0 (gfx1151), so fp16 decodes to float32 there and rounds in torch.
-    index = packed.device.index or 0
-    native = _fp16_native(index) if dtype == torch.float16 else (_native_bf16(index) if dtype == torch.bfloat16 else True)
+    native = dtype != torch.bfloat16 or torch.version.hip is not None or torch.cuda.get_device_capability(packed.device)[0] >= 8
     out = torch.empty(shape, dtype = dtype if native else torch.float32, device = packed.device)
     if out.numel() == 0:
         return out.to(dtype)
@@ -241,12 +239,6 @@ def _native_bf16(index):
 
 
 @torch.compiler.assume_constant_result
-def _fp16_native(index):
-    from unsloth_zoo.rocm_build import is_rocm_torch
-    return not is_rocm_torch(torch)
-
-
-@torch.compiler.assume_constant_result
 def _cuda_table(index):
     # The lookup table as a graph constant: built once at trace time, never inside the compiled graph.
     return _table(torch.device("cuda", index))
@@ -265,8 +257,6 @@ def _traced_ok(packed, ggml_type, dtype):
         return False
     if dtype not in (torch.float16, torch.bfloat16, torch.float32) or not _env_on("UNSLOTH_GGUF_TRITON"):
         return False
-    if dtype == torch.float16:
-        return _fp16_native(packed.device.index or 0)
     return dtype != torch.bfloat16 or _native_bf16(packed.device.index or 0)
 
 
