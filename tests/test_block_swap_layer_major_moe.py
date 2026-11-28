@@ -1,0 +1,248 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Layer-major gradient accumulation on mixture-of-experts decoders (CPU): with the router load-balancing loss on
+(output_router_logits, router_aux_loss_coef > 0), a router z-loss, and router logits returned by the layer itself,
+losses (aux included) and every trainable gradient (LoRA and the full-finetuned router) equal standard accumulation
+bitwise under reentrant, non-reentrant and no gradient checkpointing; decoder buffers written in the forward are
+refused."""
+
+import functools
+import importlib.util
+import os
+import re
+
+import pytest
+import torch
+
+transformers = pytest.importorskip("transformers")
+peft = pytest.importorskip("peft")
+
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location(
+    "block_swap_layer_major_moe_under_test", os.path.join(_HERE, "unsloth_zoo", "block_swap_layer_major.py"))
+lm = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(lm)
+
+torch.set_num_threads(min(4, torch.get_num_threads()))
+_ROUTER = re.compile(r"\.(gate|router)\.(weight|bias)$")
+
+MOE = {
+    "qwen3_moe": ("Qwen3MoeConfig", "Qwen3MoeForCausalLM", dict(
+        intermediate_size = 64, moe_intermediate_size = 16, head_dim = 8, num_experts = 4, num_experts_per_tok = 2,
+        decoder_sparse_step = 1, mlp_only_layers = [])),
+    "mixtral": ("MixtralConfig", "MixtralForCausalLM", dict(
+        intermediate_size = 32, num_local_experts = 4, num_experts_per_tok = 2)),
+    "gpt_oss": ("GptOssConfig", "GptOssForCausalLM", dict(
+        intermediate_size = 32, head_dim = 8, num_local_experts = 4, num_experts_per_tok = 2,
+        layer_types = ["sliding_attention", "full_attention", "sliding_attention"], sliding_window = 8)),
+}
+
+
+def _model(arch, gc, coef = 0.5, seed = 0):
+    cfg_name, model_name, extra = MOE[arch]
+    if not hasattr(transformers, model_name):
+        pytest.skip(f"transformers {transformers.__version__} has no {model_name}")
+    torch.manual_seed(seed)
+    cfg = getattr(transformers, cfg_name)(hidden_size = 32, num_hidden_layers = 3, num_attention_heads = 4,
+                                          num_key_value_heads = 2, vocab_size = 64, max_position_embeddings = 64,
+                                          output_router_logits = True, router_aux_loss_coef = coef,
+                                          tie_word_embeddings = False, **extra)
+    cfg._attn_implementation = "eager"
+    model = getattr(transformers, model_name)(cfg)
+    model.config.use_cache = False
+    if gc != "none":
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": gc == "reentrant"})
+    model = peft.get_peft_model(model, peft.LoraConfig(r = 4, lora_alpha = 8, init_lora_weights = False,
+                                                       target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]))
+    model.enable_input_require_grads()
+    routers = [p for n, p in model.named_parameters() if _ROUTER.search(n)]
+    assert routers
+    for p in routers:
+        p.requires_grad_(True)     # full finetuning of the router weights
+    model.train()
+    return model
+
+
+def _batches(n = 3, seed = 1):
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for m in range(n):
+        rows, cols = 2, 6 + 3 * m
+        ids = torch.randint(0, 64, (rows, cols), generator = g)
+        mask = torch.ones(rows, cols, dtype = torch.long)
+        mask[1, cols - 2 - m:] = 0
+        out.append(dict(input_ids = ids, attention_mask = mask, labels = ids.masked_fill(mask == 0, -100)))
+    items = sum(int((b["labels"][..., 1:] != -100).sum()) for b in out)
+    return out, torch.tensor(items)
+
+
+def _step(model, batch, items, zloss = False):
+    out = model(**batch, num_items_in_batch = items)
+    loss = out.loss
+    if zloss:
+        # A router z-loss on the recorded router logits (as switch-style routers add it).
+        loss = loss + 1e-2 * sum(torch.logsumexp(r.float(), -1).square().mean() for r in out.router_logits)
+    loss.backward()
+    return loss.detach(), out.aux_loss.detach()
+
+
+def _layers(model):
+    return model.get_base_model().model.layers
+
+
+def _grads(model):
+    return {n: p.grad.clone() for n, p in model.named_parameters() if p.requires_grad and p.grad is not None}
+
+
+def _compare(model, zloss = False):
+    batches, items = _batches()
+    model.zero_grad(set_to_none = True)
+    base = [_step(model, b, items, zloss) for b in batches]
+    base_grads = _grads(model)
+    model.zero_grad(set_to_none = True)
+    lm.layer_major_stats(reset = True)
+    fns = [functools.partial(_step, model, b, items, zloss) for b in batches]
+    results, why = lm.run_layer_major(_layers(model), fns, model = model)
+    assert why is None, why
+    stats = lm.layer_major_stats()
+    assert (stats["windows"], stats["aborts"]) == (1, 0), stats
+    grads = _grads(model)
+    for (loss, aux), (loss2, aux2) in zip(base, results):
+        assert torch.equal(loss, loss2) and torch.equal(aux, aux2)
+    assert base_grads.keys() == grads.keys() and any(_ROUTER.search(k) for k in grads)
+    for k in base_grads:
+        assert torch.equal(base_grads[k], grads[k]), k
+    # No capture wrapper survives the window (transformers 4.x itself leaves the bound original behind).
+    assert all(getattr(m.__dict__["forward"], "__self__", None) is m for m in model.modules() if "forward" in m.__dict__)
+    return base_grads
+
+
+@pytest.mark.parametrize("gc", ["reentrant", "non_reentrant", "none"])
+@pytest.mark.parametrize("arch", sorted(MOE))
+def test_moe_router_aux_loss_bitwise(arch, gc):
+    _compare(_model(arch, gc))
+
+
+def test_router_z_loss_bitwise():
+    _compare(_model("qwen3_moe", "non_reentrant"), zloss = True)
+
+
+def test_the_aux_loss_gradient_reaches_the_router():
+    """Non-reentrant checkpointing differentiates the recorded router logits: the router gradient with the aux loss
+    differs from the one without, and the window reproduces both."""
+    with_aux = _compare(_model("qwen3_moe", "non_reentrant", coef = 0.5))
+    without = _compare(_model("qwen3_moe", "non_reentrant", coef = 0.0))
+    routers = [k for k in with_aux if _ROUTER.search(k)]
+    assert any(not torch.equal(with_aux[k], without[k]) for k in routers)
+
+
+class _RouterLayer(torch.nn.Module):
+    """A decoder layer that returns its router logits after the hidden states (older / remote-code MoE layers)."""
+    def __init__(self, w = 16, experts = 4, ckpt = None):
+        super().__init__()
+        self.lin = torch.nn.Linear(w, w)
+        self.router = torch.nn.Linear(w, experts)
+        self.gradient_checkpointing = ckpt is not None
+        self._gradient_checkpointing_func = ckpt
+
+    def _inner(self, x):
+        logits = self.router(x)
+        weight = torch.softmax(logits, -1).amax(-1, keepdim = True)
+        return torch.tanh(self.lin(x)) * weight, logits
+
+    def forward(self, x):
+        if self.gradient_checkpointing and self.training:
+            return self._gradient_checkpointing_func(self._inner, x)
+        return self._inner(x)
+
+
+@pytest.mark.parametrize("ckpt", ["reentrant", "none"])
+def test_router_logits_returned_by_the_layer_bitwise(ckpt):
+    func = functools.partial(torch.utils.checkpoint.checkpoint, use_reentrant = True) if ckpt == "reentrant" else None
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([_RouterLayer(ckpt = func) for _ in range(3)])
+
+    def fn(m):
+        x = torch.randn(2, 5, 16, generator = torch.Generator().manual_seed(m)).requires_grad_(True)
+        aux = 0
+        for layer in layers:
+            x, logits = layer(x)
+            aux = aux + torch.logsumexp(logits, -1).square().mean()
+        loss = x.square().sum() + 0.1 * aux
+        loss.backward()
+        return loss.detach()
+
+    for m in range(2):
+        fn(m)
+    base = {n: p.grad.clone() for n, p in layers.named_parameters()}
+    for p in layers.parameters():
+        p.grad = None
+    lm.layer_major_stats(reset = True)
+    results, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], model = layers)
+    assert why is None, why
+    assert lm.layer_major_stats()["windows"] == 1
+    for n, p in layers.named_parameters():
+        assert torch.equal(base[n], p.grad), n
+
+
+def test_a_buffer_written_in_the_forward_is_refused():
+    """An expert bias updated inside the forward from the routed load (aux-free balancing done in the layer): the
+    standard order updates it micro-batch after micro-batch, so the window refuses and leaves no gradient."""
+    class Biased(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(16, 16)
+            self.register_buffer("bias", torch.zeros(16))
+
+        def forward(self, x):
+            out = torch.tanh(self.lin(x) + self.bias)
+            with torch.no_grad():
+                self.bias.add_(0.1 * out.mean((0, 1)))
+            return out
+
+    torch.manual_seed(0)
+    layers = torch.nn.ModuleList([Biased() for _ in range(3)])
+
+    def fn(m):
+        x = torch.randn(2, 5, 16, generator = torch.Generator().manual_seed(m)).requires_grad_(True)
+        for layer in layers:
+            x = layer(x)
+        x.square().sum().backward()
+
+    results, why = lm.run_layer_major(layers, [functools.partial(fn, m) for m in range(2)], model = layers)
+    assert results is None and "buffers" in why, why
+    assert all(p.grad is None for p in layers.parameters())
+
+
+def test_capture_hooks_installed_by_the_first_call_inside_a_window():
+    """transformers 5.x installs its output-capture hooks on the first call that records: here that call is a
+    window's first micro-batch (no standard step before it on this model). Bitwise to a twin model trained the
+    standard way."""
+    batches, items = _batches()
+    twin = _model("qwen3_moe", "non_reentrant")
+    for b in batches:
+        _step(twin, b, items)
+    base = _grads(twin)
+    model = _model("qwen3_moe", "non_reentrant")
+    lm.layer_major_stats(reset = True)
+    fns = [functools.partial(_step, model, b, items) for b in batches]
+    results, why = lm.run_layer_major(_layers(model), fns, model = model)
+    assert why is None, why
+    grads = _grads(model)
+    assert base.keys() == grads.keys()
+    for k in base:
+        assert torch.equal(base[k], grads[k]), k

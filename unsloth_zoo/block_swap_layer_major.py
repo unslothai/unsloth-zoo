@@ -35,6 +35,13 @@ accumulation with per-layer checkpointing. Dropout masks are replayed in the rec
 so with dropout they differ from standard accumulation's). The price is memory: every micro-batch's layer inputs are
 held at once (gradient checkpointing holds one micro-batch's), see `boundary_bytes`.
 
+Mixture-of-experts layers: the router logits transformers records for the load-balancing loss (5.x: into the
+calling thread's output collector; 4.x: through capture wrappers assigned to `module.forward` per model call, kept
+per thread for the length of a window) and tensors a layer returns after its hidden states become leaves of their
+own where standard accumulation differentiates them, and each layer's recompute backpropagates them together with
+its hidden states. Unsloth's MoE routing frames are replayed in the recompute as its checkpoint does. A decoder
+buffer written in the forward (an expert bias updated from the routed load) is refused.
+
 Anything outside the protocol (a layer called out of order or twice, hidden states changed or written in place between
 layers, a layer input other than the hidden states that needs gradients, a mapping passed between layers (shared KV
 states), a checkpoint around the layer call, forward hooks or wrappers added to a layer during the window, saved-tensor
@@ -185,16 +192,144 @@ def _is_cache(obj):
     return "Cache" in type(obj).__name__ or "cache" in type(obj).__name__
 
 
-def _recorders_beyond_hidden_states():
-    """transformers' active output collector (5.x) when it records more than hidden states (attentions, router
-    logits): those are captured inside the decoder, under the window's no-grad forward."""
+_RECORD_SKIP = ("hidden_states", "_hidden_states_layers")
+
+
+def _capture_collector():
+    """transformers 5.x: this thread's active output collector (key -> list), or None."""
     mod = sys.modules.get("transformers.utils.output_capturing")
-    collector = getattr(mod, "_active_collector", None)
+    var = getattr(mod, "_active_collector", None)
     try:
-        active = collector.get() if collector is not None else None
+        active = var.get() if var is not None else None
     except Exception:
+        return None
+    return active if isinstance(active, dict) else None
+
+
+def _is_capture_hook(hook):
+    """transformers 5.x output-capturing forward hook: it records only while a collector is active."""
+    return getattr(hook, "__module__", None) == "transformers.utils.output_capturing" and \
+        getattr(hook, "__name__", None) == "output_capturing_hook"
+
+
+def _code_mentions(code, name, depth = 0):
+    if name in code.co_names or name in code.co_varnames or name in code.co_freevars or name in code.co_cellvars:
+        return True
+    return depth < 4 and any(_code_mentions(c, name, depth + 1) for c in code.co_consts if hasattr(c, "co_names"))
+
+
+def _forward_swapping_capture():
+    """transformers 4.x check_model_inputs: records outputs by assigning a capture wrapper to `module.forward` per
+    model call (and assigning the original back afterwards)."""
+    gen = sys.modules.get("transformers.utils.generic")
+    fn = getattr(gen, "check_model_inputs", None)
+    code = getattr(fn, "__code__", None)
+    return code is not None and "transformers.utils.output_capturing" not in sys.modules and \
+        _code_mentions(code, "monkey_patched_layers")
+
+
+def _closure(fn):
+    code, cells = getattr(fn, "__code__", None), getattr(fn, "__closure__", None)
+    if code is None or not cells:
+        return {}
+    out = {}
+    for name, cell in zip(code.co_freevars, cells):
+        try:
+            out[name] = cell.cell_contents
+        except ValueError:
+            pass
+    return out
+
+
+def _recorder_targets(model, layers):
+    """Module classes inside the decoder layers that transformers' output recorders (_can_record_outputs) target."""
+    specs = []
+    for module in ([model] if model is not None else []) + list(layers):
+        for m in module.modules():
+            flags = getattr(type(m), "_can_record_outputs", None)
+            if isinstance(flags, dict):
+                for value in flags.values():
+                    specs.extend(value if isinstance(value, list) else [value])
+    classes = set()
+    for layer in layers:
+        for m in layer.modules():
+            for spec in specs:
+                target = spec if isinstance(spec, type) else getattr(spec, "target_class", None)
+                name = spec if isinstance(spec, str) else getattr(spec, "class_name", None)
+                if (isinstance(target, type) and isinstance(m, target)) or \
+                        (isinstance(name, str) and type(m).__name__.endswith(name)):
+                    classes.add(type(m))
+    return classes
+
+
+class _ThreadForward:
+    """`forward` of a module class for the length of a window: assignments to `module.forward` (transformers 4.x
+    capture wrappers, assigned and put back once per model call) are kept per thread, so each micro-batch's worker
+    sees only its own wrapper. Reads without one fall back to the instance dict, then the class's own forward."""
+    def __init__(self, cls, orig):
+        self.cls, self.orig = cls, orig
+        self.local = threading.local()
+
+    def overrides(self):
+        d = getattr(self.local, "d", None)
+        if d is None:
+            d = self.local.d = {}
+        return d
+
+    def _own(self, obj):
+        for k in type(obj).__mro__:
+            if "forward" in k.__dict__:
+                return k is self.cls
         return False
-    return bool(active) and bool(set(active.keys()) - {"hidden_states", "_hidden_states_layers"})
+
+    def _bound(self, obj, objtype):
+        get = getattr(type(self.orig), "__get__", None)
+        return get(self.orig, obj, objtype) if get is not None else self.orig
+
+    def __get__(self, obj, objtype = None):
+        if obj is None:
+            return self._bound(None, objtype) if isinstance(self.orig, _ThreadForward) else self.orig
+        if self._own(obj):
+            entry = self.overrides().get(id(obj))
+            if entry is not None and entry[0] is obj:
+                return entry[1]
+            if "forward" in obj.__dict__:
+                return obj.__dict__["forward"]
+        return self._bound(obj, objtype)
+
+    def __set__(self, obj, value):
+        self.overrides()[id(obj)] = (obj, value)
+
+    def __delete__(self, obj):
+        if self.overrides().pop(id(obj), None) is None:
+            obj.__dict__.pop("forward", None)
+
+    def override(self, obj):
+        entry = self.overrides().get(id(obj))
+        return entry[1] if entry is not None and entry[0] is obj else None
+
+
+@contextmanager
+def _thread_forwards(classes):
+    """Install _ThreadForward on `classes` (origins resolved before any is patched), undone after."""
+    origins = {}
+    for cls in classes:
+        for k in cls.__mro__:
+            if "forward" in k.__dict__:
+                origins[cls] = ("forward" in cls.__dict__, k.__dict__["forward"])
+                break
+    installed = {}
+    try:
+        for cls, (had, orig) in origins.items():
+            installed[cls] = (had, cls.__dict__.get("forward"), _ThreadForward(cls, orig))
+            cls.forward = installed[cls][2]
+        yield {cls: d for cls, (_, _, d) in installed.items()}
+    finally:
+        for cls, (had, own, _) in installed.items():
+            if had:
+                cls.forward = own
+            else:
+                del cls.forward
 
 
 def _recompile_limit(error):
@@ -353,7 +488,8 @@ def _output_metadata(out):
     import struct
 
     values = tuple(out[1:]) if type(out) in (tuple, list) else ()
-    return type(out), tuple((type(v), struct.pack("!d", v) if type(v) is float else v) for v in values)
+    return type(out), tuple((torch.Tensor, tuple(v.shape), v.dtype, v.device) if isinstance(v, torch.Tensor) else
+                            (type(v), struct.pack("!d", v) if type(v) is float else v) for v in values)
 
 
 def _stock_checkpoint(fn):
@@ -393,11 +529,11 @@ def _unsloth_checkpoint_function():
 def _unsloth_frames(layer, x, swapper = None):
     """Around the window's no-grad forward of a layer whose checkpoint is Unsloth's (a shim, or torch's reentrant
     checkpoint once Unsloth's CheckpointFunction is patched in). Yields [refusal reason or None, routing frame,
-    (scope, saved-attention frame) or None]:
-    standard training gives that checkpoint a MoE routing frame its recompute replays, and UnslothCheckpointFunction
-    may store a float32 input in bfloat16 for its recompute. The window does neither, so an input stored that way
-    is refused up front and a layer that records routing in the frame is refused after its forward."""
-    state = [None, None, None]
+    (scope, saved-attention frame) or None, whether the checkpoint is one of Unsloth's shims]:
+    standard training gives that checkpoint a MoE routing frame its recompute replays (the window keeps one per
+    layer and micro-batch and replays it the same way), and UnslothCheckpointFunction may store a float32 input in
+    bfloat16 for its recompute, which the window does not, so an input stored that way is refused up front."""
+    state = [None, None, None, False]
     gc = sys.modules.get("unsloth_zoo.gradient_checkpointing")
     fn = getattr(layer, "_gradient_checkpointing_func", None)
     for _ in range(4):
@@ -410,6 +546,7 @@ def _unsloth_frames(layer, x, swapper = None):
         else:
             break
     shim = gc is not None and any(fn is getattr(gc, name, None) for name in _CKPT_SHIMS)
+    state[3] = shim
     if gc is None or not (shim or _unsloth_checkpoint_function()):
         yield state
         return
@@ -504,18 +641,27 @@ def _differs(a, b):
 
 
 def _split_output(out):
-    """(hidden, rebuild) for a layer output that is the hidden states or a plain tuple / list led by them."""
+    """(hidden, rebuild, extras) for a layer output that is the hidden states or a plain tuple / list led by them.
+    extras: positions of further tensors in it (router logits a layer returns), which the window turns into leaves
+    of their own; rebuild(h, {position: leaf}) puts them back in."""
     if isinstance(out, torch.Tensor):
-        return out, lambda h: h
+        return out, lambda h, replace = None: h, ()
     if type(out) in (tuple, list) and out and isinstance(out[0], torch.Tensor):
-        # Attention weights / router logits (also nested in containers) computed without gradients would silently
-        # lose their gradient: only plain metadata may follow the hidden states.
-        if any(type(o) not in (type(None), bool, int, float, str) for o in out[1:]):
-            return None, None
-        rest = tuple(out[1:])
-        kind = type(out)
-        return out[0], lambda h: kind((h,) + rest)
-    return None, None
+        # Values nested in containers (a dict of auxiliary losses) computed without gradients would silently lose
+        # their gradient: only tensors and plain metadata may follow the hidden states.
+        if any(type(o) not in (type(None), bool, int, float, str) and not isinstance(o, torch.Tensor) for o in out[1:]):
+            return None, None, ()
+        kind, items = type(out), tuple(out)
+        extras = tuple(i for i in range(1, len(items)) if isinstance(items[i], torch.Tensor))
+
+        def rebuild(h, replace = None):
+            new = list(items)
+            new[0] = h
+            for i, v in (replace or {}).items():
+                new[i] = v
+            return kind(new)
+        return items[0], rebuild, extras
+    return None, None, ()
 
 
 class _Window:
@@ -537,6 +683,12 @@ class _Window:
         self.h0 = [None] * n
         self.saved = [[None] * n for _ in range(self.L)]
         self.attention = [[None] * n for _ in range(self.L)]   # (scope, saved-attention frame) per call
+        self.routing = [[None] * n for _ in range(self.L)]     # Unsloth MoE routing frame per call, replayed
+        # Auxiliary outputs per call (router logits a recorder captured or the layer returned), as leaves:
+        # {"records": [(collector #, key, ordinal, leaf)], "recorders": [None (5.x collector) or
+        # [(module, key, index)] (4.x capture wrappers)], "extras": [(position, leaf)]}.
+        self.aux = [[None] * n for _ in range(self.L)]
+        self.thread_forwards = {}   # class -> _ThreadForward (transformers 4.x forward-swapping capture)
         # Every layer's output as the model sees it: a leaf, so a loss on intermediate hidden states (and the
         # loss part on the last one) leaves its gradient there for the backward.
         self.outs = [[None] * n for _ in range(self.L)]
@@ -557,7 +709,10 @@ class _Window:
         from torch.nn.modules import module as nn_module
         sig = [len(getattr(nn_module, "_global_forward_hooks", ())), len(getattr(nn_module, "_global_forward_pre_hooks", ()))]
         for mod in self.layers[l].modules():
-            sig += (len(mod._forward_hooks), len(mod._forward_pre_hooks), id(mod.__dict__.get("forward")))
+            # transformers 5.x installs its output-capture hooks on the first call that records (inside a window
+            # too); they record per thread, so they are not counted.
+            hooks = sum(not _is_capture_hook(h) for h in mod._forward_hooks.values())
+            sig += (hooks, len(mod._forward_pre_hooks), id(mod.__dict__.get("forward")))
         return tuple(sig)
 
     # ---- turn taking: exactly one worker runs at a time, in micro-batch order ----
@@ -616,8 +771,6 @@ class _Window:
         if _saved_tensor_hooks_active():
             # Entered inside the micro-batch (a callback): the window's decoder replay would bypass them.
             self._abort("saved-tensor hooks are active inside the micro-batch")
-        if _recorders_beyond_hidden_states():
-            self._abort("transformers is recording decoder outputs other than hidden states (output_attentions)")
         if self._call_signature(l) != self.signatures[l]:
             # Per-call output recorders (transformers' output_hidden_states / output_attentions capture wrappers,
             # hooks) would collect every interleaved micro-batch's outputs.
@@ -648,17 +801,22 @@ class _Window:
         if m == 0 and self.swapper is not None:
             self.swapper.hold(l)
             self.held.add(l)
+        collectors = self._collectors(layer)
+        before = [_record_counts(c) for c, _ in collectors]
         with torch.no_grad(), _checkpointing_off(layer), _unsloth_frames(layer, x, self.swapper) as frames:
             if frames[0] is not None:
                 self._abort(frames[0])
             out = orig_call(layer, *args2, **kwargs2)
         if frames[1] is not None and frames[1].entries:
-            self._abort("a decoder layer routes MoE experts under Unsloth's checkpoint, whose recompute replays it")
+            # Standard training's Unsloth checkpoint replays this routing in its recompute; so does the window's.
+            self.routing[l][m] = frames[1]
         self.attention[l][m] = frames[2]
-        out_h, rebuild = _split_output(out)
+        out_h, rebuild, extras = _split_output(out)
         if out_h is None:
             self._abort("a decoder layer output that is not the hidden states (or a tuple led by them)")
         self.saved[l][m] += (_output_metadata(out),)
+        replace = self._aux_leaves(l, m, collectors, before, out, extras, x,
+                                   grads = not no_grad_forward, shim = frames[3])
         if l in self.held and m == self.n - 1:
             self.held.discard(l)
             self.swapper.unhold(l)
@@ -672,12 +830,114 @@ class _Window:
         # the call (transformers' hidden-state capture) then holds the leaf, and a loss on it reaches the layers.
         leaf = out_h.requires_grad_(True) if out_h is not x and out_h.is_leaf else out_h.detach().requires_grad_(True)
         self.outs[l][m] = leaf
-        out = rebuild(leaf)
+        out = rebuild(leaf, replace)
         self.last_out[m], self.last_version[m] = leaf, leaf._version
         # Let the other micro-batches through this layer; after the last layer the loss parts run in order.
         self._pass_turn(m)
         self._wait_turn(m)
         return out
+
+    def _collectors(self, layer):
+        """[(collector, recorders)] recording this thread's micro-batch: transformers 5.x's active collector
+        (recorders None: its hooks record whenever it is active), and transformers 4.x capture wrappers this
+        micro-batch's model call assigned to modules of `layer` (recorders [(module, key, index)])."""
+        out = []
+        active = _capture_collector()
+        if active is not None:
+            out.append((active, None))
+        if self.thread_forwards:
+            found = {}
+            for mod in layer.modules():
+                desc = self.thread_forwards.get(type(mod))
+                fn = desc.override(mod) if desc is not None else None
+                if fn is None:
+                    continue
+                # check_model_inputs stacks one capture wrapper per recorded key; the original method ends it.
+                for _ in range(8):
+                    if getattr(fn, "__self__", None) is mod or fn is mod.__dict__.get("forward"):
+                        break
+                    cv = _closure(fn)
+                    sink = cv.get("collected_outputs")
+                    if not isinstance(sink, dict) or "key" not in cv or "index" not in cv or "orig_forward" not in cv:
+                        self._abort("a decoder module's forward was replaced during the window by something other "
+                                    "than transformers' output capture")
+                    found.setdefault(id(sink), (sink, []))[1].append((mod, cv["key"], cv["index"]))
+                    fn = cv["orig_forward"]
+            out.extend(found.values())
+        return out
+
+    def _aux_leaves(self, l, m, collectors, before, out, extras, x, grads, shim):
+        """Turn this call's auxiliary outputs into leaves (in place, so every holder sees the leaf) where standard
+        accumulation differentiates them, and remember them for the recompute. Recorded outputs (router logits,
+        attentions) are differentiable in standard training only when its forward runs under grad mode (`grads`):
+        a reentrant checkpoint records them without gradients. Tensors the layer returns after the hidden states
+        get gradients through any checkpoint. Returns {position: leaf} for the rebuilt output."""
+        records, recorders, replace, made = [], [], {}, {}
+
+        def leafify(t):
+            if id(t) in made:
+                return made[id(t)]
+            if t is x or t.requires_grad or not t.is_leaf:
+                self._abort("a decoder layer's auxiliary output already needs gradients (it aliases an input)")
+            made[id(t)] = t.requires_grad_(True)
+            return t
+
+        for ci, ((sink, recs), counts) in enumerate(zip(collectors, before)):
+            recorders.append(recs)
+            for key, now in _record_counts(sink).items():
+                for j, t in enumerate(tuple(sink[key])[counts.get(key, 0):now]):
+                    if grads and isinstance(t, torch.Tensor) and t.is_floating_point():
+                        records.append((ci, key, j, leafify(t)))
+        if extras:
+            if shim:
+                self._abort("a decoder layer returns tensors besides the hidden states under Unsloth's checkpoint "
+                            "shim, whose backward differentiates only the hidden states")
+            for i in extras:
+                t = out[i]
+                if t.is_floating_point():
+                    replace[i] = made[id(t)] if id(t) in made else (
+                        t.requires_grad_(True) if t.is_leaf and not t.requires_grad and t is not x
+                        else t.detach().requires_grad_(True))
+        if records or replace:
+            self.aux[l][m] = {"records": records, "recorders": recorders,
+                              "extras": list(replace.items())}
+        return replace
+
+    @contextmanager
+    def _capture(self, aux):
+        """Record a recompute's auxiliary outputs the way its forward's were: a private transformers 5.x collector
+        on this thread, or (4.x) a capture wrapper per recorded module, kept for this thread only."""
+        records = aux["records"] if aux is not None else ()
+        if not records:
+            yield None
+            return
+        keys = {}
+        for ci, key, _, _ in records:
+            keys.setdefault(ci, set()).add(key)
+        sinks = {ci: {k: [] for k in ks} for ci, ks in keys.items()}
+        installed = []
+        token, var = None, None
+        try:
+            for ci, recs in enumerate(aux["recorders"]):
+                if ci not in sinks:
+                    continue
+                if recs is None:
+                    var = getattr(sys.modules.get("transformers.utils.output_capturing"), "_active_collector", None)
+                    token = var.set(sinks[ci])
+                    continue
+                for mod, key, index in recs:
+                    if key not in sinks[ci]:
+                        continue
+                    desc = self.thread_forwards[type(mod)]
+                    inner = desc.override(mod) or desc.__get__(mod, type(mod))
+                    desc.__set__(mod, _capture_wrapper(inner, sinks[ci][key], index))
+                    installed.append((desc, mod))
+            yield sinks
+        finally:
+            for desc, mod in installed:
+                desc.overrides().pop(id(mod), None)
+            if var is not None:
+                var.reset(token)
 
     def _input_grad(self, m, grad):
         if not self.in_backward:
@@ -745,35 +1005,53 @@ class _Window:
                 for m in range(self.n):
                     saved, self.saved[l][m] = self.saved[l][m], None
                     attention, self.attention[l][m] = self.attention[l][m], None
+                    routing, self.routing[l][m] = self.routing[l][m], None
+                    aux, self.aux[l][m] = self.aux[l][m], None
                     leaf, self.outs[l][m] = self.outs[l][m], None
                     # The loss part's gradient on the last output, or a loss on an intermediate one.
                     extra = leaf.grad if leaf is not None else None
                     if extra is not None:
                         g[m] = extra if g[m] is None else g[m] + extra
                     del extra
-                    if saved is None or g[m] is None:
-                        del leaf
+                    # Auxiliary outputs the loss part reached (router logits in a load-balancing loss).
+                    wanted = _aux_wanted(aux, self.check_values[l])
+                    if saved is None or (g[m] is None and not any(a.grad is not None for *_, a in wanted)):
+                        del leaf, aux, wanted
                         continue
                     args2, kwargs2, where, ac, rng, metadata = saved
                     x = args2[0] if where == 0 else kwargs2[where]
                     x.requires_grad_(True)
                     with torch.enable_grad(), _autocast(ac), _checkpointing_off(layer), _replay_rng(rng), \
-                            (attention[0](attention[1], True) if attention is not None else nullcontext()):
+                            (attention[0](attention[1], True) if attention is not None else nullcontext()), \
+                            _routing_replay(routing), self._capture(aux) as sinks:
                         out = orig_call(layer, *args2, **kwargs2)
-                    out_h, _ = _split_output(out)
+                    out_h, _, _ = _split_output(out)
                     if out_h is None or not out_h.requires_grad or leaf is None or \
                             (out_h.shape, out_h.dtype, out_h.device) != (leaf.shape, leaf.dtype, leaf.device):
                         raise _ReplayAbort("a decoder recompute returned an output its forward did not")
                     if self.check_values[l] and _output_metadata(out) != metadata:
                         raise _ReplayAbort("a decoder recompute changed the layer's output metadata")
+                    roots, grads = ([out_h], [g[m]]) if g[m] is not None else ([], [])
+                    r = a = None
+                    pairs = [(out_h, leaf)]
+                    for where_aux, a in wanted:
+                        r = _recomputed_aux(out, sinks, where_aux)
+                        if r is None or not r.requires_grad or (r.shape, r.dtype, r.device) != (a.shape, a.dtype, a.device):
+                            raise _ReplayAbort("a decoder recompute did not reproduce an auxiliary output (router logits)")
+                        pairs.append((r, a))
+                        if a.grad is not None:
+                            roots.append(r)
+                            grads.append(a.grad)
                     if self.check_values[l]:
                         with torch.no_grad():
-                            flag = _differs(out_h, leaf)
-                            prev = differs.get(flag.device)
-                            differs[flag.device] = flag if prev is None else prev.logical_or_(flag)
+                            for r, a in pairs:
+                                flag = _differs(r, a)
+                                prev = differs.get(flag.device)
+                                differs[flag.device] = flag if prev is None else prev.logical_or_(flag)
                         del flag, prev
-                    del leaf
-                    torch.autograd.backward(out_h, g[m])
+                    del leaf, pairs, wanted, aux, sinks, r, a
+                    torch.autograd.backward(roots, grads)
+                    del roots, grads
                     _STATS["recomputes"] += 1
                     g[m] = x.grad
                     del out, out_h, x, args2, kwargs2, saved
@@ -788,6 +1066,54 @@ class _Window:
             if self.h0[m] is not None and g[m] is not None:
                 torch.autograd.backward(self.h0[m], g[m])
         self.h0 = [None] * self.n
+
+
+def _record_counts(sink):
+    """Entries per recorded key of an output collector (hidden states are the window's own leaves)."""
+    return {k: len(v) for k, v in sink.items() if k not in _RECORD_SKIP and isinstance(v, (list, tuple))}
+
+
+def _capture_wrapper(fn, sink, index):
+    """What transformers 4.x's capture wrapper records: the output, or its `index` entry when it is a tuple."""
+    def forward(*args, **kwargs):
+        output = fn(*args, **kwargs)
+        if not isinstance(output, tuple):
+            sink.append(output)
+        elif output[index] is not None:
+            sink.append(output[index])
+        return output
+    return forward
+
+
+def _aux_wanted(aux, check):
+    """[(where, leaf)] of a call's auxiliary leaves to recompute: those the loss part reached (all of them where the
+    recompute's values are checked)."""
+    if aux is None:
+        return []
+    out = [(("rec", ci, key, j), a) for ci, key, j, a in aux["records"]]
+    out += [(("out", i), a) for i, a in aux["extras"]]
+    return [(w, a) for w, a in out if check or a.grad is not None]
+
+
+def _recomputed_aux(out, sinks, where):
+    try:
+        if where[0] == "out":
+            return out[where[1]]
+        return sinks[where[1]][where[2]][where[3]]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+@contextmanager
+def _routing_replay(frame):
+    """Replay a forward's Unsloth MoE routing frame, as UnslothCheckpointFunction's recompute does."""
+    gc = sys.modules.get("unsloth_zoo.gradient_checkpointing")
+    scope = getattr(gc, "_checkpoint_routing_scope", None)
+    if frame is None or scope is None:
+        yield
+        return
+    with scope(frame, True):
+        yield
 
 
 class _Workers:
@@ -917,7 +1243,11 @@ def _decoder_forward_hooks(layers, swapper):
     own = {handle.id for handle in getattr(swapper, "handles", ()) if hasattr(handle, "id")}
     for layer in layers:
         for module in layer.modules():
-            if (set(module._forward_pre_hooks) | set(module._forward_hooks)) - own:
+            if set(module._forward_pre_hooks) - own:
+                return True
+            # transformers 5.x output capture records into the calling thread's collector only: the window gives
+            # each micro-batch's forward its own and the recompute a private one.
+            if any(i not in own and not _is_capture_hook(h) for i, h in module._forward_hooks.items()):
                 return True
     return False
 
@@ -1022,6 +1352,12 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
 
 
 def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement):
+    classes = _recorder_targets(model, layers) if _forward_swapping_capture() else set()
+    with _thread_forwards(classes) as forwards:
+        return _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, forwards)
+
+
+def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, forwards):
     device, streams = None, ()
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         device = torch.device("cuda", torch.cuda.current_device())
@@ -1031,6 +1367,10 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
         streams = tuple(torch.cuda.current_stream(d) for d in sorted(devices, key = lambda d: d.index or 0))
     w = _Window(layers, n, swapper, device, streams)
     w.agreement = agreement
+    w.thread_forwards = forwards
+    # Decoder buffers (an expert bias or token counter updated in the forward): standard accumulation writes them
+    # micro-batch after micro-batch (its recompute again), the window layer by layer.
+    buffers = [(b, b._version) for layer in layers for b in layer.buffers()]
     w.caller_grad, w.caller_autocast = torch.is_grad_enabled(), _autocast_state()
     try:
         with _intercept(w, layers) as orig_calls:
@@ -1058,6 +1398,13 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
             if w.abort_reason is None and any(w.input_used):
                 w.abort_reason = ("a loss part backpropagated into the first decoder layer's input directly "
                                   "(a loss on the embedding output)")
+            if w.abort_reason is None and any(b._version != v for b, v in buffers):
+                w.abort_reason = ("a decoder layer wrote one of its buffers in the forward (an expert bias or token "
+                                  "counter update), which standard accumulation does between micro-batches")
+            if w.abort_reason is None and any(
+                    s is not None and (s[0][0] if s[2] == 0 else s[1][s[2]]).grad is not None
+                    for row in w.saved for s in row):
+                w.abort_reason = "a loss used a decoder layer's recorded input (output_hidden_states)"
             if w.abort_reason is None and any(p.grad is not g or (g is not None and g._version != v)
                                               for p, g, v in watched):
                 w.abort_reason = "a loss part wrote a decoder layer weight's gradient (a regulariser on it)"
@@ -1071,7 +1418,7 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
                 w.swapper.unhold(l)
             w.held.clear()
     if w.abort_reason is not None:
-        w.saved = w.outs = w.h0 = None
+        w.saved = w.outs = w.h0 = w.aux = w.routing = None
         error, w.error = w.error, None
         if error is not None and (agreement.stage == 1 or
                                   (not isinstance(error, torch.OutOfMemoryError) and not _recompile_limit(error))):

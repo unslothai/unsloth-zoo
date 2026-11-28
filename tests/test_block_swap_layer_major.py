@@ -399,8 +399,9 @@ def test_loss_on_intermediate_hidden_states_is_refused():
 
 
 def test_output_recorder_hooks_abort_or_match():
-    """transformers' output_hidden_states records layer outputs with per-call hooks (they would collect every
-    interleaved micro-batch): the window aborts. Versions that return hidden states from the loop match instead."""
+    """transformers' output_hidden_states records layer outputs (4.x by swapping module forwards per call, kept per
+    thread inside a window; 5.x with forward hooks into the calling thread's collector). A loss on an intermediate
+    hidden state is refused, and no capture wrapper outlives the window."""
     model = _model()
     batches, items = _batches(2)
 
@@ -415,9 +416,9 @@ def test_output_recorder_hooks_abort_or_match():
     base_grads = _grads(model)
     model.zero_grad(set_to_none = True)
     losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
+    assert all(getattr(m.__dict__["forward"], "__self__", None) is m for m in model.modules() if "forward" in m.__dict__)
     if losses is None:
-        # transformers 5.x keeps its recorders as forward hooks on the layers: refused up front.
-        assert "output recorders" in why or "forward hooks" in why, why
+        assert "intermediate decoder output" in why, why
         assert _grads(model) == {}
     else:
         assert all(torch.equal(a, b) for a, b in zip(base, losses))
@@ -1115,23 +1116,30 @@ def _unsloth_ckpt_case(model, gc, ckpt):
         _assert_same(base_grads, grads)
 
 
-def test_moe_routing_under_unsloth_checkpoint_aborts():
-    """Unsloth's checkpoint replays the forward's MoE routing in its recompute; the window does not, so a layer that
-    routes under it aborts before any decoder gradient exists."""
+def test_moe_routing_under_unsloth_checkpoint_is_replayed():
+    """Unsloth's checkpoint replays the forward's MoE routing in its recompute; the window keeps a routing frame per
+    layer and micro-batch and replays it the same way: bitwise to standard, every frame reused."""
     gc = pytest.importorskip("unsloth_zoo.gradient_checkpointing")
 
     class Routed(_CkptToy):
         def _inner(self, x, past_key_value = None):
-            index = torch.zeros(x.shape[:-1] + (1,), dtype = torch.long)
-            weights = torch.ones(x.shape[:-1] + (1,))
+            logits = self.lin(x)
+            weights, index = torch.softmax(logits, -1).topk(2, dim = -1)
             index, weights = gc.moe_checkpoint_routing(self, index, weights)
-            return torch.tanh(self.lin(x)) * weights
+            return torch.tanh(logits) * weights.sum(-1, keepdim = True)
 
     torch.manual_seed(0)
     layers = torch.nn.ModuleList([Routed(gc.unsloth_gradient_checkpoint) for _ in range(3)])
+    for fn in _ckpt_fns(layers):
+        fn()
+    base = {n: p.grad.clone() for n, p in layers.named_parameters()}
+    gc.MOE_GC_ROUTING_STATS.clear()
+    lm.layer_major_stats(reset = True)
     losses, why = _toy_run(layers, _ckpt_fns(layers))
-    assert losses is None and "routes MoE" in why, why
-    assert all(p.grad is None for p in layers.parameters())
+    assert why is None, why
+    assert lm.layer_major_stats()["windows"] == 1
+    assert gc.MOE_GC_ROUTING_STATS["reused"] == 6 and not gc.MOE_GC_ROUTING_STATS["mismatch"], gc.MOE_GC_ROUTING_STATS
+    _assert_same(base, {n: p.grad for n, p in layers.named_parameters()})
 
 
 def test_float32_inputs_stored_in_bfloat16_are_refused(monkeypatch):
@@ -1177,7 +1185,7 @@ def test_block_swap_wrapped_unsloth_checkpoint_gets_a_routing_frame():
     with lm._unsloth_frames(layer, x, swapper) as frames:
         assert frames[0] is None and frames[1] is not None
     with lm._unsloth_frames(layer, x, object()) as frames:
-        assert frames == [None, None, None]
+        assert frames[:3] == [None, None, None]
 
 
 def test_unsloth_gradient_checkpoint_engages_bitwise():
