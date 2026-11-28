@@ -1254,6 +1254,14 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
         bm = -(-rows // srows)  # ceil(rows / srows)
         bn = -(-cols // scols)  # ceil(cols / scols)
     scale = scale_inv.to(out_dtype)
+    # Exact tiling: in-place broadcast multiply (bitwise identical, no full-size scale). Never mutate W_fp8.
+    if (
+        srows * bm == rows and scols * bn == cols
+        and W is not W_fp8 and W.is_contiguous() and scale.is_contiguous()
+        and W.device == scale.device
+    ):
+        W.view(srows, bm, scols, bn).mul_(scale.view(srows, 1, scols, 1))
+        return W
     if bm > 1:
         scale = scale.repeat_interleave(bm, dim = 0)[:rows]
     if bn > 1:
