@@ -647,11 +647,13 @@ def _take_block(device_index, nbytes, require_pinned = False):
             use[1] = max(use[1], use[0])
             return block, event, epoch
         if require_pinned and (device_index, bucket) in _HOST_REFUSED:
+            SAVED_ATTENTION_STATS["declined_host_ram"] += 1
             return None, None, epoch
     block = _new_block(bucket)
     if require_pinned and not _block_pinned(block):
         with _HOST_POOL_LOCK:
             _HOST_REFUSED.add((device_index, bucket))
+        SAVED_ATTENTION_STATS["declined_host_ram"] += 1
         return None, None, epoch
     with _HOST_POOL_LOCK:
         if epoch == _HOST_POOL_EPOCH[0]:
@@ -746,15 +748,18 @@ def _side_stream(device):
 
 
 def _dense(t):
-    try:
-        from torch._prims_common import is_non_overlapping_and_dense
-        return is_non_overlapping_and_dense(t)
-    except Exception:
-        return t.is_contiguous()
+    """Its elements fill [storage_offset, storage_offset + numel) exactly once (any dim order), so a
+    flat block can hold it with the same strides (flash attention outputs are (B, S, H, D) memory)."""
+    expected = 1
+    for stride, size in sorted((st, n) for st, n in zip(t.stride(), t.shape) if n != 1):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
 
 
 def _offloadable(t):
-    return isinstance(t, torch.Tensor) and t.is_cuda and _bytes(t) >= _OFFLOAD_MIN_BYTES
+    return isinstance(t, torch.Tensor) and t.is_cuda and t.numel() > 0 and _bytes(t) >= _OFFLOAD_MIN_BYTES
 
 
 def _to_host(t, require_pinned = False):
@@ -766,6 +771,7 @@ def _to_host(t, require_pinned = False):
     device = t.device
     if not _dense(t):
         if require_pinned:
+            SAVED_ATTENTION_STATS["declined_host_layout"] += 1
             return None
         # Layout the block cannot hold: a private pinned copy, as before.
         stream = _side_stream(device)

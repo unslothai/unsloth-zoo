@@ -1408,6 +1408,15 @@ def test_host_pool_refusal_is_latched(monkeypatch):
     assert SA._take_block(0, 8 << 20, require_pinned = True)[0] is None and len(made) == 2
 
 
+def test_dense_layouts():
+    assert SA._dense(torch.empty(2, 3, 4))
+    # Flash attention's output: (B, H, S, D) shape over (B, S, H, D) memory.
+    assert SA._dense(torch.empty(2, 8, 4, 16).transpose(1, 2))
+    assert SA._dense(torch.empty(1, 4, 1, 8)[:, :, :, :].expand(1, 4, 1, 8))
+    assert not SA._dense(torch.empty(4, 8)[:, :4])
+    assert not SA._dense(torch.empty(4, 1).expand(4, 8))
+
+
 def test_host_pool_buckets():
     assert SA._bucket_bytes(1000) == 1000
     assert SA._bucket_bytes(4 << 20) == 4 << 20
