@@ -40,6 +40,12 @@ _bs = _load("block_swap_compress_under_test", "block_swap.py")
 _bs._CODEC.append(C)
 
 
+@pytest.fixture(autouse = True)
+def _fixed_width_format(monkeypatch):
+    # This file covers the fixed-width format; tests/test_block_swap_codec_huff.py covers the Huffman one.
+    monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_CODEC", "v1")
+
+
 def _cuda():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
