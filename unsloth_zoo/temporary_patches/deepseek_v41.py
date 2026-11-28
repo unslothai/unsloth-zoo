@@ -146,7 +146,12 @@ def patch_deepseek_v41_gradient_checkpointing():
         return
     layer_cls = getattr(modeling, "DeepseekV41DecoderLayer", None)
     pretrained_cls = getattr(modeling, "DeepseekV41PreTrainedModel", None)
-    if layer_cls is None or pretrained_cls is None or getattr(layer_cls.__call__, "_unsloth_patched", False):
+    if layer_cls is None or pretrained_cls is None:
+        return
+    if getattr(layer_cls.__call__, "_unsloth_patched", False):
+        # A compiled cache keeps the decoder layer but replaces the indexer class after this first ran: wrap the new
+        # one too (its post_compile run), else every recompute scores the indexer again.
+        _replay_indexer_selection(getattr(modeling, "DeepseekV41Indexer", None))
         return
     try:
         from transformers.modeling_layers import GradientCheckpointingLayer
