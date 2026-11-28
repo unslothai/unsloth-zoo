@@ -618,7 +618,7 @@ def _unsloth_frames(layer, x, swapper = None):
         yield state
 
 
-def _checkpoint_mode(layer, swapper = None):
+def _checkpoint_mode(layer, swapper = None, training = None):
     """(no_grad_forward, problem) for the layer's own checkpoint wrapper, which the window bypasses. Only these
     function objects (identity, not names: functools.wraps copies those) are known: torch's checkpoint (current or
     the pristine one Unsloth keeps; what Unsloth's own layers carry), optionally a functools.partial binding nothing
@@ -627,7 +627,8 @@ def _checkpoint_mode(layer, swapper = None):
     layer's forward without gradients (reentrant: use_reentrant True or unset, which torch resolves to True), so the
     window's no-grad forward and grad-mode recompute are exactly standard accumulation's, also where the two differ
     in the last bit (a compiled block's inference and training graphs)."""
-    if not (getattr(layer, "gradient_checkpointing", False) and getattr(layer, "training", False)):
+    training = getattr(layer, "training", False) if training is None else training
+    if not (getattr(layer, "gradient_checkpointing", False) and training):
         return False, None
     fn, reentrant = getattr(layer, "_gradient_checkpointing_func", None), None
     shims = sys.modules.get("unsloth_zoo.gradient_checkpointing")
@@ -1327,7 +1328,8 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
         return None, "decoder layers share key / value states (KV sharing)"
     if _operator_modes_active():
         return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
-    if _compiled_layers(layers) and not all(_checkpoint_mode(layer, swapper)[0] for layer in layers):
+    # As the micro-batches will run them (the trainer switches to train mode inside each training step).
+    if _compiled_layers(layers) and not all(_checkpoint_mode(layer, swapper, training = True)[0] for layer in layers):
         # Standard training runs these layers' forward under grad mode (non-reentrant checkpointing, which Unsloth
         # uses when the MoE router loss is on, or none): the window's no-grad forward would run another compiled
         # graph (inference vs training), which can differ in the last bit; refused before any layer runs, so the
