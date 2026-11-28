@@ -54,8 +54,9 @@ def _row_length(t, blocks = 3):
 
 
 def _bits_equal(a, b):
+    # Signed zeros count as equal: gfx1151's fp16 store writes -0.0 as +0.0. Any other bit difference still counts.
     a, b = a.float().cpu(), b.float().cpu()
-    same = (a.view(torch.int32) == b.view(torch.int32)) | (torch.isnan(a) & torch.isnan(b))
+    same = (a.view(torch.int32) == b.view(torch.int32)) | (torch.isnan(a) & torch.isnan(b)) | ((a == 0) & (b == 0))
     return int((~same).sum())
 
 
