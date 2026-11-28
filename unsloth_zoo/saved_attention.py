@@ -36,6 +36,8 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_map_only, tree_unflatten
 
+from .rocm_build import is_rocm_torch
+
 __all__ = [
     "SAVED_ATTENTION_STATS",
     "SavedAttentionFrame",
@@ -141,7 +143,7 @@ def save_attention_enabled(device = None):
     """Whether a checkpoint on ``device`` (default: the current GPU, or CPU without one) keeps attention."""
     if not save_attention_requested():
         return False
-    if not getattr(torch.version, "hip", None):
+    if not is_rocm_torch(torch):
         return True
     kept = _rocm_sdpa_is_kept(device)
     if kept is False:
@@ -170,7 +172,7 @@ _AUTO_ACTIVE = [False]
 def _auto_device_min_seq(index):
     """The measured automatic-mode query length for one GPU, or None (unmeasured, unreadable)."""
     try:
-        if getattr(torch.version, "hip", None):
+        if is_rocm_torch(torch):
             arch = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", "") or "")
             return _AUTO_MIN_SEQ_ROCM.get(arch.split(":", 1)[0].strip().lower())
         return _AUTO_MIN_SEQ.get(tuple(torch.cuda.get_device_capability(index)))
@@ -376,7 +378,7 @@ def _auto_host_allowed(query):
         return False
     if not _offloadable(query):
         return False
-    if setting not in ("1", "true", "yes", "on") and (getattr(torch.version, "hip", None) or not _auto_host_measured(query)):
+    if setting not in ("1", "true", "yes", "on") and (is_rocm_torch(torch) or not _auto_host_measured(query)):
         return False
     try:
         if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
@@ -471,7 +473,7 @@ def _auto_frame_min_seq(device):
     min_seq = save_attention_auto_min_seq(device)
     if min_seq is None:
         return None
-    if getattr(torch.version, "hip", None) and _rocm_sdpa_is_kept(device) is not True:
+    if is_rocm_torch(torch) and _rocm_sdpa_is_kept(device) is not True:
         return None
     return min_seq
 

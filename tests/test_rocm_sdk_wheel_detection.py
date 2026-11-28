@@ -176,6 +176,7 @@ _GUARDED = (
     "unsloth_zoo/packed_experts.py",
     "unsloth_zoo/rl_replacements.py",
     "unsloth_zoo/rocm_flex_static.py",
+    "unsloth_zoo/saved_attention.py",
     "unsloth_zoo/score_centering.py",
     "unsloth_zoo/sparse_mqa_kernel.py",
     "unsloth_zoo/temporary_patches/fla_vendor.py",
@@ -309,3 +310,18 @@ def test_is_rocm_torch_traces_under_fullgraph():
 
     x = torch.zeros(2)
     assert torch.equal(torch.compile(fn, backend = "eager", fullgraph = True)(x), fn(x))
+
+
+def test_saved_attention_auto_mode_reads_the_rocm_arch_table_on_an_sdk_wheel(sdk_wheel, monkeypatch):
+    from unsloth_zoo import saved_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(gcnArchName = "gfx1151:sramecc-"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: (11, 5))
+    assert saved_attention._auto_device_min_seq(0) == saved_attention._AUTO_MIN_SEQ_ROCM["gfx1151"]
+
+
+def test_saved_attention_auto_mode_keeps_the_cuda_table_on_a_cuda_wheel(cuda_wheel, monkeypatch):
+    from unsloth_zoo import saved_attention
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: (8, 0))
+    assert saved_attention._auto_device_min_seq(0) == saved_attention._AUTO_MIN_SEQ[(8, 0)]
