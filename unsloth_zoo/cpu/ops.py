@@ -635,12 +635,27 @@ def _bf16_to_fp32(value):
     return value.float() if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16 else value
 
 
+def _fp32_attention_call(module, query, key, kwargs):
+    """A call that needs a gradient, or one a no-grad reference forward makes the same way: full-sequence
+    attention, or non-causal attention (encoder self-attention, cross-attention). Left out: causal self-attention
+    with fewer queries than keys, i.e. a decode step against a KV cache."""
+    if query.requires_grad and torch.is_grad_enabled():
+        return True
+    if query.shape[-2] == key.shape[-2]:
+        return True
+    causal = kwargs.get("is_causal", None)
+    if causal is None:
+        causal = getattr(module, "is_causal", True)
+    return not causal
+
+
 def patch_cpu_bf16_sdpa_fp32():
     """bf16 attention on CPU computed by the fp32 SDPA kernel: bf16 query / key / value (and a floating mask) are
     upcast exactly, the output is rounded back to bf16 and gradients flow back through the casts in bf16. Taken by
-    every call whose query needs a gradient and by every full-sequence call (as many queries as keys), so no-grad
-    reference / old-policy forwards of DPO and GRPO see the same attention as the policy forward they are compared
-    with. Decode steps against a KV cache keep the bf16 kernel: the cache would need an upcast per token."""
+    every call whose query needs a gradient and by the no-grad calls a reference forward makes (full-sequence and
+    non-causal attention), so no-grad reference / old-policy forwards of DPO and GRPO see the same attention as the
+    policy forward they are compared with. Decode steps against a KV cache keep the bf16 kernel: the cache would
+    need an upcast per token."""
     if not _bf16_sdpa_in_fp32_pays():
         return False
     try:
@@ -655,8 +670,7 @@ def patch_cpu_bf16_sdpa_fp32():
     @functools.wraps(original)
     def sdpa_attention_forward(module, query, key, value, attention_mask, *args, **kwargs):
         if not (isinstance(query, torch.Tensor) and isinstance(key, torch.Tensor) and query.device.type == "cpu"
-                and query.dtype == torch.bfloat16
-                and ((query.requires_grad and torch.is_grad_enabled()) or query.shape[-2] == key.shape[-2])):
+                and query.dtype == torch.bfloat16 and _fp32_attention_call(module, query, key, kwargs)):
             return original(module, query, key, value, attention_mask, *args, **kwargs)
         if kwargs.get("cache", None) is not None:  # a paged cache would be written with fp32 keys / values
             return original(module, query, key, value, attention_mask, *args, **kwargs)

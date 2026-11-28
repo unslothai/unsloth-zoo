@@ -47,6 +47,11 @@ class _Attn(torch.nn.Module):
     is_causal = True
 
 
+class _Cross(torch.nn.Module):
+    num_key_value_groups = 2
+    is_causal = False
+
+
 def _qkv(dtype = torch.bfloat16, grad = True, seq = 24):
     gen = torch.Generator().manual_seed(0)
     q = torch.randn(2, 4, seq, 32, generator = gen).to(dtype)
@@ -211,7 +216,7 @@ def test_tiny_t5_position_bias_trains(mapping):
     from unsloth_zoo.cpu import ops
     ops.patch_cpu_bf16_sdpa_fp32()
     config = T5Config(vocab_size = 64, d_model = 32, d_kv = 8, d_ff = 64, num_layers = 1, num_decoder_layers = 1,
-                      num_heads = 4, decoder_start_token_id = 0, pad_token_id = 0)
+                      num_heads = 4, decoder_start_token_id = 0, pad_token_id = 0, dropout_rate = 0.0)
     config._attn_implementation = "sdpa"
     torch.manual_seed(0)
     try:
@@ -224,9 +229,14 @@ def test_tiny_t5_position_bias_trains(mapping):
     assert torch.isfinite(loss)
     if ops.SDPA_FP32_ENGAGED[0] == 0:
         pytest.skip("this transformers version's T5 does not call the sdpa attention function")
+    # Source and target lengths differ: the no-grad reference forward's cross-attention takes the fp32 kernel too.
+    target = ids[:, :7]
+    policy = model(input_ids = ids, decoder_input_ids = target).logits
+    with torch.no_grad():
+        assert torch.equal(model(input_ids = ids, decoder_input_ids = target).logits, policy.detach())
 
 
-def test_cached_decode_and_fp32_calls_keep_the_stock_function(mapping, monkeypatch):
+def test_cached_decode_and_fp32_calls_keep_the_stock_function_cross_attention_does_not(mapping, monkeypatch):
     from transformers.integrations import sdpa_attention
     from unsloth_zoo.cpu import ops
     table, original = mapping
@@ -243,8 +253,13 @@ def test_cached_decode_and_fp32_calls_keep_the_stock_function(mapping, monkeypat
     with torch.no_grad():
         table["sdpa"](_Attn(), q[:, :, -1:], k, v, None)    # one decoded token against a 24-token cache
         table["sdpa"](_Attn(), q[:, :, -3:], k, v, None)    # a few tokens against the cache
+        table["sdpa"](_Cross(), q[:, :, -3:], k, v, None, is_causal = True)  # the call's own flag wins
     table["sdpa"](_Attn(), *_qkv(torch.float32), None)      # fp32 training
-    assert seen == [torch.bfloat16, torch.bfloat16, torch.float32] and ops.SDPA_FP32_ENGAGED[0] == 0
+    assert seen == [torch.bfloat16] * 3 + [torch.float32] and ops.SDPA_FP32_ENGAGED[0] == 0
+    with torch.no_grad():  # cross-attention (non-causal), target shorter than source: a reference forward's call
+        table["sdpa"](_Cross(), q[:, :, -7:], k, v, None)
+        table["sdpa"](_Attn(), q[:, :, -7:], k, v, None, is_causal = False)
+    assert seen[4:] == [torch.float32, torch.float32] and ops.SDPA_FP32_ENGAGED[0] == 2
 
 
 def test_no_grad_full_sequence_matches_the_training_call(mapping):
