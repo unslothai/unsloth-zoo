@@ -1476,14 +1476,54 @@ _FP32_ROLLOUT_RAM_SHARE = 0.5
 
 def _slow_bf16_upcast():
     """Apple Silicon: upcasting the bf16-stored projections on every decoded token made a Qwen3-0.6B GRPO step 1.6x
-    slower (M1). On x86 without native bf16 (AVX2) it cost about 2%, not worth the fp32 copy's RAM."""
+    slower (M1), so every train-mode rollout there decodes through an fp32 copy."""
     import platform
     return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
 
 
-def _fp32_rollout_fits(model):
-    """True on Apple Silicon when the frozen bf16 projections' fp32 copy (2 more bytes per weight) fits in RAM."""
-    if not _slow_bf16_upcast():
+# AVX2-only x86 without native bf16 (EPYC 7763): the fp32 copy costs a fixed upcast and store-back per rollout and
+# pays back per decoded token only for wide batches. Qwen3-0.6B GRPO step: 8 rollouts x 64 tokens 9.0-9.6% faster,
+# 2 rollouts x 16 tokens 5.6-7.7% slower (two Linux EPYC 7763 runners).
+_FP32_ROLLOUT_MIN_ROWS = 8
+_FP32_ROLLOUT_MIN_NEW_TOKENS = 32
+
+
+def _avx2_fp32_rollout(rows, new_tokens):
+    """True on x86 without AVX-512 or native bf16 when the rollout decodes at least _FP32_ROLLOUT_MIN_ROWS rows for at
+    least _FP32_ROLLOUT_MIN_NEW_TOKENS tokens. One decoded token through all Qwen3-0.6B projections took 200-231 ms
+    with the per-call upcast and 159-197 ms through fp32 weights at 8 rows, but 96-113 vs 90-143 ms at 2 rows."""
+    import platform
+    if rows is None or new_tokens is None or rows < _FP32_ROLLOUT_MIN_ROWS or new_tokens < _FP32_ROLLOUT_MIN_NEW_TOKENS:
+        return False
+    if platform.machine().lower() not in ("x86_64", "amd64") or cpu_bf16_supported():
+        return False
+    from .runtime import cpu_flags
+    flags = cpu_flags()
+    return "avx2" in flags and "avx512f" not in flags
+
+
+def _rollout_shape(model, args, kwargs):
+    """(rows, new tokens) a generate call will decode, or (None, None) when they cannot be read."""
+    ids = kwargs.get("input_ids", args[0] if args and isinstance(args[0], torch.Tensor) else None)
+    if not isinstance(ids, torch.Tensor):
+        ids = kwargs.get("inputs_embeds", None)
+    if not isinstance(ids, torch.Tensor) or ids.dim() < 2:
+        return None, None
+    config = kwargs.get("generation_config", None) or getattr(model, "generation_config", None)
+    def setting(name):
+        value = kwargs.get(name, None)
+        return getattr(config, name, None) if value is None else value
+    rows = ids.shape[0] * max(1, int(setting("num_return_sequences") or 1))
+    new_tokens = setting("max_new_tokens")
+    if new_tokens is None and setting("max_length") is not None:
+        new_tokens = int(setting("max_length")) - ids.shape[1]
+    return rows, (int(new_tokens) if new_tokens is not None else None)
+
+
+def _fp32_rollout_fits(model, rows = None, new_tokens = None):
+    """True when a train-mode rollout should decode through an fp32 copy of the frozen bf16 projections (Apple
+    Silicon always, AVX2-only x86 for wide, long rollouts) and that copy (2 more bytes per weight) fits in RAM."""
+    if not (_slow_bf16_upcast() or _avx2_fp32_rollout(rows, new_tokens)):
         return False
     extra = 2 * sum(m.weight.numel() for m in model.modules()
                     if isinstance(m, Bf16StoredLinear) and m.weight.dtype == torch.bfloat16 and not m.weight.requires_grad)
@@ -1513,9 +1553,11 @@ def _unpack_encoding_generate(generate):
         if isinstance(self, torch.nn.Module) and not self.training:
             # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
             _frozen_bf16_for(self, training = False)
-        elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and _fp32_rollout_fits(self):
+        elif isinstance(self, torch.nn.Module) and _frozen_bf16_mode(self) == "training" and \
+                _fp32_rollout_fits(self, *_rollout_shape(self, args, kwargs)):
             # Generating mid-training (GRPO / online DPO rollouts, train mode): decode with fp32 frozen weights too, as
-            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon, then store bf16.
+            # upcasting every projection per token made a CPU GRPO step 1.6x slower on Apple Silicon (and wide AVX2
+            # rollouts slower), then store bf16.
             # inference_mode(False): converted under a caller's inference_mode, the weights would stay inference
             # tensors, and the next training forward could not save them for backward.
             with torch.inference_mode(False):
