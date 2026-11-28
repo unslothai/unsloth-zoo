@@ -1394,6 +1394,24 @@ def test_host_pool_stays_bounded_across_lengths(monkeypatch):
         assert in_use == 0 and idle == SA.host_pool_bytes() <= 1.25 * most
 
 
+def test_host_pool_frees_blocks_outgrown_by_a_longer_call(monkeypatch):
+    monkeypatch.setattr(SA, "_HOST_POOL", {})
+    monkeypatch.setattr(SA, "_HOST_USE", {})
+    monkeypatch.setattr(SA, "_block_pinned", lambda block: True)
+    released = []
+    monkeypatch.setattr(G, "_release_pinned", lambda nbytes: released.append(nbytes))
+    short, long = 8 << 20, 32 << 20
+    taken = [SA._take_block(0, short) for _ in range(3)]
+    for block, _, epoch in taken:
+        SA._give_block(0, block, None, epoch)
+    assert SA.host_pool_bytes() == 3 * short
+    # A longer step: the short blocks can serve none of its calls, so the first miss frees them.
+    block, _, epoch = SA._take_block(0, long)
+    assert SA.host_pool_bytes() == 0 and released == [short] * 3
+    SA._give_block(0, block, None, epoch)
+    assert SA.host_pool_bytes() == block.numel() and SA._HOST_USE[0][2] == block.numel()
+
+
 def test_host_pool_refusal_is_latched(monkeypatch):
     monkeypatch.setattr(SA, "_HOST_POOL", {})
     monkeypatch.setattr(SA, "_HOST_REFUSED", set())

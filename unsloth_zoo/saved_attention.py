@@ -649,6 +649,14 @@ def _take_block(device_index, nbytes, require_pinned = False):
         if require_pinned and (device_index, bucket) in _HOST_REFUSED:
             SAVED_ATTENTION_STATS["declined_host_ram"] += 1
             return None, None, epoch
+        # A miss means longer calls than the idle blocks were made for: those smaller blocks can never
+        # serve this length again before a shorter one comes back, so free them rather than hold both.
+        stale = [block for block, _ in free or () if block.numel() < nbytes]
+        if stale:
+            _HOST_POOL[device_index] = [(b, e) for b, e in free if b.numel() >= nbytes]
+            _use(device_index)[2] -= sum(b.numel() for b in stale)
+    for block in stale:
+        _drop_block(block)
     block = _new_block(bucket)
     if require_pinned and not _block_pinned(block):
         with _HOST_POOL_LOCK:
