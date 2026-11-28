@@ -812,17 +812,22 @@ if _HAS_TRITON:
     def _fl_log_mix(delta, beta, onemb):
         # log((1 - beta) + beta exp(delta)) = m - ls for delta = lt - ls; exactly 0 at delta = 0, where
         # logaddexp(ls + log(1 - beta), lt + log(beta)) - ls is an ulp of |ls| off (a spurious gradient at p = q).
-        x = -tl.abs(delta)
+        # onemb = 1 - beta from the host in fp64 (in fp32 1 - beta is 0 for beta within 6e-8 of 1).
+        x = tl.minimum(delta, 80.0)
         e = x * (1.0 + x * (1.0 / 2.0 + x * (1.0 / 6.0 + x * (1.0 / 24.0 + x * (1.0 / 120.0 + x * (
             1.0 / 720.0 + x * (1.0 / 5040.0 + x * (1.0 / 40320.0))))))))
-        e = tl.where(x > -0.25, e, tl.exp(x) - 1.0)
-        pos = delta > 0
-        # onemb = 1 - beta from the host in fp64: in fp32 1 - beta is 0 for beta within 6e-8 of 1.
-        c = tl.where(pos, onemb, beta)
-        u = c * e
-        # 1 + u = (1 - c) + c exp(x): the direct sum once u < -1/2, so beta near 0 or 1 keeps a finite log.
-        lg = tl.where(u >= -0.5, _fl_log1p_neg(tl.minimum(-u, 0.5)), tl.log(tl.where(pos, beta, onemb) + c * tl.exp(x)))
-        return lg + tl.maximum(delta, 0.0)
+        e = tl.where(tl.abs(x) < 0.25, e, tl.exp(x) - 1.0)
+        u = beta * e
+        # log1p(u) = 2 atanh(u / (2 + u)) on [-1/2, 1]; plain log past 1; the log-space sum where 1 + u loses
+        # the (1 - beta) share (u < -1/2) or exp overflows (delta > 80).
+        lp = tl.where(u <= 1.0, _fl_log1p_neg(-tl.maximum(u, -0.5)), tl.log(1.0 + u))
+        lse = _fl_logaddexp(tl.zeros_like(delta) + tl.log(onemb), delta + tl.log(beta))
+        return tl.where((delta <= 80.0) & (u >= -0.5), lp, lse)
+
+    @triton.jit
+    def _fl_logaddexp(a, b):
+        mx = tl.maximum(a, b)
+        return mx + tl.log(tl.exp(a - mx) + tl.exp(b - mx))
 
     @triton.jit
     def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta, onemb,
@@ -880,12 +885,9 @@ if _HAS_TRITON:
             tl.store(a + 4, ls_j - lt_j)
         else:
             tl.store(a + 3, -_fl_log_mix(tj - sj, beta, onemb))
-            mix_o = p_o + beta * (q_o - p_o)
-            # ls_j - m_j and lt_j - m_j, each from its own log-mix (no cancellation against a large |lt_j - ls_j|).
-            conf = mix_o < 0.5
-            m_c = _fl_log1p_neg(tl.minimum(mix_o, 0.5))
-            tl.store(a + 4, tl.exp(lt_j) * tl.where(conf, lt_j - m_c, -_fl_log_mix(ls_j - lt_j, onemb, beta)))
-            tl.store(a + 5, tl.where(conf, ls_j - m_c, -_fl_log_mix(lt_j - ls_j, beta, onemb)))
+            # ls_j - m_j and lt_j - m_j from the peak log-probs, each its own log-mix (exact at p = q).
+            tl.store(a + 4, tl.exp(lt_j) * -_fl_log_mix(ls_j - lt_j, onemb, beta))
+            tl.store(a + 5, -_fl_log_mix(lt_j - ls_j, beta, onemb))
 
     @triton.jit
     def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, aux_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
@@ -2241,29 +2243,27 @@ def _jsd_peak(l_j, others):
     return torch.where(others < 0.5, torch.log1p(-others), l_j)
 
 
-def _jsd_log_mix(delta, beta):
-    """log((1 - b) + b exp(delta)) = m - ls of the mixture log-prob m for delta = lt - ls.
+def _jsd_log_mix(delta, beta, onemb = None):
+    """log((1 - b) + b exp(delta)) = m - ls of the mixture log-prob m for delta = lt - ls; onemb = 1 - b.
+
+    The mirrored lt - m passes both weights swapped: 1 - (1 - b) is not b once 1 - b rounds to 1 (b = 1e-18).
 
     Exactly 0 at delta = 0: logaddexp(ls + log(1 - b), lt + log(b)) - ls is an ulp of |ls| off there, a spurious
     gradient at p = q that Adam turns into full-size steps (a LoRA student identical to its adapter-off teacher)."""
-    x = -delta.abs()
-    pos = delta > 0
-    u = torch.where(pos, torch.expm1(x) * (1.0 - beta), torch.expm1(x) * beta)
-    # 1 + u = (1 - c) + c exp(x) for the weight c of u: summed directly once u < -1/2, so beta near 0 or 1 stays finite.
-    lb, l1b = math.log(beta), math.log1p(-beta)
-    tail = torch.where(pos, torch.logaddexp(x + l1b, torch.full_like(x, lb)),
-                       torch.logaddexp(x + lb, torch.full_like(x, l1b)))
-    return torch.where(u >= -0.5, torch.log1p(u), tail) + delta.clamp_min(0.0)
+    onemb = 1.0 - beta if onemb is None else onemb
+    u = torch.expm1(delta.clamp_max(80.0)) * beta
+    # log1p(b expm1(delta)) keeps a small (1 - b) share exactly; the log-space sum where 1 + u would lose it
+    # (u < -1/2, b near 1) or exp overflows (delta > 80).
+    lse = torch.logaddexp(delta + math.log(beta), torch.full_like(delta, math.log(onemb)))
+    return torch.where((delta <= 80.0) & (u >= -0.5), torch.log1p(u), lse)
 
 
 def _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta):
-    """(ls_j - m_j, lt_j - m_j) for the top token's m_j = log((1 - b) p_j + b q_j), = log1p(-((1 - b) p_o + b q_o))
-    on a confident row; otherwise each difference from its own log-mix."""
-    mix_o = p_o + beta * (q_o - p_o)
-    conf = mix_o < 0.5
-    m_c = torch.log1p(-mix_o)
-    return (torch.where(conf, ls_j - m_c, -_jsd_log_mix(lt_j - ls_j, beta)),
-            torch.where(conf, lt_j - m_c, -_jsd_log_mix(ls_j - lt_j, 1.0 - beta)))
+    """(ls_j - m_j, lt_j - m_j) for the top token's m_j = log((1 - b) p_j + b q_j).
+
+    From the _jsd_peak log-probs (log1p of the others' mass on a confident row), each difference its own log-mix:
+    exact at p = q, and no cancellation of the small (1 - b) or b share. p_o / q_o are kept for the call sites."""
+    return -_jsd_log_mix(lt_j - ls_j, beta), -_jsd_log_mix(ls_j - lt_j, 1.0 - beta, beta)
 
 
 def _jsd_peak_dz(ls_j, lt_j, p_o, q_o):
@@ -2316,7 +2316,7 @@ def _jsd_chunk(ls, lt, beta, want_grad):
     m = torch.sub(lt, ls)
     q = _jsd_log_mix(m, beta)
     # lt - m_mix from the mirrored log-mix, not m - q (which cancels against a large |lt - ls|).
-    m = _jsd_log_mix(m.neg_(), 1.0 - beta).neg_()
+    m = _jsd_log_mix(m.neg_(), 1.0 - beta, beta).neg_()
     q.neg_()
     lt.exp_()
     q_o = lt.scatter_(1, j, 0.0).sum(-1, keepdim = True)
@@ -2375,7 +2375,7 @@ def _jsd_body(s, t, factor, beta: float, inv_t: float, s_scale: float, s_cap: fl
     else:
         delta = lt - ls
         sm_j, tm_j = _jsd_peak_mix(ls_j, lt_j, p_o, q_o, beta)
-        row_t = (torch.where(top, 0.0, q * -_jsd_log_mix(-delta, 1.0 - beta)).sum(-1, keepdim = True)
+        row_t = (torch.where(top, 0.0, q * -_jsd_log_mix(-delta, 1.0 - beta, beta)).sum(-1, keepdim = True)
                  + lt_j.exp() * tm_j)
         d = -_jsd_log_mix(delta, beta)
         g = p * torch.where(top, 0.0, d - d.gather(1, j))

@@ -377,6 +377,34 @@ def test_beta_near_endpoints_stays_finite(beta, path):
         torch.testing.assert_close(dz[i], gref, rtol = 1e-3, atol = 1e-12)
 
 
+@pytest.mark.parametrize("path", ["body", "chunk", "triton"])
+def test_beta_near_one_shared_top_token_keeps_small_mixture_mass(path):
+    """beta = 1 - 1e-8 with a shared top token: the (1 - b) p_o share of the off-top mass must survive (loss > 0)."""
+    beta = 1.0 - 1e-8
+    s, t = torch.tensor([[0.0, -1.0]]), torch.tensor([[0.0, -4.0]])
+    one = torch.tensor(1.0)
+    if path == "body":
+        row, _ = fl._jsd_body(s, t, one, beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    elif path == "chunk":
+        row, _ = fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(t, -1), beta, True)
+    else:
+        if not torch.cuda.is_available() or not fl._use_triton(torch.device("cuda")):
+            pytest.skip("Triton on CUDA")
+        row, _ = fl._jsd_triton(s.cuda(), t.cuda(), one.cuda(), beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32)
+    ref, _ = _exact_jsd(s[0], t[0], beta)
+    torch.testing.assert_close(row.cpu().double()[0], ref, rtol = 0.05, atol = 0.0)
+
+
+@pytest.mark.parametrize("beta", [1e-18, 1.0 - 1e-16])
+def test_beta_with_unrepresentable_complement_does_not_raise(beta):
+    """1 - (1 - b) is 0 for b = 1e-18: the mirrored log-mix takes both weights, not a reconstructed one."""
+    s = torch.randn(3, 50, generator = torch.Generator().manual_seed(5))
+    one = torch.tensor(1.0)
+    for row, dz in (fl._jsd_body(s, s + 0.1, one, beta, 1.0, 1.0, 0.0, 1.0, 0.0, True, torch.float32),
+                    fl._jsd_chunk(torch.log_softmax(s, -1), torch.log_softmax(s + 0.1 * s.sin(), -1), beta, True)):
+        assert torch.isfinite(row).all() and torch.isfinite(dz).all()
+
+
 def test_fully_masked_is_finite_zero():
     hs, ws, _, ht, wt, _, labels = _case(3)
     h = hs.clone().requires_grad_(True)
