@@ -6256,6 +6256,38 @@ def _distillation_generalized_jsd(student_log_probs, teacher_log_probs, beta: fl
     return beta_t * kl_teacher + (1 - beta_t) * kl_student
 
 
+def _distillation_log_mix(delta, beta: float, onemb: float):
+    """log((1 - b) + b exp(delta)) with onemb = 1 - b passed separately; exactly 0 at delta = 0."""
+    u = torch.expm1(delta.clamp_max(80.0)) * beta
+    lse = torch.logaddexp(delta + math.log(beta), torch.full_like(delta, math.log(onemb)))
+    return torch.where((delta <= 80.0) & (u >= -0.5), torch.log1p(u), lse)
+
+
+def _distillation_jsd_rows(student_logits, teacher_logits, beta: float):
+    """Per-row generalized JSD, its gradient in the student logits and the student entropy, all from the logits.
+
+    beta 0: KL(q || p), dz = p - q. beta 1: KL(p || q), dz = p (d - E_p d) with d = ls - lt. Otherwise
+    m = log((1 - b) p + b q) formed relative to ls / lt (exactly ls at p = q), dz = (1 - b) p (d - E_p d), d = ls - m.
+    """
+    ls = student_logits - torch.logsumexp(student_logits, dim = -1, keepdim = True)
+    lt = teacher_logits - torch.logsumexp(teacher_logits, dim = -1, keepdim = True)
+    p = ls.exp()
+    entropy = -(p * ls).sum(-1)
+    if beta == 0.0:
+        q = lt.exp()
+        return (q * (lt - ls)).sum(-1), p - q, entropy
+    if beta == 1.0:
+        d = ls - lt
+        rs = (p * d).sum(-1, keepdim = True)
+        return rs.squeeze(-1), p * (d - rs), entropy
+    delta = lt - ls
+    d = -_distillation_log_mix(delta, beta, 1.0 - beta)
+    t_term = (lt.exp() * -_distillation_log_mix(-delta, 1.0 - beta, beta)).sum(-1)
+    rs = (p * d).sum(-1, keepdim = True)
+    row = beta * t_term + (1.0 - beta) * rs.squeeze(-1)
+    return row, (1.0 - beta) * p * (d - rs), entropy
+
+
 def _distillation_jsd_chunk(
     student_hidden_states, student_lm_head, student_lm_head_bias,
     teacher_hidden_states, teacher_lm_head, teacher_lm_head_bias,
@@ -6281,22 +6313,24 @@ def _distillation_jsd_chunk(
         student_logits = student_logits / temperature
         teacher_logits = teacher_logits / temperature
 
-    student_log_probs = torch.nn.functional.log_softmax(student_logits, dim = -1)
-    teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim = -1)
-
     # Reduce on STUDENT head's device (grads accumulate there); accelerate may split heads.
-    if teacher_log_probs.device != student_log_probs.device:
-        teacher_log_probs = teacher_log_probs.to(student_log_probs.device)
-    if valid.device != student_log_probs.device:
-        valid = valid.to(student_log_probs.device)
+    if teacher_logits.device != student_logits.device:
+        teacher_logits = teacher_logits.to(student_logits.device)
+    if valid.device != student_logits.device:
+        valid = valid.to(student_logits.device)
 
-    jsd = _distillation_generalized_jsd(student_log_probs, teacher_log_probs, beta)
-
+    # Loss and d loss / d logits in closed form from the logits (no autograd through log_softmax, whose backward
+    # leaves a ~1e-8 gradient when student == teacher that Adam turns into full-size steps); autograd only carries
+    # the analytic dz through the temperature, softcapping and head via a linear surrogate.
+    row, dz, per_token_entropy = _distillation_jsd_rows(student_logits.detach(), teacher_logits.detach(), beta)
     # The final chunk's tail holds positions packed out of the valid prefix.
-    per_token_jsd = jsd.sum(dim = -1) * valid
-    per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim = -1) * valid
-    loss = per_token_jsd.sum() / divisor
-    return loss * grad_scale, (loss, per_token_entropy.sum())
+    # valid arrives in the student dtype: fp32 before dividing, or an fp16 1 / divisor underflows past 2**24 rows.
+    valid = valid.to(torch.float32)
+    loss = (row * valid).sum() / divisor
+    weight = (dz * valid.unsqueeze(-1) / divisor).detach()
+    surrogate = (weight * student_logits).sum()
+    objective = loss.detach() + (surrogate - surrogate.detach())
+    return objective * grad_scale, (loss, (per_token_entropy * valid).sum())
 pass
 
 
