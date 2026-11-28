@@ -1022,7 +1022,7 @@ def test_the_fixture_really_neutralises_the_zoo_readers(dnp):
     module = sys.modules.get("unsloth_zoo.hf_xet_tuning")
     if module is None:
         pytest.skip("unsloth_zoo.hf_xet_tuning is not reachable here")
-    assert str(module.CGROUP_ROOT).startswith("/nonexistent"), module.CGROUP_ROOT
+    assert Path(module.CGROUP_ROOT).as_posix().startswith("/nonexistent"), module.CGROUP_ROOT
     assert module._cgroup_v2_dirs() == []
     assert module._cgroup_v1_dirs("memory") == []
 
