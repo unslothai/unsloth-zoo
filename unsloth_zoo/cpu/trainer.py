@@ -426,14 +426,16 @@ def _patch_cpu_num_items(trainer_cls):
     if original is None or getattr(original, "_unsloth_cpu", False) \
             or getattr(original, "__name__", "") == "_unsloth_get_batch_samples":
         return False
-    from ..loss_utils import (
-        NON_CAUSAL_HEADS, _loss_shifts_labels, _unsloth_get_batch_samples, _unwrap_training_wrappers,
-        counts_unshifted_labels, num_items_labels_convention,
-    )
 
+    # loss_utils imports fused_losses: imported at the first batch, not while `import unsloth` patches the Trainer.
     def causal_head(trainer, model):
         """A positive causal-loss signal (the head shifts labels, or Unsloth recorded its count convention);
         masked LM, classification, QA and encoder-decoder heads have none and keep transformers' count."""
+        from unsloth_zoo.loss_utils import (
+            NON_CAUSAL_HEADS, _loss_shifts_labels, _unwrap_training_wrappers, counts_unshifted_labels,
+            num_items_labels_convention,
+        )
+
         m = _unwrap_training_wrappers(model)
         if hasattr(m, "get_base_model"):
             m = m.get_base_model()
@@ -447,6 +449,8 @@ def _patch_cpu_num_items(trainer_cls):
     def get_batch_samples(self, *args, **kwargs):
         if not causal_head(self, getattr(self, "model", None)):
             return original(self, *args, **kwargs)
+        from unsloth_zoo.loss_utils import _unsloth_get_batch_samples
+
         return _unsloth_get_batch_samples(self, *args, **kwargs)
 
     get_batch_samples._unsloth_cpu = True
