@@ -611,6 +611,64 @@ def patch_cpu_sdpa_gqa():
     return True
 
 
+# Training attention calls that ran in float32 (tests and benchmarks read it).
+SDPA_FP32_ENGAGED = [0]
+
+
+def _bf16_sdpa_in_fp32_pays():
+    """Arm CPUs: torch's bf16 CPU flash attention backward is far slower than the fp32 one. On a Linux aarch64
+    Neoverse N2 (Cobalt 100, 4 threads) a Qwen3-0.6B-shaped forward + backward took 142 ms in bf16 against 7.9 ms
+    in fp32 at 128 tokens, and 5.4 s against 0.27 s at 1024; bf16 SFT / DPO / full FT steps were 23-36% faster with
+    attention in fp32, and a 512-token SFT step 10.6x. UNSLOTH_CPU_SDPA_FP32=0 / 1 turns it off / on anywhere."""
+    setting = os.environ.get("UNSLOTH_CPU_SDPA_FP32", "").strip().lower()
+    if setting in ("0", "false", "no", "off"):
+        return False
+    if setting in ("1", "true", "yes", "on"):
+        return True
+    import platform
+    return platform.machine().lower() in ("aarch64", "arm64")
+
+
+def patch_cpu_bf16_sdpa_fp32():
+    """bf16 training attention on CPU (query needs a gradient) computed by the fp32 SDPA kernel: bf16 query / key /
+    value (and a floating mask) are upcast exactly, the output is rounded back to bf16 and the gradients flow back
+    through the casts in bf16. No-grad calls (decode, reference forwards) keep the bf16 kernel, where the forward is
+    as fast and the KV cache would need an upcast per token."""
+    if not _bf16_sdpa_in_fp32_pays():
+        return False
+    try:
+        from transformers.integrations import sdpa_attention
+        from transformers.modeling_utils import AttentionInterface
+    except Exception:
+        return False
+    mapping = getattr(AttentionInterface, "_global_mapping", None)
+    original = mapping.get("sdpa") if isinstance(mapping, dict) else None
+    if original is None:
+        return False
+    if getattr(original, "_unsloth_cpu_fp32", False):
+        return True
+
+    @functools.wraps(original)
+    def sdpa_attention_forward(module, query, key, value, attention_mask, *args, **kwargs):
+        if not (isinstance(query, torch.Tensor) and query.device.type == "cpu" and query.dtype == torch.bfloat16
+                and query.requires_grad and torch.is_grad_enabled()):
+            return original(module, query, key, value, attention_mask, *args, **kwargs)
+        if not torch.compiler.is_compiling():
+            SDPA_FP32_ENGAGED[0] += 1
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.is_floating_point():
+            attention_mask = attention_mask.float()
+        with torch.autocast("cpu", enabled = False):
+            output, weights = original(module, query.float(), key.float(), value.float(), attention_mask,
+                                       *args, **kwargs)
+        return output.to(query.dtype), weights
+
+    sdpa_attention_forward._unsloth_cpu_fp32 = True
+    mapping["sdpa"] = sdpa_attention_forward
+    if getattr(sdpa_attention, "sdpa_attention_forward", None) is original:
+        sdpa_attention.sdpa_attention_forward = sdpa_attention_forward
+    return True
+
+
 # torch's CPU 2-norm of one float32 tensor sums every square into float32 partials: on a 151936 x 1024 embedding
 # gradient it is 2% off the float64 norm (6e-5 at 3072 x 1024) and runs at ~10 GB/s. One float32 norm per row (a
 # row is at most a few thousand elements) combined in float64 is accurate to 1e-9 and reads the gradient faster.

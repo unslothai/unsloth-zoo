@@ -923,6 +923,8 @@ def install_cpu_training_defaults():
     if os.environ.get("UNSLOTH_CPU_SDPA_GQA", "1") != "0":
         from .ops import patch_cpu_sdpa_gqa
         patch_cpu_sdpa_gqa()
+    from .ops import patch_cpu_bf16_sdpa_fp32
+    patch_cpu_bf16_sdpa_fp32()
     if os.environ.get("UNSLOTH_CPU_GRAD_NORM", "1") != "0":
         from .ops import patch_cpu_grad_total_norm
         patch_cpu_grad_total_norm()
