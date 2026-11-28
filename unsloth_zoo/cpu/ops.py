@@ -619,7 +619,9 @@ def _bf16_sdpa_in_fp32_pays():
     """Arm CPUs: torch's bf16 CPU flash attention backward is far slower than the fp32 one. On a Linux aarch64
     Neoverse N2 (Cobalt 100, 4 threads) a Qwen3-0.6B-shaped forward + backward took 142 ms in bf16 against 7.9 ms
     in fp32 at 128 tokens, and 5.4 s against 0.27 s at 1024; bf16 SFT / DPO / full FT steps were 23-36% faster with
-    attention in fp32, and a 512-token SFT step 10.6x. UNSLOTH_CPU_SDPA_FP32=0 / 1 turns it off / on anywhere."""
+    attention in fp32, and a 512-token SFT step 10.6x. On x86 with native bf16 (EPYC 9V45 / 9V74) the bf16 kernel is
+    the faster one (161 against 257 ms at 1024 tokens) and fp32 made that SFT step 2-11% slower, so x86 keeps it.
+    UNSLOTH_CPU_SDPA_FP32=0 / 1 turns it off / on anywhere."""
     setting = os.environ.get("UNSLOTH_CPU_SDPA_FP32", "").strip().lower()
     if setting in ("0", "false", "no", "off"):
         return False
@@ -638,12 +640,9 @@ def patch_cpu_bf16_sdpa_fp32():
         return False
     try:
         from transformers.integrations import sdpa_attention
-        from transformers.modeling_utils import AttentionInterface
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        original = ALL_ATTENTION_FUNCTIONS["sdpa"]
     except Exception:
-        return False
-    mapping = getattr(AttentionInterface, "_global_mapping", None)
-    original = mapping.get("sdpa") if isinstance(mapping, dict) else None
-    if original is None:
         return False
     if getattr(original, "_unsloth_cpu_fp32", False):
         return True
@@ -663,7 +662,9 @@ def patch_cpu_bf16_sdpa_fp32():
         return output.to(query.dtype), weights
 
     sdpa_attention_forward._unsloth_cpu_fp32 = True
-    mapping["sdpa"] = sdpa_attention_forward
+    # The registry's local entry wins over its global one (patch_sdpa_bool_causal_mask writes it too); a patch
+    # installed later wraps the module attribute, so it chains to this one.
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_attention_forward
     if getattr(sdpa_attention, "sdpa_attention_forward", None) is original:
         sdpa_attention.sdpa_attention_forward = sdpa_attention_forward
     return True

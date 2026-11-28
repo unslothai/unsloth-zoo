@@ -24,17 +24,21 @@ import torch
 
 @pytest.fixture
 def mapping(monkeypatch):
+    """The attention registry as models read it (ALL_ATTENTION_FUNCTIONS: its local entry, then the global one),
+    starting from transformers' own function and restored after each test; returns (registry, that function)."""
     from transformers.integrations import sdpa_attention
-    from transformers.modeling_utils import AttentionInterface
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, AttentionInterface
     from unsloth_zoo.cpu import ops
     original = AttentionInterface._global_mapping["sdpa"]
-    # Restored after each test: the patch writes the global attention registry.
+    # Another patch (the bool causal mask fix) may own the local entry and the module attribute already.
+    monkeypatch.setattr(ALL_ATTENTION_FUNCTIONS, "_local_mapping",
+                        {k: v for k, v in ALL_ATTENTION_FUNCTIONS._local_mapping.items() if k != "sdpa"})
     monkeypatch.setitem(AttentionInterface._global_mapping, "sdpa", original)
-    monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", sdpa_attention.sdpa_attention_forward)
+    monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", original)
     monkeypatch.setattr(ops, "SDPA_FP32_ENGAGED", [0])
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
     monkeypatch.delenv("UNSLOTH_CPU_SDPA_FP32", raising = False)
-    return AttentionInterface._global_mapping, original
+    return ALL_ATTENTION_FUNCTIONS, original
 
 
 class _Attn(torch.nn.Module):
@@ -88,6 +92,39 @@ def test_install_is_idempotent_and_registered(mapping):
     assert patch_cpu_bf16_sdpa_fp32() is True and table["sdpa"] is wrapped
 
 
+def test_chains_with_another_sdpa_patch_in_either_order(mapping, monkeypatch):
+    """A registry override written before this patch is wrapped by it; one written after (it wraps the module
+    attribute, as patch_sdpa_bool_causal_mask does) wraps this one. Either way both run."""
+    from transformers.integrations import sdpa_attention
+    from unsloth_zoo.cpu import ops
+    table, original = mapping
+    calls = []
+
+    def other_patch():
+        inner = sdpa_attention.sdpa_attention_forward
+
+        def other(module, query, *args, **kwargs):
+            calls.append(query.dtype)
+            return inner(module, query, *args, **kwargs)
+        sdpa_attention.sdpa_attention_forward = other
+        table["sdpa"] = other
+        return other
+
+    first = other_patch()
+    ops.patch_cpu_bf16_sdpa_fp32()
+    assert table["sdpa"].__wrapped__ is first
+    table["sdpa"](_Attn(), *_qkv(), None)
+    assert calls == [torch.float32] and ops.SDPA_FP32_ENGAGED[0] == 1
+
+    calls.clear()
+    monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", original)
+    del table._local_mapping["sdpa"]
+    ops.patch_cpu_bf16_sdpa_fp32()
+    other_patch()
+    table["sdpa"](_Attn(), *_qkv(), None)
+    assert calls == [torch.bfloat16] and ops.SDPA_FP32_ENGAGED[0] == 2
+
+
 def test_off_on_other_cpus_and_with_the_kill_switch(mapping, monkeypatch):
     from unsloth_zoo.cpu.ops import patch_cpu_bf16_sdpa_fp32
     table, original = mapping
@@ -95,7 +132,7 @@ def test_off_on_other_cpus_and_with_the_kill_switch(mapping, monkeypatch):
     assert patch_cpu_bf16_sdpa_fp32() is False and table["sdpa"] is original
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
     monkeypatch.setenv("UNSLOTH_CPU_SDPA_FP32", "0")
-    assert patch_cpu_bf16_sdpa_fp32() is False and table["sdpa"] is original
+    assert patch_cpu_bf16_sdpa_fp32() is False and table["sdpa"] is original and "sdpa" not in table._local_mapping
 
 
 @pytest.mark.parametrize("masked", [False, True])
@@ -131,7 +168,7 @@ def test_inner_call_sees_fp32_even_under_autocast(mapping, monkeypatch):
                      _cpu_autocast_on()))
         return original(module, query, key, value, attention_mask, *args, **kwargs)
 
-    monkeypatch.setitem(table, "sdpa", spy)
+    table["sdpa"] = spy
     monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", spy)
     ops.patch_cpu_bf16_sdpa_fp32()
     q, k, v = _qkv()
@@ -152,7 +189,7 @@ def test_no_grad_and_fp32_calls_keep_the_stock_function(mapping, monkeypatch):
         seen.append(query.dtype)
         return original(module, query, *args, **kwargs)
 
-    monkeypatch.setitem(table, "sdpa", spy)
+    table["sdpa"] = spy
     monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", spy)
     ops.patch_cpu_bf16_sdpa_fp32()
     with torch.no_grad():
