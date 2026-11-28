@@ -171,7 +171,7 @@ def test_lora_rollout_under_inference_mode_leaves_trainable_weights():
 
 
 def test_train_mode_generate_stays_bf16_off_apple_silicon(monkeypatch):
-    """x86 without native bf16 gained about 2% from the fp32 copy: not worth its RAM, so nothing changes there."""
+    """x86 without native bf16 for a narrow, short rollout (1 row, 6 tokens): the fp32 copy would not pay back."""
     from unsloth_zoo.cpu import loader
     monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: False, raising = False)
     model, _ = _tiny_bf16_llama("training")

@@ -440,6 +440,7 @@ jobs:
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
         # test_cpu_rollout_threads: CPU generate decodes on the SMT siblings on AMD x86 without native bf16, restores the training count after (also on error); other hosts, user / launcher / quota counts and UNSLOTH_CPU_ROLLOUT_THREADS=0 keep it.
         # test_cpu_fast_multinomial: CPU one-draw torch.multinomial without the serial exponential_ fill; same samples and RNG state, torch's errors and other calls unchanged.
+        # test_cpu_fp32_rollout_avx2: on AVX2-only x86 without native bf16, train-mode rollouts of 8+ rows x 32+ tokens decode through an fp32 copy of the frozen bf16 projections and store bf16 again, same tokens; narrower rollouts and other CPUs keep bf16.
         # test_cpu_growable_kv: CPU generate appends KV in place (no per-token torch.cat of the whole cache), same greedy / sampled tokens; sliding, hybrid and beam keep the stock cache.
         # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
         # One pytest process per group: MLX export shims replace sys.modules globally,
@@ -514,6 +515,7 @@ jobs:
               tests/test_cpu_growable_kv.py \
               tests/test_cpu_rollout_threads.py \
               tests/test_cpu_fast_multinomial.py \
+              tests/test_cpu_fp32_rollout_avx2.py \
               tests/test_deepseek_v41_compile_entries.py \
               tests/test_moe_weight_preprocessor_registry_shared.py \
               tests/test_moe_triton_down_lora_roworder.py \
