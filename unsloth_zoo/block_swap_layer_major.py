@@ -493,15 +493,143 @@ def _needs_grad(obj, depth = 0):
     return False
 
 
-def _shared_state(obj, depth = 0):
-    """A mapping or list among a decoder layer's inputs: mutable per-call state one layer can write and a later one
-    read (Gemma 4's shared key / value states). The window's no-grad forward would hand the later layer detached
-    tensors. Tuples (position embeddings) are looked into."""
+def _shared_state(obj, depth = 0, empties = None):
+    """A non-empty mapping or list among a decoder layer's inputs: mutable per-call state one layer can write and a
+    later one read. The window's no-grad forward would hand the later layer detached tensors. Tuples (position
+    embeddings) are looked into. Empty ones are collected into `empties`: the call must leave them empty. Plain dicts
+    and UserDicts passed directly (Gemma 4's KV-sharing mapping) are handled by _SharedMappings instead."""
     if isinstance(obj, (Mapping, list)):
-        return True
+        if len(obj) or empties is None:
+            return True
+        empties.append(obj)
+        return False
     if depth < 3 and isinstance(obj, tuple):
-        return any(_shared_state(o, depth + 1) for o in obj)
+        return any(_shared_state(o, depth + 1, empties) for o in obj)
     return False
+
+
+class _RecordingDict(dict):
+    """A copy of a layer's mapping argument that records reads of keys an earlier decoder layer wrote."""
+    def __init__(self, items, written, bad):
+        super().__init__(items)
+        self._written, self._bad = written, bad
+
+    def _read(self, key):
+        if key in self._written:
+            self._bad.append(key)
+
+    def __getitem__(self, key):
+        self._read(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default = None):
+        self._read(key)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        self._read(key)
+        return super().__contains__(key)
+
+    def _read_all(self):
+        if self._written:
+            self._bad.extend(self._written)
+
+    def __iter__(self):
+        self._read_all()
+        return super().__iter__()
+
+    def keys(self):
+        self._read_all()
+        return super().keys()
+
+    def values(self):
+        self._read_all()
+        return super().values()
+
+    def items(self):
+        self._read_all()
+        return super().items()
+
+
+class _SharedMappings:
+    """Mappings passed directly to every decoder layer (Gemma 4's KV-sharing mapping, which a layer writes even when
+    no layer reads it back). Each call gets a recording copy; what the call writes is copied into the real mapping
+    after it. A layer reading a key another layer of the window wrote would get the no-grad forward's tensors where
+    standard training passes ones with gradients: that aborts (KV consumers are also refused up front)."""
+    def __init__(self):
+        self.written = {}   # id(real mapping) -> keys written during the window
+
+    @staticmethod
+    def accepted(obj):
+        from collections import UserDict
+        return type(obj) is dict or isinstance(obj, UserDict)
+
+    def wrap(self, obj, bad):
+        """(proxy to pass, real store, the proxy's store, keys written so far)."""
+        from collections import UserDict
+        written = self.written.setdefault(id(obj), set())
+        if isinstance(obj, UserDict):
+            proxy = type(obj).__new__(type(obj))
+            proxy.__dict__.update(obj.__dict__)
+            proxy.data = _RecordingDict(obj.data, written, bad)
+            return proxy, obj.data, proxy.data, written
+        proxy = _RecordingDict(obj, written, bad)
+        return proxy, obj, proxy, written
+
+    @staticmethod
+    def commit(real, copy, written):
+        """Copy the call's writes into the real store; False when the call deleted a key."""
+        keys = set(dict.keys(copy))
+        if any(k not in keys for k in list(real.keys())):
+            return False
+        for k in keys:
+            v = dict.__getitem__(copy, k)
+            if k not in real or real[k] is not v:
+                real[k] = v
+                written.add(k)
+        return True
+
+
+def _grad_observable(obj, allowed, limit = 4096):
+    """Whether a gradient flowing into `obj` (tensors, also inside tuples / lists / mappings) reaches any leaf other
+    than those in `allowed` (ids): a trainable parameter, or any other tensor whose .grad standard training fills.
+    Gemma 4's per-layer inputs under LoRA are computed from frozen weights and the input embeddings, so they reach
+    only the micro-batch's first decoder input (the leaf enable_input_require_grads marks), which the window
+    backpropagates itself. Too large a graph to walk counts as observable."""
+    pending, nodes, seen = [obj], [], set()
+    while pending:
+        o = pending.pop()
+        if isinstance(o, torch.Tensor):
+            if o.requires_grad:
+                if o.grad_fn is None:
+                    if id(o) not in allowed:
+                        return True
+                else:
+                    nodes.append(o.grad_fn)
+        elif isinstance(o, (tuple, list)):
+            pending.extend(o)
+        elif isinstance(o, Mapping):
+            pending.extend(o.values())
+    while nodes:
+        node = nodes.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if len(seen) > limit:
+            return True
+        variable = getattr(node, "variable", None)
+        if isinstance(variable, torch.Tensor) and id(variable) not in allowed:
+            return True
+        nodes.extend(fn for fn, _ in getattr(node, "next_functions", ()))
+    return False
+
+
+def _detach_tensors(obj, depth = 0):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach() if obj.requires_grad else obj
+    if depth < 3 and type(obj) in (tuple, list):
+        return type(obj)(_detach_tensors(o, depth + 1) for o in obj)
+    return obj
 
 
 def _contains_cache(values):
@@ -726,6 +854,7 @@ class _Window:
         # Generator cursors in standard order (set by _execute_window): start[m] where micro-batch m starts, cursor[m]
         # where it is now (saved when its worker passes the turn), end[m] where it finished.
         self.rng_start = self.rng_cursor = self.rng_end = None
+        self.mappings = _SharedMappings()
 
     def _call_signature(self, l):
         """Forward hooks and instance-level forwards in layer l (and the global hooks): what a per-call output
@@ -789,8 +918,31 @@ class _Window:
         else:
             others = (args, {k: v for k, v in kwargs.items() if k != where})
         if _needs_grad(others):
-            self._abort("a decoder layer input other than the hidden states needs gradients")
-        if _shared_state(tuple(others[0]) + tuple(others[1].values())):
+            first = h if l == 0 else self.h0[m]
+            if first is None or not first.is_leaf or _grad_observable(others, {id(first)}):
+                self._abort("a decoder layer input other than the hidden states needs gradients")
+            # Their gradient reaches nothing but this micro-batch's first decoder input, a leaf (frozen per-layer
+            # embeddings under LoRA): passed without one, so the recompute does not backpropagate into the input
+            # side once per layer; that leaf's own .grad is the only value that differs, and nothing trains it.
+            if where == 0:
+                args = (args[0],) + _detach_tensors(tuple(args[1:]))
+            else:
+                args = _detach_tensors(tuple(args))
+            kwargs = {k: (v if k == where else _detach_tensors(v)) for k, v in kwargs.items()}
+            others = (args[1:], {k: v for k, v in kwargs.items() if k != where}) if where == 0 else \
+                (args, {k: v for k, v in kwargs.items() if k != where})
+        # Plain dicts / UserDicts passed directly: recording copies (_SharedMappings); anything else that is a
+        # non-empty mapping or list (or one inside a tuple) aborts.
+        shared, bad = [], []
+        if where == 0:
+            args = (args[0],) + tuple(self._share(a, shared, bad) for a in args[1:])
+        else:
+            args = tuple(self._share(a, shared, bad) for a in args)
+        kwargs = {k: (v if k == where else self._share(v, shared, bad)) for k, v in kwargs.items()}
+        empties = []
+        plain = [v for v in (*(args[1:] if where == 0 else args), *(v for k, v in kwargs.items() if k != where))
+                 if not any(v is entry[0] for entry in shared)]
+        if _shared_state(tuple(plain), empties = empties):
             self._abort("a decoder layer input is a mapping or list (state shared between layers, such as shared KV)")
         if _operator_modes_active():
             self._abort("a TorchFunctionMode / TorchDispatchMode is active inside the micro-batch")
@@ -833,6 +985,13 @@ class _Window:
             if frames[0] is not None:
                 self._abort(frames[0])
             out = orig_call(layer, *args2, **kwargs2)
+        if any(len(c) for c in empties):
+            self._abort("a decoder layer wrote into a mapping or list passed to every layer (shared KV states)")
+        if bad:
+            self._abort("a decoder layer read a mapping entry another decoder layer wrote (shared KV states)")
+        for _, real, copy, written in shared:
+            if not _SharedMappings.commit(real, copy, written):
+                self._abort("a decoder layer removed entries from a mapping passed to every layer")
         if frames[1] is not None and frames[1].entries:
             self._abort("a decoder layer routes MoE experts under Unsloth's checkpoint, whose recompute replays it")
         self.attention[l][m] = frames[2]
@@ -859,6 +1018,13 @@ class _Window:
         self._pass_turn(m)
         self._wait_turn(m)
         return out
+
+    def _share(self, value, shared, bad):
+        if not _SharedMappings.accepted(value):
+            return value
+        entry = self.mappings.wrap(value, bad)
+        shared.append(entry)
+        return entry[0]
 
     def _input_grad(self, m, grad):
         if not self.in_backward:

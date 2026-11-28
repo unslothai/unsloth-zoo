@@ -1274,8 +1274,9 @@ def test_gemma4_kv_sharing_is_refused(monkeypatch):
     assert losses is None and "share key / value states" in why
     monkeypatch.setattr(lm, "_kv_shared_layers", lambda layers: False)
     losses, why = lm.run_layer_major(layers, fns, model = model)
-    # The shared KV mapping, or the per-layer inputs that need gradients here, whichever the window meets first.
-    assert losses is None and ("mapping" in why or "needs gradients" in why), why
+    # Whichever the window meets first: the shared KV mapping read, a per-layer input feeding a trained weight, or
+    # the hidden states sliced before the first KV-sharing layer.
+    assert losses is None and ("mapping" in why or "needs gradients" in why or "hidden states changed" in why), why
     assert _grads(model) == {}
 
 
