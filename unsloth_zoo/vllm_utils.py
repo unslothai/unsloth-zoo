@@ -1406,17 +1406,11 @@ def _standby_pool_cache():
 pass
 
 
-def _standby_free_memory():
-    """(device free bytes, reusable default-pool cache bytes, device total): training can use the first two."""
-    free, total = torch.cuda.mem_get_info()
-    return int(free), _standby_pool_cache()[0], int(total)
-pass
-
-
-def _standby_pending(tokens):
+def _standby_pending(tokens, private_cached = None):
     """The start point of the coming training step's measurement."""
     _, peak, allocated = _standby_memory_point()
-    return {"allocated": allocated, "peak": peak, "tokens": tokens, "private_cached": _standby_pool_cache()[1]}
+    if private_cached is None: private_cached = _standby_pool_cache()[1]
+    return {"allocated": allocated, "peak": peak, "tokens": tokens, "private_cached": private_cached}
 pass
 
 
@@ -1451,12 +1445,13 @@ def _standby_close_measurement(s):
 pass
 
 
-def _standby_fits(s, tokens):
+def _standby_fits(s, tokens, cache):
     """True when the coming training step, scaled to this rollout's padded size, fits in the memory training can use
-    with the safety factor and a margin, judged from this engine's training steps measured so far."""
+    (device free memory plus the reusable default-pool `cache`) with the safety factor and a margin, judged from this
+    engine's training steps measured so far."""
     if not s["measured"]: return False, None
-    device_free, cache, total = _standby_free_memory()
-    free = device_free + cache
+    device_free, total = torch.cuda.mem_get_info()
+    free, total = int(device_free) + cache, int(total)
     need = _STANDBY_KEEP_AWAKE_SAFETY * max(g * max(1.0, tokens / t) for g, t in s["measured"])
     margin = max(1 << 30, int(0.05 * total))
     info = {"need_gb": round(need / 1e9, 3), "free_gb": round(free / 1e9, 3), "cache_gb": round(cache / 1e9, 3),
@@ -1540,7 +1535,12 @@ def _standby_skip_resets(llm):
     if fn is not None:
         try: fn()
         except Exception: return False
-    return _reset_merged_rollout_prefix_cache(llm)
+    fn = getattr(llm, "reset_prefix_cache", None)
+    if fn is None: return False
+    try: result = fn()
+    except Exception: return False
+    # vLLM 0.11.x drops the scheduler's bool (None); a reset only fails while requests run, and none do here
+    return result is None or bool(result)
 pass
 
 
@@ -1597,9 +1597,10 @@ def patch_vllm_standby_keep_awake():
         if enabled:
             try:
                 _standby_close_measurement(s)
+                cache, private = _standby_pool_cache()
                 if tokens > 0 and not stats.get("disabled"):
-                    fits, info = _standby_fits(s, tokens)
-                s["pending"] = _standby_pending(tokens)
+                    fits, info = _standby_fits(s, tokens, cache)
+                s["pending"] = _standby_pending(tokens, private)
             except Exception as e:
                 fits, info = False, {"error": repr(e)}
             if fits and not _standby_skip_resets(self):
