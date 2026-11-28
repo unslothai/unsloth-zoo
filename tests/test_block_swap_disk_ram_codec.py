@@ -183,11 +183,13 @@ def test_install_keeps_disk_blocks_in_the_ram_the_host_codec_frees(monkeypatch, 
         _equal(ref, got)
         seen[mode] = (len(disk), ram_encoded, sw.stats()["disk_promoted"], reads[-1])
         _check_readback(base, layers, sw, want)
-    # 5 raw-sized layers of host budget: raw, 5 in RAM and 6 on disk; encoded (about 0.75 of raw), the room
-    # left holds a sixth, so one fewer disk layer, two fewer reads per micro-batch (2 micro-batches per step).
+    # 5 raw-sized layers of host budget: raw, 5 in RAM and 6 on disk. Encoded (0.75 of raw with the fixed-width
+    # codec), the room left holds at least a sixth; each layer kept is two fewer reads per micro-batch (it is not at
+    # a turnaround), and a step has 2 micro-batches.
     assert seen["0"][:3] == (6, 0, 0), seen
-    assert seen[None][0] == 5 and seen[None][1] == 6 and seen[None][2] == 1, seen
-    assert seen[None][3] == seen["0"][3] - 2 * 2, seen
+    kept = seen[None][2]
+    assert kept >= 1 and seen[None][0] == 6 - kept and seen[None][1] == 5 + kept, seen
+    assert seen[None][3] == seen["0"][3] - 2 * 2 * kept, seen
 
 
 @_codec_gpu
@@ -273,3 +275,23 @@ def test_promotion_order_moves_twice_read_blocks_first():
         assert _mod._promotion_order([0, 1, 3, 8, 9], 10, 2) == [0, 3, 1, 8, 9]
     finally:
         _mod._KEEP_BOTTOM = keep
+
+
+@_codec_gpu
+def test_host_recheck_runs_before_the_staging_ring_is_taken(monkeypatch):
+    """The host check for the encoder's scratch counts the disk staging ring: it must run while the ring is not yet
+    allocated (and so not yet out of free host RAM), else the ring is counted twice."""
+    base = _stack()
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 5)))
+    seen = []
+    real = BlockSwap._compress_beside_disk
+
+    def probe(self, fit_with):
+        seen.append(self._disk_tier)
+        return real(self, fit_with)
+
+    monkeypatch.setattr(BlockSwap, "_compress_beside_disk", probe)
+    sw = BlockSwap(copy.deepcopy(base), 11, prefetch_depth = 2, placement = "tail")
+    assert seen == [None], seen
+    assert sw._disk_tier is not None and sw._compress
+    sw.remove()

@@ -1311,10 +1311,12 @@ class BlockSwap:
                             layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
 
             if self._staging_bytes():
-                self._disk_tier = _disk().DiskTier(self._staging_bytes() // 2, slots = 2)
                 self._disk_decoders = self._disk_compress_check()
+                # Before the staging ring is allocated: the host recheck counts the ring itself, and a ring already
+                # taken out of free RAM would be counted twice.
                 if not self._compress and self._disk_decoders and _host_codec_with_disk():
                     self._compress_beside_disk(fit_with)
+                self._disk_tier = _disk().DiskTier(self._staging_bytes() // 2, slots = 2)
             self._pack()
             if self._disk_tier is not None and not any(b.disk is not None for b in self.blocks):
                 # Every disk block moved into the host RAM the encoded blocks freed: no reads, no staging ring.
