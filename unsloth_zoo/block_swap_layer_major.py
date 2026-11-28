@@ -291,74 +291,97 @@ def _recorder_targets(model, layers):
     return classes
 
 
-class _ThreadForward:
-    """`forward` of a module class for the length of a window: assignments to `module.forward` (transformers 4.x
-    capture wrappers, assigned and put back once per model call) are kept per thread, so each micro-batch's worker
-    sees only its own wrapper. Reads without one fall back to the instance dict, then the class's own forward."""
-    def __init__(self, cls, orig):
-        self.cls, self.orig = cls, orig
-        self.local = threading.local()
+def _capture_wrapper_vars(fn):
+    """The closure of a transformers 4.x capture wrapper (check_model_inputs' make_capture_wrapper), or None."""
+    cv = _closure(fn)
+    sink = cv.get("collected_outputs")
+    if isinstance(sink, dict) and "key" in cv and "index" in cv and "orig_forward" in cv:
+        return cv
+    return None
 
-    def overrides(self):
-        d = getattr(self.local, "d", None)
-        if d is None:
-            d = self.local.d = {}
-        return d
 
-    def _own(self, obj):
-        for k in type(obj).__mro__:
-            if "forward" in k.__dict__:
-                return k is self.cls
-        return False
+# Windows carry router losses (recorded router logits, per-turn capture wrappers): the trainer checks this.
+MOE_ROUTER_LOSSES = True
+_MIRROR_KEYS = ("_unsloth_eager_value", "_unsloth_eager_single", "_unsloth_eager_unordered")
+_MIRROR = [None]   # (collector variable, its mirror state when the window started); one window per process
 
-    def _bound(self, obj, objtype):
-        get = getattr(type(self.orig), "__get__", None)
-        return get(self.orig, obj, objtype) if get is not None else self.orig
 
-    def __get__(self, obj, objtype = None):
-        if obj is None:
-            return self._bound(None, objtype) if isinstance(self.orig, _ThreadForward) else self.orig
-        if self._own(obj):
-            entry = self.overrides().get(id(obj))
-            if entry is not None and entry[0] is obj:
-                return entry[1]
-            if "forward" in obj.__dict__:
-                return obj.__dict__["forward"]
-        return self._bound(obj, objtype)
-
-    def __set__(self, obj, value):
-        self.overrides()[id(obj)] = (obj, value)
-
-    def __delete__(self, obj):
-        if self.overrides().pop(id(obj), None) is None:
-            obj.__dict__.pop("forward", None)
-
-    def override(self, obj):
-        entry = self.overrides().get(id(obj))
-        return entry[1] if entry is not None and entry[0] is obj else None
+def _collector_var():
+    """transformers 5.x's output collector, when Unsloth mirrors it for compiled code (temporary_patches/misc.py:
+    compiled hooks read `_unsloth_eager_value` while `_unsloth_eager_single`)."""
+    var = getattr(sys.modules.get("transformers.utils.output_capturing"), "_active_collector", None)
+    return var if var is not None and getattr(type(var), "_unsloth_eager_mirror", False) else None
 
 
 @contextmanager
-def _thread_forwards(classes):
-    """Install _ThreadForward on `classes` (origins resolved before any is patched), undone after."""
-    origins = {}
-    for cls in classes:
-        for k in cls.__mro__:
-            if "forward" in k.__dict__:
-                origins[cls] = ("forward" in cls.__dict__, k.__dict__["forward"])
-                break
-    installed = {}
+def _collector_mirror_scope():
+    """The mirror state the window found, put back after it: with several micro-batches' model calls active at
+    once (and their collectors reset out of order) the mirror would otherwise read as multi-threaded / unordered
+    from then on, and compiled code would take another path than in standard training."""
+    var = _collector_var()
+    _MIRROR[0] = None if var is None else (var, {k: var.__dict__.get(k, _MISSING) for k in _MIRROR_KEYS})
+    if var is not None:
+        # A micro-batch's model call sets / resets its collector during its turn: the mirror follows that one
+        # (single-threaded, in order), as it does in standard training, instead of seeing every worker's at once.
+        cls = type(var)
+
+        def set(value, _cls = cls, _var = var):
+            token = _cls.set(_var, value)
+            _mirror_pin()
+            return token
+
+        def reset(token, _cls = cls, _var = var):
+            result = _cls.reset(_var, token)
+            _mirror_pin()
+            return result
+        var.__dict__["set"], var.__dict__["reset"] = set, reset
     try:
-        for cls, (had, orig) in origins.items():
-            installed[cls] = (had, cls.__dict__.get("forward"), _ThreadForward(cls, orig))
-            cls.forward = installed[cls][2]
-        yield {cls: d for cls, (_, _, d) in installed.items()}
+        yield
     finally:
-        for cls, (had, own, _) in installed.items():
-            if had:
-                cls.forward = own
-            else:
-                del cls.forward
+        if var is not None:
+            var.__dict__.pop("set", None)
+            var.__dict__.pop("reset", None)
+        _mirror_settle()
+        _MIRROR[0] = None
+
+
+def _mirror_pin():
+    """Before a decoder layer call in a worker: the mirror reads this micro-batch's collector, single-threaded, as
+    it does in standard training while that micro-batch's model call is the only one active."""
+    if _MIRROR[0] is None:
+        return
+    var = _MIRROR[0][0]
+    try:
+        active = var.context_var.get()
+    except Exception:
+        return
+    var.__dict__["_unsloth_eager_value"] = active
+    var.__dict__["_unsloth_eager_single"] = True
+
+
+def _mirror_settle():
+    if _MIRROR[0] is None:
+        return
+    var, saved = _MIRROR[0]
+    for k, v in saved.items():
+        if v is _MISSING:
+            var.__dict__.pop(k, None)
+        else:
+            var.__dict__[k] = v
+
+
+def _unwrapped_forward(mod):
+    """A module's instance forward without transformers 4.x capture wrappers (None for none, or for the bound
+    class forward check_model_inputs assigns back after a call)."""
+    fn = mod.__dict__.get("forward")
+    for _ in range(8):
+        cv = _capture_wrapper_vars(fn) if fn is not None else None
+        if cv is None:
+            break
+        fn = cv["orig_forward"]
+    if getattr(fn, "__self__", None) is mod and getattr(fn, "__func__", None) is getattr(type(mod), "forward", None):
+        return None
+    return fn
 
 
 _NO_COMPILE_MESSAGE = "torch.compile stance is 'fail_on_recompile'"
@@ -1109,7 +1132,9 @@ class _Window:
         # Layers run through their own non-reentrant checkpoint: the forward's graph (it keeps no activations, only the
         # checkpoint's recompute), backpropagated as standard accumulation does: (hidden output, {id(leaf): output}).
         self.graphs = [[None] * n for _ in range(self.L)]
-        self.thread_forwards = {}   # class -> _ThreadForward (transformers 4.x forward-swapping capture)
+        # transformers 4.x capture: the recorded modules whose instance `forward` each micro-batch's model call swaps;
+        # the window swaps them per turn (exactly one worker runs at a time), see _swap_forwards.
+        self.swap_modules, self.swap_ids, self.swap_state = [], set(), [None] * n
         # Every layer's output as the model sees it: a leaf, so a loss on intermediate hidden states (and the
         # loss part on the last one) leaves its gradient there for the backward.
         self.outs = [[None] * n for _ in range(self.L)]
@@ -1140,7 +1165,9 @@ class _Window:
             # transformers 5.x installs its output-capture hooks on the first call that records (inside a window
             # too); they record per thread, so they are not counted.
             hooks = sum(not _is_capture_hook(h) for h in mod._forward_hooks.values())
-            sig += (hooks, len(mod._forward_pre_hooks), id(mod.__dict__.get("forward")))
+            # A swapped-per-turn module's capture wrappers belong to the micro-batch whose turn it is.
+            forward = _unwrapped_forward(mod) if id(mod) in self.swap_ids else mod.__dict__.get("forward")
+            sig += (hooks, len(mod._forward_pre_hooks), id(forward))
         return tuple(sig)
 
     # ---- turn taking: exactly one worker runs at a time, in micro-batch order ----
@@ -1150,6 +1177,7 @@ class _Window:
                 self.cv.wait()
             if self.abort_reason is not None:
                 raise LayerMajorAbort(self.abort_reason)
+        _mirror_pin()   # this micro-batch's collector, as while its model call is the only one active
         if self.rng_cursor is not None:
             # This micro-batch's draws continue where its own last ran, not where the previous worker stopped.
             rng_load(self.rng_cursor[m])
@@ -1161,11 +1189,26 @@ class _Window:
                 return j
         return None
 
+    def _swap_forwards(self, out_m, in_m):
+        """Keep the outgoing micro-batch's instance forwards of the recorded modules (its capture wrappers) and put
+        the incoming one's back: each micro-batch's model call sees only its own, as in standard training."""
+        if not self.swap_modules or in_m is None or in_m == out_m:
+            return
+        self.swap_state[out_m] = [mod.__dict__.get("forward", _MISSING) for mod in self.swap_modules]
+        state = self.swap_state[in_m] or self.swap_originals
+        for mod, value in zip(self.swap_modules, state):
+            if value is _MISSING:
+                mod.__dict__.pop("forward", None)
+            else:
+                mod.__dict__["forward"] = value
+
     def _pass_turn(self, m):
         if self.rng_cursor is not None:
             self.rng_cursor[m] = rng_snapshot(self.rng_devices)
         with self.cv:
-            self.turn = self._next_alive(m)
+            nxt = self._next_alive(m)
+            self._swap_forwards(m, nxt)
+            self.turn = nxt
             self.cv.notify_all()
 
     def _abort(self, reason):
@@ -1277,6 +1320,7 @@ class _Window:
         with forward:
             if frames[0] is not None:
                 self._abort(frames[0])
+            _mirror_pin()
             with _no_compiles():
                 out = orig_call(layer, *args2, **kwargs2)
         if any(len(c) for c in empties):
@@ -1341,23 +1385,19 @@ class _Window:
                 if rec is not None and rec[0] == me and isinstance(rec[1], list):
                     # One sink per model call; its entries are this layer's recorded router outputs.
                     out.append(({"router_logits": rec[1]}, [(mod, "router_logits", "hook")]))
-        if self.thread_forwards:
+        if self.swap_ids:
             found = {}
             for mod in layer.modules():
-                desc = self.thread_forwards.get(type(mod))
-                fn = desc.override(mod) if desc is not None else None
-                if fn is None:
+                if id(mod) not in self.swap_ids:
                     continue
-                # check_model_inputs stacks one capture wrapper per recorded key; the original method ends it.
+                # check_model_inputs stacks one capture wrapper per recorded key on the instance forward.
+                fn = mod.__dict__.get("forward")
                 for _ in range(8):
-                    if getattr(fn, "__self__", None) is mod or fn is mod.__dict__.get("forward"):
+                    cv = _capture_wrapper_vars(fn) if fn is not None else None
+                    if cv is None:
                         break
-                    cv = _closure(fn)
-                    sink = cv.get("collected_outputs")
-                    if not isinstance(sink, dict) or "key" not in cv or "index" not in cv or "orig_forward" not in cv:
-                        self._abort("a decoder module's forward was replaced during the window by something other "
-                                    "than transformers' output capture")
-                    found.setdefault(id(sink), (sink, []))[1].append((mod, cv["key"], cv["index"]))
+                    found.setdefault(id(cv["collected_outputs"]), (cv["collected_outputs"], []))[1].append(
+                        (mod, cv["key"], cv["index"]))
                     fn = cv["orig_forward"]
             out.extend(found.values())
         return out
@@ -1444,17 +1484,19 @@ class _Window:
                                 output[0] if isinstance(output, tuple) else output))
                         installed.append((None, handle))
                         continue
-                    desc = self.thread_forwards[type(mod)]
-                    inner = desc.override(mod) or desc.__get__(mod, type(mod))
-                    desc.__set__(mod, _capture_wrapper(inner, sinks[ci][key], index))
-                    installed.append((desc, mod))
+                    # The decoder backward runs alone: the recompute's own capture wrapper on the instance.
+                    before = mod.__dict__.get("forward", _MISSING)
+                    mod.__dict__["forward"] = _capture_wrapper(mod.forward, sinks[ci][key], index)
+                    installed.append((before, mod))
             yield sinks
         finally:
-            for desc, mod in installed:
-                if desc is None:
+            for before, mod in reversed(installed):
+                if before is None:
                     mod.remove()   # a temporary hook handle
+                elif before is _MISSING:
+                    mod.__dict__.pop("forward", None)
                 else:
-                    desc.overrides().pop(id(mod), None)
+                    mod.__dict__["forward"] = before
             if var is not None:
                 var.reset(token)
 
@@ -1506,7 +1548,9 @@ class _Window:
                 self.rng_end[m] = rng_snapshot(self.rng_devices)
             with self.cv:
                 self.alive[m] = False
-                self.turn = self._next_alive(m)
+                nxt = self._next_alive(m)
+                self._swap_forwards(m, nxt)
+                self.turn = nxt
                 self.cv.notify_all()
 
     # ---- backward, layer by layer, on the calling thread ----
@@ -1841,12 +1885,6 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement, rng_plan = No
     if _operator_modes_active():
         return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
     # As the micro-batches will run them (the trainer switches to train mode inside each training step).
-    if _forward_swapping_capture() and _recorder_targets(model, layers) and _compiled_layers(layers):
-        # The window keeps each micro-batch's capture wrapper per thread through a class-level forward, which
-        # compiled decoder code cannot trace (Unsloth's block compile would fall back to eager, changing numerics).
-        return None, ("transformers 4.x records router logits by swapping module forwards per call, which a window "
-                      "cannot keep per thread inside compiled decoder layers (transformers 5 records them per "
-                      "thread; UNSLOTH_BLOCK_COMPILE=0 also works)")
     if _decoder_forward_hooks(layers, swapper):
         # Standard training runs them once around a checkpointed forward; the window calls the layer twice (no-grad
         # forward and grad-mode recompute).
@@ -1942,7 +1980,9 @@ def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, ag
     owners = ([model] if model is not None else []) + list(layers)
     forwards_before = {id(m): (m, m.__dict__.get("forward", _MISSING)) for o in owners for m in o.modules()}
     try:
-        with _thread_forwards(classes) as forwards:
+        swapped = [m for o in owners for m in o.modules() if type(m) in classes]
+        forwards = list({id(m): m for m in swapped}.values())
+        with _collector_mirror_scope():
             return _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, forwards,
                                         rng_plan, rng_trace)
     finally:
@@ -1976,7 +2016,9 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
         planned = rng_plan[m] if rng_plan is not None and m < len(rng_plan) else None
         w.rng_start.append(rng_advance(w.rng_start[-1], planned if planned is not None else ZERO_CONSUMPTION))
     w.rng_cursor, w.rng_end = list(w.rng_start), [None] * n
-    w.thread_forwards = forwards
+    w.swap_modules, w.swap_ids = forwards, {id(m) for m in forwards}
+    w.swap_originals = [m.__dict__.get("forward", _MISSING) for m in forwards]
+    w.signatures = [w._call_signature(l) for l in range(w.L)]
     # Decoder buffers (an expert bias or token counter updated in the forward): standard accumulation writes them
     # micro-batch after micro-batch (its recompute again), the window layer by layer.
     buffers = [(b, b._version) for layer in layers for b in layer.buffers()]
@@ -2061,6 +2103,7 @@ def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_bac
         return roll_back(w.abort_reason)
     # Standard accumulation leaves the generators where the last micro-batch ended (the recompute replays its own).
     rng_load(w.rng_end[-1])
+    _mirror_settle()   # the decoder backward sees the collector state standard training's backward sees
     try:
         with _no_compiles():
             w.backward(orig_calls)
