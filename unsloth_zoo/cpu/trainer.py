@@ -412,6 +412,48 @@ def _patch_cpu_autocast_cache(trainer_cls):
     trainer_cls.autocast_smart_context_manager = autocast_smart_context_manager
 
 
+def _patch_cpu_num_items(trainer_cls):
+    """Count num_items_in_batch with zoo's counter (the one the GPU route installs), not transformers' own.
+
+    transformers 4.x counts it over the unshifted labels: one target per supervised row start more than a causal
+    LM's shifted loss sees (5.x counts labels[..., 1:]). The CPU route keeps stock transformers, so a padded
+    single process, DDP or accelerate FSDP2 run divided by that larger count while padding-free, native FSDP2,
+    tensor / pipeline / context parallel (which install Unsloth's counter) did not: the same rows gave another
+    loss and gradient. Only heads with a positive causal-loss signal: masked LM, classification / QA and
+    encoder-decoder heads (whose labels are not shifted targets, and which zoo's counter declines) keep
+    transformers' count."""
+    original = getattr(trainer_cls, "get_batch_samples", None)
+    if original is None or getattr(original, "_unsloth_cpu", False) \
+            or getattr(original, "__name__", "") == "_unsloth_get_batch_samples":
+        return False
+    from ..loss_utils import (
+        NON_CAUSAL_HEADS, _loss_shifts_labels, _unsloth_get_batch_samples, _unwrap_training_wrappers,
+        counts_unshifted_labels, num_items_labels_convention,
+    )
+
+    def causal_head(trainer, model):
+        """A positive causal-loss signal (the head shifts labels, or Unsloth recorded its count convention);
+        masked LM, classification, QA and encoder-decoder heads have none and keep transformers' count."""
+        m = _unwrap_training_wrappers(model)
+        if hasattr(m, "get_base_model"):
+            m = m.get_base_model()
+        if m is None or any(head in type(m).__name__ for head in NON_CAUSAL_HEADS):
+            return False
+        if num_items_labels_convention(model) is not None or counts_unshifted_labels(m):
+            return True
+        return _loss_shifts_labels(trainer, m, bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False)))
+
+    @functools.wraps(original)
+    def get_batch_samples(self, *args, **kwargs):
+        if not causal_head(self, getattr(self, "model", None)):
+            return original(self, *args, **kwargs)
+        return _unsloth_get_batch_samples(self, *args, **kwargs)
+
+    get_batch_samples._unsloth_cpu = True
+    trainer_cls.get_batch_samples = get_batch_samples
+    return True
+
+
 def _chunked_ce_model(trainer, model):
     """The CPU model whose forward Unsloth patched (patch_chunked_causal_lm_loss), behind accelerate / PEFT wrappers."""
     unwrapped = trainer.accelerator.unwrap_model(model) if getattr(trainer, "accelerator", None) is not None else model
@@ -935,6 +977,8 @@ def install_cpu_training_defaults():
         _patch_cpu_fp16_accelerator(Trainer)
         _patch_cpu_preference_trainers(Trainer)
     _patch_cpu_autocast_cache(Trainer)
+    if os.environ.get("UNSLOTH_CPU_NUM_ITEMS", "1") != "0":
+        _patch_cpu_num_items(Trainer)
     try:
         import trl
         from trl.trainer import sft_trainer
