@@ -33,12 +33,19 @@ CASES = {
     "temporary_patches/moe_fused_swiglu.py": {"_swiglu_fwd_kernel": ("M",), "_swiglu_bwd_kernel": ("M",)},
     "temporary_patches/moe_nf4_grouped.py": {"_nf4_grouped_kernel": ("M", "M_HINT")},
     "gpt_oss_decode_fused.py": {"_sink_scale_kernel": ("Q", "sl_b", "sl_h")},
+    "gguf_kernels/triton_kernels.py": {"mm_kernel": ("M",)},
 }
 
 # Sizes that must keep Triton's % 16 hint: they mask a contiguous axis, so dropping it loses vectorised loads.
 KEEP_SPECIALIZED = {
     "fused_losses/fused_linear.py": {"_fl_scale_kernel": ("n",)},
     "gpt_oss_decode_fused.py": {"_sink_scale_kernel": ("D", "sl_q", "sa_b", "sa_h", "sa_q", "so_b", "so_q", "so_h")},
+    # N / K mask the contiguous output / value axes and row_bytes / strides address packed rows: fixed per weight.
+    "gguf_kernels/triton_kernels.py": {
+        "mm_kernel": ("N", "K", "row_bytes", "stride_xm", "stride_om"),
+        "gemv_kernel": ("N", "K", "row_bytes"),
+        "dequantize_kernel": ("K", "row_bytes"),
+    },
 }
 
 
