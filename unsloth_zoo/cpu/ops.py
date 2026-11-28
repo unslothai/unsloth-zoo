@@ -631,6 +631,10 @@ def _bf16_sdpa_in_fp32_pays():
     return platform.machine().lower() in ("aarch64", "arm64")
 
 
+def _bf16_to_fp32(value):
+    return value.float() if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16 else value
+
+
 def patch_cpu_bf16_sdpa_fp32():
     """bf16 attention on CPU computed by the fp32 SDPA kernel: bf16 query / key / value (and a floating mask) are
     upcast exactly, the output is rounded back to bf16 and gradients flow back through the casts in bf16. Taken by
@@ -654,10 +658,15 @@ def patch_cpu_bf16_sdpa_fp32():
                 and query.dtype == torch.bfloat16
                 and ((query.requires_grad and torch.is_grad_enabled()) or query.shape[-2] == key.shape[-2])):
             return original(module, query, key, value, attention_mask, *args, **kwargs)
+        if kwargs.get("cache", None) is not None:  # a paged cache would be written with fp32 keys / values
+            return original(module, query, key, value, attention_mask, *args, **kwargs)
         if not torch.compiler.is_compiling():
             SDPA_FP32_ENGAGED[0] += 1
         if isinstance(attention_mask, torch.Tensor) and attention_mask.is_floating_point():
             attention_mask = attention_mask.float()
+        # Other bf16 tensors (T5's position_bias) join the mask or the scores, so they are upcast too.
+        args = tuple(_bf16_to_fp32(arg) for arg in args)
+        kwargs = {name: _bf16_to_fp32(arg) for name, arg in kwargs.items()}
         with torch.autocast("cpu", enabled = False):
             output, weights = original(module, query.float(), key.float(), value.float(), attention_mask,
                                        *args, **kwargs)

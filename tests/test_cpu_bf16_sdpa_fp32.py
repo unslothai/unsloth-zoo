@@ -180,6 +180,52 @@ def test_inner_call_sees_fp32_even_under_autocast(mapping, monkeypatch):
     assert seen[0][4] is False
 
 
+def test_extra_bf16_tensors_are_upcast_and_a_paged_cache_keeps_the_stock_path(mapping, monkeypatch):
+    """T5-style position_bias (keyword or positional) joins the mask, so it reaches the fp32 kernel as fp32; a
+    paged cache argument (written with the keys / values) keeps the stock path."""
+    from transformers.integrations import sdpa_attention
+    from unsloth_zoo.cpu import ops
+    table, _ = mapping
+    seen = []
+
+    def spy(module, query, key, value, attention_mask, *args, **kwargs):
+        seen.append((query.dtype, [a.dtype for a in args if isinstance(a, torch.Tensor)],
+                     {k: v.dtype for k, v in kwargs.items() if isinstance(v, torch.Tensor)}))
+        return torch.zeros(query.shape[0], query.shape[2], query.shape[1], query.shape[3], dtype = query.dtype), None
+
+    table["sdpa"] = spy
+    monkeypatch.setattr(sdpa_attention, "sdpa_attention_forward", spy)
+    ops.patch_cpu_bf16_sdpa_fp32()
+    bias = torch.zeros(1, 4, 24, 24, dtype = torch.bfloat16)
+    table["sdpa"](_Attn(), *_qkv(), None, position_bias = bias, layer_idx = torch.tensor(3))
+    table["sdpa"](_Attn(), *_qkv(), None, 0.0, None, None, bias)
+    table["sdpa"](_Attn(), *_qkv(), None, cache = object())
+    assert seen[0] == (torch.float32, [], {"position_bias": torch.float32, "layer_idx": torch.int64})
+    assert seen[1] == (torch.float32, [torch.float32], {})
+    assert seen[2] == (torch.bfloat16, [], {})
+    assert ops.SDPA_FP32_ENGAGED[0] == 2
+
+
+def test_tiny_t5_position_bias_trains(mapping):
+    from transformers import T5Config, T5ForConditionalGeneration
+    from unsloth_zoo.cpu import ops
+    ops.patch_cpu_bf16_sdpa_fp32()
+    config = T5Config(vocab_size = 64, d_model = 32, d_kv = 8, d_ff = 64, num_layers = 1, num_decoder_layers = 1,
+                      num_heads = 4, decoder_start_token_id = 0, pad_token_id = 0)
+    config._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    try:
+        model = T5ForConditionalGeneration(config).bfloat16()
+    except ValueError as error:  # transformers 4.x: T5 has no sdpa attention
+        pytest.skip(str(error)[:80])
+    ids = torch.randint(1, 64, (2, 12), generator = torch.Generator().manual_seed(0))
+    loss = model(input_ids = ids, labels = ids).loss
+    loss.backward()
+    assert torch.isfinite(loss)
+    if ops.SDPA_FP32_ENGAGED[0] == 0:
+        pytest.skip("this transformers version's T5 does not call the sdpa attention function")
+
+
 def test_cached_decode_and_fp32_calls_keep_the_stock_function(mapping, monkeypatch):
     from transformers.integrations import sdpa_attention
     from unsloth_zoo.cpu import ops
