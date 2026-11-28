@@ -739,7 +739,8 @@ class _Window:
         if _needs_grad(others):
             first = h if l == 0 else self.h0[m]
             if first is None or not first.is_leaf or _grad_observable(others, {id(first)}):
-                self._abort("a decoder layer input other than the hidden states needs gradients")
+                self._abort("a decoder layer input other than the hidden states needs gradients that reach a "
+                            "trained weight (such as Gemma 4's per-layer inputs with a trainable projection)")
             # Their gradient reaches nothing but this micro-batch's first decoder input, a leaf (frozen per-layer
             # embeddings under LoRA): passed without one, so the recompute does not backpropagate into the input
             # side once per layer; that leaf's own .grad is the only value that differs, and nothing trains it.
