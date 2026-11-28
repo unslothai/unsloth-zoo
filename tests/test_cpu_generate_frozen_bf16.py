@@ -26,6 +26,8 @@ def _apple_silicon(monkeypatch):
     """Every test runs as on Apple Silicon, where the rollout upcast applies."""
     from unsloth_zoo.cpu import loader
     monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: True, raising = False)
+    # Apple Silicon has no FBGEMM, so the x86 fp16 decode packs (test_cpu_fp16_decode) never take the rollout there.
+    monkeypatch.setenv("UNSLOTH_CPU_FP16_DECODE", "0")
 
 
 def _tiny_bf16_llama(mode):

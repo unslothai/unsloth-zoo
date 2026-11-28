@@ -27,6 +27,8 @@ import torch
 def avx2_host(monkeypatch):
     """Runs as on an AVX2-only x86 host without native bf16 (not Apple Silicon)."""
     from unsloth_zoo.cpu import loader, runtime
+    # The fp32 copy is the path when the fp16 decode packs are off or unavailable (test_cpu_fp16_decode covers those).
+    monkeypatch.setenv("UNSLOTH_CPU_FP16_DECODE", "0")
     monkeypatch.setattr(loader, "_slow_bf16_upcast", lambda: False)
     monkeypatch.setattr(loader, "cpu_bf16_supported", lambda: False)
     monkeypatch.setattr(runtime, "cpu_flags", lambda: frozenset({"sse4_2", "avx", "avx2", "fma"}))
