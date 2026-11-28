@@ -257,14 +257,22 @@ def _pack_parallel(jobs):
     return out
 
 
+def _cpu_autocast():
+    try:
+        return torch.is_autocast_enabled("cpu")
+    except TypeError:  # torch < 2.4
+        return torch.is_autocast_cpu_enabled()
+
+
 def _decode_forward(module, owner, key, parts, forward):
     run = torch.ops.quantized.linear_dynamic_fp16
     out_features = module.weight.shape[0]
 
     def wrapped(x, *args, **kwargs):
         if args or kwargs or x.dtype != torch.float32 or x.device.type != "cpu" or torch.is_grad_enabled() \
-                or x.shape[-1] != module.weight.shape[1] or _key(module, owner) != key:
-            # The key again per call: PEFT unmerges a disabled adapter inside its forward, right before this call.
+                or x.shape[-1] != module.weight.shape[1] or _cpu_autocast() or _key(module, owner) != key:
+            # Autocast would compute in its own dtype. The key again per call: PEFT unmerges a disabled adapter
+            # inside its forward, right before this call.
             return forward(x, *args, **kwargs)
         rows = x.numel() // x.shape[-1] if x.shape[-1] else 0
         if rows == 0 or rows > _MAX_ROWS:

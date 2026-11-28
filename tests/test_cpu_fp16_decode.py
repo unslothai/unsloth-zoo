@@ -254,6 +254,19 @@ def test_stock_path_for_autograd_long_prefill_and_wrong_dtype(no_bf16):
 
 
 @needs_fbgemm
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cpu_autocast_keeps_the_stock_path(no_bf16, dtype):
+    model = _tiny_llama()
+    q = model.model.layers[0].self_attn.q_proj
+    x = torch.randn(2, 32)
+    with torch.no_grad(), no_bf16.fp16_decode(model) as ctx:
+        assert ctx.active
+        with torch.autocast("cpu", dtype = dtype):
+            y = q(x)
+    assert y.dtype == dtype and no_bf16.ENGAGED[0] == 0
+
+
+@needs_fbgemm
 def test_forwards_restored_on_error(no_bf16):
     model = _tiny_llama()
     with pytest.raises(RuntimeError, match = "boom"):
