@@ -241,15 +241,31 @@ def _closure(fn):
     return out
 
 
+def _recording_on(model, key):
+    """Whether the model's config asks transformers to record `key` (output_router_logits and the like)."""
+    config = getattr(model, "config", None)
+    configs = [config]
+    get = getattr(config, "get_text_config", None)
+    if callable(get):
+        try:
+            configs.append(get())
+        except Exception:
+            pass
+    return any(bool(getattr(c, f"output_{key}", False)) for c in configs if c is not None)
+
+
 def _recorder_targets(model, layers):
-    """Module classes inside the decoder layers that transformers' output recorders (_can_record_outputs) target."""
+    """Module classes inside the decoder layers that transformers' output recorders (_can_record_outputs) target,
+    for the keys the model's config records (router logits when output_router_logits is on). Keys a caller asks
+    for per call are not known here: a forward swapped for them during a window aborts it (output recorders)."""
     specs = []
     for module in ([model] if model is not None else []) + list(layers):
         for m in module.modules():
             flags = getattr(type(m), "_can_record_outputs", None)
             if isinstance(flags, dict):
-                for value in flags.values():
-                    specs.extend(value if isinstance(value, list) else [value])
+                for key, value in flags.items():
+                    if _recording_on(model, key):
+                        specs.extend(value if isinstance(value, list) else [value])
     classes = set()
     for layer in layers:
         for m in layer.modules():
@@ -507,6 +523,28 @@ def _stock_checkpoint(fn):
     return outer.get("__name__") == "torch._compile" and getattr(fn, "__wrapped__", None) is body
 
 
+def _unsloth_non_reentrant(fn):
+    """Unsloth's process-wide non-reentrant checkpoint (unsloth/models/non_reentrant_checkpoint.py, installed when
+    the MoE router loss is on): torch's checkpoint with use_reentrant forced False, optionally inside saved-tensor
+    hooks that copy the checkpoint's inputs to the host and back unchanged."""
+    return getattr(fn, "__module__", None) == "unsloth.models.non_reentrant_checkpoint" and \
+        getattr(fn, "__qualname__", None) == "non_reentrant_checkpoint.<locals>._nonre_checkpoint" and \
+        _stock_checkpoint(getattr(fn, "_unsloth_original", None))
+
+
+def _compiled_layers(layers):
+    """A decoder layer whose forward runs compiled (Unsloth's block compile, torch.compile)."""
+    optimized = getattr(getattr(torch, "_dynamo", None), "OptimizedModule", None)
+    for layer in layers:
+        forward = getattr(type(layer), "forward", None)
+        if (getattr(forward, "__module__", "") or "").startswith("unsloth.models._block_compile"):
+            return True
+        for m in layer.modules():
+            if getattr(m, "_compiled_call_impl", None) is not None or (optimized is not None and isinstance(m, optimized)):
+                return True
+    return False
+
+
 def _kv_shared_layers(layers):
     """Decoder layers that reuse another layer's key / value states (Gemma 4 is_kv_shared_layer)."""
     for layer in layers:
@@ -606,6 +644,8 @@ def _checkpoint_mode(layer, swapper = None):
             return True, None
         if _stock_checkpoint(fn):
             return reentrant is None or reentrant is True, None
+        if _unsloth_non_reentrant(fn):
+            return False, None   # grad-mode forward, recompute in backward: values checked like torch's own
         attrs = getattr(fn, "__dict__", None) or {}
         if swapper is not None and attrs.get("_unsloth_block_swap") is swapper and \
                 attrs.get("_unsloth_block_swap_wrapper") is fn and reentrant is None:
@@ -878,7 +918,8 @@ class _Window:
             if id(t) in made:
                 return made[id(t)]
             if t is x or t.requires_grad or not t.is_leaf:
-                self._abort("a decoder layer's auxiliary output already needs gradients (it aliases an input)")
+                self._abort("a decoder layer recorded an auxiliary output that already needs gradients (it aliases "
+                            "an input, or a grad-mode run inside the layer call recorded it)")
             made[id(t)] = t.requires_grad_(True)
             return t
 
@@ -1283,6 +1324,12 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
         return None, "decoder layers share key / value states (KV sharing)"
     if _operator_modes_active():
         return None, "a TorchFunctionMode / TorchDispatchMode is active (the workers would run without it)"
+    if _forward_swapping_capture() and _recorder_targets(model, layers) and _compiled_layers(layers):
+        # The window keeps each micro-batch's capture wrapper per thread through a class-level forward, which
+        # compiled decoder code cannot trace (Unsloth's block compile would fall back to eager, changing numerics).
+        return None, ("transformers 4.x records router logits by swapping module forwards per call, which a window "
+                      "cannot keep per thread inside compiled decoder layers (transformers 5 records them per "
+                      "thread; UNSLOTH_BLOCK_COMPILE=0 also works)")
     if _decoder_forward_hooks(layers, swapper):
         # Standard training runs them once around a checkpointed forward; the window calls the layer twice (no-grad
         # forward and grad-mode recompute).
@@ -1353,8 +1400,24 @@ def _run_layer_major(layers, micro_fns, swapper, model, agreement):
 
 def _execute_window(layers, micro_fns, swapper, model, n, watched, roll_back, agreement):
     classes = _recorder_targets(model, layers) if _forward_swapping_capture() else set()
-    with _thread_forwards(classes) as forwards:
-        return _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, forwards)
+    # transformers 4.x assigns capture wrappers to `module.forward` and puts the original back only when the model
+    # call returns: a micro-batch the window unwinds would leave them installed for good.
+    owners = ([model] if model is not None else []) + list(layers)
+    forwards_before = {id(m): (m, m.__dict__.get("forward", _MISSING)) for o in owners for m in o.modules()}
+    try:
+        with _thread_forwards(classes) as forwards:
+            return _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, forwards)
+    finally:
+        for m, before in forwards_before.values():
+            now = m.__dict__.get("forward", _MISSING)
+            if now is not before:
+                if before is _MISSING:
+                    m.__dict__.pop("forward", None)
+                else:
+                    m.__dict__["forward"] = before
+
+
+_MISSING = object()
 
 
 def _execute_window_body(layers, micro_fns, swapper, model, n, watched, roll_back, agreement, forwards):

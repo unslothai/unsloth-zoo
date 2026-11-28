@@ -246,3 +246,46 @@ def test_capture_hooks_installed_by_the_first_call_inside_a_window():
     assert base.keys() == grads.keys()
     for k in base:
         assert torch.equal(base[k], grads[k]), k
+
+
+def _unsloth_non_reentrant_checkpoint():
+    """A stand-in with the identity of Unsloth's process-wide non-reentrant checkpoint (unsloth's
+    non_reentrant_checkpoint(), which the trainer installs when the MoE router loss is on)."""
+    original = torch.utils.checkpoint.checkpoint
+
+    def non_reentrant_checkpoint(original):
+        def _nonre_checkpoint(function, *args, **kwargs):
+            kwargs["use_reentrant"] = False
+            return original(function, *args, **kwargs)
+        _nonre_checkpoint._unsloth_original = original
+        _nonre_checkpoint._unsloth_offloads = False
+        return _nonre_checkpoint
+    fn = non_reentrant_checkpoint(original)
+    fn.__module__ = "unsloth.models.non_reentrant_checkpoint"
+    fn.__qualname__ = "non_reentrant_checkpoint.<locals>._nonre_checkpoint"
+    return fn
+
+
+def test_unsloth_non_reentrant_checkpoint_engages_bitwise():
+    model = _model("qwen3_moe", "reentrant")
+    fn = _unsloth_non_reentrant_checkpoint()
+    for layer in _layers(model):
+        layer._gradient_checkpointing_func = fn
+    assert lm._checkpoint_mode(_layers(model)[0]) == (False, None)
+    with_aux = _compare(model)
+    # The router gets the load-balancing loss's gradient there (non-reentrant), and the window reproduces it.
+    assert any(_ROUTER.search(k) and with_aux[k].abs().sum() > 0 for k in with_aux)
+
+
+def test_forward_swapping_capture_in_compiled_layers_is_refused():
+    """transformers 4.x records router logits by swapping module forwards per call; the window keeps those per
+    thread through a class-level forward, which compiled decoder layers cannot trace: refused up front."""
+    if not lm._forward_swapping_capture():
+        pytest.skip("transformers 5.x records router logits per thread through hooks")
+    model = _model("qwen3_moe", "non_reentrant")
+    _layers(model)[1].compile()
+    batches, items = _batches()
+    fns = [functools.partial(_step, model, b, items) for b in batches]
+    results, why = lm.run_layer_major(_layers(model), fns, model = model)
+    assert results is None and "compiled decoder layers" in why, why
+    assert _grads(model) == {}

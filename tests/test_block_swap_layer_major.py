@@ -418,7 +418,8 @@ def test_output_recorder_hooks_abort_or_match():
     losses, why = lm.run_layer_major(_layers(model), [lambda b = b: step(b) for b in batches], model = model)
     assert all(getattr(m.__dict__["forward"], "__self__", None) is m for m in model.modules() if "forward" in m.__dict__)
     if losses is None:
-        assert "intermediate decoder output" in why, why
+        # 4.x with output_hidden_states asked per call (no per-thread forwards for it): the swapped forward aborts.
+        assert "intermediate decoder output" in why or "output recorders" in why, why
         assert _grads(model) == {}
     else:
         assert all(torch.equal(a, b) for a, b in zip(base, losses))
